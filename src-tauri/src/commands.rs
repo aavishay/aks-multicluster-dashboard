@@ -393,6 +393,18 @@ pub async fn claude_sign_out() -> Result<ClaudeAuthState, String> {
 }
 
 #[tauri::command]
+pub async fn claude_set_api_key(api_key: String) -> Result<ClaudeAuthState, String> {
+    claude::set_api_key(&api_key)?;
+    Ok(claude::auth_status().await)
+}
+
+#[tauri::command]
+pub async fn claude_clear_api_key() -> Result<ClaudeAuthState, String> {
+    claude::clear_api_key()?;
+    Ok(claude::auth_status().await)
+}
+
+#[tauri::command]
 pub async fn claude_explain_error(error_text: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
     // Not wrapped in `with_retry`/`with_deadline`: those are keyed to a cluster
     // context, and a streaming call already surfaces progress incrementally, so

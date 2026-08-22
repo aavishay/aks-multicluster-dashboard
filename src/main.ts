@@ -2540,6 +2540,8 @@ function setMetricsRange(minutes: number) {
   toggleClaudePanel,
   claudeSignIn,
   claudeSignOut,
+  saveClaudeApiKey,
+  clearClaudeApiKey,
   explainError,
   closeClaudeExplain,
   openMetricsBackendEditor,
@@ -2953,14 +2955,28 @@ function renderClaudePanel(): string {
   const signedIn = auth?.signed_in === true;
   const installed = auth?.cli_installed === true;
 
-  const setupSteps = `
+  const usingKeychainKey = auth?.source === "API key (Keychain)";
+
+  // Never rendered with a `value` — the key is read from the DOM on save and
+  // never round-trips through app state.
+  const keyField = `
     <div class="flex flex-col gap-2">
-      <div class="text-xs text-ink-secondary">Install the Anthropic CLI, then sign in:</div>
-      <pre class="select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-primary">brew install anthropics/tap/ant
-xattr -d com.apple.quarantine "$(brew --prefix)/bin/ant"</pre>
+      <div class="text-xs font-medium text-ink-primary">Paste an API key</div>
+      <div class="flex items-center gap-2">
+        <input
+          type="password"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="sk-ant-..."
+          data-claude-key-input
+          data-filter-key="claude-api-key"
+          class="min-w-0 flex-1 rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none focus:border-series-blue"
+        />
+        <button type="button" onclick="window.__app.saveClaudeApiKey()" class="shrink-0 rounded-md bg-series-blue px-3 py-1.5 text-xs font-medium text-white">Save</button>
+      </div>
       <div class="text-xs text-ink-muted">
-        The <code class="rounded bg-surface-2 px-1 py-0.5">xattr</code> step clears macOS quarantine on the
-        downloaded binary — the same reason this app needs it.
+        Stored in your macOS Keychain, not in the app. Create one at
+        <span class="text-ink-secondary">console.anthropic.com &rarr; API keys</span>.
       </div>
     </div>`;
 
@@ -2968,15 +2984,29 @@ xattr -d com.apple.quarantine "$(brew --prefix)/bin/ant"</pre>
     ? `<div class="flex flex-col gap-3">
         <div class="text-sm text-status-good">Connected${auth?.source ? ` via ${esc(auth.source)}` : ""}.</div>
         ${auth?.detail ? `<pre class="max-h-40 select-text overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-secondary">${esc(auth.detail)}</pre>` : ""}
-        <button type="button" onclick="window.__app.claudeSignOut()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Sign out</button>
+        <div class="flex items-center gap-2">
+          ${
+            usingKeychainKey
+              ? `<button type="button" onclick="window.__app.clearClaudeApiKey()" class="rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Remove key</button>`
+              : `<button type="button" onclick="window.__app.claudeSignOut()" class="rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Sign out</button>`
+          }
+        </div>
       </div>`
-    : `<div class="flex flex-col gap-3">
-        ${installed ? "" : setupSteps}
-        ${
-          installed
-            ? `<button type="button" onclick="window.__app.claudeSignIn()" class="self-start rounded-md bg-series-blue px-3 py-1.5 text-xs font-medium text-white">Sign in with browser</button>`
-            : `<button type="button" onclick="window.__app.refreshClaudeAuth()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-primary hover:bg-surface-3">Re-check</button>`
-        }
+    : `<div class="flex flex-col gap-4">
+        ${keyField}
+        <div class="flex flex-col gap-2 border-t border-gridline pt-3">
+          <div class="text-xs font-medium text-ink-primary">Or sign in with a browser</div>
+          ${
+            installed
+              ? `<button type="button" onclick="window.__app.claudeSignIn()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-primary hover:bg-surface-3">Sign in with browser</button>`
+              : `<pre class="select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-primary">brew install anthropics/tap/ant
+xattr -d com.apple.quarantine "$(brew --prefix)/bin/ant"</pre>`
+          }
+          <div class="text-xs text-ink-muted">
+            Browser sign-in needs an organization that admits your account; if your join request is
+            still pending approval, use an API key instead.
+          </div>
+        </div>
         ${auth?.detail ? `<pre class="max-h-32 select-text overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-muted">${esc(auth.detail)}</pre>` : ""}
       </div>`;
 
@@ -4014,6 +4044,30 @@ async function claudeSignIn() {
     state.claudeAuth = await api.claudeSignIn();
   } catch (e) {
     state.claudeAuth = { ...state.claudeAuth, signed_in: false, detail: String(e) };
+  }
+  render();
+}
+
+async function saveClaudeApiKey() {
+  const input = document.querySelector<HTMLInputElement>("[data-claude-key-input]");
+  const key = input?.value?.trim();
+  if (!key) return;
+  try {
+    state.claudeAuth = await api.claudeSetApiKey(key);
+    // Clear the field immediately — the key lives in the Keychain now, and
+    // leaving it in the DOM serves no purpose.
+    if (input) input.value = "";
+  } catch (e) {
+    if (state.claudeAuth) state.claudeAuth.detail = String(e);
+  }
+  render();
+}
+
+async function clearClaudeApiKey() {
+  try {
+    state.claudeAuth = await api.claudeClearApiKey();
+  } catch (e) {
+    if (state.claudeAuth) state.claudeAuth.detail = String(e);
   }
   render();
 }

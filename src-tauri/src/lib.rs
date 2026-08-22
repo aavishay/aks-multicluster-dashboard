@@ -137,6 +137,8 @@ pub fn run() {
             commands::claude_auth_status,
             commands::claude_sign_in,
             commands::claude_sign_out,
+            commands::claude_set_api_key,
+            commands::claude_clear_api_key,
             commands::claude_explain_error,
             commands::kubeconfig_path,
         ])
