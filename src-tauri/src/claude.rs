@@ -10,6 +10,7 @@
 //! There is no official Anthropic Rust SDK, so the API is called over raw HTTP.
 
 use crate::models::{ClaudeAuthState, ClaudeCredential};
+use keyring::v1::Entry;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -52,6 +53,51 @@ fn ant_is_installed() -> bool {
         .unwrap_or(false)
 }
 
+/// Keychain coordinates for a pasted API key. Deliberately the macOS Keychain
+/// rather than localStorage (plaintext inside the WebView) or a file this app
+/// owns — the key is then protected by the OS, and other apps can't read it.
+const KEYCHAIN_SERVICE: &str = "io.github.aavishay.aks-fleet-dashboard";
+const KEYCHAIN_ACCOUNT: &str = "anthropic-api-key";
+
+fn keychain_entry() -> Result<Entry, String> {
+    Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| format!("Keychain unavailable: {e}"))
+}
+
+/// Stores a pasted key. Trimmed because pasting from a browser or password
+/// manager very often carries a trailing newline, which would otherwise travel
+/// in the `x-api-key` header and fail authentication for a non-obvious reason.
+pub fn set_api_key(key: &str) -> Result<(), String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("The API key is empty.".to_string());
+    }
+    keychain_entry()?
+        .set_password(key)
+        .map_err(|e| format!("Could not save to the Keychain: {e}"))
+}
+
+pub fn clear_api_key() -> Result<(), String> {
+    match keychain_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        // Nothing stored is the desired end state, not a failure.
+        Err(keyring::v1::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Could not remove the key from the Keychain: {e}")),
+    }
+}
+
+fn keychain_api_key() -> Option<String> {
+    let key = keychain_entry().ok()?.get_password().ok()?;
+    let key = key.trim().to_string();
+    (!key.is_empty()).then_some(key)
+}
+
+/// Last four characters, for confirming *which* key is stored without
+/// displaying it.
+fn key_hint(key: &str) -> String {
+    let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("…{tail}")
+}
+
 /// An env-var key short-circuits the CLI entirely, so CI and power users can
 /// bypass `ant` — matching the SDKs' own precedence, where `ANTHROPIC_API_KEY`
 /// outranks a stored profile.
@@ -77,12 +123,23 @@ pub async fn auth_status() -> ClaudeAuthState {
         };
     }
 
+    // Checked before the CLI so a pasted key works without `ant` installed at
+    // all — which is the whole point of offering it.
+    if let Some(key) = keychain_api_key() {
+        return ClaudeAuthState {
+            cli_installed: ant_is_installed(),
+            signed_in: true,
+            source: Some("API key (Keychain)".to_string()),
+            detail: Some(format!("Using the API key stored in your Keychain ({}).", key_hint(&key))),
+        };
+    }
+
     if !ant_is_installed() {
         return ClaudeAuthState {
             cli_installed: false,
             signed_in: false,
             source: None,
-            detail: Some("Install the Anthropic CLI, then sign in.".to_string()),
+            detail: Some("Paste an API key below, or install the Anthropic CLI to sign in with a browser.".to_string()),
         };
     }
 
@@ -173,8 +230,11 @@ pub async fn resolve_credential() -> Result<ClaudeCredential, String> {
     if let Some(key) = env_api_key() {
         return Ok(ClaudeCredential::ApiKey(key));
     }
+    if let Some(key) = keychain_api_key() {
+        return Ok(ClaudeCredential::ApiKey(key));
+    }
     if !ant_is_installed() {
-        return Err("Not signed in to Claude, and the `ant` CLI is not installed.".to_string());
+        return Err("No Claude credential: paste an API key, or install the `ant` CLI and sign in.".to_string());
     }
     let out = run_ant(&["auth", "print-credentials", "--access-token"], CLI_TIMEOUT).await?;
     if !out.status.success() {
@@ -454,6 +514,14 @@ mod tests {
         for junk in ["", "not json", r#"{"type":"#, "[]"] {
             assert_eq!(classify_sse_event(junk), SseEvent::Ignored, "junk: {junk:?}");
         }
+    }
+
+    #[test]
+    fn key_hint_shows_only_the_tail() {
+        assert_eq!(key_hint("sk-ant-api03-abcdefgh"), "…efgh");
+        // Must not leak more than the tail even for a very short value.
+        assert_eq!(key_hint("ab"), "…ab");
+        assert_eq!(key_hint(""), "…");
     }
 
     /// Sets one env var for the duration of the closure, restoring it after, so

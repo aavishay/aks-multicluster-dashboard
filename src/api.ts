@@ -112,6 +112,9 @@ export const api = {
   claudeAuthStatus: () => invoke<ClaudeAuthState>("claude_auth_status"),
   claudeSignIn: () => invoke<ClaudeAuthState>("claude_sign_in"),
   claudeSignOut: () => invoke<ClaudeAuthState>("claude_sign_out"),
+  /** Stores a pasted key in the OS keychain; the key is never persisted frontend-side. */
+  claudeSetApiKey: (apiKey: string) => invoke<ClaudeAuthState>("claude_set_api_key", { apiKey }),
+  claudeClearApiKey: () => invoke<ClaudeAuthState>("claude_clear_api_key"),
   /** Streams an explanation of one error string; `onToken` fires per text delta. */
   claudeExplainError: (errorText: string, onToken: (chunk: string) => void) => {
     const channel = new Channel<string>();
