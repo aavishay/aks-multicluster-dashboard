@@ -132,6 +132,12 @@ export interface MetricsBackendInfo {
   api_path_prefix: string;
 }
 
+export interface MetricsBackendTestResult {
+  ok: boolean;
+  message: string;
+  container_series: number | null;
+}
+
 export interface MetricSample {
   timestamp: number;
   value: number;

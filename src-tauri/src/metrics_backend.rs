@@ -11,7 +11,9 @@
 //! kubeconfig's existing API server access.
 
 use crate::kubeconfig::client_for_context;
-use crate::models::{MetricSample, MetricsBackendInfo, MetricsBackendKind, MetricsOverTimeResult};
+use crate::models::{
+    MetricSample, MetricsBackendInfo, MetricsBackendKind, MetricsBackendTestResult, MetricsOverTimeResult,
+};
 use chrono::Utc;
 use k8s_openapi::api::core::v1::Service;
 use kube::api::{Api, ListParams, ResourceExt};
@@ -123,7 +125,13 @@ fn classify_service(svc: &Service) -> Option<Candidate> {
     None
 }
 
-async fn discover_with_client(client: &Client) -> Result<Option<MetricsBackendInfo>, String> {
+/// Every Service that looks like a queryable Prometheus-API endpoint, best
+/// candidate first. Exposed so the UI can offer the alternatives rather than
+/// making the user type a service/port by hand when the heuristic guesses
+/// wrong — the scoring is only a heuristic, and on a cluster running the
+/// VictoriaMetrics k8s-stack several scrape-target Services match the same
+/// name substrings as the real query endpoint.
+async fn candidates_with_client(client: &Client) -> Result<Vec<MetricsBackendInfo>, String> {
     let services_api: Api<Service> = Api::all(client.clone());
     let services = services_api
         .list(&ListParams::default())
@@ -131,26 +139,43 @@ async fn discover_with_client(client: &Client) -> Result<Option<MetricsBackendIn
         .map_err(|e| format!("Failed to list services: {e}"))?
         .items;
 
-    let mut best: Option<Candidate> = None;
-    for svc in &services {
-        if let Some(candidate) = classify_service(svc) {
-            let is_better = match &best {
-                None => true,
-                Some(b) => candidate.score > b.score,
-            };
-            if is_better {
-                best = Some(candidate);
-            }
-        }
-    }
+    let mut found: Vec<Candidate> = services.iter().filter_map(classify_service).collect();
+    // Descending score; ties broken by name so the order is stable between
+    // calls rather than depending on Service list order.
+    found.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.namespace.cmp(&b.namespace))
+            .then_with(|| a.service_name.cmp(&b.service_name))
+    });
 
-    Ok(best.map(|c| MetricsBackendInfo {
-        kind: c.kind,
-        namespace: c.namespace,
-        service_name: c.service_name,
-        port: c.port,
-        api_path_prefix: c.api_path_prefix,
-    }))
+    Ok(found
+        .into_iter()
+        .map(|c| MetricsBackendInfo {
+            kind: c.kind,
+            namespace: c.namespace,
+            service_name: c.service_name,
+            port: c.port,
+            api_path_prefix: c.api_path_prefix,
+        })
+        .collect())
+}
+
+async fn discover_with_client(client: &Client) -> Result<Option<MetricsBackendInfo>, String> {
+    Ok(candidates_with_client(client).await?.into_iter().next())
+}
+
+/// An explicit override wins outright — no discovery call at all, which also
+/// means an override keeps working on a cluster where the heuristic would
+/// find nothing.
+async fn resolve_backend(
+    client: &Client,
+    override_backend: Option<MetricsBackendInfo>,
+) -> Result<Option<MetricsBackendInfo>, String> {
+    match override_backend {
+        Some(b) => Ok(Some(b)),
+        None => discover_with_client(client).await,
+    }
 }
 
 /// Percent-encode a query-string value. Hand-rolled rather than pulling in a
@@ -275,9 +300,13 @@ async fn resource_usage_over_time(
     }
 }
 
-pub async fn get_metrics_over_time(context_name: &str, range_minutes: i64) -> Result<MetricsOverTimeResult, String> {
+pub async fn get_metrics_over_time(
+    context_name: &str,
+    range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
+) -> Result<MetricsOverTimeResult, String> {
     let client = client_for_context(context_name).await?;
-    let backend = match discover_with_client(&client).await? {
+    let backend = match resolve_backend(&client, override_backend).await? {
         Some(b) => b,
         None => return Ok(MetricsOverTimeResult::default()),
     };
@@ -303,9 +332,10 @@ pub async fn get_pod_metrics_over_time(
     namespace: &str,
     pod_name: &str,
     range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
 ) -> Result<MetricsOverTimeResult, String> {
     let client = client_for_context(context_name).await?;
-    let backend = match discover_with_client(&client).await? {
+    let backend = match resolve_backend(&client, override_backend).await? {
         Some(b) => b,
         None => return Ok(MetricsOverTimeResult::default()),
     };
@@ -372,9 +402,10 @@ pub async fn get_node_metrics_over_time(
     context_name: &str,
     node_name: &str,
     range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
 ) -> Result<MetricsOverTimeResult, String> {
     let client = client_for_context(context_name).await?;
-    let backend = match discover_with_client(&client).await? {
+    let backend = match resolve_backend(&client, override_backend).await? {
         Some(b) => b,
         None => return Ok(MetricsOverTimeResult::default()),
     };
@@ -399,10 +430,11 @@ pub async fn get_workload_metrics_over_time(
     namespace: &str,
     name: &str,
     range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
 ) -> Result<MetricsOverTimeResult, String> {
     let pod_regex = workload_pod_regex(kind, name)?;
     let client = client_for_context(context_name).await?;
-    let backend = match discover_with_client(&client).await? {
+    let backend = match resolve_backend(&client, override_backend).await? {
         Some(b) => b,
         None => return Ok(MetricsOverTimeResult::default()),
     };
@@ -411,6 +443,91 @@ pub async fn get_workload_metrics_over_time(
     let mem_query = format!(r#"sum(container_memory_working_set_bytes{{{scope}}})"#);
     let ephemeral_storage_query = format!(r#"sum(container_ephemeral_storage_usage_bytes{{{scope}}})"#);
     Ok(resource_usage_over_time(&client, backend, &cpu_query, &mem_query, &ephemeral_storage_query, range_minutes).await)
+}
+
+/// Instant query against a candidate, used only by `test_metrics_backend`.
+async fn query_instant(client: &Client, backend: &MetricsBackendInfo, promql: &str) -> Result<f64, String> {
+    let uri = format!(
+        "/api/v1/namespaces/{}/services/{}:{}/proxy{}/api/v1/query?query={}",
+        backend.namespace,
+        backend.service_name,
+        backend.port,
+        backend.api_path_prefix,
+        percent_encode(promql),
+    );
+    let req = http::Request::builder()
+        .uri(uri)
+        .body(Vec::new())
+        .map_err(|e| format!("Failed to build request: {e}"))?;
+    let value: serde_json::Value = match tokio::time::timeout(QUERY_TIMEOUT, client.request(req)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(format!("{e}")),
+        Err(_) => return Err(format!("timed out after {}s", QUERY_TIMEOUT.as_secs())),
+    };
+    if value.get("status").and_then(|v| v.as_str()) != Some("success") {
+        return Err(value
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("endpoint returned a non-success status")
+            .to_string());
+    }
+    Ok(value
+        .pointer("/data/result/0/value/1")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0))
+}
+
+/// Every candidate the heuristic found, best first. The frontend shows these
+/// as the choices when overriding, so a wrong auto-pick can be corrected by
+/// selection rather than by typing a service name and port.
+pub async fn list_metrics_backends(context_name: &str) -> Result<Vec<MetricsBackendInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    candidates_with_client(&client).await
+}
+
+/// Probes a candidate before it's saved as an override.
+///
+/// Two distinct failure modes are worth telling apart, so this reports them
+/// differently: the endpoint not answering PromQL at all (wrong service, wrong
+/// port, wrong path prefix), versus answering fine but carrying none of the
+/// cAdvisor container series the graphs are built from — which would look like
+/// a working config that silently renders empty charts.
+pub async fn test_metrics_backend(
+    context_name: &str,
+    backend: MetricsBackendInfo,
+) -> Result<MetricsBackendTestResult, String> {
+    let client = client_for_context(context_name).await?;
+
+    // `vector(1)` needs no data to exist — it only proves the PromQL API is there.
+    if let Err(e) = query_instant(&client, &backend, "vector(1)").await {
+        return Ok(MetricsBackendTestResult {
+            ok: false,
+            message: format!("Not a reachable Prometheus-compatible endpoint: {e}"),
+            container_series: None,
+        });
+    }
+
+    let series = query_instant(&client, &backend, r#"count(container_memory_working_set_bytes{container!=""})"#)
+        .await
+        .unwrap_or(0.0) as i64;
+
+    Ok(if series > 0 {
+        MetricsBackendTestResult {
+            ok: true,
+            message: format!("Connected. {series} container series available."),
+            container_series: Some(series),
+        }
+    } else {
+        MetricsBackendTestResult {
+            ok: false,
+            message: "Endpoint answers PromQL but has no container_memory_working_set_bytes series, \
+                      so graphs would be empty. This is usually a scrape target rather than the \
+                      query endpoint."
+                .to_string(),
+            container_series: Some(0),
+        }
+    })
 }
 
 #[cfg(test)]

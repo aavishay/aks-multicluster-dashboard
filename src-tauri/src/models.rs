@@ -1,7 +1,7 @@
 //! Serializable data types shared between the Rust backend and the TypeScript frontend.
 //! Keep these in sync with `src/types.ts` on the frontend.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ClusterEntry {
@@ -160,7 +160,7 @@ pub struct ResourceUsageSummary {
     pub memory_allocatable_ki: i64,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum MetricsBackendKind {
     Prometheus,
     VictoriaMetrics,
@@ -171,7 +171,7 @@ pub enum MetricsBackendKind {
 /// Queried through the API server's service-proxy subresource, so no direct
 /// network route to the in-cluster Service is required — the same path
 /// `fetch_node_metrics` already uses for `metrics.k8s.io`.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MetricsBackendInfo {
     pub kind: MetricsBackendKind,
     pub namespace: String,
@@ -182,6 +182,20 @@ pub struct MetricsBackendInfo {
     /// mode's `vmselect` component nests the Prometheus-compatible API under
     /// `/select/0/prometheus`.
     pub api_path_prefix: String,
+}
+
+/// Outcome of probing a candidate backend, so the user gets a verdict before
+/// committing to an override rather than discovering it's wrong via an empty
+/// graph.
+#[derive(Serialize, Clone, Debug)]
+pub struct MetricsBackendTestResult {
+    pub ok: bool,
+    pub message: String,
+    /// Series count for the cAdvisor metric the graphs depend on. A reachable
+    /// endpoint reporting zero here answers PromQL but has no container
+    /// metrics — which would render empty graphs, so it's worth surfacing
+    /// separately from an outright connection failure.
+    pub container_series: Option<i64>,
 }
 
 #[derive(Serialize, Clone, Debug)]
