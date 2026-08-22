@@ -2,6 +2,7 @@ import "./styles.css";
 import { api } from "./api";
 import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
 import type {
+  ClaudeAuthState,
   ClusterEntry,
   ClusterOverview,
   EventInfo,
@@ -329,6 +330,18 @@ interface HelmDetailState {
   searchIndex: number;
 }
 
+/** The "explain this error" panel: one error in, streamed prose out. */
+interface ClaudeExplainState {
+  /** The error text sent to Claude — shown verbatim so it's clear what left the machine. */
+  errorText: string;
+  /** Short label for the panel header, e.g. "apisix (Helm release)". */
+  subject: string;
+  /** Accumulated text deltas. */
+  answer: string;
+  streaming: boolean;
+  error: string | null;
+}
+
 interface AppState {
   theme: Theme;
   /** Root font-size as a percentage — scales the whole rem-based UI. One of `UI_SCALE_STEPS`. */
@@ -362,6 +375,9 @@ interface AppState {
   metricsBackendDraft: MetricsBackendInfo | null;
   metricsBackendTest: MetricsBackendTestResult | null;
   metricsBackendTesting: boolean;
+  claudeAuth: ClaudeAuthState | null;
+  claudePanelOpen: boolean;
+  claudeExplain: ClaudeExplainState | null;
   sortState: Partial<Record<TabId, SortSpec>>;
   filterState: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
   /** filterKey (`${tab}:${col.key}`) of the currently open enum-filter dropdown, or null. */
@@ -417,6 +433,9 @@ const state: AppState = {
   metricsBackendDraft: null,
   metricsBackendTest: null,
   metricsBackendTesting: false,
+  claudeAuth: null,
+  claudePanelOpen: false,
+  claudeExplain: null,
   sortState: {},
   filterState: {},
   openEnumFilter: null,
@@ -451,6 +470,10 @@ let workloadDetailToken = 0;
 let gitOpsDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
 let helmDetailToken = 0;
+/** Bumped per explain request, so a stale stream can't append to a newer one. */
+let claudeExplainToken = 0;
+/** rAF-batches streamed token appends, same as the log-follow path. */
+let claudeRenderScheduled = false;
 let logRenderScheduled = false;
 /**
  * Set only by an explicit search action (typing a query, next/prev), so the
@@ -1118,6 +1141,9 @@ async function init() {
   }
   render();
   scheduleAutoRefresh();
+  // Probed once at startup so the Claude affordances know whether to offer
+  // an explain button or a sign-in prompt.
+  refreshClaudeAuth();
 }
 
 async function refreshSidebarBadges() {
@@ -2510,6 +2536,12 @@ function setMetricsRange(minutes: number) {
   toggleEventsFilter,
   toggleUnhealthyOnly,
   setMetricsRange,
+  refreshClaudeAuth,
+  toggleClaudePanel,
+  saveClaudeApiKey,
+  clearClaudeApiKey,
+  explainError,
+  closeClaudeExplain,
   openMetricsBackendEditor,
   closeMetricsBackendEditor,
   setMetricsBackendField,
@@ -2652,6 +2684,8 @@ function render() {
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
     ${renderMetricsBackendEditor()}
+    ${renderClaudePanel()}
+    ${renderClaudeExplainPanel()}
   `;
 
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
@@ -2864,6 +2898,151 @@ function uiScaleButton(): string {
     ><span class="${glyphClass} font-semibold leading-none">A</span></button>`;
 }
 
+
+// ---------------------------------------------------------------------------
+// Claude UI
+// ---------------------------------------------------------------------------
+
+/** Small "Explain" affordance, rendered only where an error string exists. */
+function claudeExplainButton(subject: string, errorText: string): string {
+  if (!errorText.trim()) return "";
+  const signedIn = state.claudeAuth?.signed_in === true;
+  const title = signedIn
+    ? "Explain this error with Claude (sends only this message)"
+    : "Sign in to Claude first — see the ✦ button in the top bar";
+  return `
+    <button
+      type="button"
+      title="${esc(title)}"
+      ${signedIn ? "" : "disabled"}
+      onclick="window.__app.explainError('${esc(subject)}', this.dataset.err)"
+      data-err="${esc(errorText)}"
+      class="shrink-0 rounded border border-gridline px-1.5 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
+    >Explain</button>`;
+}
+
+/** Top-bar Claude status/auth control. Click cycles: re-probe, or open the setup panel. */
+function claudeAuthButton(): string {
+  const auth = state.claudeAuth;
+  const signedIn = auth?.signed_in === true;
+  const label = signedIn
+    ? `Claude connected${auth?.source ? ` (${auth.source})` : ""}`
+    : "No Claude API key — click to add one";
+  return `
+    <button
+      type="button"
+      onclick="window.__app.toggleClaudePanel()"
+      title="${esc(label)}"
+      class="flex items-center justify-center rounded-md border border-gridline bg-surface-2 px-2.5 py-1.5 hover:bg-surface-3 ${
+        signedIn ? "text-status-good" : "text-ink-muted"
+      }"
+    ><span class="text-sm font-semibold leading-none">✦</span></button>`;
+}
+
+/**
+ * Setup/sign-in panel. The install commands live here rather than only in the
+ * README so a teammate who installs the app via Homebrew isn't left guessing —
+ * including the `xattr` step, which the CLI needs for the same Gatekeeper
+ * reason this app does.
+ */
+function renderClaudePanel(): string {
+  if (!state.claudePanelOpen) return "";
+  const auth = state.claudeAuth;
+  const signedIn = auth?.signed_in === true;
+
+  const usingKeychainKey = auth?.source === "API key (Keychain)";
+
+  // Never rendered with a `value` — the key is read from the DOM on save and
+  // never round-trips through app state, which matters because render()
+  // rebuilds the whole #app subtree and would re-emit it every time.
+  const keyField = `
+    <div class="flex flex-col gap-2">
+      <div class="text-xs font-medium text-ink-primary">Paste an API key</div>
+      <div class="flex items-center gap-2">
+        <input
+          type="password"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="sk-ant-..."
+          data-claude-key-input
+          data-filter-key="claude-api-key"
+          onkeydown="if (event.key === 'Enter') { event.preventDefault(); window.__app.saveClaudeApiKey(); }"
+          class="min-w-0 flex-1 rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none focus:border-series-blue"
+        />
+        <button type="button" onclick="window.__app.saveClaudeApiKey()" class="shrink-0 rounded-md bg-series-blue px-3 py-1.5 text-xs font-medium text-white">Save</button>
+      </div>
+      <div class="text-xs text-ink-muted">
+        Stored in your macOS Keychain, not in the app. Create one at
+        <span class="text-ink-secondary">console.anthropic.com &rarr; API keys</span>.
+      </div>
+    </div>`;
+
+  const body = signedIn
+    ? `<div class="flex flex-col gap-3">
+        <div class="text-sm text-status-good">Connected${auth?.source ? ` via ${esc(auth.source)}` : ""}.</div>
+        ${auth?.detail ? `<div class="text-xs text-ink-secondary">${esc(auth.detail)}</div>` : ""}
+        ${
+          usingKeychainKey
+            ? `<button type="button" onclick="window.__app.clearClaudeApiKey()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Remove key</button>`
+            : `<div class="text-xs text-ink-muted">Unset the environment variable to use a Keychain key instead.</div>`
+        }
+      </div>`
+    : `<div class="flex flex-col gap-3">
+        ${keyField}
+        ${auth?.detail ? `<div class="text-xs text-status-critical">${esc(auth.detail)}</div>` : ""}
+      </div>`;
+
+  return `
+    <div class="fixed inset-0 z-40 flex items-start justify-end bg-black/40 p-6" onclick="window.__app.toggleClaudePanel()">
+      <div class="mt-12 flex w-full max-w-md flex-col rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="text-sm font-medium text-ink-primary">Claude</div>
+          <button type="button" onclick="window.__app.toggleClaudePanel()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+        </div>
+        <div class="p-4">${body}</div>
+      </div>
+    </div>`;
+}
+
+function renderClaudeExplainPanel(): string {
+  const ex = state.claudeExplain;
+  if (!ex) return "";
+  const scrollId = "claude-explain";
+
+  const body = ex.error
+    ? `<div class="text-sm text-status-critical">${esc(ex.error)}</div>`
+    : ex.answer
+      ? `<div class="whitespace-pre-wrap text-sm leading-relaxed text-ink-primary">${esc(ex.answer)}</div>`
+      : `<div class="text-sm text-ink-muted">Thinking…</div>`;
+
+  return `
+    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeClaudeExplain()">
+      <div class="flex h-full w-full max-w-2xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">Explain error</div>
+            <div class="truncate text-xs text-ink-muted">${esc(ex.subject)}</div>
+          </div>
+          <button type="button" onclick="window.__app.closeClaudeExplain()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4" data-scroll-id="${scrollId}">
+          <div>
+            <div class="mb-1 text-xs font-medium text-ink-secondary">Sent to Claude</div>
+            <pre class="max-h-32 overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-secondary">${esc(ex.errorText)}</pre>
+          </div>
+          <div class="border-t border-gridline pt-3">
+            <div class="mb-1 flex items-center gap-2 text-xs font-medium text-ink-secondary">
+              Explanation
+              ${ex.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}
+            </div>
+            ${body}
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
 function renderTopbar(): string {
   const refreshOptions = [
     [0, "Off"],
@@ -2899,6 +3078,7 @@ function renderTopbar(): string {
         >
           Refresh now
         </button>
+        ${claudeAuthButton()}
         ${uiScaleButton()}
         ${themeToggleButton()}
       </div>
@@ -3811,6 +3991,94 @@ function renderTimeSeriesChart(
 
 function chartLegendLabel(color: string, label: string): string {
   return `<span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 shrink-0 rounded-full" style="background:${color}"></span>${esc(label)}</span>`;
+}
+
+// ---------------------------------------------------------------------------
+// Claude: auth + explain-error
+// ---------------------------------------------------------------------------
+
+function toggleClaudePanel() {
+  state.claudePanelOpen = !state.claudePanelOpen;
+  render();
+  // Re-probe on open so a sign-in completed in a terminal is reflected without
+  // restarting the app.
+  if (state.claudePanelOpen) refreshClaudeAuth();
+}
+
+async function refreshClaudeAuth() {
+  try {
+    state.claudeAuth = await api.claudeAuthStatus();
+  } catch {
+    // Treated as "unavailable" rather than an error banner — Claude is an
+    // optional add-on, and a failure here shouldn't disrupt cluster work.
+    state.claudeAuth = { signed_in: false, source: null, detail: null };
+  }
+  render();
+}
+
+async function saveClaudeApiKey() {
+  const input = document.querySelector<HTMLInputElement>("[data-claude-key-input]");
+  const key = input?.value?.trim();
+  if (!key) return;
+  try {
+    state.claudeAuth = await api.claudeSetApiKey(key);
+    // Clear the field immediately — the key lives in the Keychain now, and
+    // leaving it in the DOM serves no purpose.
+    if (input) input.value = "";
+  } catch (e) {
+    if (state.claudeAuth) state.claudeAuth.detail = String(e);
+  }
+  render();
+}
+
+async function clearClaudeApiKey() {
+  try {
+    state.claudeAuth = await api.claudeClearApiKey();
+  } catch (e) {
+    if (state.claudeAuth) state.claudeAuth.detail = String(e);
+  }
+  render();
+}
+
+function closeClaudeExplain() {
+  claudeExplainToken += 1;
+  state.claudeExplain = null;
+  render();
+}
+
+/**
+ * Opens the explain panel for one error string. Only this string is sent —
+ * no logs, manifests or cluster identifiers — which is what keeps this the
+ * lowest-exposure Claude feature in the app.
+ */
+async function explainError(subject: string, errorText: string) {
+  if (!errorText.trim()) return;
+  const token = ++claudeExplainToken;
+  state.claudeExplain = { errorText, subject, answer: "", streaming: true, error: null };
+  render();
+
+  try {
+    await api.claudeExplainError(errorText, (chunk) => {
+      if (token !== claudeExplainToken || !state.claudeExplain) return;
+      state.claudeExplain.answer += chunk;
+      // Coalesce bursts of deltas into one render per frame — a full re-render
+      // per token would thrash, same reasoning as the log-follow path.
+      if (!claudeRenderScheduled) {
+        claudeRenderScheduled = true;
+        requestAnimationFrame(() => {
+          claudeRenderScheduled = false;
+          render();
+        });
+      }
+    });
+    if (token !== claudeExplainToken || !state.claudeExplain) return;
+    state.claudeExplain.streaming = false;
+  } catch (e) {
+    if (token !== claudeExplainToken || !state.claudeExplain) return;
+    state.claudeExplain.streaming = false;
+    state.claudeExplain.error = String(e);
+  }
+  render();
 }
 
 // ---------------------------------------------------------------------------
@@ -5552,7 +5820,12 @@ function renderHelm(): string {
               <td class="tabular">${esc(r.app_version) || "—"}</td>
               <td class="tabular" title="${r.revision_count} revision${r.revision_count === 1 ? "" : "s"} retained">${r.revision}</td>
               <td class="tabular">${formatAgeDetailed(r.age_days, r.age_seconds)}</td>
-              <td class="max-w-xs truncate" title="${esc(r.description)}">${esc(r.description) || "—"}</td>
+              <td class="max-w-xs" title="${esc(r.description)}">
+                <span class="inline-flex items-center gap-1.5">
+                  <span class="min-w-0 truncate">${esc(r.description) || "—"}</span>
+                  ${helmReleaseHealthy(r) ? "" : claudeExplainButton(`${r.name} (Helm release)`, r.description)}
+                </span>
+              </td>
             </tr>`;
             })
             .join("")}
@@ -5703,7 +5976,9 @@ function closeOpenDetailPanel(): boolean {
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (state.metricsBackendEditor) closeMetricsBackendEditor();
+    if (state.claudeExplain) closeClaudeExplain();
+    else if (state.claudePanelOpen) toggleClaudePanel();
+    else if (state.metricsBackendEditor) closeMetricsBackendEditor();
     else closeOpenDetailPanel();
     return;
   }

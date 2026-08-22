@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  ClaudeAuthState,
   ClusterEntry,
   ClusterOverview,
   EventInfo,
@@ -108,6 +109,16 @@ export const api = {
     invoke<MetricsBackendInfo[]>("list_metrics_backends", { contextName }),
   testMetricsBackend: (contextName: string, backend: MetricsBackendInfo) =>
     invoke<MetricsBackendTestResult>("test_metrics_backend", { contextName, backend }),
+  claudeAuthStatus: () => invoke<ClaudeAuthState>("claude_auth_status"),
+  /** Stores a pasted key in the OS keychain; the key is never persisted frontend-side. */
+  claudeSetApiKey: (apiKey: string) => invoke<ClaudeAuthState>("claude_set_api_key", { apiKey }),
+  claudeClearApiKey: () => invoke<ClaudeAuthState>("claude_clear_api_key"),
+  /** Streams an explanation of one error string; `onToken` fires per text delta. */
+  claudeExplainError: (errorText: string, onToken: (chunk: string) => void) => {
+    const channel = new Channel<string>();
+    channel.onmessage = onToken;
+    return invoke<void>("claude_explain_error", { errorText, onToken: channel });
+  },
   getGitOpsApps: (contextName: string) => invoke<GitOpsResult>("get_gitops_apps", { contextName }),
   getGitOpsManifest: (contextName: string, namespace: string, name: string) =>
     invoke<GitOpsAppManifest>("get_gitops_manifest", { contextName, namespace, name }),
