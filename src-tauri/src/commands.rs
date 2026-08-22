@@ -1,0 +1,416 @@
+use crate::models::*;
+use crate::{helm, k8s, kubeconfig, metrics_backend};
+use std::future::Future;
+use std::time::Duration;
+
+/// Ceiling on any single cluster operation, enforced here rather than relying
+/// on transport timeouts alone.
+///
+/// The failure mode this exists for: a private-link AKS cluster reached from
+/// outside its VNet completes the TCP handshake (the private endpoint's NIC
+/// answers) but never returns a response. Without a deadline the tab sits on
+/// "Loading…" indefinitely with no error to explain why, and each stalled
+/// request pins its connection — and descriptors — until the read timeout
+/// elapses. Cancelling the future here drops the connection and frees them.
+///
+/// Generous enough for a genuinely slow cluster over a VPN, but well short of
+/// "the user assumes the app is broken".
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn with_deadline<T>(
+    context_name: &str,
+    operation: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(OPERATION_TIMEOUT, operation).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Timed out after {}s talking to '{context_name}'. If this is a private cluster, \
+             check that you're connected to the VPN and that this machine is allowed to reach \
+             the cluster's private endpoint.",
+            OPERATION_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Extra attempts `with_retry` gets beyond the first, for a failure that
+/// looks transient. Kept small — this is papering over a momentary network
+/// blip (a VPN hiccup, a dropped TCP connection), not standing in for a
+/// cluster that's genuinely unreachable, which should still surface promptly
+/// rather than making the user wait through several multiplied timeouts.
+const MAX_RETRIES: u32 = 2;
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Substrings of the lower-cased error text that mark a failure as a
+/// transport-level blip worth retrying, rather than something retrying won't
+/// fix (auth failure, RBAC denial, a resource that doesn't exist, or the
+/// deadline in `with_deadline` above — re-issuing a request right after a
+/// full `OPERATION_TIMEOUT` wait would just make a genuinely slow/unreachable
+/// cluster take several times as long to report that, for no benefit).
+/// Matched against the fully-formatted error string rather than a structured
+/// error type, since every call site in `k8s.rs` already collapses its
+/// `kube::Error` into a `String` before it reaches here — a pragmatic
+/// tradeoff, not a precise classification.
+const TRANSIENT_ERROR_MARKERS: &[&str] = &[
+    "connection reset",
+    "connection refused",
+    "connection closed",
+    "broken pipe",
+    "unexpected eof",
+    "eof while parsing",
+    "end of file before message length reached",
+    "error trying to connect",
+    "dns error",
+    "failed to lookup address",
+    "temporary failure in name resolution",
+    "tls handshake",
+    "os error 54", // ECONNRESET
+    "os error 32", // EPIPE
+];
+
+fn is_transient_error(message: &str) -> bool {
+    if message.starts_with("Timed out after") {
+        return false;
+    }
+    let lower = message.to_lowercase();
+    TRANSIENT_ERROR_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Wraps `with_deadline`, re-running `operation` a couple of times if it
+/// fails with what looks like a transient network error. Safe to layer over
+/// every command in this file: each one is a read-only GET/LIST (or, for the
+/// log-follow streams, has its own independent per-line error handling), so
+/// re-issuing a request after a blip can't cause any duplicated side effect.
+async fn with_retry<T, F, Fut>(context_name: &str, mut operation: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match with_deadline(context_name, operation()).await {
+            Ok(value) => return Ok(value),
+            Err(e) if attempt <= MAX_RETRIES && is_transient_error(&e) => {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[tauri::command]
+pub fn list_clusters() -> Result<Vec<ClusterEntry>, String> {
+    kubeconfig::list_contexts()
+}
+
+#[tauri::command]
+pub async fn get_cluster_overview(context_name: String) -> Result<ClusterOverview, String> {
+    // The overview backs the sidebar's per-cluster health dot, so failures are
+    // reported in-band as `reachable: false` rather than as a command error —
+    // including a timeout, which is the shape an unreachable private cluster
+    // takes. That way such a cluster settles on "unreachable" with a reason
+    // instead of being stuck on "checking…".
+    match with_retry(&context_name, || k8s::get_overview(&context_name)).await {
+        Ok(overview) => Ok(overview),
+        Err(error) => Ok(ClusterOverview {
+            context_name,
+            reachable: false,
+            error: Some(error),
+            ..Default::default()
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn get_nodes(context_name: String) -> Result<Vec<NodeInfo>, String> {
+    with_retry(&context_name, || k8s::get_nodes(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_node_manifest(context_name: String, node_name: String) -> Result<NodeManifest, String> {
+    with_retry(&context_name, || k8s::get_node_manifest(&context_name, &node_name)).await
+}
+
+#[tauri::command]
+pub async fn get_node_events(context_name: String, node_name: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || k8s::get_node_events(&context_name, &node_name)).await
+}
+
+#[tauri::command]
+pub async fn get_pods(context_name: String, namespace: Option<String>) -> Result<Vec<PodInfo>, String> {
+    with_retry(&context_name, || k8s::get_pods(&context_name, namespace.clone())).await
+}
+
+#[tauri::command]
+pub async fn get_workloads(context_name: String) -> Result<Vec<WorkloadInfo>, String> {
+    with_retry(&context_name, || k8s::get_workloads(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_workload_manifest(
+    context_name: String,
+    kind: String,
+    namespace: String,
+    name: String,
+) -> Result<WorkloadManifest, String> {
+    with_retry(&context_name, || {
+        k8s::get_workload_manifest(&context_name, &kind, &namespace, &name)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_workload_events(
+    context_name: String,
+    kind: String,
+    namespace: String,
+    name: String,
+) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || {
+        k8s::get_workload_events(&context_name, &kind, &namespace, &name)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_workload_revisions(
+    context_name: String,
+    kind: String,
+    namespace: String,
+    name: String,
+) -> Result<Vec<WorkloadRevisionInfo>, String> {
+    with_retry(&context_name, || {
+        k8s::get_workload_revisions(&context_name, &kind, &namespace, &name)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_events(context_name: String, warnings_only: bool) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || k8s::get_events(&context_name, warnings_only)).await
+}
+
+#[tauri::command]
+pub async fn get_resource_usage(context_name: String) -> Result<ResourceUsageSummary, String> {
+    with_retry(&context_name, || k8s::get_resource_usage(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_metrics_over_time(context_name: String, range_minutes: i64) -> Result<MetricsOverTimeResult, String> {
+    with_retry(&context_name, || {
+        metrics_backend::get_metrics_over_time(&context_name, range_minutes)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_pod_manifest(
+    context_name: String,
+    namespace: String,
+    pod_name: String,
+) -> Result<PodManifest, String> {
+    with_retry(&context_name, || {
+        k8s::get_pod_manifest(&context_name, &namespace, &pod_name)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_pod_logs(
+    context_name: String,
+    namespace: String,
+    pod_name: String,
+    container: String,
+    tail: bool,
+    lines: i64,
+) -> Result<String, String> {
+    with_retry(&context_name, || {
+        k8s::get_pod_logs(&context_name, &namespace, &pod_name, &container, tail, lines)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn start_pod_log_stream(
+    context_name: String,
+    namespace: String,
+    pod_name: String,
+    container: String,
+    on_line: tauri::ipc::Channel<String>,
+) -> Result<u64, String> {
+    with_deadline(
+        &context_name,
+        k8s::start_pod_log_stream(&context_name, &namespace, &pod_name, &container, on_line),
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn stop_pod_log_stream(stream_id: u64) {
+    k8s::stop_pod_log_stream(stream_id);
+}
+
+#[tauri::command]
+pub async fn get_workload_logs(
+    context_name: String,
+    namespace: String,
+    pod_names: Vec<String>,
+    container: String,
+    tail: bool,
+    lines: i64,
+) -> Result<String, String> {
+    with_retry(&context_name, || {
+        k8s::get_workload_logs(&context_name, &namespace, &pod_names, &container, tail, lines)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn start_workload_log_stream(
+    context_name: String,
+    namespace: String,
+    pod_names: Vec<String>,
+    container: String,
+    on_line: tauri::ipc::Channel<String>,
+) -> Result<u64, String> {
+    with_deadline(
+        &context_name,
+        k8s::start_workload_log_stream(&context_name, &namespace, &pod_names, &container, on_line),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn get_pod_metrics_over_time(
+    context_name: String,
+    namespace: String,
+    pod_name: String,
+    range_minutes: i64,
+) -> Result<MetricsOverTimeResult, String> {
+    with_retry(&context_name, || {
+        metrics_backend::get_pod_metrics_over_time(&context_name, &namespace, &pod_name, range_minutes)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_node_metrics_over_time(
+    context_name: String,
+    node_name: String,
+    range_minutes: i64,
+) -> Result<MetricsOverTimeResult, String> {
+    with_retry(&context_name, || {
+        metrics_backend::get_node_metrics_over_time(&context_name, &node_name, range_minutes)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_workload_metrics_over_time(
+    context_name: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    range_minutes: i64,
+) -> Result<MetricsOverTimeResult, String> {
+    with_retry(&context_name, || {
+        metrics_backend::get_workload_metrics_over_time(&context_name, &kind, &namespace, &name, range_minutes)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_helm_releases(context_name: String) -> Result<Vec<HelmReleaseInfo>, String> {
+    with_retry(&context_name, || helm::get_helm_releases(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_helm_release_detail(
+    context_name: String,
+    namespace: String,
+    name: String,
+    revision: i64,
+) -> Result<HelmReleaseDetail, String> {
+    with_retry(&context_name, || {
+        helm::get_helm_release_detail(&context_name, &namespace, &name, revision)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_gitops_apps(context_name: String) -> Result<GitOpsResult, String> {
+    with_retry(&context_name, || k8s::get_gitops_apps(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_gitops_manifest(context_name: String, namespace: String, name: String) -> Result<GitOpsAppManifest, String> {
+    with_retry(&context_name, || k8s::get_gitops_manifest(&context_name, &namespace, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_gitops_events(context_name: String, namespace: String, name: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || k8s::get_gitops_events(&context_name, &namespace, &name)).await
+}
+
+#[tauri::command]
+pub fn kubeconfig_path() -> Option<String> {
+    kubeconfig::kubeconfig_path().map(|p| p.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_transient_error_matches_common_network_blips() {
+        assert!(is_transient_error("Failed to list pods: error trying to connect: dns error: failed to lookup address information"));
+        assert!(is_transient_error("Failed to get node 'x': connection reset by peer (os error 54)"));
+        assert!(is_transient_error("Failed to list events: IO error: broken pipe"));
+        assert!(is_transient_error("SOME WRAPPER: Connection Refused"));
+    }
+
+    #[test]
+    fn is_transient_error_rejects_the_deadline_timeout_message() {
+        assert!(!is_transient_error(
+            "Timed out after 60s talking to 'aks-dev-weu-ng'. If this is a private cluster, check that you're connected to the VPN."
+        ));
+    }
+
+    #[test]
+    fn is_transient_error_rejects_non_network_failures() {
+        assert!(!is_transient_error("Failed to get pod 'x': pods \"x\" not found"));
+        assert!(!is_transient_error("Failed to list nodes: Unauthorized"));
+        assert!(!is_transient_error("Unsupported workload kind 'CronJob'"));
+    }
+
+    #[tokio::test]
+    async fn with_retry_recovers_from_a_transient_failure() {
+        let attempts = std::cell::Cell::new(0);
+        let result = with_retry("test-ctx", || {
+            attempts.set(attempts.get() + 1);
+            let this_attempt = attempts.get();
+            async move {
+                if this_attempt < 2 {
+                    Err("connection reset by peer (os error 54)".to_string())
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(42));
+        assert_eq!(attempts.get(), 2, "should have recovered on the second attempt");
+    }
+
+    #[tokio::test]
+    async fn with_retry_does_not_retry_a_non_transient_error() {
+        let attempts = std::cell::Cell::new(0);
+        let result = with_retry("test-ctx", || {
+            attempts.set(attempts.get() + 1);
+            async move { Err::<(), _>("pods \"x\" not found".to_string()) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1, "a non-transient error should not be retried at all");
+    }
+}

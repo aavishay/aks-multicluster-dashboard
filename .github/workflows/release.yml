@@ -1,0 +1,115 @@
+name: Release
+
+# Tag-driven: `git tag v1.2.3 && git push --tags` builds and publishes.
+# Also runnable by hand from the Actions tab to re-cut a build.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: write # needed to create the release and upload assets
+
+jobs:
+  macos:
+    runs-on: macos-14 # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust with both macOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # A universal binary needs both slices; without the x86_64 target the
+          # app would refuse to launch on Intel Macs.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Test
+        run: |
+          npx tsc --noEmit
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build universal .app and .dmg
+        # No signing identity is configured, so Tauri ad-hoc signs. That means
+        # Gatekeeper will quarantine the download — the Homebrew cask and the
+        # release notes both tell users how to clear it. Adding a Developer ID
+        # here later is the fix; nothing else needs to change.
+        run: npm run tauri build -- --target universal-apple-darwin
+
+      - name: Collect artifacts and checksums
+        id: artifacts
+        run: |
+          set -euo pipefail
+          BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          mkdir -p dist-release
+
+          # The .dmg is what the cask installs from.
+          cp "$BUNDLE/dmg/AKS Fleet Dashboard_${VERSION}_universal.dmg" \
+             "dist-release/AKS-Fleet-Dashboard-${VERSION}-universal.dmg"
+
+          # A zipped .app as well, for anyone who'd rather not mount a disk image.
+          ditto -c -k --keepParent "$BUNDLE/macos/AKS Fleet Dashboard.app" \
+             "dist-release/AKS-Fleet-Dashboard-${VERSION}-universal.app.zip"
+
+          cd dist-release
+          shasum -a 256 * | tee SHA256SUMS.txt
+          # Surfaced in the job summary so the cask's sha256 can be copied
+          # without downloading the asset again.
+          {
+            echo "### Checksums for the Homebrew cask"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the binary really is universal
+        run: |
+          set -euo pipefail
+          BIN="src-tauri/target/universal-apple-darwin/release/bundle/macos/AKS Fleet Dashboard.app/Contents/MacOS/k8s-view"
+          ARCHS=$(lipo -archs "$BIN")
+          echo "architectures: $ARCHS"
+          # Fail loudly rather than shipping an arm64-only build labelled universal.
+          for want in arm64 x86_64; do
+            case "$ARCHS" in *"$want"*) ;; *) echo "::error::missing $want slice"; exit 1 ;; esac
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist-release/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```bash
+            brew install --cask aavishay/aks-fleet-dashboard/aks-fleet-dashboard
+            ```
+
+            ## Not notarized
+
+            This build is ad-hoc signed, not signed with an Apple Developer ID,
+            so macOS quarantines it on first launch. Clear the flag once:
+
+            ```bash
+            xattr -dr com.apple.quarantine "/Applications/AKS Fleet Dashboard.app"
+            ```
+
+            Universal binary — runs natively on both Apple Silicon and Intel.

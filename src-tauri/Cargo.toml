@@ -1,0 +1,48 @@
+[package]
+name = "k8s-view"
+version = "0.1.0"
+description = "Native multi-cluster Kubernetes dashboard for Azure AKS fleets"
+authors = ["Avishay Ashkenazi"]
+edition = "2021"
+license = "AGPL-3.0-only"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "k8s_view_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+kube = { version = "0.99", default-features = false, features = ["client", "config", "rustls-tls"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+# Helm stores each release as base64(gzip(json)) inside a Secret — decoding
+# that needs both. Already present transitively via kube/tauri, so pinning
+# them as direct dependencies adds no new compilation. DEFLATE is a real
+# algorithm, not the kind of small stable shape this crate hand-rolls
+# elsewhere (see the metrics/YAML parsing in k8s.rs).
+base64 = "0.22"
+flate2 = "1"
+anyhow = "1"
+thiserror = "2"
+dirs = "5"
+http = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
