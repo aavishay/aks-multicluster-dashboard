@@ -7,6 +7,8 @@ import type {
   GitOpsResult,
   HelmReleaseDetail,
   HelmReleaseInfo,
+  MetricsBackendInfo,
+  MetricsBackendTestResult,
   MetricsOverTimeResult,
   NodeInfo,
   NodeManifest,
@@ -38,8 +40,8 @@ export const api = {
   getEvents: (contextName: string, warningsOnly: boolean) =>
     invoke<EventInfo[]>("get_events", { contextName, warningsOnly }),
   getResourceUsage: (contextName: string) => invoke<ResourceUsageSummary>("get_resource_usage", { contextName }),
-  getMetricsOverTime: (contextName: string, rangeMinutes: number) =>
-    invoke<MetricsOverTimeResult>("get_metrics_over_time", { contextName, rangeMinutes }),
+  getMetricsOverTime: (contextName: string, rangeMinutes: number, overrideBackend?: MetricsBackendInfo | null) =>
+    invoke<MetricsOverTimeResult>("get_metrics_over_time", { contextName, rangeMinutes, overrideBackend }),
   getPodManifest: (contextName: string, namespace: string, podName: string) =>
     invoke<PodManifest>("get_pod_manifest", { contextName, namespace, podName }),
   getPodLogs: (contextName: string, namespace: string, podName: string, container: string, tail: boolean, lines: number) =>
@@ -57,8 +59,13 @@ export const api = {
     return invoke<number>("start_pod_log_stream", { contextName, namespace, podName, container, onLine: channel });
   },
   stopPodLogStream: (streamId: number) => invoke<void>("stop_pod_log_stream", { streamId }),
-  getPodMetricsOverTime: (contextName: string, namespace: string, podName: string, rangeMinutes: number) =>
-    invoke<MetricsOverTimeResult>("get_pod_metrics_over_time", { contextName, namespace, podName, rangeMinutes }),
+  getPodMetricsOverTime: (
+    contextName: string,
+    namespace: string,
+    podName: string,
+    rangeMinutes: number,
+    overrideBackend?: MetricsBackendInfo | null,
+  ) => invoke<MetricsOverTimeResult>("get_pod_metrics_over_time", { contextName, namespace, podName, rangeMinutes, overrideBackend }),
   /** Merged, chronologically-interleaved Head/Tail across every pod passed in, each line prefixed with its source pod. */
   getWorkloadLogs: (
     contextName: string,
@@ -80,13 +87,27 @@ export const api = {
     channel.onmessage = onLine;
     return invoke<number>("start_workload_log_stream", { contextName, namespace, podNames, container, onLine: channel });
   },
-  getNodeMetricsOverTime: (contextName: string, nodeName: string, rangeMinutes: number) =>
-    invoke<MetricsOverTimeResult>("get_node_metrics_over_time", { contextName, nodeName, rangeMinutes }),
-  getWorkloadMetricsOverTime: (contextName: string, kind: string, namespace: string, name: string, rangeMinutes: number) =>
-    invoke<MetricsOverTimeResult>("get_workload_metrics_over_time", { contextName, kind, namespace, name, rangeMinutes }),
+  getNodeMetricsOverTime: (
+    contextName: string,
+    nodeName: string,
+    rangeMinutes: number,
+    overrideBackend?: MetricsBackendInfo | null,
+  ) => invoke<MetricsOverTimeResult>("get_node_metrics_over_time", { contextName, nodeName, rangeMinutes, overrideBackend }),
+  getWorkloadMetricsOverTime: (
+    contextName: string,
+    kind: string,
+    namespace: string,
+    name: string,
+    rangeMinutes: number,
+    overrideBackend?: MetricsBackendInfo | null,
+  ) => invoke<MetricsOverTimeResult>("get_workload_metrics_over_time", { contextName, kind, namespace, name, rangeMinutes, overrideBackend }),
   getHelmReleases: (contextName: string) => invoke<HelmReleaseInfo[]>("get_helm_releases", { contextName }),
   getHelmReleaseDetail: (contextName: string, namespace: string, name: string, revision: number) =>
     invoke<HelmReleaseDetail>("get_helm_release_detail", { contextName, namespace, name, revision }),
+  listMetricsBackends: (contextName: string) =>
+    invoke<MetricsBackendInfo[]>("list_metrics_backends", { contextName }),
+  testMetricsBackend: (contextName: string, backend: MetricsBackendInfo) =>
+    invoke<MetricsBackendTestResult>("test_metrics_backend", { contextName, backend }),
   getGitOpsApps: (contextName: string) => invoke<GitOpsResult>("get_gitops_apps", { contextName }),
   getGitOpsManifest: (contextName: string, namespace: string, name: string) =>
     invoke<GitOpsAppManifest>("get_gitops_manifest", { contextName, namespace, name }),

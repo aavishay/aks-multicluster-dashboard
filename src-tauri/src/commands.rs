@@ -196,9 +196,13 @@ pub async fn get_resource_usage(context_name: String) -> Result<ResourceUsageSum
 }
 
 #[tauri::command]
-pub async fn get_metrics_over_time(context_name: String, range_minutes: i64) -> Result<MetricsOverTimeResult, String> {
+pub async fn get_metrics_over_time(
+    context_name: String,
+    range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
+) -> Result<MetricsOverTimeResult, String> {
     with_retry(&context_name, || {
-        metrics_backend::get_metrics_over_time(&context_name, range_minutes)
+        metrics_backend::get_metrics_over_time(&context_name, range_minutes, override_backend.clone())
     })
     .await
 }
@@ -286,9 +290,10 @@ pub async fn get_pod_metrics_over_time(
     namespace: String,
     pod_name: String,
     range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
 ) -> Result<MetricsOverTimeResult, String> {
     with_retry(&context_name, || {
-        metrics_backend::get_pod_metrics_over_time(&context_name, &namespace, &pod_name, range_minutes)
+        metrics_backend::get_pod_metrics_over_time(&context_name, &namespace, &pod_name, range_minutes, override_backend.clone())
     })
     .await
 }
@@ -298,9 +303,10 @@ pub async fn get_node_metrics_over_time(
     context_name: String,
     node_name: String,
     range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
 ) -> Result<MetricsOverTimeResult, String> {
     with_retry(&context_name, || {
-        metrics_backend::get_node_metrics_over_time(&context_name, &node_name, range_minutes)
+        metrics_backend::get_node_metrics_over_time(&context_name, &node_name, range_minutes, override_backend.clone())
     })
     .await
 }
@@ -312,9 +318,10 @@ pub async fn get_workload_metrics_over_time(
     namespace: String,
     name: String,
     range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
 ) -> Result<MetricsOverTimeResult, String> {
     with_retry(&context_name, || {
-        metrics_backend::get_workload_metrics_over_time(&context_name, &kind, &namespace, &name, range_minutes)
+        metrics_backend::get_workload_metrics_over_time(&context_name, &kind, &namespace, &name, range_minutes, override_backend.clone())
     })
     .await
 }
@@ -350,6 +357,22 @@ pub async fn get_gitops_manifest(context_name: String, namespace: String, name: 
 #[tauri::command]
 pub async fn get_gitops_events(context_name: String, namespace: String, name: String) -> Result<Vec<EventInfo>, String> {
     with_retry(&context_name, || k8s::get_gitops_events(&context_name, &namespace, &name)).await
+}
+
+#[tauri::command]
+pub async fn list_metrics_backends(context_name: String) -> Result<Vec<MetricsBackendInfo>, String> {
+    with_retry(&context_name, || metrics_backend::list_metrics_backends(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn test_metrics_backend(
+    context_name: String,
+    backend: MetricsBackendInfo,
+) -> Result<MetricsBackendTestResult, String> {
+    // Not wrapped in `with_retry`: this is a deliberate probe whose whole
+    // purpose is to report a failure verbatim, so retrying would just delay
+    // the answer the user asked for.
+    with_deadline(&context_name, metrics_backend::test_metrics_backend(&context_name, backend)).await
 }
 
 #[tauri::command]

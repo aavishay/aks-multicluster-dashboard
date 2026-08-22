@@ -131,6 +131,8 @@ pub fn run() {
             commands::get_gitops_apps,
             commands::get_gitops_manifest,
             commands::get_gitops_events,
+            commands::list_metrics_backends,
+            commands::test_metrics_backend,
             commands::kubeconfig_path,
         ])
         .run(tauri::generate_context!())

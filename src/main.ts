@@ -9,6 +9,8 @@ import type {
   GitOpsAppManifest,
   GitOpsResult,
   HelmReleaseDetail,
+  MetricsBackendInfo,
+  MetricsBackendTestResult,
   HelmReleaseInfo,
   MetricSample,
   MetricsOverTimeResult,
@@ -136,6 +138,46 @@ function resetUiScale() {
 /** The "A" button: wraps around, so the whole ladder stays reachable by clicking alone. */
 function cycleUiScale() {
   setUiScale(UI_SCALE_STEPS[(currentUiScaleIndex() + 1) % UI_SCALE_STEPS.length]);
+}
+
+// ---------------------------------------------------------------------------
+// Time-series datasource override
+//
+// The backend auto-discovers a Prometheus/VictoriaMetrics Service per cluster
+// by scoring Service names, which is a heuristic and can pick wrong — on a
+// VictoriaMetrics k8s-stack cluster several scrape-target Services match the
+// same name substrings as the real query endpoint. An override here wins
+// outright and skips discovery entirely, so it also works on a cluster where
+// discovery finds nothing at all.
+//
+// Keyed by kubeconfig context, since each cluster has its own backend.
+// ---------------------------------------------------------------------------
+
+const METRICS_BACKEND_STORAGE_KEY = "aks-dashboard-metrics-backends";
+
+function loadMetricsBackendOverrides(): Map<string, MetricsBackendInfo> {
+  try {
+    const raw = localStorage.getItem(METRICS_BACKEND_STORAGE_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw) as Record<string, MetricsBackendInfo>;
+    return new Map(Object.entries(parsed));
+  } catch {
+    // A malformed entry (hand-edited, or written by an older build) shouldn't
+    // stop the app from starting — fall back to pure auto-discovery.
+    return new Map();
+  }
+}
+
+function saveMetricsBackendOverrides() {
+  localStorage.setItem(
+    METRICS_BACKEND_STORAGE_KEY,
+    JSON.stringify(Object.fromEntries(state.metricsBackendOverrides)),
+  );
+}
+
+/** The override for a context, or null to let the backend auto-discover. */
+function metricsBackendFor(ctx: string): MetricsBackendInfo | null {
+  return state.metricsBackendOverrides.get(ctx) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +353,15 @@ interface AppState {
   resourceUsage: Map<string, ResourceUsageSummary>;
   metricsOverTime: Map<string, MetricsOverTimeResult>;
   metricsRangeMinutes: number;
+  /** Per-context datasource override; absent means auto-discover. */
+  metricsBackendOverrides: Map<string, MetricsBackendInfo>;
+  /** Context whose datasource editor is open, or null. */
+  metricsBackendEditor: string | null;
+  /** Candidates discovered for the editor's context, and the probe verdict. */
+  metricsBackendCandidates: MetricsBackendInfo[] | null;
+  metricsBackendDraft: MetricsBackendInfo | null;
+  metricsBackendTest: MetricsBackendTestResult | null;
+  metricsBackendTesting: boolean;
   sortState: Partial<Record<TabId, SortSpec>>;
   filterState: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
   /** filterKey (`${tab}:${col.key}`) of the currently open enum-filter dropdown, or null. */
@@ -360,6 +411,12 @@ const state: AppState = {
   resourceUsage: new Map(),
   metricsOverTime: new Map(),
   metricsRangeMinutes: 60,
+  metricsBackendOverrides: loadMetricsBackendOverrides(),
+  metricsBackendEditor: null,
+  metricsBackendCandidates: null,
+  metricsBackendDraft: null,
+  metricsBackendTest: null,
+  metricsBackendTesting: false,
   sortState: {},
   filterState: {},
   openEnumFilter: null,
@@ -1102,7 +1159,7 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       state.resourceUsage.set(ctx, await api.getResourceUsage(ctx));
       break;
     case "metrics":
-      state.metricsOverTime.set(ctx, await api.getMetricsOverTime(ctx, state.metricsRangeMinutes));
+      state.metricsOverTime.set(ctx, await api.getMetricsOverTime(ctx, state.metricsRangeMinutes, metricsBackendFor(ctx)));
       break;
     case "events":
       state.events.set(ctx, await api.getEvents(ctx, state.eventsWarningsOnly));
@@ -1465,7 +1522,7 @@ async function fetchNodeMetrics() {
   nd.metricsError = null;
   render();
   try {
-    const result = await api.getNodeMetricsOverTime(nd.ctx, nd.name, nd.metricsRangeMinutes);
+    const result = await api.getNodeMetricsOverTime(nd.ctx, nd.name, nd.metricsRangeMinutes, metricsBackendFor(nd.ctx));
     if (token !== nodeDetailToken || !state.nodeDetail) return;
     state.nodeDetail.metrics = result;
   } catch (e) {
@@ -1873,7 +1930,7 @@ async function fetchWorkloadMetrics() {
   wd.metricsError = null;
   render();
   try {
-    const result = await api.getWorkloadMetricsOverTime(wd.ctx, wd.kind, wd.namespace, wd.name, wd.metricsRangeMinutes);
+    const result = await api.getWorkloadMetricsOverTime(wd.ctx, wd.kind, wd.namespace, wd.name, wd.metricsRangeMinutes, metricsBackendFor(wd.ctx));
     if (token !== workloadDetailToken || !state.workloadDetail) return;
     state.workloadDetail.metrics = result;
   } catch (e) {
@@ -2365,7 +2422,7 @@ async function fetchPodMetrics() {
   pd.metricsError = null;
   render();
   try {
-    const result = await api.getPodMetricsOverTime(pd.ctx, pd.namespace, pd.name, pd.metricsRangeMinutes);
+    const result = await api.getPodMetricsOverTime(pd.ctx, pd.namespace, pd.name, pd.metricsRangeMinutes, metricsBackendFor(pd.ctx));
     if (token !== podDetailToken || !state.podDetail) return;
     state.podDetail.metrics = result;
   } catch (e) {
@@ -2453,6 +2510,13 @@ function setMetricsRange(minutes: number) {
   toggleEventsFilter,
   toggleUnhealthyOnly,
   setMetricsRange,
+  openMetricsBackendEditor,
+  closeMetricsBackendEditor,
+  setMetricsBackendField,
+  pickMetricsBackendCandidate,
+  testMetricsBackendDraft,
+  saveMetricsBackendOverride,
+  clearMetricsBackendOverride,
   setSort,
   setStringFilter,
   setNumberFilter,
@@ -2587,6 +2651,7 @@ function render() {
     ${renderWorkloadDetailPanel()}
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
+    ${renderMetricsBackendEditor()}
   `;
 
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
@@ -3748,6 +3813,270 @@ function chartLegendLabel(color: string, label: string): string {
   return `<span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 shrink-0 rounded-full" style="background:${color}"></span>${esc(label)}</span>`;
 }
 
+// ---------------------------------------------------------------------------
+// Datasource editor (Metrics tab)
+// ---------------------------------------------------------------------------
+
+function openMetricsBackendEditor(ctx: string) {
+  state.metricsBackendEditor = ctx;
+  state.metricsBackendCandidates = null;
+  state.metricsBackendTest = null;
+  state.metricsBackendTesting = false;
+  // Seed the form from the active override, or from whatever the last
+  // discovery reported, so editing starts from the real current value rather
+  // than an empty form.
+  const active = metricsBackendFor(ctx) ?? state.metricsOverTime.get(ctx)?.backend ?? null;
+  state.metricsBackendDraft = active
+    ? { ...active }
+    : { kind: "VictoriaMetrics", namespace: "", service_name: "", port: 8428, api_path_prefix: "" };
+  render();
+
+  api
+    .listMetricsBackends(ctx)
+    .then((candidates) => {
+      if (state.metricsBackendEditor !== ctx) return;
+      state.metricsBackendCandidates = candidates;
+      render();
+    })
+    .catch(() => {
+      if (state.metricsBackendEditor !== ctx) return;
+      // Discovery failing doesn't block a manual override — that's arguably
+      // the case where overriding matters most.
+      state.metricsBackendCandidates = [];
+      render();
+    });
+}
+
+function closeMetricsBackendEditor() {
+  state.metricsBackendEditor = null;
+  state.metricsBackendCandidates = null;
+  state.metricsBackendDraft = null;
+  state.metricsBackendTest = null;
+  render();
+}
+
+function setMetricsBackendField(field: keyof MetricsBackendInfo, value: string) {
+  const draft = state.metricsBackendDraft;
+  if (!draft) return;
+  if (field === "port") draft.port = Math.max(1, Math.min(65535, Number(value) || 0));
+  else if (field === "kind") draft.kind = value === "Prometheus" ? "Prometheus" : "VictoriaMetrics";
+  else if (field === "namespace") draft.namespace = value.trim();
+  else if (field === "service_name") draft.service_name = value.trim();
+  else if (field === "api_path_prefix") draft.api_path_prefix = value.trim();
+  // A previous verdict no longer describes the edited draft.
+  state.metricsBackendTest = null;
+  render();
+}
+
+/** Load one of the discovered candidates into the form. */
+function pickMetricsBackendCandidate(index: number) {
+  const candidate = state.metricsBackendCandidates?.[index];
+  if (!candidate) return;
+  state.metricsBackendDraft = { ...candidate };
+  state.metricsBackendTest = null;
+  render();
+}
+
+async function testMetricsBackendDraft() {
+  const ctx = state.metricsBackendEditor;
+  const draft = state.metricsBackendDraft;
+  if (!ctx || !draft) return;
+  state.metricsBackendTesting = true;
+  state.metricsBackendTest = null;
+  render();
+  try {
+    const result = await api.testMetricsBackend(ctx, draft);
+    if (state.metricsBackendEditor !== ctx) return;
+    state.metricsBackendTest = result;
+  } catch (e) {
+    if (state.metricsBackendEditor !== ctx) return;
+    state.metricsBackendTest = { ok: false, message: String(e), container_series: null };
+  } finally {
+    if (state.metricsBackendEditor === ctx) state.metricsBackendTesting = false;
+    render();
+  }
+}
+
+function saveMetricsBackendOverride() {
+  const ctx = state.metricsBackendEditor;
+  const draft = state.metricsBackendDraft;
+  if (!ctx || !draft || !draft.namespace || !draft.service_name) return;
+  state.metricsBackendOverrides.set(ctx, { ...draft });
+  saveMetricsBackendOverrides();
+  closeMetricsBackendEditor();
+  // Drop the cached series so the tab refetches through the new datasource
+  // instead of showing the old backend's data until the next refresh tick.
+  state.metricsOverTime.delete(ctx);
+  loadTabData();
+}
+
+function clearMetricsBackendOverride() {
+  const ctx = state.metricsBackendEditor;
+  if (!ctx) return;
+  state.metricsBackendOverrides.delete(ctx);
+  saveMetricsBackendOverrides();
+  closeMetricsBackendEditor();
+  state.metricsOverTime.delete(ctx);
+  loadTabData();
+}
+
+function datasourceEditButton(ctx: string, label: string): string {
+  return `
+    <button
+      type="button"
+      onclick="window.__app.openMetricsBackendEditor('${esc(ctx)}')"
+      class="rounded border border-gridline px-2 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+    >${esc(label)}</button>`;
+}
+
+/** The "which datasource am I looking at" line above each cluster's charts. */
+function renderDatasourceRow(ctx: string, backend: MetricsBackendInfo): string {
+  const overridden = metricsBackendFor(ctx) !== null;
+  const target = `${backend.namespace}/${backend.service_name}:${backend.port}${backend.api_path_prefix}`;
+  return `
+    <div class="mb-3 flex flex-wrap items-center gap-2 text-xs text-ink-muted">
+      <span>${esc(backend.kind)} · ${esc(target)}</span>
+      ${
+        overridden
+          ? '<span class="rounded bg-surface-3 px-1.5 py-0.5 text-ink-secondary" title="Set manually — auto-discovery is bypassed for this cluster">manual</span>'
+          : '<span class="text-ink-muted" title="Chosen by scoring Service names in this cluster">auto-discovered</span>'
+      }
+      ${datasourceEditButton(ctx, "Change")}
+    </div>`;
+}
+
+function renderMetricsBackendEditor(): string {
+  const ctx = state.metricsBackendEditor;
+  const draft = state.metricsBackendDraft;
+  if (!ctx || !draft) return "";
+
+  const candidates = state.metricsBackendCandidates;
+  const overridden = metricsBackendFor(ctx) !== null;
+  const test = state.metricsBackendTest;
+
+  const candidateList =
+    candidates === null
+      ? `<div class="text-xs text-ink-muted">Scanning services…</div>`
+      : candidates.length === 0
+        ? `<div class="text-xs text-ink-muted">No candidates auto-detected — enter one below.</div>`
+        : candidates
+            .map((c, i) => {
+              const same =
+                c.namespace === draft.namespace &&
+                c.service_name === draft.service_name &&
+                c.port === draft.port &&
+                c.api_path_prefix === draft.api_path_prefix;
+              return `
+        <button
+          type="button"
+          onclick="window.__app.pickMetricsBackendCandidate(${i})"
+          class="flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-xs ${
+            same ? "border-series-blue bg-surface-3 text-ink-primary" : "border-gridline text-ink-secondary hover:bg-surface-3"
+          }"
+        >
+          <span class="truncate">${esc(c.namespace)}/${esc(c.service_name)}:${c.port}${esc(c.api_path_prefix)}</span>
+          <span class="shrink-0 text-ink-muted">${esc(c.kind)}${i === 0 ? " · best guess" : ""}</span>
+        </button>`;
+            })
+            .join("");
+
+  const field = (label: string, key: string, value: string, placeholder: string, type = "text") => `
+    <label class="flex flex-col gap-1 text-xs text-ink-secondary">
+      ${esc(label)}
+      <input
+        type="${type}"
+        value="${esc(value)}"
+        placeholder="${esc(placeholder)}"
+        data-filter-key="metrics-backend:${key}"
+        oninput="window.__app.setMetricsBackendField('${key}', this.value)"
+        class="rounded border border-gridline bg-surface-2 px-2 py-1 text-ink-primary outline-none focus:border-series-blue"
+      />
+    </label>`;
+
+  const verdict = test
+    ? `<div class="rounded-md border p-2 text-xs ${
+        test.ok
+          ? "border-status-good/40 bg-status-good/10 text-status-good"
+          : "border-status-critical/40 bg-status-critical/10 text-status-critical"
+      }">${esc(test.message)}</div>`
+    : "";
+
+  const canSave = draft.namespace.length > 0 && draft.service_name.length > 0;
+
+  return `
+    <div class="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-6" onclick="window.__app.closeMetricsBackendEditor()">
+      <div class="flex max-h-full w-full max-w-xl flex-col overflow-auto rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">Time-series data source</div>
+            <div class="truncate text-xs text-ink-muted">${esc(ctx)}</div>
+          </div>
+          <button type="button" onclick="window.__app.closeMetricsBackendEditor()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+        </div>
+
+        <div class="flex flex-col gap-4 p-4">
+          <div class="flex flex-col gap-1.5">
+            <div class="text-xs font-medium text-ink-primary">Detected candidates</div>
+            ${candidateList}
+          </div>
+
+          <div class="flex flex-col gap-2 border-t border-gridline pt-3">
+            <div class="text-xs font-medium text-ink-primary">Connection</div>
+            <div class="grid grid-cols-2 gap-2">
+              ${field("Namespace", "namespace", draft.namespace, "monitoring")}
+              ${field("Service", "service_name", draft.service_name, "prometheus-server")}
+              ${field("Port", "port", String(draft.port), "8428", "number")}
+              <label class="flex flex-col gap-1 text-xs text-ink-secondary">
+                Kind
+                <select
+                  onchange="window.__app.setMetricsBackendField('kind', this.value)"
+                  class="rounded border border-gridline bg-surface-2 px-2 py-1 text-ink-primary outline-none"
+                >
+                  <option value="VictoriaMetrics" ${draft.kind === "VictoriaMetrics" ? "selected" : ""}>VictoriaMetrics</option>
+                  <option value="Prometheus" ${draft.kind === "Prometheus" ? "selected" : ""}>Prometheus</option>
+                </select>
+              </label>
+            </div>
+            ${field("API path prefix", "api_path_prefix", draft.api_path_prefix, "empty, or /select/0/prometheus for vmselect")}
+            <div class="text-xs text-ink-muted">
+              Queried through the API server proxy:
+              <code class="rounded bg-surface-2 px-1 py-0.5">/api/v1/namespaces/${esc(draft.namespace || "&lt;ns&gt;")}/services/${esc(draft.service_name || "&lt;svc&gt;")}:${draft.port}/proxy${esc(draft.api_path_prefix)}/api/v1/query_range</code>
+            </div>
+          </div>
+
+          ${verdict}
+
+          <div class="flex flex-wrap items-center justify-between gap-2 border-t border-gridline pt-3">
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                onclick="window.__app.testMetricsBackendDraft()"
+                ${!canSave || state.metricsBackendTesting ? "disabled" : ""}
+                class="rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-primary hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-50"
+              >${state.metricsBackendTesting ? "Testing…" : "Test connection"}</button>
+              ${
+                overridden
+                  ? `<button
+                      type="button"
+                      onclick="window.__app.clearMetricsBackendOverride()"
+                      class="rounded-md px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+                      title="Go back to auto-discovery for this cluster"
+                    >Reset to auto</button>`
+                  : ""
+              }
+            </div>
+            <button
+              type="button"
+              onclick="window.__app.saveMetricsBackendOverride()"
+              ${!canSave ? "disabled" : ""}
+              class="rounded-md bg-series-blue px-3 py-1.5 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >Save</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
 function renderMetrics(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
@@ -3781,10 +4110,11 @@ function renderMetrics(): string {
               No Prometheus or VictoriaMetrics found in this cluster. Metrics-over-time needs a Prometheus-API-compatible
               time-series database reachable as a Service (commonly in a <code class="rounded bg-surface-2 px-1 py-0.5">monitoring</code> namespace).
             </div>
+            <div class="mt-3">${datasourceEditButton(ctx, "Set data source manually")}</div>
           </div>`;
       }
 
-      const backendLabel = `${esc(result.backend.kind)} · ${esc(result.backend.namespace)}/${esc(result.backend.service_name)}`;
+      const backendLabel = renderDatasourceRow(ctx, result.backend);
       const errorNote = result.error
         ? `<div class="mb-3 rounded-md border border-status-warning/40 bg-status-warning/10 p-2 text-xs text-status-warning">${esc(result.error)}</div>`
         : "";
@@ -3804,7 +4134,7 @@ function renderMetrics(): string {
       return `
         <div class="rounded-lg border border-gridline bg-surface-1 p-4">
           ${heading}
-          <div class="mb-3 text-xs text-ink-muted">${backendLabel}</div>
+          ${backendLabel}
           ${errorNote}
           <div class="flex flex-col gap-4">
             <div>
@@ -5373,7 +5703,8 @@ function closeOpenDetailPanel(): boolean {
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    closeOpenDetailPanel();
+    if (state.metricsBackendEditor) closeMetricsBackendEditor();
+    else closeOpenDetailPanel();
     return;
   }
   if (!e.metaKey) return;
