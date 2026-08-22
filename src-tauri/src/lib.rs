@@ -1,3 +1,4 @@
+mod claude;
 mod commands;
 mod helm;
 mod k8s;
@@ -133,6 +134,10 @@ pub fn run() {
             commands::get_gitops_events,
             commands::list_metrics_backends,
             commands::test_metrics_backend,
+            commands::claude_auth_status,
+            commands::claude_sign_in,
+            commands::claude_sign_out,
+            commands::claude_explain_error,
             commands::kubeconfig_path,
         ])
         .run(tauri::generate_context!())
