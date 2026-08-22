@@ -110,8 +110,6 @@ export const api = {
   testMetricsBackend: (contextName: string, backend: MetricsBackendInfo) =>
     invoke<MetricsBackendTestResult>("test_metrics_backend", { contextName, backend }),
   claudeAuthStatus: () => invoke<ClaudeAuthState>("claude_auth_status"),
-  claudeSignIn: () => invoke<ClaudeAuthState>("claude_sign_in"),
-  claudeSignOut: () => invoke<ClaudeAuthState>("claude_sign_out"),
   /** Stores a pasted key in the OS keychain; the key is never persisted frontend-side. */
   claudeSetApiKey: (apiKey: string) => invoke<ClaudeAuthState>("claude_set_api_key", { apiKey }),
   claudeClearApiKey: () => invoke<ClaudeAuthState>("claude_clear_api_key"),

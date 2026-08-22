@@ -376,32 +376,22 @@ pub async fn test_metrics_backend(
 }
 
 #[tauri::command]
-pub async fn claude_auth_status() -> ClaudeAuthState {
-    // Infallible by design: every failure mode (no CLI, not signed in, CLI
-    // error) is a state the UI renders, not an error it has to handle.
-    claude::auth_status().await
+pub fn claude_auth_status() -> ClaudeAuthState {
+    // Infallible by design: "no key configured" is a state the UI renders,
+    // not an error it has to handle.
+    claude::auth_status()
 }
 
 #[tauri::command]
-pub async fn claude_sign_in() -> Result<ClaudeAuthState, String> {
-    claude::sign_in().await
-}
-
-#[tauri::command]
-pub async fn claude_sign_out() -> Result<ClaudeAuthState, String> {
-    claude::sign_out().await
-}
-
-#[tauri::command]
-pub async fn claude_set_api_key(api_key: String) -> Result<ClaudeAuthState, String> {
+pub fn claude_set_api_key(api_key: String) -> Result<ClaudeAuthState, String> {
     claude::set_api_key(&api_key)?;
-    Ok(claude::auth_status().await)
+    Ok(claude::auth_status())
 }
 
 #[tauri::command]
-pub async fn claude_clear_api_key() -> Result<ClaudeAuthState, String> {
+pub fn claude_clear_api_key() -> Result<ClaudeAuthState, String> {
     claude::clear_api_key()?;
-    Ok(claude::auth_status().await)
+    Ok(claude::auth_status())
 }
 
 #[tauri::command]

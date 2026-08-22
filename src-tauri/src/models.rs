@@ -275,25 +275,13 @@ pub struct HelmReleaseInfo {
 /// `helm get values` / `helm get manifest` / `helm get notes` for one release,
 /// fetched on demand rather than as part of the list.
 /// Whether Claude features are usable, and via which credential source.
-/// `cli_installed: false` with `signed_in: false` is the first-run state and
-/// renders install instructions rather than a sign-in button.
 #[derive(Serialize, Clone, Debug)]
 pub struct ClaudeAuthState {
-    pub cli_installed: bool,
     pub signed_in: bool,
-    /// Human-readable credential source ("ant CLI profile", "environment variable").
+    /// Human-readable credential source ("API key (Keychain)", "environment variable").
     pub source: Option<String>,
-    /// Verbatim CLI output, so an unexpected failure is visible rather than swallowed.
+    /// Extra context for the panel — e.g. which key is in use, by its last four.
     pub detail: Option<String>,
-}
-
-/// The two credential shapes the Messages API accepts. They differ by *header*,
-/// not just value: an API key goes on `x-api-key`, while an OAuth token goes on
-/// `Authorization: Bearer` and also needs the `oauth-2025-04-20` beta header.
-#[derive(Clone, Debug)]
-pub enum ClaudeCredential {
-    ApiKey(String),
-    OAuth(String),
 }
 
 #[derive(Serialize, Clone, Debug)]
