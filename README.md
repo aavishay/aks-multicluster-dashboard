@@ -17,8 +17,12 @@ need to embed any Azure credentials or auth flows of its own.
 ## Install
 
 ```bash
+brew trust aavishay/aks-fleet-dashboard
 brew install --cask aavishay/aks-fleet-dashboard/aks-fleet-dashboard
 ```
+
+The `brew trust` step is a one-off — Homebrew requires it for casks from
+third-party taps.
 
 Universal build — native on both Apple Silicon and Intel Macs.
 
