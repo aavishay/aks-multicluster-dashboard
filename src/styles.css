@@ -1,0 +1,184 @@
+@import "tailwindcss";
+
+/* Tokens per the dataviz skill's status/chrome palette. The plain --* names
+   below are the single source of truth per theme; the @theme block just
+   aliases each Tailwind color utility (bg-surface-page, text-ink-primary,
+   etc.) to the matching plain variable via var(), so a theme switch only
+   has to redefine the plain names once and both the Tailwind utilities and
+   the hand-rolled table CSS further down pick it up automatically. Default
+   is dark (matches the Lens/Headlamp/Aptakube aesthetic this app targets);
+   [data-theme="light"] on <html> — set in main.ts from the OS preference or
+   a saved choice — overrides it. */
+@theme {
+  --color-surface-page: var(--surface-page);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-ink-primary: var(--text-primary);
+  --color-ink-secondary: var(--text-secondary);
+  --color-ink-muted: var(--text-muted);
+  --color-gridline: var(--gridline);
+
+  --color-series-blue: var(--series-blue);
+  --color-series-orange: var(--series-orange);
+  --color-series-aqua: var(--series-aqua);
+
+  --color-status-good: var(--status-good);
+  --color-status-warning: var(--status-warning);
+  --color-status-serious: var(--status-serious);
+  --color-status-critical: var(--status-critical);
+}
+
+:root {
+  color-scheme: dark;
+  --surface-page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --surface-2: #212120;
+  --surface-3: #2a2a28;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --gridline: #2c2c2a;
+  --border: rgba(255, 255, 255, 0.1);
+
+  --series-blue: #3987e5;
+  --series-orange: #d95926;
+  --series-aqua: #199e70;
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #e66767;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --surface-page: #f5f4f1;
+  --surface-1: #ffffff;
+  --surface-2: #eeece7;
+  --surface-3: #e2dfd8;
+  --text-primary: #1a1a17;
+  --text-secondary: #57554c;
+  --text-muted: #8a8779;
+  --gridline: #ddd9d0;
+  --border: rgba(0, 0, 0, 0.1);
+
+  /* Darkened from the dark-theme hues so text/lines using these stay
+     readable at roughly WCAG-AA contrast against the light surfaces above —
+     the dark-theme values read fine on near-black but wash out on white. */
+  --series-blue: #1d5fc2;
+  --series-orange: #b8481a;
+  --series-aqua: #12805c;
+
+  --status-good: #0a8a0a;
+  --status-warning: #a3690a;
+  --status-serious: #b8502a;
+  --status-critical: #c23636;
+}
+
+/* The UI scale (zoom) is an inline `font-size` percentage set on :root by
+   applyUiScale() in main.ts — Tailwind's utilities are rem-based, so that one
+   value scales text, padding and gaps together. No rule needed here. */
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  background: var(--surface-page);
+  color: var(--text-primary);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+table.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  /* Explicit per-column widths (via <colgroup>, user-resizable) hold steady
+     regardless of cell content, rather than the browser re-measuring every
+     row's content on each render. */
+  table-layout: fixed;
+}
+table.data-table th {
+  text-align: left;
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--gridline);
+  position: sticky;
+  top: 0;
+  background: var(--surface-1);
+  white-space: nowrap;
+}
+/* The sort/label header row above stays pinned at top:0 via the sticky rule
+   above; this row of per-column filter controls sits directly beneath it in
+   the same <thead> and would otherwise also stick to top:0 and overlap it. */
+table.data-table tr.filter-row th {
+  position: static;
+  top: auto;
+  padding: 4px 8px 8px;
+  white-space: normal;
+}
+table.data-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--gridline);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+table.data-table tbody tr:hover td {
+  background: var(--surface-2);
+}
+
+/* A single cluster's fetch has no real sub-progress to report, so its
+   loading bar slides indefinitely rather than faking a percentage. */
+@keyframes progress-indeterminate-slide {
+  0% {
+    left: -35%;
+    width: 35%;
+  }
+  50% {
+    left: 25%;
+    width: 55%;
+  }
+  100% {
+    left: 100%;
+    width: 35%;
+  }
+}
+.progress-indeterminate {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 9999px;
+  background: var(--series-blue);
+  animation: progress-indeterminate-slide 1.4s ease-in-out infinite;
+}

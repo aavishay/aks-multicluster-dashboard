@@ -1,0 +1,10 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/gen
+.DS_Store
+
+# Per-machine Claude Code settings: absolute paths and allow-lists specific to
+# one checkout, not something to share. `.claude/launch.json` is deliberately
+# not ignored — the dev-server config is useful to everyone.
+.claude/settings.local.json

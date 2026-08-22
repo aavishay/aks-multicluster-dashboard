@@ -1,0 +1,95 @@
+import { Channel, invoke } from "@tauri-apps/api/core";
+import type {
+  ClusterEntry,
+  ClusterOverview,
+  EventInfo,
+  GitOpsAppManifest,
+  GitOpsResult,
+  HelmReleaseDetail,
+  HelmReleaseInfo,
+  MetricsOverTimeResult,
+  NodeInfo,
+  NodeManifest,
+  PodInfo,
+  PodManifest,
+  ResourceUsageSummary,
+  WorkloadInfo,
+  WorkloadManifest,
+  WorkloadRevisionInfo,
+} from "./types";
+
+export const api = {
+  listClusters: () => invoke<ClusterEntry[]>("list_clusters"),
+  kubeconfigPath: () => invoke<string | null>("kubeconfig_path"),
+  getOverview: (contextName: string) => invoke<ClusterOverview>("get_cluster_overview", { contextName }),
+  getNodes: (contextName: string) => invoke<NodeInfo[]>("get_nodes", { contextName }),
+  getNodeManifest: (contextName: string, nodeName: string) =>
+    invoke<NodeManifest>("get_node_manifest", { contextName, nodeName }),
+  getNodeEvents: (contextName: string, nodeName: string) =>
+    invoke<EventInfo[]>("get_node_events", { contextName, nodeName }),
+  getPods: (contextName: string, namespace?: string) => invoke<PodInfo[]>("get_pods", { contextName, namespace }),
+  getWorkloads: (contextName: string) => invoke<WorkloadInfo[]>("get_workloads", { contextName }),
+  getWorkloadManifest: (contextName: string, kind: string, namespace: string, name: string) =>
+    invoke<WorkloadManifest>("get_workload_manifest", { contextName, kind, namespace, name }),
+  getWorkloadEvents: (contextName: string, kind: string, namespace: string, name: string) =>
+    invoke<EventInfo[]>("get_workload_events", { contextName, kind, namespace, name }),
+  getWorkloadRevisions: (contextName: string, kind: string, namespace: string, name: string) =>
+    invoke<WorkloadRevisionInfo[]>("get_workload_revisions", { contextName, kind, namespace, name }),
+  getEvents: (contextName: string, warningsOnly: boolean) =>
+    invoke<EventInfo[]>("get_events", { contextName, warningsOnly }),
+  getResourceUsage: (contextName: string) => invoke<ResourceUsageSummary>("get_resource_usage", { contextName }),
+  getMetricsOverTime: (contextName: string, rangeMinutes: number) =>
+    invoke<MetricsOverTimeResult>("get_metrics_over_time", { contextName, rangeMinutes }),
+  getPodManifest: (contextName: string, namespace: string, podName: string) =>
+    invoke<PodManifest>("get_pod_manifest", { contextName, namespace, podName }),
+  getPodLogs: (contextName: string, namespace: string, podName: string, container: string, tail: boolean, lines: number) =>
+    invoke<string>("get_pod_logs", { contextName, namespace, podName, container, tail, lines }),
+  /** Starts a live-follow log stream; `onLine` fires once per line until `stopPodLogStream` cancels it. */
+  startPodLogStream: (
+    contextName: string,
+    namespace: string,
+    podName: string,
+    container: string,
+    onLine: (line: string) => void,
+  ) => {
+    const channel = new Channel<string>();
+    channel.onmessage = onLine;
+    return invoke<number>("start_pod_log_stream", { contextName, namespace, podName, container, onLine: channel });
+  },
+  stopPodLogStream: (streamId: number) => invoke<void>("stop_pod_log_stream", { streamId }),
+  getPodMetricsOverTime: (contextName: string, namespace: string, podName: string, rangeMinutes: number) =>
+    invoke<MetricsOverTimeResult>("get_pod_metrics_over_time", { contextName, namespace, podName, rangeMinutes }),
+  /** Merged, chronologically-interleaved Head/Tail across every pod passed in, each line prefixed with its source pod. */
+  getWorkloadLogs: (
+    contextName: string,
+    namespace: string,
+    podNames: string[],
+    container: string,
+    tail: boolean,
+    lines: number,
+  ) => invoke<string>("get_workload_logs", { contextName, namespace, podNames, container, tail, lines }),
+  /** Same idea as `startPodLogStream`, but one stream per pod feeding the same `onLine` callback, each line prefixed with its source pod. */
+  startWorkloadLogStream: (
+    contextName: string,
+    namespace: string,
+    podNames: string[],
+    container: string,
+    onLine: (line: string) => void,
+  ) => {
+    const channel = new Channel<string>();
+    channel.onmessage = onLine;
+    return invoke<number>("start_workload_log_stream", { contextName, namespace, podNames, container, onLine: channel });
+  },
+  getNodeMetricsOverTime: (contextName: string, nodeName: string, rangeMinutes: number) =>
+    invoke<MetricsOverTimeResult>("get_node_metrics_over_time", { contextName, nodeName, rangeMinutes }),
+  getWorkloadMetricsOverTime: (contextName: string, kind: string, namespace: string, name: string, rangeMinutes: number) =>
+    invoke<MetricsOverTimeResult>("get_workload_metrics_over_time", { contextName, kind, namespace, name, rangeMinutes }),
+  getHelmReleases: (contextName: string) => invoke<HelmReleaseInfo[]>("get_helm_releases", { contextName }),
+  getHelmReleaseDetail: (contextName: string, namespace: string, name: string, revision: number) =>
+    invoke<HelmReleaseDetail>("get_helm_release_detail", { contextName, namespace, name, revision }),
+  getGitOpsApps: (contextName: string) => invoke<GitOpsResult>("get_gitops_apps", { contextName }),
+  getGitOpsManifest: (contextName: string, namespace: string, name: string) =>
+    invoke<GitOpsAppManifest>("get_gitops_manifest", { contextName, namespace, name }),
+  getGitOpsEvents: (contextName: string, namespace: string, name: string) =>
+    invoke<EventInfo[]>("get_gitops_events", { contextName, namespace, name }),
+};
