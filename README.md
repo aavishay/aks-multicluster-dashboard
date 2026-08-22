@@ -37,6 +37,21 @@ xattr -dr com.apple.quarantine "/Applications/AKS Fleet Dashboard.app"
 Prefer not to use Homebrew? Grab the `.dmg` from
 [Releases](https://github.com/aavishay/aks-multicluster-dashboard/releases).
 
+### Optional: Claude features
+
+Explaining cryptic Helm/ArgoCD errors uses the Anthropic API. Install the CLI
+and sign in once — the app never handles your credential, it defers to the
+CLI's browser sign-in the same way it defers cluster auth to `kubelogin`:
+
+```bash
+brew install anthropics/tap/ant
+xattr -d com.apple.quarantine "$(brew --prefix)/bin/ant"
+ant auth login
+```
+
+Then click the ✦ button in the top bar. `ANTHROPIC_API_KEY` is honoured as an
+alternative if you'd rather not use the CLI.
+
 ### Prerequisites
 
 A working `kubectl` context per cluster — the app reads your existing
