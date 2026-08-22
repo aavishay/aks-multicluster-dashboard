@@ -42,19 +42,9 @@ Prefer not to use Homebrew? Grab the `.dmg` from
 Explaining cryptic Helm/ArgoCD errors uses the Anthropic API. Click the ✦
 button in the top bar and paste an API key (from
 [console.anthropic.com](https://console.anthropic.com) → API keys). It's stored
-in your macOS Keychain, never in the app.
+in your macOS Keychain, never in the app or in a file it owns.
 
-Alternatively, sign in with a browser via the Anthropic CLI — note this needs an
-organization that admits your account, so it won't work while a join request is
-pending approval:
-
-```bash
-brew install anthropics/tap/ant
-xattr -d com.apple.quarantine "$(brew --prefix)/bin/ant"
-ant auth login
-```
-
-An exported `ANTHROPIC_API_KEY` takes precedence over both.
+An exported `ANTHROPIC_API_KEY` takes precedence if you'd rather not store one.
 
 ### Prerequisites
 

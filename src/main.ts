@@ -2538,8 +2538,6 @@ function setMetricsRange(minutes: number) {
   setMetricsRange,
   refreshClaudeAuth,
   toggleClaudePanel,
-  claudeSignIn,
-  claudeSignOut,
   saveClaudeApiKey,
   clearClaudeApiKey,
   explainError,
@@ -2929,9 +2927,7 @@ function claudeAuthButton(): string {
   const signedIn = auth?.signed_in === true;
   const label = signedIn
     ? `Claude connected${auth?.source ? ` (${auth.source})` : ""}`
-    : auth?.cli_installed
-      ? "Not signed in to Claude — click for sign-in"
-      : "Claude not set up — click for setup steps";
+    : "No Claude API key — click to add one";
   return `
     <button
       type="button"
@@ -2953,12 +2949,12 @@ function renderClaudePanel(): string {
   if (!state.claudePanelOpen) return "";
   const auth = state.claudeAuth;
   const signedIn = auth?.signed_in === true;
-  const installed = auth?.cli_installed === true;
 
   const usingKeychainKey = auth?.source === "API key (Keychain)";
 
   // Never rendered with a `value` — the key is read from the DOM on save and
-  // never round-trips through app state.
+  // never round-trips through app state, which matters because render()
+  // rebuilds the whole #app subtree and would re-emit it every time.
   const keyField = `
     <div class="flex flex-col gap-2">
       <div class="text-xs font-medium text-ink-primary">Paste an API key</div>
@@ -2970,6 +2966,7 @@ function renderClaudePanel(): string {
           placeholder="sk-ant-..."
           data-claude-key-input
           data-filter-key="claude-api-key"
+          onkeydown="if (event.key === 'Enter') { event.preventDefault(); window.__app.saveClaudeApiKey(); }"
           class="min-w-0 flex-1 rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none focus:border-series-blue"
         />
         <button type="button" onclick="window.__app.saveClaudeApiKey()" class="shrink-0 rounded-md bg-series-blue px-3 py-1.5 text-xs font-medium text-white">Save</button>
@@ -2983,31 +2980,16 @@ function renderClaudePanel(): string {
   const body = signedIn
     ? `<div class="flex flex-col gap-3">
         <div class="text-sm text-status-good">Connected${auth?.source ? ` via ${esc(auth.source)}` : ""}.</div>
-        ${auth?.detail ? `<pre class="max-h-40 select-text overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-secondary">${esc(auth.detail)}</pre>` : ""}
-        <div class="flex items-center gap-2">
-          ${
-            usingKeychainKey
-              ? `<button type="button" onclick="window.__app.clearClaudeApiKey()" class="rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Remove key</button>`
-              : `<button type="button" onclick="window.__app.claudeSignOut()" class="rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Sign out</button>`
-          }
-        </div>
+        ${auth?.detail ? `<div class="text-xs text-ink-secondary">${esc(auth.detail)}</div>` : ""}
+        ${
+          usingKeychainKey
+            ? `<button type="button" onclick="window.__app.clearClaudeApiKey()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Remove key</button>`
+            : `<div class="text-xs text-ink-muted">Unset the environment variable to use a Keychain key instead.</div>`
+        }
       </div>`
-    : `<div class="flex flex-col gap-4">
+    : `<div class="flex flex-col gap-3">
         ${keyField}
-        <div class="flex flex-col gap-2 border-t border-gridline pt-3">
-          <div class="text-xs font-medium text-ink-primary">Or sign in with a browser</div>
-          ${
-            installed
-              ? `<button type="button" onclick="window.__app.claudeSignIn()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-primary hover:bg-surface-3">Sign in with browser</button>`
-              : `<pre class="select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-primary">brew install anthropics/tap/ant
-xattr -d com.apple.quarantine "$(brew --prefix)/bin/ant"</pre>`
-          }
-          <div class="text-xs text-ink-muted">
-            Browser sign-in needs an organization that admits your account; if your join request is
-            still pending approval, use an API key instead.
-          </div>
-        </div>
-        ${auth?.detail ? `<pre class="max-h-32 select-text overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-muted">${esc(auth.detail)}</pre>` : ""}
+        ${auth?.detail ? `<div class="text-xs text-status-critical">${esc(auth.detail)}</div>` : ""}
       </div>`;
 
   return `
@@ -4029,21 +4011,7 @@ async function refreshClaudeAuth() {
   } catch {
     // Treated as "unavailable" rather than an error banner — Claude is an
     // optional add-on, and a failure here shouldn't disrupt cluster work.
-    state.claudeAuth = { cli_installed: false, signed_in: false, source: null, detail: null };
-  }
-  render();
-}
-
-async function claudeSignIn() {
-  if (!state.claudeAuth) return;
-  // The CLI opens a browser and blocks until the user finishes, so reflect
-  // that in the UI rather than looking frozen.
-  state.claudeAuth = { ...state.claudeAuth, detail: "Waiting for the browser sign-in to complete…" };
-  render();
-  try {
-    state.claudeAuth = await api.claudeSignIn();
-  } catch (e) {
-    state.claudeAuth = { ...state.claudeAuth, signed_in: false, detail: String(e) };
+    state.claudeAuth = { signed_in: false, source: null, detail: null };
   }
   render();
 }
@@ -4066,15 +4034,6 @@ async function saveClaudeApiKey() {
 async function clearClaudeApiKey() {
   try {
     state.claudeAuth = await api.claudeClearApiKey();
-  } catch (e) {
-    if (state.claudeAuth) state.claudeAuth.detail = String(e);
-  }
-  render();
-}
-
-async function claudeSignOut() {
-  try {
-    state.claudeAuth = await api.claudeSignOut();
   } catch (e) {
     if (state.claudeAuth) state.claudeAuth.detail = String(e);
   }

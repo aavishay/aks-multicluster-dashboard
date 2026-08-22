@@ -1,61 +1,19 @@
-//! Claude integration: credential resolution via the `ant` CLI, and streaming
-//! calls to the Messages API.
+//! Claude integration: API-key storage and streaming calls to the Messages API.
 //!
-//! Auth deliberately defers to `ant auth login` rather than collecting a key
-//! in-app, mirroring how this app already defers cluster auth to
-//! `kubelogin`/`az` instead of implementing Azure AD itself. The browser-based
-//! OAuth flow means the app never handles the user's credential, and the
-//! README's "stores no credentials of its own" stays true.
+//! Auth is an API key held in the OS keychain (or an `ANTHROPIC_API_KEY` env
+//! var). Browser/OAuth sign-in via the `ant` CLI was deliberately dropped: it
+//! only completes for an account an organization already admits, so it
+//! dead-ends while a join request awaits admin approval — and a key needs no
+//! org membership and no CLI at all.
 //!
 //! There is no official Anthropic Rust SDK, so the API is called over raw HTTP.
 
-use crate::models::{ClaudeAuthState, ClaudeCredential};
+use crate::models::ClaudeAuthState;
 use keyring::v1::Entry;
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::process::Command;
 
-/// `ant auth login` waits on a human completing a browser flow, so it needs a
-/// far longer ceiling than a cluster call. Still bounded, so a user who
-/// abandons the browser tab doesn't leave the command pending forever.
-const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
-/// Status/credential lookups are local and should be near-instant.
-const CLI_TIMEOUT: Duration = Duration::from_secs(15);
-
-async fn run_ant(args: &[&str], timeout: Duration) -> Result<std::process::Output, String> {
-    let mut cmd = Command::new("ant");
-    cmd.args(args).stdin(Stdio::null());
-    match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(out)) => Ok(out),
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err("The `ant` CLI is not installed or not on PATH.".to_string())
-        }
-        Ok(Err(e)) => Err(format!("Failed to run `ant {}`: {e}", args.join(" "))),
-        Err(_) => Err(format!(
-            "`ant {}` did not finish within {}s.",
-            args.join(" "),
-            timeout.as_secs()
-        )),
-    }
-}
-
-fn ant_is_installed() -> bool {
-    // `Command::new("ant")` failing with NotFound is the authoritative signal,
-    // but checking PATH up front lets `auth_status` distinguish "not installed"
-    // from "installed but not signed in" without running anything.
-    std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path).any(|dir| {
-                let candidate = dir.join("ant");
-                candidate.is_file()
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Keychain coordinates for a pasted API key. Deliberately the macOS Keychain
-/// rather than localStorage (plaintext inside the WebView) or a file this app
-/// owns — the key is then protected by the OS, and other apps can't read it.
+/// Keychain coordinates for the API key. Deliberately the OS keychain rather
+/// than localStorage (plaintext inside the WebView) or a file this app owns —
+/// the key is then protected by the OS, and other apps can't read it.
 const KEYCHAIN_SERVICE: &str = "io.github.aavishay.aks-fleet-dashboard";
 const KEYCHAIN_ACCOUNT: &str = "anthropic-api-key";
 
@@ -98,9 +56,8 @@ fn key_hint(key: &str) -> String {
     format!("…{tail}")
 }
 
-/// An env-var key short-circuits the CLI entirely, so CI and power users can
-/// bypass `ant` — matching the SDKs' own precedence, where `ANTHROPIC_API_KEY`
-/// outranks a stored profile.
+/// An env var wins over the keychain, matching the SDKs' own precedence and
+/// letting CI or a power user override without touching the UI.
 fn env_api_key() -> Option<String> {
     for var in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
         if let Ok(value) = std::env::var(var) {
@@ -113,138 +70,32 @@ fn env_api_key() -> Option<String> {
     None
 }
 
-pub async fn auth_status() -> ClaudeAuthState {
+pub fn auth_status() -> ClaudeAuthState {
     if env_api_key().is_some() {
         return ClaudeAuthState {
-            cli_installed: ant_is_installed(),
             signed_in: true,
             source: Some("environment variable".to_string()),
             detail: Some("Using ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN from the environment.".to_string()),
         };
     }
-
-    // Checked before the CLI so a pasted key works without `ant` installed at
-    // all — which is the whole point of offering it.
-    if let Some(key) = keychain_api_key() {
-        return ClaudeAuthState {
-            cli_installed: ant_is_installed(),
+    match keychain_api_key() {
+        Some(key) => ClaudeAuthState {
             signed_in: true,
             source: Some("API key (Keychain)".to_string()),
             detail: Some(format!("Using the API key stored in your Keychain ({}).", key_hint(&key))),
-        };
-    }
-
-    if !ant_is_installed() {
-        return ClaudeAuthState {
-            cli_installed: false,
+        },
+        None => ClaudeAuthState {
             signed_in: false,
             source: None,
-            detail: Some("Paste an API key below, or install the Anthropic CLI to sign in with a browser.".to_string()),
-        };
-    }
-
-    // Whether a credential can actually be *obtained* is the only sound
-    // signal. `ant auth status` reports status for humans and is explicitly
-    // documented as unsuitable as a health check — keying off its exit code
-    // risks showing "connected" while every API call 401s.
-    let signed_in = match run_ant(&["auth", "print-credentials", "--access-token"], CLI_TIMEOUT).await {
-        Ok(out) => out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-        Err(_) => false,
-    };
-
-    // Its human-readable output is still the best thing to show: it names the
-    // winning credential source, profile and workspace. Best-effort only.
-    let detail = match run_ant(&["auth", "status"], CLI_TIMEOUT).await {
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let text = if text.is_empty() {
-                String::from_utf8_lossy(&out.stderr).trim().to_string()
-            } else {
-                text
-            };
-            (!text.is_empty()).then_some(text)
-        }
-        Err(e) => Some(e),
-    };
-
-    ClaudeAuthState {
-        cli_installed: true,
-        signed_in,
-        source: signed_in.then(|| "ant CLI profile".to_string()),
-        detail: detail.or_else(|| {
-            (!signed_in).then(|| "Not signed in. Run sign-in to open a browser.".to_string())
-        }),
+            detail: None,
+        },
     }
 }
 
-/// Runs `ant auth login`, which opens the user's browser. The app never sees
-/// the credential — only whether the flow succeeded.
-pub async fn sign_in() -> Result<ClaudeAuthState, String> {
-    if !ant_is_installed() {
-        return Err("The `ant` CLI is not installed. Install it, then sign in.".to_string());
-    }
-    let out = run_ant(&["auth", "login"], SIGN_IN_TIMEOUT).await?;
-    let state = auth_status().await;
-    // Trust the resulting credential over the exit code: a cancelled browser
-    // flow can still exit cleanly, and a successful one is only meaningful if
-    // a token actually landed.
-    if !state.signed_in {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        // The most common non-obvious cause is an organization gate: if the
-        // account's email domain matches an existing org, the browser flow
-        // stops at "Join your team" and only sends a membership request — no
-        // token is minted until an org admin approves it. A bare "did not
-        // complete" sends people looking for a bug in the app instead.
-        let hint = "Sign-in did not complete — no credential was stored.\n\n\
-                    Common causes:\n\
-                    • Your join request to an organization is still awaiting admin approval \
-                    (the browser showed \"Join your team — Request sent\"). Sign-in can only \
-                    finish once it's approved.\n\
-                    • The browser tab was closed or the flow was cancelled.\n\n\
-                    Run `ant auth status` in a terminal to see the current state.";
-        return Err(if stderr.is_empty() {
-            hint.to_string()
-        } else {
-            format!("{hint}\n\nCLI output:\n{stderr}")
-        });
-    }
-    Ok(state)
-}
-
-pub async fn sign_out() -> Result<ClaudeAuthState, String> {
-    if ant_is_installed() {
-        // Failure here is non-fatal: there may simply have been nothing to log
-        // out of, and reporting the resulting state is more useful than an error.
-        let _ = run_ant(&["auth", "logout"], CLI_TIMEOUT).await;
-    }
-    Ok(auth_status().await)
-}
-
-/// Resolves whatever credential is available into the header form the Messages
-/// API expects. An API key goes on `x-api-key`; an OAuth access token goes on
-/// `Authorization: Bearer` and additionally requires the `oauth-2025-04-20`
-/// beta header — converting between the two is a header change, not just a
-/// value swap, which is why the distinction is modelled rather than flattened
-/// into a single string.
-pub async fn resolve_credential() -> Result<ClaudeCredential, String> {
-    if let Some(key) = env_api_key() {
-        return Ok(ClaudeCredential::ApiKey(key));
-    }
-    if let Some(key) = keychain_api_key() {
-        return Ok(ClaudeCredential::ApiKey(key));
-    }
-    if !ant_is_installed() {
-        return Err("No Claude credential: paste an API key, or install the `ant` CLI and sign in.".to_string());
-    }
-    let out = run_ant(&["auth", "print-credentials", "--access-token"], CLI_TIMEOUT).await?;
-    if !out.status.success() {
-        return Err("Not signed in to Claude. Sign in from the Claude panel first.".to_string());
-    }
-    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if token.is_empty() {
-        return Err("The `ant` CLI returned an empty access token.".to_string());
-    }
-    Ok(ClaudeCredential::OAuth(token))
+fn resolve_api_key() -> Result<String, String> {
+    env_api_key()
+        .or_else(keychain_api_key)
+        .ok_or_else(|| "No Claude API key configured. Paste one in the Claude panel (✦).".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -260,10 +111,6 @@ const MODEL: &str = "claude-opus-5";
 /// here is a realistic outcome; with fallbacks the API re-runs the request on
 /// another model inside the same call instead of just stopping.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
-/// Required alongside `Authorization: Bearer` when the credential came from an
-/// `ant auth login` profile rather than an API key.
-const OAUTH_BETA: &str = "oauth-2025-04-20";
-
 /// Generous for an explanation that should run a few paragraphs, while staying
 /// far from the point where a truncated answer is likely. Streaming means the
 /// large ceiling costs nothing in timeout risk.
@@ -293,25 +140,14 @@ additional information would settle it rather than guessing.";
 /// identifiers — which is what makes this the lowest-exposure Claude feature
 /// in the app.
 pub async fn explain_error(error_text: &str, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
-    let credential = resolve_credential().await?;
+    let api_key = resolve_api_key()?;
 
-    let mut betas = vec![FALLBACK_BETA];
-    let mut request = reqwest::Client::new()
+    let request = reqwest::Client::new()
         .post(API_URL)
         .header("anthropic-version", API_VERSION)
-        .header("content-type", "application/json");
-
-    request = match &credential {
-        ClaudeCredential::ApiKey(key) => request.header("x-api-key", key),
-        ClaudeCredential::OAuth(token) => {
-            // OAuth tokens ride on Authorization, not x-api-key, and need
-            // their own beta flag — the two credential shapes are not
-            // interchangeable at the header level.
-            betas.push(OAUTH_BETA);
-            request.header("authorization", format!("Bearer {token}"))
-        }
-    };
-    request = request.header("anthropic-beta", betas.join(","));
+        .header("content-type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-beta", FALLBACK_BETA);
 
     let body = serde_json::json!({
         "model": MODEL,

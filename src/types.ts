@@ -200,7 +200,6 @@ export interface HelmReleaseDetail {
 }
 
 export interface ClaudeAuthState {
-  cli_installed: boolean;
   signed_in: boolean;
   source: string | null;
   detail: string | null;
