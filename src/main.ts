@@ -376,6 +376,7 @@ interface AppState {
   metricsBackendTest: MetricsBackendTestResult | null;
   metricsBackendTesting: boolean;
   claudeAuth: ClaudeAuthState | null;
+  claudePanelOpen: boolean;
   claudeExplain: ClaudeExplainState | null;
   sortState: Partial<Record<TabId, SortSpec>>;
   filterState: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
@@ -433,6 +434,7 @@ const state: AppState = {
   metricsBackendTest: null,
   metricsBackendTesting: false,
   claudeAuth: null,
+  claudePanelOpen: false,
   claudeExplain: null,
   sortState: {},
   filterState: {},
@@ -2535,6 +2537,7 @@ function setMetricsRange(minutes: number) {
   toggleUnhealthyOnly,
   setMetricsRange,
   refreshClaudeAuth,
+  toggleClaudePanel,
   claudeSignIn,
   claudeSignOut,
   explainError,
@@ -2681,6 +2684,7 @@ function render() {
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
     ${renderMetricsBackendEditor()}
+    ${renderClaudePanel()}
     ${renderClaudeExplainPanel()}
   `;
 
@@ -2917,20 +2921,75 @@ function claudeExplainButton(subject: string, errorText: string): string {
     >Explain</button>`;
 }
 
-/** Top-bar Claude status/auth control. */
+/** Top-bar Claude status/auth control. Click cycles: re-probe, or open the setup panel. */
 function claudeAuthButton(): string {
   const auth = state.claudeAuth;
   const signedIn = auth?.signed_in === true;
-  const label = signedIn ? "Claude connected" : auth?.cli_installed ? "Sign in to Claude" : "Claude not set up";
+  const label = signedIn
+    ? `Claude connected${auth?.source ? ` (${auth.source})` : ""}`
+    : auth?.cli_installed
+      ? "Not signed in to Claude — click for sign-in"
+      : "Claude not set up — click for setup steps";
   return `
     <button
       type="button"
-      onclick="window.__app.refreshClaudeAuth()"
+      onclick="window.__app.toggleClaudePanel()"
       title="${esc(label)}"
       class="flex items-center justify-center rounded-md border border-gridline bg-surface-2 px-2.5 py-1.5 hover:bg-surface-3 ${
         signedIn ? "text-status-good" : "text-ink-muted"
       }"
     ><span class="text-sm font-semibold leading-none">✦</span></button>`;
+}
+
+/**
+ * Setup/sign-in panel. The install commands live here rather than only in the
+ * README so a teammate who installs the app via Homebrew isn't left guessing —
+ * including the `xattr` step, which the CLI needs for the same Gatekeeper
+ * reason this app does.
+ */
+function renderClaudePanel(): string {
+  if (!state.claudePanelOpen) return "";
+  const auth = state.claudeAuth;
+  const signedIn = auth?.signed_in === true;
+  const installed = auth?.cli_installed === true;
+
+  const setupSteps = `
+    <div class="flex flex-col gap-2">
+      <div class="text-xs text-ink-secondary">Install the Anthropic CLI, then sign in:</div>
+      <pre class="select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-primary">brew install anthropics/tap/ant
+xattr -d com.apple.quarantine "$(brew --prefix)/bin/ant"</pre>
+      <div class="text-xs text-ink-muted">
+        The <code class="rounded bg-surface-2 px-1 py-0.5">xattr</code> step clears macOS quarantine on the
+        downloaded binary — the same reason this app needs it.
+      </div>
+    </div>`;
+
+  const body = signedIn
+    ? `<div class="flex flex-col gap-3">
+        <div class="text-sm text-status-good">Connected${auth?.source ? ` via ${esc(auth.source)}` : ""}.</div>
+        ${auth?.detail ? `<pre class="max-h-40 select-text overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-secondary">${esc(auth.detail)}</pre>` : ""}
+        <button type="button" onclick="window.__app.claudeSignOut()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Sign out</button>
+      </div>`
+    : `<div class="flex flex-col gap-3">
+        ${installed ? "" : setupSteps}
+        ${
+          installed
+            ? `<button type="button" onclick="window.__app.claudeSignIn()" class="self-start rounded-md bg-series-blue px-3 py-1.5 text-xs font-medium text-white">Sign in with browser</button>`
+            : `<button type="button" onclick="window.__app.refreshClaudeAuth()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-primary hover:bg-surface-3">Re-check</button>`
+        }
+        ${auth?.detail ? `<pre class="max-h-32 select-text overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-muted">${esc(auth.detail)}</pre>` : ""}
+      </div>`;
+
+  return `
+    <div class="fixed inset-0 z-40 flex items-start justify-end bg-black/40 p-6" onclick="window.__app.toggleClaudePanel()">
+      <div class="mt-12 flex w-full max-w-md flex-col rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="text-sm font-medium text-ink-primary">Claude</div>
+          <button type="button" onclick="window.__app.toggleClaudePanel()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+        </div>
+        <div class="p-4">${body}</div>
+      </div>
+    </div>`;
 }
 
 function renderClaudeExplainPanel(): string {
@@ -3925,6 +3984,14 @@ function chartLegendLabel(color: string, label: string): string {
 // ---------------------------------------------------------------------------
 // Claude: auth + explain-error
 // ---------------------------------------------------------------------------
+
+function toggleClaudePanel() {
+  state.claudePanelOpen = !state.claudePanelOpen;
+  render();
+  // Re-probe on open so a sign-in completed in a terminal is reflected without
+  // restarting the app.
+  if (state.claudePanelOpen) refreshClaudeAuth();
+}
 
 async function refreshClaudeAuth() {
   try {
@@ -5897,6 +5964,7 @@ function closeOpenDetailPanel(): boolean {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (state.claudeExplain) closeClaudeExplain();
+    else if (state.claudePanelOpen) toggleClaudePanel();
     else if (state.metricsBackendEditor) closeMetricsBackendEditor();
     else closeOpenDetailPanel();
     return;

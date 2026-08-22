@@ -86,38 +86,37 @@ pub async fn auth_status() -> ClaudeAuthState {
         };
     }
 
-    match run_ant(&["auth", "status"], CLI_TIMEOUT).await {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            ClaudeAuthState {
-                cli_installed: true,
-                signed_in: true,
-                source: Some("ant CLI profile".to_string()),
-                detail: Some(text),
-            }
-        }
-        // A non-zero exit is how `ant` reports "no active credential", which is
-        // a normal state to render, not an error to surface as a failure.
+    // Whether a credential can actually be *obtained* is the only sound
+    // signal. `ant auth status` reports status for humans and is explicitly
+    // documented as unsuitable as a health check — keying off its exit code
+    // risks showing "connected" while every API call 401s.
+    let signed_in = match run_ant(&["auth", "print-credentials", "--access-token"], CLI_TIMEOUT).await {
+        Ok(out) => out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        Err(_) => false,
+    };
+
+    // Its human-readable output is still the best thing to show: it names the
+    // winning credential source, profile and workspace. Best-effort only.
+    let detail = match run_ant(&["auth", "status"], CLI_TIMEOUT).await {
         Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stderr);
-            let text = if text.trim().is_empty() {
-                String::from_utf8_lossy(&out.stdout).to_string()
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let text = if text.is_empty() {
+                String::from_utf8_lossy(&out.stderr).trim().to_string()
             } else {
-                text.to_string()
+                text
             };
-            ClaudeAuthState {
-                cli_installed: true,
-                signed_in: false,
-                source: None,
-                detail: Some(text.trim().to_string()),
-            }
+            (!text.is_empty()).then_some(text)
         }
-        Err(e) => ClaudeAuthState {
-            cli_installed: true,
-            signed_in: false,
-            source: None,
-            detail: Some(e),
-        },
+        Err(e) => Some(e),
+    };
+
+    ClaudeAuthState {
+        cli_installed: true,
+        signed_in,
+        source: signed_in.then(|| "ant CLI profile".to_string()),
+        detail: detail.or_else(|| {
+            (!signed_in).then(|| "Not signed in. Run sign-in to open a browser.".to_string())
+        }),
     }
 }
 
@@ -128,15 +127,19 @@ pub async fn sign_in() -> Result<ClaudeAuthState, String> {
         return Err("The `ant` CLI is not installed. Install it, then sign in.".to_string());
     }
     let out = run_ant(&["auth", "login"], SIGN_IN_TIMEOUT).await?;
-    if !out.status.success() {
+    let state = auth_status().await;
+    // Trust the resulting credential over the exit code: a cancelled browser
+    // flow can still exit cleanly, and a successful one is only meaningful if
+    // a token actually landed.
+    if !state.signed_in {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            "Sign-in did not complete.".to_string()
+            "Sign-in did not complete — no credential was stored.".to_string()
         } else {
             stderr
         });
     }
-    Ok(auth_status().await)
+    Ok(state)
 }
 
 pub async fn sign_out() -> Result<ClaudeAuthState, String> {
