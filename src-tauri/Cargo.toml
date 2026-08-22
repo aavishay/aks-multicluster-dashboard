@@ -25,7 +25,7 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util"] }
 kube = { version = "0.99", default-features = false, features = ["client", "config", "rustls-tls"] }
 k8s-openapi = { version = "0.24", features = ["latest"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -38,6 +38,14 @@ futures = "0.3"
 # elsewhere (see the metrics/YAML parsing in k8s.rs).
 base64 = "0.22"
 flate2 = "1"
+# Anthropic has no official Rust SDK, so the Claude integration talks to
+# /v1/messages over raw HTTP. Pinned to rustls (never native-tls) to match the
+# ring CryptoProvider lib.rs installs at startup. `rustls-no-provider` is
+# deliberate over `rustls`: it bundles no provider of its own and uses the
+# process default, so it cannot race that `install_default().expect(...)`
+# into a launch-time panic, and it keeps aws-lc-rs out of the tree.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider", "http2", "charset"] }
+futures-util = "0.3"
 anyhow = "1"
 thiserror = "2"
 dirs = "5"

@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::{helm, k8s, kubeconfig, metrics_backend};
+use crate::{claude, helm, k8s, kubeconfig, metrics_backend};
 use std::future::Future;
 use std::time::Duration;
 
@@ -373,6 +373,31 @@ pub async fn test_metrics_backend(
     // purpose is to report a failure verbatim, so retrying would just delay
     // the answer the user asked for.
     with_deadline(&context_name, metrics_backend::test_metrics_backend(&context_name, backend)).await
+}
+
+#[tauri::command]
+pub async fn claude_auth_status() -> ClaudeAuthState {
+    // Infallible by design: every failure mode (no CLI, not signed in, CLI
+    // error) is a state the UI renders, not an error it has to handle.
+    claude::auth_status().await
+}
+
+#[tauri::command]
+pub async fn claude_sign_in() -> Result<ClaudeAuthState, String> {
+    claude::sign_in().await
+}
+
+#[tauri::command]
+pub async fn claude_sign_out() -> Result<ClaudeAuthState, String> {
+    claude::sign_out().await
+}
+
+#[tauri::command]
+pub async fn claude_explain_error(error_text: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
+    // Not wrapped in `with_retry`/`with_deadline`: those are keyed to a cluster
+    // context, and a streaming call already surfaces progress incrementally, so
+    // a stall is visible rather than silent.
+    claude::explain_error(&error_text, on_token).await
 }
 
 #[tauri::command]
