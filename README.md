@@ -37,6 +37,15 @@ xattr -dr com.apple.quarantine "/Applications/AKS Fleet Dashboard.app"
 Prefer not to use Homebrew? Grab the `.dmg` from
 [Releases](https://github.com/aavishay/aks-multicluster-dashboard/releases).
 
+### Optional: Claude features
+
+Explaining cryptic Helm/ArgoCD errors uses the Anthropic API. Click the ✦
+button in the top bar and paste an API key (from
+[console.anthropic.com](https://console.anthropic.com) → API keys). It's stored
+in your macOS Keychain, never in the app or in a file it owns.
+
+An exported `ANTHROPIC_API_KEY` takes precedence if you'd rather not store one.
+
 ### Prerequisites
 
 A working `kubectl` context per cluster — the app reads your existing

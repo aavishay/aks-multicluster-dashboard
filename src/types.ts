@@ -199,4 +199,10 @@ export interface HelmReleaseDetail {
   notes: string;
 }
 
+export interface ClaudeAuthState {
+  signed_in: boolean;
+  source: string | null;
+  detail: string | null;
+}
+
 export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "gitops" | "helm" | "cost";

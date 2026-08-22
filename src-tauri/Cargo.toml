@@ -38,6 +38,20 @@ futures = "0.3"
 # elsewhere (see the metrics/YAML parsing in k8s.rs).
 base64 = "0.22"
 flate2 = "1"
+# Anthropic has no official Rust SDK, so the Claude integration talks to
+# /v1/messages over raw HTTP. Pinned to rustls (never native-tls) to match the
+# ring CryptoProvider lib.rs installs at startup. `rustls-no-provider` is
+# deliberate over `rustls`: it bundles no provider of its own and uses the
+# process default, so it cannot race that `install_default().expect(...)`
+# into a launch-time panic, and it keeps aws-lc-rs out of the tree.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider", "http2", "charset"] }
+futures-util = "0.3"
+# A pasted API key goes to the macOS Keychain, never to localStorage (which is
+# plaintext inside the WebView) and never to a file this app owns.
+# Default features give each platform its native store (Keychain on macOS,
+# Credential Manager on Windows), so this stays portable if a Windows build
+# ever happens.
+keyring = "4"
 anyhow = "1"
 thiserror = "2"
 dirs = "5"
