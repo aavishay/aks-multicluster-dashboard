@@ -133,10 +133,22 @@ pub async fn sign_in() -> Result<ClaudeAuthState, String> {
     // a token actually landed.
     if !state.signed_in {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // The most common non-obvious cause is an organization gate: if the
+        // account's email domain matches an existing org, the browser flow
+        // stops at "Join your team" and only sends a membership request — no
+        // token is minted until an org admin approves it. A bare "did not
+        // complete" sends people looking for a bug in the app instead.
+        let hint = "Sign-in did not complete — no credential was stored.\n\n\
+                    Common causes:\n\
+                    • Your join request to an organization is still awaiting admin approval \
+                    (the browser showed \"Join your team — Request sent\"). Sign-in can only \
+                    finish once it's approved.\n\
+                    • The browser tab was closed or the flow was cancelled.\n\n\
+                    Run `ant auth status` in a terminal to see the current state.";
         return Err(if stderr.is_empty() {
-            "Sign-in did not complete — no credential was stored.".to_string()
+            hint.to_string()
         } else {
-            stderr
+            format!("{hint}\n\nCLI output:\n{stderr}")
         });
     }
     Ok(state)
