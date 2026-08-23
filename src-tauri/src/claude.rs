@@ -241,24 +241,7 @@ pub async fn build_diagnosis_payload(
     let manifest_r = redact::redact(&manifest_text);
     let logs_r = redact::redact(&logs_text);
 
-    let mut findings: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for part in [&status, &events_r, &manifest_r, &logs_r] {
-        for (label, count) in &part.findings {
-            *findings.entry(label.clone()).or_insert(0) += count;
-        }
-    }
-    let redaction_summary = if findings.is_empty() {
-        "No secrets or personal data matched.".to_string()
-    } else {
-        format!(
-            "Redacted: {}",
-            findings
-                .iter()
-                .map(|(label, count)| format!("{count}× {label}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
+    let redaction_summary = redact::Redacted::merge([&status, &events_r, &manifest_r, &logs_r]).summary();
 
     let prompt = format!(
         "Pod {namespace}/{pod_name}, container {container}.\n\n\

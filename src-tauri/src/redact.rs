@@ -101,6 +101,28 @@ pub struct Redacted {
 }
 
 impl Redacted {
+    /// Combines the findings from several redaction passes into one, so a
+    /// payload assembled from multiple documents (status, events, manifest,
+    /// logs) can report a single summary covering all of them.
+    ///
+    /// The returned `Redacted` exists only to call `.summary()` on — its
+    /// `text` is always empty, since merging redacted text from unrelated
+    /// documents into one string wouldn't mean anything. Use each part's own
+    /// `text` for the actual output; use the merged value only for the
+    /// combined summary.
+    pub fn merge<'a>(parts: impl IntoIterator<Item = &'a Redacted>) -> Redacted {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for part in parts {
+            for (label, count) in &part.findings {
+                *counts.entry(label.as_str()).or_insert(0) += count;
+            }
+        }
+        Redacted {
+            text: String::new(),
+            findings: counts.into_iter().map(|(label, count)| (label.to_string(), count)).collect(),
+        }
+    }
+
     /// Human-readable one-liner for the payload preview.
     pub fn summary(&self) -> String {
         if self.findings.is_empty() {
@@ -297,6 +319,31 @@ mod tests {
         assert!(s.contains("1× secret assignment"), "{s}");
 
         assert_eq!(redact("nothing sensitive here").summary(), "No secrets or personal data matched.");
+    }
+
+    /// This is the path `build_diagnosis_payload` relies on: findings from
+    /// several documents (status/events/manifest/logs) collapse into one
+    /// summary, with matching labels summed rather than listed separately.
+    #[test]
+    fn merge_sums_matching_labels_across_parts_and_keeps_others_distinct() {
+        let status = redact("a@b.com");
+        let events = redact("no findings here");
+        let manifest = redact("c@d.com and password=supersecret");
+        let logs = redact("password=anothersecret");
+
+        let merged = Redacted::merge([&status, &events, &manifest, &logs]);
+        assert_eq!(
+            merged.findings,
+            vec![("email address".to_string(), 2), ("secret assignment".to_string(), 2)]
+        );
+        assert_eq!(merged.summary(), "Redacted: 2× email address, 2× secret assignment");
+    }
+
+    #[test]
+    fn merge_of_all_clean_parts_falls_back_to_the_no_findings_message() {
+        let clean = redact("nothing sensitive here");
+        let merged = Redacted::merge([&clean, &clean]);
+        assert_eq!(merged.summary(), "No secrets or personal data matched.");
     }
 
     #[test]
