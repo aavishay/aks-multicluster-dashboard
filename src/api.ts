@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   ClaudeAuthState,
+  ClaudeDiagnosisPayload,
   ClusterEntry,
   ClusterOverview,
   EventInfo,
@@ -113,6 +114,15 @@ export const api = {
   /** Stores a pasted key in the OS keychain; the key is never persisted frontend-side. */
   claudeSetApiKey: (apiKey: string) => invoke<ClaudeAuthState>("claude_set_api_key", { apiKey }),
   claudeClearApiKey: () => invoke<ClaudeAuthState>("claude_clear_api_key"),
+  /** Assembles the redacted diagnosis payload without sending it, for preview. */
+  claudeBuildDiagnosis: (contextName: string, namespace: string, podName: string, container: string) =>
+    invoke<ClaudeDiagnosisPayload>("claude_build_diagnosis", { contextName, namespace, podName, container }),
+  /** Sends an already-previewed diagnosis payload; `onToken` fires per text delta. */
+  claudeDiagnose: (prompt: string, onToken: (chunk: string) => void) => {
+    const channel = new Channel<string>();
+    channel.onmessage = onToken;
+    return invoke<void>("claude_diagnose", { prompt, onToken: channel });
+  },
   /** Streams an explanation of one error string; `onToken` fires per text delta. */
   claudeExplainError: (errorText: string, onToken: (chunk: string) => void) => {
     const channel = new Channel<string>();

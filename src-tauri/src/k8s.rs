@@ -1215,6 +1215,24 @@ pub async fn get_workload_events(
         .collect())
 }
 
+/// Same reasoning as `get_node_events` — filter by involved object *before*
+/// the cluster-wide cap, so a quiet pod's events aren't crowded out by churn
+/// elsewhere.
+pub async fn get_pod_events(context_name: &str, namespace: &str, pod_name: &str) -> Result<Vec<EventInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    let items = list_events_sorted(&client).await?;
+
+    Ok(items
+        .into_iter()
+        .filter(|e| {
+            e.involved_object.kind.as_deref() == Some("Pod")
+                && e.involved_object.name.as_deref() == Some(pod_name)
+                && e.metadata.namespace.as_deref() == Some(namespace)
+        })
+        .map(event_to_info)
+        .collect())
+}
+
 pub async fn get_resource_usage(context_name: &str) -> Result<ResourceUsageSummary, String> {
     let client = client_for_context(context_name).await?;
     let nodes_api: Api<Node> = Api::all(client.clone());

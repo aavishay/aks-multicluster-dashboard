@@ -394,6 +394,26 @@ pub fn claude_clear_api_key() -> Result<ClaudeAuthState, String> {
     Ok(claude::auth_status())
 }
 
+/// Assembles and returns the diagnosis payload *without* sending it, so the UI
+/// can show exactly what would leave the machine before anything does.
+#[tauri::command]
+pub async fn claude_build_diagnosis(
+    context_name: String,
+    namespace: String,
+    pod_name: String,
+    container: String,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    with_retry(&context_name, || {
+        claude::build_diagnosis_payload(&context_name, &namespace, &pod_name, &container)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn claude_diagnose(prompt: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
+    claude::diagnose(&prompt, on_token).await
+}
+
 #[tauri::command]
 pub async fn claude_explain_error(error_text: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
     // Not wrapped in `with_retry`/`with_deadline`: those are keyed to a cluster
