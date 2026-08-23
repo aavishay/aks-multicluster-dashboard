@@ -691,7 +691,14 @@ const MIN_COLUMN_WIDTH = 60;
 function defaultColumnWidth<T>(col: ColumnDef<T>): number {
   if (col.key === "message") return 320;
   if (col.key === "name" || col.key === "object" || col.key === "cluster") return 200;
-  if (col.filter === "number") return 110;
+  // A number filter is two side-by-side inputs (min/max), each with a native
+  // spinner control eating into its content box. This width (matching the
+  // general fallback below) was previously overridden to a narrower 110px
+  // for number-filter columns specifically, which left each input only
+  // ~11-15px of text room after the spinner — not enough to render "min"/
+  // "max" at text-xs. Measured directly via a rendered DOM probe against the
+  // app's own compiled CSS: 150px gives each input 65px, ~31-35px of that
+  // free for text — comfortable.
   return 150;
 }
 
