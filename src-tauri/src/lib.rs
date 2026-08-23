@@ -5,6 +5,7 @@ mod k8s;
 mod kubeconfig;
 mod metrics_backend;
 mod models;
+mod redact;
 
 /// A macOS app launched via Finder/Dock/Launchpad is spawned by launchd with
 /// a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) rather than the user's
@@ -137,6 +138,8 @@ pub fn run() {
             commands::claude_auth_status,
             commands::claude_set_api_key,
             commands::claude_clear_api_key,
+            commands::claude_build_diagnosis,
+            commands::claude_diagnose,
             commands::claude_explain_error,
             commands::kubeconfig_path,
         ])

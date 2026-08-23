@@ -205,4 +205,11 @@ export interface ClaudeAuthState {
   detail: string | null;
 }
 
+export interface ClaudeDiagnosisPayload {
+  prompt: string;
+  redaction_summary: string;
+  log_note: string | null;
+  approx_tokens: number;
+}
+
 export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "gitops" | "helm" | "cost";

@@ -2224,6 +2224,7 @@ dependencies = [
  "keyring",
  "kube",
  "libc",
+ "regex",
  "reqwest",
  "rustls",
  "serde",
