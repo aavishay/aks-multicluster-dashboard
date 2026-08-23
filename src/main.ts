@@ -561,6 +561,24 @@ function esc(s: string | null | undefined): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
 
+/**
+ * A value safe to splice into an inline event-handler attribute as a JS
+ * string-literal argument, e.g. `onclick="fn(${jsArg(x)})"`.
+ *
+ * `esc()` alone is not enough here even though it escapes quotes: HTML
+ * entities are decoded back to literal characters *before* the browser parses
+ * the attribute text as JS, so an `esc()`-escaped quote reappears as a real
+ * `'` in the JS source and can terminate the string literal early — a classic
+ * mixed-context escaping bug, not a hypothetical one. `JSON.stringify`
+ * produces a complete JS string literal (quotes, backslashes and control
+ * characters all escaped); `esc()` on top of that only neutralizes the outer
+ * HTML attribute delimiter, and round-trips cleanly since JSON's escapes are
+ * plain backslash sequences that HTML has no reason to alter.
+ */
+function jsArg(value: string): string {
+  return esc(JSON.stringify(value));
+}
+
 // ---------------------------------------------------------------------------
 // Column sorting
 //
@@ -5124,7 +5142,7 @@ function renderPodDetailPanel(): string {
                 ? `<button
                     type="button"
                     title="Diagnose this pod with Claude — you'll review exactly what is sent first"
-                    onclick="window.__app.diagnosePod('${esc(pd.ctx)}','${esc(pd.namespace)}','${esc(pd.name)}','${esc(pd.activeContainer)}')"
+                    onclick="window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer)})"
                     class="rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
                   >Diagnose</button>`
                 : ""
