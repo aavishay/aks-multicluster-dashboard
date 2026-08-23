@@ -13,18 +13,22 @@ use std::time::Duration;
 /// request pins its connection — and descriptors — until the read timeout
 /// elapses. Cancelling the future here drops the connection and frees them.
 ///
-/// Matches `kubeconfig::READ_TIMEOUT`/`WRITE_TIMEOUT` (120s) rather than
-/// picking an independent number: this used to be 60s, which was *tighter*
-/// than what the transport layer itself was already configured to allow —
-/// so this deadline, not the HTTP client, was the thing declaring a live
-/// cluster "unreachable". Measured directly against a real private-link
-/// cluster under degraded (but not dead) network conditions: DNS/connect/TLS
-/// together took under 20s, but transferring the node list alone (a few MB —
-/// ordinary for ~130 nodes, not bloated) took over 90s and was still
-/// incomplete, implying well under 50 KB/s effective throughput on that path
-/// at the time. A cluster in that state is genuinely reachable and will
-/// finish given enough time; 60s was failing it before it could.
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Set to `kubeconfig::SLOW_CLUSTER_TIMEOUT` — the same constant
+/// `READ_TIMEOUT`/`WRITE_TIMEOUT` use — rather than an independent literal.
+/// This used to be its own 60s value, tighter than what the transport layer
+/// itself was already configured to allow, so this deadline (not the HTTP
+/// client) was the thing declaring a live cluster "unreachable". Sharing the
+/// constant makes that drift impossible instead of relying on a comment to
+/// keep two numbers in sync by hand.
+///
+/// Measured directly against a real private-link cluster under degraded
+/// (but not dead) network conditions: DNS/connect/TLS together took under
+/// 20s, but transferring the node list alone (a few MB — ordinary for ~130
+/// nodes, not bloated) took over 90s and was still incomplete, implying well
+/// under 50 KB/s effective throughput on that path at the time. A cluster in
+/// that state is genuinely reachable and will finish given enough time; 60s
+/// was failing it before it could.
+const OPERATION_TIMEOUT: Duration = kubeconfig::SLOW_CLUSTER_TIMEOUT;
 
 async fn with_deadline<T>(
     context_name: &str,

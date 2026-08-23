@@ -14,14 +14,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-/// Transport-level timeouts. These are deliberately looser than the
-/// per-operation ceiling enforced in `commands.rs` (which is what actually
-/// bounds how long the UI can wait) — they exist only so a connection that
-/// has genuinely gone away can't be held forever, while still leaving room
-/// for a slow VPN and for large list responses on big clusters.
+/// How long talking to a slow-but-alive cluster is allowed to take, shared by
+/// this module's `READ_TIMEOUT`/`WRITE_TIMEOUT` and by `commands::
+/// OPERATION_TIMEOUT` — one constant rather than three independently-set
+/// literals that happen to agree. They didn't always: `OPERATION_TIMEOUT` was
+/// 60s here while these were already 120s, so the per-command deadline was
+/// declaring a cluster unreachable before its own HTTP client would have
+/// given up on it. A shared constant makes that class of drift impossible
+/// instead of relying on comments to keep the numbers in sync by hand.
+pub const SLOW_CLUSTER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Connection-establishment timeout — kept separate from
+/// `SLOW_CLUSTER_TIMEOUT` because it's a different failure mode: a handshake
+/// that hasn't completed this quickly means the endpoint has genuinely gone
+/// away, whereas a slow *read* on an already-open connection can legitimately
+/// mean a large response crawling over a slow VPN.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const READ_TIMEOUT: Duration = Duration::from_secs(120);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+const READ_TIMEOUT: Duration = SLOW_CLUSTER_TIMEOUT;
+const WRITE_TIMEOUT: Duration = SLOW_CLUSTER_TIMEOUT;
 
 /// Resolve the kubeconfig path: respects `KUBECONFIG` env var (first entry if
 /// multiple are colon-separated) and otherwise falls back to `~/.kube/config`.
