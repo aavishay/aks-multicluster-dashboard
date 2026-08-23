@@ -13,9 +13,18 @@ use std::time::Duration;
 /// request pins its connection — and descriptors — until the read timeout
 /// elapses. Cancelling the future here drops the connection and frees them.
 ///
-/// Generous enough for a genuinely slow cluster over a VPN, but well short of
-/// "the user assumes the app is broken".
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Matches `kubeconfig::READ_TIMEOUT`/`WRITE_TIMEOUT` (120s) rather than
+/// picking an independent number: this used to be 60s, which was *tighter*
+/// than what the transport layer itself was already configured to allow —
+/// so this deadline, not the HTTP client, was the thing declaring a live
+/// cluster "unreachable". Measured directly against a real private-link
+/// cluster under degraded (but not dead) network conditions: DNS/connect/TLS
+/// together took under 20s, but transferring the node list alone (a few MB —
+/// ordinary for ~130 nodes, not bloated) took over 90s and was still
+/// incomplete, implying well under 50 KB/s effective throughput on that path
+/// at the time. A cluster in that state is genuinely reachable and will
+/// finish given enough time; 60s was failing it before it could.
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn with_deadline<T>(
     context_name: &str,
