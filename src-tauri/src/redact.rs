@@ -101,6 +101,22 @@ pub struct Redacted {
 }
 
 impl Redacted {
+    /// Combines the findings from several redaction passes into one, so a
+    /// payload assembled from multiple documents (status, events, manifest,
+    /// logs) can report a single summary covering all of them.
+    pub fn merge<'a>(parts: impl IntoIterator<Item = &'a Redacted>) -> Redacted {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for part in parts {
+            for (label, count) in &part.findings {
+                *counts.entry(label.as_str()).or_insert(0) += count;
+            }
+        }
+        Redacted {
+            text: String::new(),
+            findings: counts.into_iter().map(|(label, count)| (label.to_string(), count)).collect(),
+        }
+    }
+
     /// Human-readable one-liner for the payload preview.
     pub fn summary(&self) -> String {
         if self.findings.is_empty() {
