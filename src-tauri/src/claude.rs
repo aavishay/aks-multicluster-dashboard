@@ -8,7 +8,8 @@
 //!
 //! There is no official Anthropic Rust SDK, so the API is called over raw HTTP.
 
-use crate::models::ClaudeAuthState;
+use crate::models::{ClaudeAuthState, ClaudeDiagnosisPayload};
+use crate::{k8s, redact};
 use keyring::v1::Entry;
 
 /// Keychain coordinates for the API key. Deliberately the OS keychain rather
@@ -133,6 +134,171 @@ Be direct and concise; assume fluency with kubectl and Helm. Do not restate the 
 error back. If the message is too ambiguous to diagnose confidently, say what \
 additional information would settle it rather than guessing.";
 
+// ---------------------------------------------------------------------------
+// Pod diagnosis
+// ---------------------------------------------------------------------------
+
+/// Log lines included in a diagnosis. Enough for a crashloop's story without
+/// dominating the payload — and the trim is always disclosed, never silent.
+const DIAGNOSE_LOG_LINES: usize = 200;
+/// Fetched before trimming, so `tail_lines` has a real tail to choose from.
+const DIAGNOSE_LOG_FETCH_LINES: i64 = 400;
+/// Diagnosis reasons over several documents at once, so it gets more headroom
+/// than the one-string explain path.
+const DIAGNOSE_MAX_TOKENS: u32 = 32_000;
+/// Root-causing a crashloop is the intelligence-sensitive case in this app;
+/// terser settings produce plausible-but-shallow answers here.
+const DIAGNOSE_EFFORT: &str = "high";
+
+const DIAGNOSE_SYSTEM: &str = "\
+You diagnose failing Kubernetes pods for an experienced SRE.
+
+You are given a pod's status, its recent events, its manifest, and recent \
+container logs. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the event, log line, or \
+manifest field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over a \
+list of possibilities. If the evidence is genuinely insufficient, say so and \
+name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
+/// Assembles everything a diagnosis needs, redacted and trimmed.
+///
+/// Returned to the frontend *before* being sent, so the exact text leaving the
+/// machine is inspectable rather than implied. Every document goes through
+/// `redact` — logs and manifests both, since a manifest's env values are as
+/// likely to hold a secret as a log line.
+pub async fn build_diagnosis_payload(
+    context_name: &str,
+    namespace: &str,
+    pod_name: &str,
+    container: &str,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    // Independent reads, issued concurrently — the same reasoning as the
+    // tokio::join! conversions in k8s.rs, and it matters more here because a
+    // private-link cluster costs tens of seconds per round trip.
+    let (pods, events, manifest, logs) = tokio::join!(
+        k8s::get_pods(context_name, Some(namespace.to_string())),
+        k8s::get_pod_events(context_name, namespace, pod_name),
+        k8s::get_pod_manifest(context_name, namespace, pod_name),
+        k8s::get_pod_logs(context_name, namespace, pod_name, container, true, DIAGNOSE_LOG_FETCH_LINES),
+    );
+
+    let status = pods
+        .ok()
+        .and_then(|list| list.into_iter().find(|p| p.name == pod_name))
+        .map(|p| {
+            format!(
+                "phase: {}\nready: {}\nrestarts: {}\nnode: {}\nowner: {}\nage: {}s\nreason: {}",
+                p.phase,
+                p.ready,
+                p.restarts,
+                p.node.unwrap_or_else(|| "(unscheduled)".to_string()),
+                match (p.owner_kind, p.owner_name) {
+                    (Some(k), Some(n)) => format!("{k}/{n}"),
+                    _ => "(none)".to_string(),
+                },
+                p.age_seconds,
+                p.status_reason.unwrap_or_else(|| "(none)".to_string()),
+            )
+        })
+        .unwrap_or_else(|| "(pod status unavailable)".to_string());
+
+    let events_text = match events {
+        Ok(list) if list.is_empty() => "(no events for this pod)".to_string(),
+        Ok(list) => list
+            .iter()
+            .take(25)
+            .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("(events unavailable: {e})"),
+    };
+
+    // Managed fields are pure server bookkeeping — omitting them removes a
+    // large share of the manifest's tokens with no diagnostic loss.
+    let manifest_text = match manifest {
+        Ok(m) => m.yaml_without_managed_fields,
+        Err(e) => format!("(manifest unavailable: {e})"),
+    };
+
+    let (logs_text, log_note) = match logs {
+        Ok(text) if text.trim().is_empty() => ("(container produced no log output)".to_string(), None),
+        Ok(text) => redact::tail_lines(&text, DIAGNOSE_LOG_LINES),
+        Err(e) => (format!("(logs unavailable: {e})"), None),
+    };
+
+    // Redact each document, then merge the findings so the summary reflects the
+    // whole payload rather than one part of it.
+    let status = redact::redact(&status);
+    let events_r = redact::redact(&events_text);
+    let manifest_r = redact::redact(&manifest_text);
+    let logs_r = redact::redact(&logs_text);
+
+    let mut findings: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for part in [&status, &events_r, &manifest_r, &logs_r] {
+        for (label, count) in &part.findings {
+            *findings.entry(label.clone()).or_insert(0) += count;
+        }
+    }
+    let redaction_summary = if findings.is_empty() {
+        "No secrets or personal data matched.".to_string()
+    } else {
+        format!(
+            "Redacted: {}",
+            findings
+                .iter()
+                .map(|(label, count)| format!("{count}× {label}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let prompt = format!(
+        "Pod {namespace}/{pod_name}, container {container}.\n\n\
+         ## Status\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest\n```yaml\n{}\n```\n\n\
+         ## Logs{}\n```\n{}\n```",
+        status.text,
+        events_r.text,
+        manifest_r.text,
+        log_note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default(),
+        logs_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note,
+    })
+}
+
+/// Rough token estimate for the payload preview — ~4 characters per token.
+///
+/// Deliberately not a call to `/v1/messages/count_tokens`: that would send the
+/// payload to the API *before* the user has approved it, which is precisely
+/// what the preview exists to prevent. An estimate is enough to convey scale.
+fn approx_tokens(text: &str) -> u32 {
+    (text.chars().count() as f64 / 4.0).ceil() as u32
+}
+
+/// Streams a diagnosis for an already-built payload.
+///
+/// Takes the assembled prompt rather than re-gathering, so what is sent is
+/// exactly what the user was shown — re-fetching could send something different
+/// from the preview.
+pub async fn diagnose(prompt: &str, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
+    stream_messages(prompt, DIAGNOSE_SYSTEM, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
+}
+
 /// Streams an explanation of a single error message, emitting text deltas on
 /// `on_token` as they arrive.
 ///
@@ -140,30 +306,38 @@ additional information would settle it rather than guessing.";
 /// identifiers — which is what makes this the lowest-exposure Claude feature
 /// in the app.
 pub async fn explain_error(error_text: &str, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
+    stream_messages(error_text, EXPLAIN_SYSTEM, EXPLAIN_MAX_TOKENS, EXPLAIN_EFFORT, on_token).await
+}
+
+/// One streaming Messages API call. Shared by every Claude feature so the
+/// auth, beta flags, error mapping and SSE handling exist once.
+async fn stream_messages(
+    user_content: &str,
+    system: &str,
+    max_tokens: u32,
+    effort: &str,
+    on_token: tauri::ipc::Channel<String>,
+) -> Result<(), String> {
     let api_key = resolve_api_key()?;
 
-    let request = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(API_URL)
         .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
         .header("x-api-key", api_key)
-        .header("anthropic-beta", FALLBACK_BETA);
-
-    let body = serde_json::json!({
-        "model": MODEL,
-        "max_tokens": EXPLAIN_MAX_TOKENS,
-        "stream": true,
-        // Adaptive is the only thinking mode on Opus 5; `budget_tokens` was
-        // removed and would be rejected with a 400.
-        "thinking": { "type": "adaptive" },
-        "output_config": { "effort": EXPLAIN_EFFORT },
-        "fallbacks": "default",
-        "system": EXPLAIN_SYSTEM,
-        "messages": [{ "role": "user", "content": error_text }],
-    });
-
-    let response = request
-        .json(&body)
+        .header("anthropic-beta", FALLBACK_BETA)
+        .json(&serde_json::json!({
+            "model": MODEL,
+            "max_tokens": max_tokens,
+            "stream": true,
+            // Adaptive is the only thinking mode on Opus 5; `budget_tokens`
+            // was removed and would be rejected with a 400.
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": effort },
+            "fallbacks": "default",
+            "system": system,
+            "messages": [{ "role": "user", "content": user_content }],
+        }))
         .send()
         .await
         .map_err(|e| format!("Could not reach the Claude API: {e}"))?;
@@ -171,14 +345,14 @@ pub async fn explain_error(error_text: &str, on_token: tauri::ipc::Channel<Strin
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        // Surface the API's own error message — it names the offending
-        // parameter, which a generic status line would hide.
+        // Surface the API's own message — it names the offending parameter,
+        // which a bare status line would hide.
         let detail = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
             .unwrap_or_else(|| text.chars().take(400).collect());
         return Err(match status.as_u16() {
-            401 | 403 => format!("Claude rejected the credential ({status}). Try signing in again. {detail}"),
+            401 | 403 => format!("Claude rejected the API key ({status}). Check it in the Claude panel. {detail}"),
             429 => format!("Rate limited by the Claude API. {detail}"),
             _ => format!("Claude API error {status}: {detail}"),
         });

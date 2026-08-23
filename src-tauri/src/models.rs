@@ -284,6 +284,23 @@ pub struct ClaudeAuthState {
     pub detail: Option<String>,
 }
 
+/// Everything a pod diagnosis will send, assembled and redacted but not yet
+/// sent — returned to the frontend so the exact payload can be inspected
+/// first. Sending log data is the highest-exposure thing this app does, so it
+/// is shown rather than implied.
+#[derive(Serialize, Clone, Debug)]
+pub struct ClaudeDiagnosisPayload {
+    /// The verbatim user message that will be sent.
+    pub prompt: String,
+    /// What redaction removed, e.g. "Redacted: 3× email address, 1× JWT".
+    pub redaction_summary: String,
+    /// Set when logs were trimmed, e.g. "showing the last 200 of 400 lines".
+    pub log_note: Option<String>,
+    /// Rough size estimate (~4 chars/token) for conveying scale. Not a
+    /// count_tokens call — that would send the payload before approval.
+    pub approx_tokens: u32,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct HelmReleaseDetail {
     /// User-supplied values (Helm's `config`), rendered as YAML. Empty when

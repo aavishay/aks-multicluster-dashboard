@@ -3,6 +3,7 @@ import { api } from "./api";
 import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
 import type {
   ClaudeAuthState,
+  ClaudeDiagnosisPayload,
   ClusterEntry,
   ClusterOverview,
   EventInfo,
@@ -342,6 +343,27 @@ interface ClaudeExplainState {
   error: string | null;
 }
 
+/**
+ * Pod diagnosis. Unlike explain-error this sends logs, so it is a two-step
+ * flow: assemble + preview the redacted payload, then send only on an explicit
+ * confirmation.
+ */
+interface ClaudeDiagnoseState {
+  ctx: string;
+  namespace: string;
+  podName: string;
+  container: string;
+  /** Assembled payload, or null while still being built. */
+  payload: ClaudeDiagnosisPayload | null;
+  /** True once the user has approved sending. */
+  sent: boolean;
+  /** Whether the assembled payload is expanded for review. */
+  showPayload: boolean;
+  answer: string;
+  streaming: boolean;
+  error: string | null;
+}
+
 interface AppState {
   theme: Theme;
   /** Root font-size as a percentage — scales the whole rem-based UI. One of `UI_SCALE_STEPS`. */
@@ -378,6 +400,7 @@ interface AppState {
   claudeAuth: ClaudeAuthState | null;
   claudePanelOpen: boolean;
   claudeExplain: ClaudeExplainState | null;
+  claudeDiagnose: ClaudeDiagnoseState | null;
   sortState: Partial<Record<TabId, SortSpec>>;
   filterState: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
   /** filterKey (`${tab}:${col.key}`) of the currently open enum-filter dropdown, or null. */
@@ -436,6 +459,7 @@ const state: AppState = {
   claudeAuth: null,
   claudePanelOpen: false,
   claudeExplain: null,
+  claudeDiagnose: null,
   sortState: {},
   filterState: {},
   openEnumFilter: null,
@@ -472,6 +496,8 @@ let gitOpsDetailToken = 0;
 let helmDetailToken = 0;
 /** Bumped per explain request, so a stale stream can't append to a newer one. */
 let claudeExplainToken = 0;
+/** Same guard for the diagnosis stream. */
+let claudeDiagnoseToken = 0;
 /** rAF-batches streamed token appends, same as the log-follow path. */
 let claudeRenderScheduled = false;
 let logRenderScheduled = false;
@@ -2542,6 +2568,10 @@ function setMetricsRange(minutes: number) {
   clearClaudeApiKey,
   explainError,
   closeClaudeExplain,
+  diagnosePod,
+  confirmDiagnose,
+  closeClaudeDiagnose,
+  toggleDiagnosePayload,
   openMetricsBackendEditor,
   closeMetricsBackendEditor,
   setMetricsBackendField,
@@ -2686,6 +2716,7 @@ function render() {
     ${renderMetricsBackendEditor()}
     ${renderClaudePanel()}
     ${renderClaudeExplainPanel()}
+    ${renderClaudeDiagnosePanel()}
   `;
 
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
@@ -3038,6 +3069,77 @@ function renderClaudeExplainPanel(): string {
             </div>
             ${body}
           </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderClaudeDiagnosePanel(): string {
+  const d = state.claudeDiagnose;
+  if (!d) return "";
+
+  const review = d.payload
+    ? `
+      <div class="flex flex-col gap-2 rounded-md border border-gridline bg-surface-2 p-3">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="text-xs font-medium text-ink-primary">What will be sent</div>
+          <button type="button" onclick="window.__app.toggleDiagnosePayload()" class="text-xs text-ink-secondary hover:text-ink-primary hover:underline">
+            ${d.showPayload ? "Hide" : "Review"}
+          </button>
+        </div>
+        <div class="flex flex-col gap-1 text-xs text-ink-muted">
+          <div>Status, events, manifest and the recent logs of this container.</div>
+          <div class="${d.payload.redaction_summary.startsWith("Redacted") ? "text-status-warning" : ""}">${esc(d.payload.redaction_summary)}</div>
+          ${d.payload.log_note ? `<div>Logs: ${esc(d.payload.log_note)}.</div>` : ""}
+          <div>Roughly ${d.payload.approx_tokens.toLocaleString()} tokens.</div>
+        </div>
+        ${
+          d.showPayload
+            ? `<pre class="max-h-64 select-text overflow-auto whitespace-pre-wrap rounded border border-gridline bg-surface-1 p-2 text-xs text-ink-secondary">${esc(d.payload.prompt)}</pre>`
+            : ""
+        }
+      </div>`
+    : d.error
+      ? ""
+      : `<div class="text-sm text-ink-muted">Gathering status, events, manifest and logs…</div>`;
+
+  const action = d.payload && !d.sent
+    ? `
+      <div class="flex items-center gap-2">
+        <button type="button" onclick="window.__app.confirmDiagnose()" class="rounded-md bg-series-blue px-3 py-1.5 text-xs font-medium text-white">Send to Claude</button>
+        <button type="button" onclick="window.__app.closeClaudeDiagnose()" class="rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Cancel</button>
+      </div>`
+    : "";
+
+  const answer = d.error
+    ? `<div class="text-sm text-status-critical">${esc(d.error)}</div>`
+    : d.sent
+      ? `<div class="border-t border-gridline pt-3">
+          <div class="mb-1 flex items-center gap-2 text-xs font-medium text-ink-secondary">
+            Diagnosis ${d.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}
+          </div>
+          ${
+            d.answer
+              ? `<div class="whitespace-pre-wrap text-sm leading-relaxed text-ink-primary">${esc(d.answer)}</div>`
+              : `<div class="text-sm text-ink-muted">Thinking…</div>`
+          }
+        </div>`
+      : "";
+
+  return `
+    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeClaudeDiagnose()">
+      <div class="flex h-full w-full max-w-2xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">Diagnose ${esc(d.podName)}</div>
+            <div class="truncate text-xs text-ink-muted">${esc(d.ctx)} · ${esc(d.namespace)} · ${esc(d.container)}</div>
+          </div>
+          <button type="button" onclick="window.__app.closeClaudeDiagnose()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4" data-scroll-id="claude-diagnose">
+          ${review}
+          ${action}
+          ${answer}
         </div>
       </div>
     </div>`;
@@ -4040,6 +4142,84 @@ async function clearClaudeApiKey() {
   render();
 }
 
+function closeClaudeDiagnose() {
+  claudeDiagnoseToken += 1;
+  state.claudeDiagnose = null;
+  render();
+}
+
+function toggleDiagnosePayload() {
+  if (!state.claudeDiagnose) return;
+  state.claudeDiagnose.showPayload = !state.claudeDiagnose.showPayload;
+  render();
+}
+
+/**
+ * Step 1: assemble and show the payload. Nothing is sent yet — this exists so
+ * the log data leaving the machine is reviewable rather than implied.
+ */
+async function diagnosePod(ctx: string, namespace: string, podName: string, container: string) {
+  const token = ++claudeDiagnoseToken;
+  closeClaudeExplain();
+  state.claudeDiagnose = {
+    ctx,
+    namespace,
+    podName,
+    container,
+    payload: null,
+    sent: false,
+    showPayload: false,
+    answer: "",
+    streaming: false,
+    error: null,
+  };
+  render();
+
+  try {
+    const payload = await api.claudeBuildDiagnosis(ctx, namespace, podName, container);
+    if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
+    state.claudeDiagnose.payload = payload;
+  } catch (e) {
+    if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
+    state.claudeDiagnose.error = String(e);
+  }
+  render();
+}
+
+/** Step 2: send the previewed payload verbatim. */
+async function confirmDiagnose() {
+  const d = state.claudeDiagnose;
+  if (!d?.payload || d.sent) return;
+  const token = claudeDiagnoseToken;
+  d.sent = true;
+  d.streaming = true;
+  d.answer = "";
+  render();
+
+  try {
+    // Sends the previewed prompt rather than re-gathering, so what goes out is
+    // exactly what was shown.
+    await api.claudeDiagnose(d.payload.prompt, (chunk) => {
+      if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
+      state.claudeDiagnose.answer += chunk;
+      if (!claudeRenderScheduled) {
+        claudeRenderScheduled = true;
+        requestAnimationFrame(() => {
+          claudeRenderScheduled = false;
+          render();
+        });
+      }
+    });
+    if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
+    state.claudeDiagnose.streaming = false;
+  } catch (e) {
+    if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
+    state.claudeDiagnose.streaming = false;
+    state.claudeDiagnose.error = String(e);
+  }
+  render();
+}
+
 function closeClaudeExplain() {
   claudeExplainToken += 1;
   state.claudeExplain = null;
@@ -4938,7 +5118,19 @@ function renderPodDetailPanel(): string {
             <div class="truncate text-sm font-medium text-ink-primary">${esc(pd.name)}</div>
             <div class="truncate text-xs text-ink-muted">${esc(pd.ctx)} · ${esc(pd.namespace)}</div>
           </div>
-          <button type="button" onclick="window.__app.closePodDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          <div class="flex shrink-0 items-center gap-2">
+            ${
+              state.claudeAuth?.signed_in
+                ? `<button
+                    type="button"
+                    title="Diagnose this pod with Claude — you'll review exactly what is sent first"
+                    onclick="window.__app.diagnosePod('${esc(pd.ctx)}','${esc(pd.namespace)}','${esc(pd.name)}','${esc(pd.activeContainer)}')"
+                    class="rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+                  >Diagnose</button>`
+                : ""
+            }
+            <button type="button" onclick="window.__app.closePodDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
         </div>
         <div class="flex items-center justify-between gap-3 border-b border-gridline px-4 py-2">
           <div class="flex gap-1">
@@ -5977,6 +6169,7 @@ function closeOpenDetailPanel(): boolean {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (state.claudeExplain) closeClaudeExplain();
+    else if (state.claudeDiagnose) closeClaudeDiagnose();
     else if (state.claudePanelOpen) toggleClaudePanel();
     else if (state.metricsBackendEditor) closeMetricsBackendEditor();
     else closeOpenDetailPanel();

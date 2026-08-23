@@ -52,6 +52,11 @@ futures-util = "0.3"
 # Credential Manager on Windows), so this stays portable if a Windows build
 # ever happens.
 keyring = "4"
+# Redaction of secrets/PII before anything reaches the Claude API. A real regex
+# engine rather than hand-rolled scanning: this is safety-critical matching
+# where a missed pattern leaks a credential. Already compiled in the tree via
+# tauri, so this adds no build time.
+regex = "1"
 anyhow = "1"
 thiserror = "2"
 dirs = "5"
