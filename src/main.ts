@@ -6245,7 +6245,7 @@ document.addEventListener("keydown", (e) => {
     else if (state.claudeDiagnose) closeClaudeDiagnose();
     else if (state.claudePanelOpen) toggleClaudePanel();
     else if (state.metricsBackendEditor) closeMetricsBackendEditor();
-    else closeOpenDetailPanel();
+    else if (!closeOpenDetailPanel() && hasActiveFilters(state.activeTab)) clearFilters(state.activeTab);
     return;
   }
   if (!e.metaKey) return;
