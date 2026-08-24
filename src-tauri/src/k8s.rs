@@ -2,7 +2,7 @@
 //! opens Kubernetes API calls concurrently where sensible and maps results
 //! onto the plain-data structs in `models.rs`.
 
-use crate::kubeconfig::client_for_context;
+use crate::kubeconfig::{client_for_context, SLOW_CLUSTER_TIMEOUT};
 use crate::models::*;
 use chrono::Utc;
 use futures::{AsyncBufReadExt, TryStreamExt};
@@ -26,7 +26,18 @@ use tokio::task::AbortHandle;
 /// client's full (multi-minute) read timeout, making the whole nodes/pods
 /// list look permanently stuck on "Loading…" instead of just missing usage
 /// numbers.
-const METRICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// This used to be a flat 5s, which was measured directly against this
+/// fleet to be far too tight: a full-cluster pod-metrics request took
+/// 12-40s across repeated attempts on multiple clusters, metrics-server
+/// healthy and responding the whole time. That made usage data disappear
+/// on most loads, not just occasional slow ones. Defined as a fraction of
+/// `SLOW_CLUSTER_TIMEOUT` rather than its own picked number so it stays
+/// comfortably below the pods/nodes list's own deadline — a metrics
+/// endpoint that's genuinely hanging should still fail faster than the
+/// list itself would time out — without the two constants needing to be
+/// hand-kept in agreement.
+const METRICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(SLOW_CLUSTER_TIMEOUT.as_secs() / 2);
 
 /// The `metrics.k8s.io` aggregated API (backed by metrics-server) isn't part
 /// of `k8s-openapi`'s typed models, and pulling in a separate crate for it
