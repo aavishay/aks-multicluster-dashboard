@@ -3492,7 +3492,11 @@ function renderNodes(): string {
             <tr>
               ${rowCheckboxCell("nodes", keyOf(row))}
               <td>${statusDot(n.ready)}</td>
-              ${multi ? `<td class="text-ink-muted">${esc(ctx)}</td>` : ""}
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter nodes by this cluster" onclick="window.__app.setEnumFilter('nodes','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
               <td>
                 <span class="inline-flex items-center gap-1.5">
                   <button
@@ -3593,9 +3597,13 @@ function renderWorkloads(): string {
             <tr>
               ${rowCheckboxCell("workloads", keyOf(row))}
               <td>${statusDot(w.healthy)}</td>
-              ${multi ? `<td class="text-ink-muted">${esc(ctx)}</td>` : ""}
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter workloads by this cluster" onclick="window.__app.setEnumFilter('workloads','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
               <td>${esc(w.kind)}</td>
-              <td>${esc(w.namespace)}</td>
+              <td><button type="button" title="Filter workloads by this namespace" onclick="window.__app.setEnumFilter('workloads','namespace',[${jsArg(w.namespace)}])" class="hover:text-series-blue hover:underline">${esc(w.namespace)}</button></td>
               <td>
                 <span class="inline-flex items-center gap-1.5">
                   <button
@@ -3729,8 +3737,12 @@ function renderPods(): string {
             <tr>
               ${rowCheckboxCell("pods", keyOf(row))}
               <td>${statusDot(podHealthy(row))}</td>
-              ${multi ? `<td class="text-ink-muted">${esc(ctx)}</td>` : ""}
-              <td>${esc(p.namespace)}</td>
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter pods by this cluster" onclick="window.__app.setEnumFilter('pods','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
+              <td><button type="button" title="Filter pods by this namespace" onclick="window.__app.setEnumFilter('pods','namespace',[${jsArg(p.namespace)}])" class="hover:text-series-blue hover:underline">${esc(p.namespace)}</button></td>
               <td>
                 <button
                   type="button"
@@ -5823,7 +5835,11 @@ function renderEvents(): string {
                 return `
             <tr>
               ${rowCheckboxCell("events", keyOf(row))}
-              ${multi ? `<td class="text-ink-muted">${esc(ctx)}</td>` : ""}
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter events by this cluster" onclick="window.__app.setEnumFilter('events','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
               <td><span class="${e.event_type === "Warning" ? "text-status-warning" : "text-ink-muted"}">${esc(e.event_type)}</span></td>
               <td>
                 <button
@@ -5939,8 +5955,12 @@ function renderGitOps(): string {
             <tr>
               ${rowCheckboxCell("gitops", keyOf(row))}
               <td>${statusDot(gitOpsAppHealthy(row.a))}</td>
-              ${multi ? `<td class="text-ink-muted">${esc(ctx)}</td>` : ""}
-              <td>${esc(a.namespace)}</td>
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter GitOps apps by this cluster" onclick="window.__app.setEnumFilter('gitops','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
+              <td><button type="button" title="Filter GitOps apps by this namespace" onclick="window.__app.setEnumFilter('gitops','namespace',[${jsArg(a.namespace)}])" class="hover:text-series-blue hover:underline">${esc(a.namespace)}</button></td>
               <td>
                 <button
                   type="button"
@@ -6045,8 +6065,12 @@ function renderHelm(): string {
             <tr>
               ${rowCheckboxCell("helm", keyOf(row))}
               <td>${statusDot(helmReleaseHealthy(r))}</td>
-              ${multi ? `<td class="text-ink-muted">${esc(ctx)}</td>` : ""}
-              <td>${esc(r.namespace)}</td>
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter releases by this cluster" onclick="window.__app.setEnumFilter('helm','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
+              <td><button type="button" title="Filter releases by this namespace" onclick="window.__app.setEnumFilter('helm','namespace',[${jsArg(r.namespace)}])" class="hover:text-series-blue hover:underline">${esc(r.namespace)}</button></td>
               <td>
                 <button
                   type="button"
