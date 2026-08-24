@@ -3765,7 +3765,18 @@ function renderPods(): string {
                     : "—"
                 }
               </td>
-              <td class="text-ink-muted">${esc(ownerLabel(p)) || "—"}</td>
+              <td class="text-ink-muted">
+                ${
+                  ownerLabel(p)
+                    ? `<button
+                        type="button"
+                        title="Filter pods by this owner"
+                        onclick="window.__app.setEnumFilter('pods','owner',[${jsArg(ownerLabel(p))}])"
+                        class="hover:text-series-blue hover:underline"
+                      >${esc(ownerLabel(p))}</button>`
+                    : "—"
+                }
+              </td>
               <td class="tabular">${formatAgeDetailed(p.age_days, p.age_seconds)}</td>
             </tr>`;
             })
@@ -5814,8 +5825,22 @@ function renderEvents(): string {
               ${rowCheckboxCell("events", keyOf(row))}
               ${multi ? `<td class="text-ink-muted">${esc(ctx)}</td>` : ""}
               <td><span class="${e.event_type === "Warning" ? "text-status-warning" : "text-ink-muted"}">${esc(e.event_type)}</span></td>
-              <td>${esc(e.namespace)}</td>
-              <td>${esc(e.involved_object)}</td>
+              <td>
+                <button
+                  type="button"
+                  title="Filter events by this namespace"
+                  onclick="window.__app.setEnumFilter('events','namespace',[${jsArg(e.namespace)}])"
+                  class="hover:text-series-blue hover:underline"
+                >${esc(e.namespace)}</button>
+              </td>
+              <td>
+                <button
+                  type="button"
+                  title="Filter events by this object"
+                  onclick="window.__app.setStringFilter('events','object',${jsArg(e.involved_object)})"
+                  class="hover:text-series-blue hover:underline"
+                >${esc(e.involved_object)}</button>
+              </td>
               <td>${esc(e.reason)}</td>
               <td class="max-w-md truncate" title="${esc(e.message)}">${esc(e.message)}</td>
               <td class="tabular">${e.count}</td>
