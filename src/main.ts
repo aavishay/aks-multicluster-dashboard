@@ -3448,7 +3448,7 @@ function renderNodes(): string {
       label: "Memory (used/alloc)",
       value: (r) => r.n.memory_usage_ki ?? -1,
       filter: "number",
-      copyText: (r) => `${formatKi(r.n.memory_usage_ki)} / ${r.n.memory_allocatable}`,
+      copyText: (r) => `${formatKi(r.n.memory_usage_ki)} / ${formatKi(r.n.memory_allocatable_ki)}`,
     },
     { key: "zone", label: "Zone", value: (r) => r.n.zone ?? "", filter: "enum" },
     { key: "instance_type", label: "Instance type", value: (r) => r.n.instance_type ?? "", filter: "enum" },
@@ -3517,7 +3517,7 @@ function renderNodes(): string {
               </td>
               <td>${n.roles.map(esc).join(", ")}</td>
               <td class="tabular">${formatMillicores(n.cpu_usage_millicores)} / ${esc(n.cpu_allocatable)}</td>
-              <td class="tabular">${formatKi(n.memory_usage_ki)} / ${esc(n.memory_allocatable)}</td>
+              <td class="tabular">${formatKi(n.memory_usage_ki)} / ${formatKi(n.memory_allocatable_ki)}</td>
               <td>${esc(n.zone) || "—"}</td>
               <td>${esc(n.instance_type) || "—"}</td>
               <td>${esc(n.kubelet_version)}</td>
