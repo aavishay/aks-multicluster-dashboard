@@ -42,7 +42,7 @@ pub struct NodeInfo {
     pub cpu_allocatable: String,
     pub memory_capacity: String,
     pub memory_allocatable: String,
-    pub memory_allocatable_ki: i64,
+    pub memory_allocatable_ki: Option<i64>,
     pub cpu_usage_millicores: Option<i64>,
     pub memory_usage_ki: Option<i64>,
     pub conditions: Vec<String>,
