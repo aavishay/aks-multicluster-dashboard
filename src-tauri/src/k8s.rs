@@ -191,11 +191,18 @@ fn parse_cpu_millicores(q: &str) -> i64 {
 }
 
 fn parse_memory_ki(q: &str) -> i64 {
-    let units: [(&str, f64); 8] = [
+    // Kubernetes' own canonical Quantity serialization uses lowercase "k" for
+    // decimal kilo (1000ies never being uppercase, per resource.Quantity's
+    // suffix table); "K" is kept alongside it only for leniency, since it's
+    // not actually a suffix the API server itself ever emits in
+    // `status.allocatable`/`status.capacity`/`metrics.k8s.io` — every real
+    // value seen here is API-server-generated, never hand-authored.
+    let units: [(&str, f64); 9] = [
         ("Ki", 1.0),
         ("Mi", 1024.0),
         ("Gi", 1024.0 * 1024.0),
         ("Ti", 1024.0 * 1024.0 * 1024.0),
+        ("k", 1.0 / 1.024),
         ("K", 1.0 / 1.024),
         ("M", 1000.0 / 1.024),
         ("G", 1_000_000.0 / 1.024),
@@ -1620,5 +1627,15 @@ mod tests {
         assert_eq!(parse_memory_ki("16374836Ki"), 16_374_836);
         assert_eq!(parse_memory_ki("470Mi"), 481_280);
         assert_eq!(parse_memory_ki("8Gi"), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_ki_handles_lowercase_decimal_kilo_as_well_as_uppercase() {
+        // Kubernetes' canonical Quantity serialization only ever emits
+        // lowercase "k" for decimal kilo; "K" is accepted too, but a real
+        // API-server-reported value uses "k". Both must resolve to the same
+        // amount, not silently become 0 from an unmatched suffix.
+        assert_eq!(parse_memory_ki("16k"), 15);
+        assert_eq!(parse_memory_ki("16K"), 15);
     }
 }
