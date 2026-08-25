@@ -349,7 +349,7 @@ pub async fn get_nodes(context_name: &str) -> Result<Vec<NodeInfo>, String> {
                 cpu_allocatable: alloc.get("cpu").map(|q| q.0.clone()).unwrap_or_default(),
                 memory_capacity: cap.get("memory").map(|q| q.0.clone()).unwrap_or_default(),
                 memory_allocatable: alloc.get("memory").map(|q| q.0.clone()).unwrap_or_default(),
-                memory_allocatable_ki: alloc.get("memory").map(|q| parse_memory_ki(&q.0)).unwrap_or(0),
+                memory_allocatable_ki: alloc.get("memory").map(|q| parse_memory_ki(&q.0)),
                 cpu_usage_millicores: if has_metrics { Some(cpu_usage) } else { None },
                 memory_usage_ki: if has_metrics { Some(mem_usage) } else { None },
                 conditions,
