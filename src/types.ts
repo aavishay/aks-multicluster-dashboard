@@ -34,6 +34,7 @@ export interface NodeInfo {
   cpu_allocatable: string;
   memory_capacity: string;
   memory_allocatable: string;
+  memory_allocatable_ki: number;
   cpu_usage_millicores: number | null;
   memory_usage_ki: number | null;
   conditions: string[];
