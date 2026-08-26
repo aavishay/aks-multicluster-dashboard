@@ -112,6 +112,7 @@ pub fn run() {
             commands::get_node_manifest,
             commands::get_node_events,
             commands::get_pods,
+            commands::stream_pods,
             commands::get_workloads,
             commands::get_workload_manifest,
             commands::get_workload_events,

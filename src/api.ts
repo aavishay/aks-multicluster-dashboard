@@ -32,6 +32,12 @@ export const api = {
   getNodeEvents: (contextName: string, nodeName: string) =>
     invoke<EventInfo[]>("get_node_events", { contextName, nodeName }),
   getPods: (contextName: string, namespace?: string) => invoke<PodInfo[]>("get_pods", { contextName, namespace }),
+  /** Same data as `getPods`, but paged server-side; `onPage` fires once per page as it arrives instead of waiting for the whole cluster's pods to load before resolving. */
+  streamPods: (contextName: string, namespace: string | undefined, onPage: (page: PodInfo[]) => void) => {
+    const channel = new Channel<PodInfo[]>();
+    channel.onmessage = onPage;
+    return invoke<void>("stream_pods", { contextName, namespace, onPage: channel });
+  },
   getWorkloads: (contextName: string) => invoke<WorkloadInfo[]>("get_workloads", { contextName }),
   getWorkloadManifest: (contextName: string, kind: string, namespace: string, name: string) =>
     invoke<WorkloadManifest>("get_workload_manifest", { contextName, kind, namespace, name }),
