@@ -390,32 +390,59 @@ pub async fn get_node_manifest(context_name: &str, node_name: &str) -> Result<No
     })
 }
 
-pub async fn get_pods(context_name: &str, namespace: Option<String>) -> Result<Vec<PodInfo>, String> {
-    let client = client_for_context(context_name).await?;
-    let pods_api: Api<Pod> = match &namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
-    };
-    // A Pod's own owner is normally the ReplicaSet that created it, not the
-    // Deployment that created the ReplicaSet — resolve that one extra hop so
-    // pods can be traced back to the workload shown in the Workloads tab.
-    let replicasets_api: Api<ReplicaSet> = match &namespace {
-        Some(ns) => Api::namespaced(client.clone(), ns),
-        None => Api::all(client.clone()),
+/// Owner resolution and usage-metrics lookup shared by `get_pods` (one
+/// unpaginated call) and `stream_pods` (the same mapping, applied per page).
+fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_owner: &HashMap<(String, String), (String, String)>) -> PodInfo {
+    let name = p.name_any();
+    let ns = p.namespace().unwrap_or_default();
+    let status = p.status.clone().unwrap_or_default();
+    let container_statuses = status.container_statuses.clone().unwrap_or_default();
+    let total = container_statuses.len();
+    let ready_count = container_statuses.iter().filter(|c| c.ready).count();
+    let restarts = container_statuses.iter().map(|c| c.restart_count).sum();
+    let key = (ns.clone(), name.clone());
+    let (cpu, mem) = metrics.get(&key).cloned().unwrap_or((0, 0));
+    let has_metrics = metrics.contains_key(&key);
+
+    let (owner_kind, owner_name) = match controller_owner(&p.metadata.owner_references) {
+        Some(("ReplicaSet", rs_name)) => rs_owner
+            .get(&(ns.clone(), rs_name.to_string()))
+            .cloned()
+            .map_or((Some("ReplicaSet".to_string()), Some(rs_name.to_string())), |(k, n)| {
+                (Some(k), Some(n))
+            }),
+        Some((kind, owner_name)) => (Some(kind.to_string()), Some(owner_name.to_string())),
+        None => (None, None),
     };
 
-    // The pod list, its metrics, and the ReplicaSets needed for ownership are
-    // all independent reads, issued concurrently — see `get_overview` for why
-    // that matters once each round trip alone takes several seconds.
-    let lp = ListParams::default();
-    let (pods_result, metrics, rs_list_result) = tokio::join!(
-        pods_api.list(&lp),
-        fetch_pod_metrics(&client, &namespace),
-        replicasets_api.list(&lp),
-    );
-    let pods = pods_result.map_err(|e| format!("Failed to list pods: {e}"))?.items;
+    PodInfo {
+        name,
+        namespace: ns,
+        node: p.spec.as_ref().and_then(|s| s.node_name.clone()),
+        phase: status.phase.clone().unwrap_or_else(|| "Unknown".to_string()),
+        ready: format!("{ready_count}/{total}"),
+        restarts,
+        age_days: age_days(p.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(p.metadata.creation_timestamp.clone()),
+        owner_kind,
+        owner_name,
+        cpu_usage_millicores: if has_metrics { Some(cpu) } else { None },
+        memory_usage_ki: if has_metrics { Some(mem) } else { None },
+        status_reason: status.reason.clone(),
+    }
+}
 
-    let rs_owner: HashMap<(String, String), (String, String)> = rs_list_result
+/// Resolves each ReplicaSet's own controller owner, for tracing a pod back to
+/// the Deployment shown in the Workloads tab (a pod's *direct* owner is
+/// normally the ReplicaSet, not the Deployment that created it). Not paged:
+/// in practice a namespace/cluster has far fewer ReplicaSets than Pods, and
+/// every page of pods needs the same complete map to resolve ownership
+/// correctly regardless of which page a given owning ReplicaSet happens to
+/// be listed on.
+async fn fetch_replicaset_owners(replicasets_api: &Api<ReplicaSet>) -> HashMap<(String, String), (String, String)> {
+    replicasets_api
+        .list(&ListParams::default())
+        .await
         .map(|list| {
             list.items
                 .into_iter()
@@ -426,52 +453,82 @@ pub async fn get_pods(context_name: &str, namespace: Option<String>) -> Result<V
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
-    let result = pods
-        .into_iter()
-        .map(|p| {
-            let name = p.name_any();
-            let ns = p.namespace().unwrap_or_default();
-            let status = p.status.clone().unwrap_or_default();
-            let container_statuses = status.container_statuses.clone().unwrap_or_default();
-            let total = container_statuses.len();
-            let ready_count = container_statuses.iter().filter(|c| c.ready).count();
-            let restarts = container_statuses.iter().map(|c| c.restart_count).sum();
-            let key = (ns.clone(), name.clone());
-            let (cpu, mem) = metrics.get(&key).cloned().unwrap_or((0, 0));
-            let has_metrics = metrics.contains_key(&key);
+pub async fn get_pods(context_name: &str, namespace: Option<String>) -> Result<Vec<PodInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    let pods_api: Api<Pod> = match &namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
+    let replicasets_api: Api<ReplicaSet> = match &namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
 
-            let (owner_kind, owner_name) = match controller_owner(&p.metadata.owner_references) {
-                Some(("ReplicaSet", rs_name)) => rs_owner
-                    .get(&(ns.clone(), rs_name.to_string()))
-                    .cloned()
-                    .map_or((Some("ReplicaSet".to_string()), Some(rs_name.to_string())), |(k, n)| {
-                        (Some(k), Some(n))
-                    }),
-                Some((kind, owner_name)) => (Some(kind.to_string()), Some(owner_name.to_string())),
-                None => (None, None),
-            };
+    // The pod list, its metrics, and the ReplicaSets needed for ownership are
+    // all independent reads, issued concurrently — see `get_overview` for why
+    // that matters once each round trip alone takes several seconds.
+    let lp = ListParams::default();
+    let (pods_result, metrics, rs_owner) = tokio::join!(
+        pods_api.list(&lp),
+        fetch_pod_metrics(&client, &namespace),
+        fetch_replicaset_owners(&replicasets_api),
+    );
+    let pods = pods_result.map_err(|e| format!("Failed to list pods: {e}"))?.items;
 
-            PodInfo {
-                name,
-                namespace: ns,
-                node: p.spec.as_ref().and_then(|s| s.node_name.clone()),
-                phase: status.phase.clone().unwrap_or_else(|| "Unknown".to_string()),
-                ready: format!("{ready_count}/{total}"),
-                restarts,
-                age_days: age_days(p.metadata.creation_timestamp.clone()),
-                age_seconds: age_seconds(p.metadata.creation_timestamp.clone()),
-                owner_kind,
-                owner_name,
-                cpu_usage_millicores: if has_metrics { Some(cpu) } else { None },
-                memory_usage_ki: if has_metrics { Some(mem) } else { None },
-                status_reason: status.reason.clone(),
-            }
-        })
-        .collect();
+    Ok(pods.into_iter().map(|p| build_pod_info(p, &metrics, &rs_owner)).collect())
+}
 
-    Ok(result)
+/// Matches `kubectl`'s own default `--chunk-size`: large enough that a
+/// many-thousand-pod cluster still only takes a handful of round trips, small
+/// enough that the first page — and so the first visible rows in the Pods
+/// table — lands in a fraction of the time a single unpaginated list() of the
+/// whole cluster would take.
+const POD_PAGE_SIZE: u32 = 500;
+
+/// Same data as `get_pods`, but paged through `limit`/`continue_token`
+/// instead of one unbounded `list()`, sending each page to `on_page` as it
+/// arrives rather than waiting for the whole cluster's pods to accumulate
+/// before the caller sees anything. Built for large clusters (some in this
+/// fleet run well past a thousand pods) where that single-shot wait was the
+/// entire time-to-first-row.
+pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page: Channel<Vec<PodInfo>>) -> Result<(), String> {
+    let client = client_for_context(context_name).await?;
+    let pods_api: Api<Pod> = match &namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
+    let replicasets_api: Api<ReplicaSet> = match &namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
+
+    let first_page_lp = ListParams::default().limit(POD_PAGE_SIZE);
+    let (first_page_result, metrics, rs_owner) = tokio::join!(
+        pods_api.list(&first_page_lp),
+        fetch_pod_metrics(&client, &namespace),
+        fetch_replicaset_owners(&replicasets_api),
+    );
+
+    let mut page = first_page_result.map_err(|e| format!("Failed to list pods: {e}"))?;
+    loop {
+        let mapped: Vec<PodInfo> = page.items.drain(..).map(|p| build_pod_info(p, &metrics, &rs_owner)).collect();
+        // Sending is best-effort: if the frontend has already torn down the
+        // channel (e.g. the user switched clusters mid-fetch), there's no one
+        // left to deliver a page to, but the fetch itself is cheap enough to
+        // let finish rather than plumbing a cancellation path for it.
+        let _ = on_page.send(mapped);
+
+        let Some(token) = page.metadata.continue_.clone() else {
+            break;
+        };
+        let next_lp = ListParams::default().limit(POD_PAGE_SIZE).continue_token(&token);
+        page = pods_api.list(&next_lp).await.map_err(|e| format!("Failed to list pods: {e}"))?;
+    }
+
+    Ok(())
 }
 
 /// Renders a pod as YAML the way `kubectl get pod -o yaml` would present it —
