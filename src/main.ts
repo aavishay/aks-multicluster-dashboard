@@ -3053,7 +3053,7 @@ function renderClusterPalette(): string {
           <span>${state.selectedContexts.size} selected</span>
           <span>↑↓ navigate · ↵ toggle · esc close</span>
         </div>
-        <div class="flex-1 overflow-auto p-1.5" data-scroll-id="cluster-palette:${esc(palette.query)}">
+        <div class="flex-1 overflow-auto p-1.5" data-scroll-id="cluster-palette:${encodeURIComponent(palette.query)}">
           ${rows || `<div class="p-3 text-center text-xs text-ink-muted">No clusters match.</div>`}
         </div>
       </div>
