@@ -3519,7 +3519,18 @@ function renderNodes(): string {
               <td class="tabular">${formatMillicores(n.cpu_usage_millicores)} / ${esc(n.cpu_allocatable)}</td>
               <td class="tabular">${formatKi(n.memory_usage_ki)} / ${formatKi(n.memory_allocatable_ki)}</td>
               <td>${esc(n.zone) || "—"}</td>
-              <td>${esc(n.instance_type) || "—"}</td>
+              <td>
+                ${
+                  n.instance_type
+                    ? `<button
+                        type="button"
+                        title="Filter nodes by this instance type"
+                        onclick="window.__app.setEnumFilter('nodes','instance_type',[${jsArg(n.instance_type)}])"
+                        class="hover:text-series-blue hover:underline"
+                      >${esc(n.instance_type)}</button>`
+                    : "—"
+                }
+              </td>
               <td>${esc(n.kubelet_version)}</td>
               <td class="tabular">${formatAgeDetailed(n.age_days, n.age_seconds)}</td>
             </tr>`;
