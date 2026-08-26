@@ -376,6 +376,8 @@ interface AppState {
   /** Substring filter over the sidebar's cluster list (context/cluster name); purely a display filter, doesn't affect selection. */
   clusterFilter: string;
   selectedContexts: Set<string>;
+  /** Cmd+K cluster quick-switcher; null when closed. Toggling a cluster doesn't close it, so several can be picked in one go. */
+  clusterPalette: { query: string; highlightedIndex: number } | null;
   activeTab: TabId;
   overviews: Map<string, ClusterOverview>;
   nodes: Map<string, NodeInfo[]>;
@@ -438,6 +440,7 @@ const state: AppState = {
   clusters: [],
   clusterFilter: "",
   selectedContexts: new Set(),
+  clusterPalette: null,
   activeTab: "overview",
   overviews: new Map(),
   nodes: new Map(),
@@ -509,6 +512,8 @@ let logRenderScheduled = false;
  * elsewhere in this file exist to avoid.
  */
 let pendingSearchScroll = false;
+/** Same idea as `pendingSearchScroll`, for the cluster palette's arrow-key navigation scrolling its highlighted row into view. */
+let pendingClusterPaletteScroll = false;
 /**
  * `data-scroll-id` -> edge to snap a log view to on the next render, set
  * whenever fresh Head/Tail content just loaded: "bottom" for Tail, so the
@@ -1415,6 +1420,51 @@ function clearClusterSelection() {
   state.selectedContexts.clear();
   render();
   loadTabData();
+}
+
+/** Clusters matching the palette's current query — shared by the render and the keyboard-nav bounds so they can't disagree on what's "visible". */
+function clusterPaletteVisible(): ClusterEntry[] {
+  const query = state.clusterPalette?.query.trim().toLowerCase();
+  if (!query) return state.clusters;
+  return state.clusters.filter((c) => c.context_name.toLowerCase().includes(query) || c.cluster_name.toLowerCase().includes(query));
+}
+
+function openClusterPalette() {
+  state.clusterPalette = { query: "", highlightedIndex: 0 };
+  render();
+}
+
+function closeClusterPalette() {
+  state.clusterPalette = null;
+  render();
+}
+
+function setClusterPaletteQuery(query: string) {
+  if (!state.clusterPalette) return;
+  state.clusterPalette.query = query;
+  // The old index may no longer correspond to anything, or even be in range,
+  // once the query narrows the list — simplest correct behavior is to reset
+  // to the top match, same as most quick-switchers do on every keystroke.
+  state.clusterPalette.highlightedIndex = 0;
+  render();
+}
+
+function moveClusterPaletteHighlight(delta: number) {
+  const palette = state.clusterPalette;
+  if (!palette) return;
+  const visible = clusterPaletteVisible();
+  if (visible.length === 0) return;
+  palette.highlightedIndex = Math.max(0, Math.min(visible.length - 1, palette.highlightedIndex + delta));
+  pendingClusterPaletteScroll = true;
+  render();
+}
+
+/** Toggles the highlighted cluster without closing the palette, so several can be picked in one session. */
+function toggleClusterPaletteHighlighted() {
+  const palette = state.clusterPalette;
+  if (!palette) return;
+  const c = clusterPaletteVisible()[palette.highlightedIndex];
+  if (c) toggleCluster(c.context_name);
 }
 
 interface ViewSnapshot {
@@ -2531,6 +2581,11 @@ function setMetricsRange(minutes: number) {
   toggleCluster,
   selectAllClusters,
   clearClusterSelection,
+  openClusterPalette,
+  closeClusterPalette,
+  setClusterPaletteQuery,
+  moveClusterPaletteHighlight,
+  toggleClusterPaletteHighlighted,
   selectTab,
   viewPodsForWorkload,
   viewPodsForNode,
@@ -2741,6 +2796,7 @@ function render() {
     ${renderClaudePanel()}
     ${renderClaudeExplainPanel()}
     ${renderClaudeDiagnosePanel()}
+    ${renderClusterPalette()}
   `;
 
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
@@ -2801,6 +2857,11 @@ function render() {
     app.querySelector<HTMLElement>("[data-search-current]")?.scrollIntoView({ block: "center" });
   }
 
+  if (pendingClusterPaletteScroll) {
+    pendingClusterPaletteScroll = false;
+    app.querySelector<HTMLElement>("[data-cluster-palette-current]")?.scrollIntoView({ block: "nearest" });
+  }
+
   if (activeKey) {
     // `preventScroll` matters here: without it, re-focusing an input that's
     // currently scrolled out of view (e.g. a filter box for a column
@@ -2813,6 +2874,16 @@ function render() {
     } else {
       restored?.focus({ preventScroll: true });
     }
+  }
+
+  // `autofocus` alone isn't reliable across engines for markup inserted via
+  // `innerHTML` (as opposed to initial parse), so back it with an explicit
+  // focus call for the palette's freshly-opened first render — a no-op once
+  // it's already focused, since the `activeKey` restore above then takes
+  // over on every render after that.
+  if (state.clusterPalette) {
+    const query = app.querySelector<HTMLInputElement>('[data-filter-key="cluster-palette-query"]');
+    if (query && document.activeElement !== query) query.focus({ preventScroll: true });
   }
 }
 
@@ -2925,6 +2996,68 @@ function renderSidebar(): string {
         ${esc(state.kubeconfigPath) || "no kubeconfig"}
       </div>
     </aside>`;
+}
+
+function renderClusterPalette(): string {
+  const palette = state.clusterPalette;
+  if (!palette) return "";
+
+  const visible = clusterPaletteVisible();
+  const rows = visible
+    .map((c, i) => {
+      const checked = state.selectedContexts.has(c.context_name);
+      const ov = checked ? state.overviews.get(c.context_name) : undefined;
+      const dot = ov ? statusDot(ov.reachable && ov.nodes_ready === ov.node_count) : statusDot(false, true);
+      const statusText = !checked
+        ? "not connected"
+        : ov
+          ? ov.reachable
+            ? `${ov.nodes_ready}/${ov.node_count} nodes ready`
+            : "unreachable"
+          : "checking…";
+      const highlighted = i === palette.highlightedIndex;
+      return `
+        <div
+          ${highlighted ? "data-cluster-palette-current" : ""}
+          onclick="window.__app.toggleCluster(${jsArg(c.context_name)})"
+          class="flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-2 text-left ${highlighted ? "bg-surface-3" : "hover:bg-surface-2"}"
+        >
+          <input type="checkbox" class="pointer-events-none shrink-0 accent-series-blue" ${checked ? "checked" : ""} />
+          ${dot}
+          <span class="min-w-0 flex-1 truncate text-sm text-ink-primary">${esc(c.context_name)}</span>
+          <span class="shrink-0 truncate text-xs text-ink-muted">${esc(statusText)}</span>
+        </div>`;
+    })
+    .join("");
+
+  return `
+    <div class="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-6 pt-[12vh]" onclick="window.__app.closeClusterPalette()">
+      <div class="flex max-h-[60vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="border-b border-gridline p-2">
+          <input
+            type="text"
+            autofocus
+            placeholder="Jump to cluster…"
+            value="${esc(palette.query)}"
+            data-filter-key="cluster-palette-query"
+            oninput="window.__app.setClusterPaletteQuery(this.value)"
+            onkeydown="
+              if (event.key === 'ArrowDown') { event.preventDefault(); window.__app.moveClusterPaletteHighlight(1); }
+              else if (event.key === 'ArrowUp') { event.preventDefault(); window.__app.moveClusterPaletteHighlight(-1); }
+              else if (event.key === 'Enter') { event.preventDefault(); window.__app.toggleClusterPaletteHighlighted(); }
+            "
+            class="w-full rounded-md border-none bg-transparent px-2 py-1.5 text-sm text-ink-primary outline-none"
+          />
+        </div>
+        <div class="flex items-center justify-between border-b border-gridline px-3 py-1.5 text-xs text-ink-muted">
+          <span>${state.selectedContexts.size} selected</span>
+          <span>↑↓ navigate · ↵ toggle · esc close</span>
+        </div>
+        <div class="flex-1 overflow-auto p-1.5">
+          ${rows || `<div class="p-3 text-center text-xs text-ink-muted">No clusters match.</div>`}
+        </div>
+      </div>
+    </div>`;
 }
 
 function themeToggleButton(): string {
@@ -3519,7 +3652,18 @@ function renderNodes(): string {
               <td class="tabular">${formatMillicores(n.cpu_usage_millicores)} / ${esc(n.cpu_allocatable)}</td>
               <td class="tabular">${formatKi(n.memory_usage_ki)} / ${formatKi(n.memory_allocatable_ki)}</td>
               <td>${esc(n.zone) || "—"}</td>
-              <td>${esc(n.instance_type) || "—"}</td>
+              <td>
+                ${
+                  n.instance_type
+                    ? `<button
+                        type="button"
+                        title="Filter nodes by this instance type"
+                        onclick="window.__app.setEnumFilter('nodes','instance_type',[${jsArg(n.instance_type)}])"
+                        class="hover:text-series-blue hover:underline"
+                      >${esc(n.instance_type)}</button>`
+                    : "—"
+                }
+              </td>
               <td>${esc(n.kubelet_version)}</td>
               <td class="tabular">${formatAgeDetailed(n.age_days, n.age_seconds)}</td>
             </tr>`;
@@ -6241,7 +6385,8 @@ function closeOpenDetailPanel(): boolean {
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (state.claudeExplain) closeClaudeExplain();
+    if (state.clusterPalette) closeClusterPalette();
+    else if (state.claudeExplain) closeClaudeExplain();
     else if (state.claudeDiagnose) closeClaudeDiagnose();
     else if (state.claudePanelOpen) toggleClaudePanel();
     else if (state.metricsBackendEditor) closeMetricsBackendEditor();
@@ -6250,6 +6395,15 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (!e.metaKey) return;
+
+  // Not gated on isEditableTarget: unlike Cmd+Left's native cursor-movement
+  // conflict, Cmd+K has no competing meaning inside a plain text input, so it
+  // should open the switcher no matter where focus currently is.
+  if (e.key === "k" || e.key === "K") {
+    e.preventDefault();
+    openClusterPalette();
+    return;
+  }
 
   if (e.key === "ArrowLeft" && !isEditableTarget(e.target)) {
     if (!closeOpenDetailPanel()) goBackView();
