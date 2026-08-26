@@ -1249,13 +1249,25 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       // pagination existed.
       const isFirstLoad = !state.pods.has(ctx);
       let pods: PodInfo[] = [];
-      await api.streamPods(ctx, undefined, (page) => {
-        pods = pods.concat(page);
-        if (isFirstLoad) {
-          state.pods.set(ctx, pods);
-          render();
-        }
-      });
+      try {
+        await api.streamPods(ctx, undefined, (page) => {
+          pods = pods.concat(page);
+          if (isFirstLoad) {
+            state.pods.set(ctx, pods);
+            render();
+          }
+        });
+      } catch (e) {
+        // A failure partway through a first load can leave state.pods
+        // holding whichever pages already arrived — indistinguishable from a
+        // genuinely complete list, so a later refresh would treat it as
+        // done and never retry the rest. Roll back to "no data" (the same
+        // state a first-load failure left before pagination existed) so the
+        // next attempt is a real first load again, not a refresh of a
+        // partial cache.
+        if (isFirstLoad) state.pods.delete(ctx);
+        throw e;
+      }
       if (!isFirstLoad) state.pods.set(ctx, pods);
       break;
     }

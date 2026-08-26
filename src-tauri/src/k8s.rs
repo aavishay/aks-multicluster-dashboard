@@ -401,8 +401,10 @@ fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_ow
     let ready_count = container_statuses.iter().filter(|c| c.ready).count();
     let restarts = container_statuses.iter().map(|c| c.restart_count).sum();
     let key = (ns.clone(), name.clone());
-    let (cpu, mem) = metrics.get(&key).cloned().unwrap_or((0, 0));
-    let has_metrics = metrics.contains_key(&key);
+    let (cpu, mem, has_metrics) = match metrics.get(&key) {
+        Some(&(cpu, mem)) => (cpu, mem, true),
+        None => (0, 0, false),
+    };
 
     let (owner_kind, owner_name) = match controller_owner(&p.metadata.owner_references) {
         Some(("ReplicaSet", rs_name)) => rs_owner
