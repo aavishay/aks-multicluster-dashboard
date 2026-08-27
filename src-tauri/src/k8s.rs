@@ -2,9 +2,9 @@
 //! opens Kubernetes API calls concurrently where sensible and maps results
 //! onto the plain-data structs in `models.rs`.
 
-use crate::commands::{is_transient_error, MAX_RETRIES, RETRY_DELAY};
 use crate::kubeconfig::{client_for_context, SLOW_CLUSTER_TIMEOUT};
 use crate::models::*;
+use crate::retry::retry_transient;
 use chrono::Utc;
 use futures::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{ControllerRevision, DaemonSet, Deployment, ReplicaSet, StatefulSet};
@@ -492,34 +492,20 @@ pub async fn get_pods(context_name: &str, namespace: Option<String>) -> Result<V
 const POD_PAGE_SIZE: u32 = 500;
 
 /// Retries a single page fetch — not the whole multi-page operation — on a
-/// transient network blip, using the same classification and backoff as
-/// `commands::with_retry`. Scoped to just the failing page so a blip on,
-/// say, page 3 doesn't force re-fetching (and re-sending, duplicating)
+/// transient network blip (see `retry::retry_transient` for the
+/// classification and backoff). Scoped to just the failing page so a blip
+/// on, say, page 3 doesn't force re-fetching (and re-sending, duplicating)
 /// pages 1-2 that already arrived cleanly: that duplication risk is exactly
 /// why `stream_pods`'s own command wrapper deliberately uses `with_deadline`
-/// instead of `with_retry` for the operation as a whole. Measured directly
-/// against this fleet: a full-cluster pods list can fail outright with a
+/// instead of retrying the operation as a whole. Measured directly against
+/// this fleet: a full-cluster pods list can fail outright with a
 /// transport-level error mid-transfer (proven live: "error reading a body
 /// from connection" after 111s on one cluster, immediately after a
 /// successful call to a different one), so a multi-page fetch that never
 /// retries any single page is only as reliable as its least reliable
 /// individual request.
 async fn list_pods_page(pods_api: &Api<Pod>, lp: &ListParams) -> Result<ObjectList<Pod>, String> {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match pods_api.list(lp).await {
-            Ok(page) => return Ok(page),
-            Err(e) => {
-                let message = format!("Failed to list pods: {e}");
-                if attempt <= MAX_RETRIES && is_transient_error(&message) {
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                }
-                return Err(message);
-            }
-        }
-    }
+    retry_transient(|| async { pods_api.list(lp).await.map_err(|e| format!("Failed to list pods: {e}")) }).await
 }
 
 /// Same data as `get_pods`, but paged through `limit`/`continue_token`
