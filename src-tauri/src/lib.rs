@@ -6,6 +6,7 @@ mod kubeconfig;
 mod metrics_backend;
 mod models;
 mod redact;
+mod retry;
 
 /// A macOS app launched via Finder/Dock/Launchpad is spawned by launchd with
 /// a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) rather than the user's
