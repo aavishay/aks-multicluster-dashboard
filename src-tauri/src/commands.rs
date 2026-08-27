@@ -155,6 +155,19 @@ pub async fn get_pods(context_name: String, namespace: Option<String>) -> Result
 }
 
 #[tauri::command]
+pub async fn stream_pods(
+    context_name: String,
+    namespace: Option<String>,
+    on_page: tauri::ipc::Channel<Vec<PodInfo>>,
+) -> Result<(), String> {
+    // Not wrapped in with_retry, same reasoning as the log streams below: a
+    // retry that re-runs the whole operation from scratch would re-send
+    // pages the frontend already appended, double-counting pods rather than
+    // recovering cleanly.
+    with_deadline(&context_name, k8s::stream_pods(&context_name, namespace, on_page)).await
+}
+
+#[tauri::command]
 pub async fn get_workloads(context_name: String) -> Result<Vec<WorkloadInfo>, String> {
     with_retry(&context_name, || k8s::get_workloads(&context_name)).await
 }
