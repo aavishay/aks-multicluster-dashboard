@@ -2,6 +2,7 @@
 //! opens Kubernetes API calls concurrently where sensible and maps results
 //! onto the plain-data structs in `models.rs`.
 
+use crate::commands::{is_transient_error, MAX_RETRIES, RETRY_DELAY};
 use crate::kubeconfig::{client_for_context, SLOW_CLUSTER_TIMEOUT};
 use crate::models::*;
 use chrono::Utc;
@@ -9,7 +10,7 @@ use futures::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{ControllerRevision, DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams, ResourceExt};
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams, ObjectList, ResourceExt};
 use kube::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -490,6 +491,37 @@ pub async fn get_pods(context_name: &str, namespace: Option<String>) -> Result<V
 /// whole cluster would take.
 const POD_PAGE_SIZE: u32 = 500;
 
+/// Retries a single page fetch — not the whole multi-page operation — on a
+/// transient network blip, using the same classification and backoff as
+/// `commands::with_retry`. Scoped to just the failing page so a blip on,
+/// say, page 3 doesn't force re-fetching (and re-sending, duplicating)
+/// pages 1-2 that already arrived cleanly: that duplication risk is exactly
+/// why `stream_pods`'s own command wrapper deliberately uses `with_deadline`
+/// instead of `with_retry` for the operation as a whole. Measured directly
+/// against this fleet: a full-cluster pods list can fail outright with a
+/// transport-level error mid-transfer (proven live: "error reading a body
+/// from connection" after 111s on one cluster, immediately after a
+/// successful call to a different one), so a multi-page fetch that never
+/// retries any single page is only as reliable as its least reliable
+/// individual request.
+async fn list_pods_page(pods_api: &Api<Pod>, lp: &ListParams) -> Result<ObjectList<Pod>, String> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match pods_api.list(lp).await {
+            Ok(page) => return Ok(page),
+            Err(e) => {
+                let message = format!("Failed to list pods: {e}");
+                if attempt <= MAX_RETRIES && is_transient_error(&message) {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(message);
+            }
+        }
+    }
+}
+
 /// Same data as `get_pods`, but paged through `limit`/`continue_token`
 /// instead of one unbounded `list()`, sending each page to `on_page` as it
 /// arrives rather than waiting for the whole cluster's pods to accumulate
@@ -509,12 +541,12 @@ pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page:
 
     let first_page_lp = ListParams::default().limit(POD_PAGE_SIZE);
     let (first_page_result, metrics, rs_owner) = tokio::join!(
-        pods_api.list(&first_page_lp),
+        list_pods_page(&pods_api, &first_page_lp),
         fetch_pod_metrics(&client, &namespace),
         fetch_replicaset_owners(&replicasets_api),
     );
 
-    let mut page = first_page_result.map_err(|e| format!("Failed to list pods: {e}"))?;
+    let mut page = first_page_result?;
     loop {
         let mapped: Vec<PodInfo> = page.items.drain(..).map(|p| build_pod_info(p, &metrics, &rs_owner)).collect();
         // Sending is best-effort: if the frontend has already torn down the
@@ -527,7 +559,7 @@ pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page:
             break;
         };
         let next_lp = ListParams::default().limit(POD_PAGE_SIZE).continue_token(&token);
-        page = pods_api.list(&next_lp).await.map_err(|e| format!("Failed to list pods: {e}"))?;
+        page = list_pods_page(&pods_api, &next_lp).await?;
     }
 
     Ok(())
