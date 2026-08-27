@@ -382,6 +382,17 @@ interface AppState {
   overviews: Map<string, ClusterOverview>;
   nodes: Map<string, NodeInfo[]>;
   pods: Map<string, PodInfo[]>;
+  /**
+   * Contexts where every page of a pods fetch has actually landed — NOT the
+   * same as `pods.has(ctx)`, which goes true after just the first page of a
+   * first load. Governs whether the next pods fetch for a context is
+   * treated as a first load (progressive render, roll back on error) or a
+   * refresh (silent accumulate, preserve stale data on error): a first load
+   * interrupted after page one must still count as incomplete, or a later
+   * failed refresh would silently and permanently freeze that partial page
+   * as if it were the whole cluster.
+   */
+  podsLoadedComplete: Set<string>;
   workloads: Map<string, WorkloadInfo[]>;
   events: Map<string, EventInfo[]>;
   eventsWarningsOnly: boolean;
@@ -445,6 +456,7 @@ const state: AppState = {
   overviews: new Map(),
   nodes: new Map(),
   pods: new Map(),
+  podsLoadedComplete: new Set(),
   workloads: new Map(),
   events: new Map(),
   eventsWarningsOnly: true,
@@ -1240,16 +1252,26 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       // cluster, replacing the whole table only once everything has arrived
       // means the first row takes as long to appear as the last one does.
       //
-      // Only shown page-by-page on a genuinely first load, though (nothing
-      // yet in state.pods for this context). On a refresh — including the
-      // routine 30s auto-refresh tick — there's already a complete table on
-      // screen, very possibly filtered down to a handful of rows; replacing
-      // it with just page one and growing from there means matching rows
-      // visibly vanish and reappear as later pages land, which reads as
-      // pods flickering in and out rather than a smoother load. Refreshes
-      // stay atomic: accumulate locally and commit once, same as before
-      // pagination existed.
-      const isFirstLoad = !state.pods.has(ctx);
+      // Only shown page-by-page on a genuinely first load, though. "First
+      // load" is tracked by podsLoadedComplete, NOT by whether state.pods
+      // already has an entry — a first load that gets interrupted after
+      // page one still leaves state.pods non-empty, and on a slow/flaky
+      // cluster (one real fetch here took 82s against this app's own 30s
+      // auto-refresh interval, so overlapping attempts are the norm, not
+      // the exception) every later refresh attempt can keep failing
+      // without ever re-completing. If "first load" were keyed off
+      // state.pods.has(ctx), that single page-one write would permanently
+      // pass every future attempt through the refresh path below — which
+      // preserves stale data on failure by design — freezing that one
+      // partial page forever with nothing to ever mark it incomplete again.
+      // On a genuine refresh of confirmed-complete data, there's already a
+      // complete table on screen, very possibly filtered down to a handful
+      // of rows; replacing it with just page one and growing from there
+      // means matching rows visibly vanish and reappear as later pages
+      // land, which reads as pods flickering in and out rather than a
+      // smoother load — so refreshes still stay atomic: accumulate locally
+      // and commit once.
+      const isFirstLoad = !state.podsLoadedComplete.has(ctx);
       let pods: PodInfo[] = [];
       try {
         await api.streamPods(ctx, undefined, (page) => {
@@ -1267,10 +1289,23 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
         // state a first-load failure left before pagination existed) so the
         // next attempt is a real first load again, not a refresh of a
         // partial cache.
-        if (isFirstLoad) state.pods.delete(ctx);
+        //
+        // Only if this attempt is still the last writer, though: auto-refresh
+        // doesn't wait for a slow context's previous attempt to finish before
+        // starting another, so an older first-load attempt can still be
+        // failing after a newer, faster one already completed and marked
+        // podsLoadedComplete. Deleting unconditionally would then wipe out
+        // that newer, already-confirmed-complete result out from under it.
+        // pods !== state.pods.get(ctx) means someone else has already
+        // written over this attempt's own progress.
+        if (isFirstLoad && state.pods.get(ctx) === pods) state.pods.delete(ctx);
         throw e;
       }
       if (!isFirstLoad) state.pods.set(ctx, pods);
+      // Only reached once every page has actually arrived without throwing
+      // — this, not the presence of any data, is what "first load done"
+      // means from here on.
+      state.podsLoadedComplete.add(ctx);
       break;
     }
     case "resources":
