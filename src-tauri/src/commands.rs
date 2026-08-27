@@ -50,8 +50,8 @@ async fn with_deadline<T>(
 /// blip (a VPN hiccup, a dropped TCP connection), not standing in for a
 /// cluster that's genuinely unreachable, which should still surface promptly
 /// rather than making the user wait through several multiplied timeouts.
-const MAX_RETRIES: u32 = 2;
-const RETRY_DELAY: Duration = Duration::from_millis(500);
+pub(crate) const MAX_RETRIES: u32 = 2;
+pub(crate) const RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Substrings of the lower-cased error text that mark a failure as a
 /// transport-level blip worth retrying, rather than something retrying won't
@@ -76,11 +76,12 @@ const TRANSIENT_ERROR_MARKERS: &[&str] = &[
     "failed to lookup address",
     "temporary failure in name resolution",
     "tls handshake",
+    "reading a body from connection", // the connection died mid-transfer, after headers but before the body finished
     "os error 54", // ECONNRESET
     "os error 32", // EPIPE
 ];
 
-fn is_transient_error(message: &str) -> bool {
+pub(crate) fn is_transient_error(message: &str) -> bool {
     if message.starts_with("Timed out after") {
         return false;
     }
@@ -463,6 +464,11 @@ mod tests {
         assert!(is_transient_error("Failed to get node 'x': connection reset by peer (os error 54)"));
         assert!(is_transient_error("Failed to list events: IO error: broken pipe"));
         assert!(is_transient_error("SOME WRAPPER: Connection Refused"));
+        // Reproduced live against a real cluster: the connection died mid-body-
+        // transfer on a full-page pods list, after headers but before the body
+        // finished — a real (if unusually-worded) transient blip, not one of
+        // the other markers above.
+        assert!(is_transient_error("Failed to list pods: ServiceError: error reading a body from connection"));
     }
 
     #[test]
