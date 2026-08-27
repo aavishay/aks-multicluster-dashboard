@@ -382,7 +382,16 @@ interface AppState {
   overviews: Map<string, ClusterOverview>;
   nodes: Map<string, NodeInfo[]>;
   pods: Map<string, PodInfo[]>;
-  /** Contexts where every page of a pods fetch has actually landed — NOT the same as `pods.has(ctx)`, which goes true after just the first page of a first load. Governs whether the next pods fetch for a context is treated as a first load (progressive render, roll back on error) or a refresh (silent accumulate, preserve stale data on error): a first load interrupted after page one must still count as incomplete, or a later failed refresh would silently and permanently freeze that partial page as if it were the whole cluster. */
+  /**
+   * Contexts where every page of a pods fetch has actually landed — NOT the
+   * same as `pods.has(ctx)`, which goes true after just the first page of a
+   * first load. Governs whether the next pods fetch for a context is
+   * treated as a first load (progressive render, roll back on error) or a
+   * refresh (silent accumulate, preserve stale data on error): a first load
+   * interrupted after page one must still count as incomplete, or a later
+   * failed refresh would silently and permanently freeze that partial page
+   * as if it were the whole cluster.
+   */
   podsLoadedComplete: Set<string>;
   workloads: Map<string, WorkloadInfo[]>;
   events: Map<string, EventInfo[]>;
@@ -1280,7 +1289,16 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
         // state a first-load failure left before pagination existed) so the
         // next attempt is a real first load again, not a refresh of a
         // partial cache.
-        if (isFirstLoad) state.pods.delete(ctx);
+        //
+        // Only if this attempt is still the last writer, though: auto-refresh
+        // doesn't wait for a slow context's previous attempt to finish before
+        // starting another, so an older first-load attempt can still be
+        // failing after a newer, faster one already completed and marked
+        // podsLoadedComplete. Deleting unconditionally would then wipe out
+        // that newer, already-confirmed-complete result out from under it.
+        // pods !== state.pods.get(ctx) means someone else has already
+        // written over this attempt's own progress.
+        if (isFirstLoad && state.pods.get(ctx) === pods) state.pods.delete(ctx);
         throw e;
       }
       if (!isFirstLoad) state.pods.set(ctx, pods);
