@@ -24,6 +24,12 @@ brew install --cask aavishay/aks-fleet-dashboard/aks-fleet-dashboard
 The `brew trust` step is a one-off — Homebrew requires it for casks from
 third-party taps.
 
+To upgrade an existing install to the latest release:
+
+```bash
+brew upgrade --cask aavishay/aks-fleet-dashboard/aks-fleet-dashboard
+```
+
 Universal build — native on both Apple Silicon and Intel Macs.
 
 The app is ad-hoc signed rather than signed with an Apple Developer ID, so
