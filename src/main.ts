@@ -1233,9 +1233,44 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
     case "workloads":
       state.workloads.set(ctx, await api.getWorkloads(ctx));
       break;
-    case "pods":
-      state.pods.set(ctx, await api.getPods(ctx));
+    case "pods": {
+      // Paged rather than one getPods() await: on a thousand-plus-pod
+      // cluster, replacing the whole table only once everything has arrived
+      // means the first row takes as long to appear as the last one does.
+      //
+      // Only shown page-by-page on a genuinely first load, though (nothing
+      // yet in state.pods for this context). On a refresh — including the
+      // routine 30s auto-refresh tick — there's already a complete table on
+      // screen, very possibly filtered down to a handful of rows; replacing
+      // it with just page one and growing from there means matching rows
+      // visibly vanish and reappear as later pages land, which reads as
+      // pods flickering in and out rather than a smoother load. Refreshes
+      // stay atomic: accumulate locally and commit once, same as before
+      // pagination existed.
+      const isFirstLoad = !state.pods.has(ctx);
+      let pods: PodInfo[] = [];
+      try {
+        await api.streamPods(ctx, undefined, (page) => {
+          pods = pods.concat(page);
+          if (isFirstLoad) {
+            state.pods.set(ctx, pods);
+            render();
+          }
+        });
+      } catch (e) {
+        // A failure partway through a first load can leave state.pods
+        // holding whichever pages already arrived — indistinguishable from a
+        // genuinely complete list, so a later refresh would treat it as
+        // done and never retry the rest. Roll back to "no data" (the same
+        // state a first-load failure left before pagination existed) so the
+        // next attempt is a real first load again, not a refresh of a
+        // partial cache.
+        if (isFirstLoad) state.pods.delete(ctx);
+        throw e;
+      }
+      if (!isFirstLoad) state.pods.set(ctx, pods);
       break;
+    }
     case "resources":
       state.resourceUsage.set(ctx, await api.getResourceUsage(ctx));
       break;
