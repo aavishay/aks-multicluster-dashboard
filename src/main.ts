@@ -1494,6 +1494,14 @@ function moveClusterPaletteHighlight(delta: number) {
   render();
 }
 
+/** Mouse hover takes over the highlight rather than drawing its own separate hover state, so there's only ever one highlighted row, whether it got there by keyboard or mouse. */
+function setClusterPaletteHighlight(index: number) {
+  const palette = state.clusterPalette;
+  if (!palette || palette.highlightedIndex === index) return;
+  palette.highlightedIndex = index;
+  render();
+}
+
 /** Toggles the highlighted cluster without closing the palette, so several can be picked in one session. */
 function toggleClusterPaletteHighlighted() {
   const palette = state.clusterPalette;
@@ -2620,6 +2628,7 @@ function setMetricsRange(minutes: number) {
   closeClusterPalette,
   setClusterPaletteQuery,
   moveClusterPaletteHighlight,
+  setClusterPaletteHighlight,
   toggleClusterPaletteHighlighted,
   selectTab,
   viewPodsForWorkload,
@@ -3055,7 +3064,8 @@ function renderClusterPalette(): string {
         <div
           ${highlighted ? "data-cluster-palette-current" : ""}
           onclick="window.__app.toggleCluster(${jsArg(c.context_name)})"
-          class="flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-2 text-left ${highlighted ? "bg-surface-3" : "hover:bg-surface-2"}"
+          onmouseenter="window.__app.setClusterPaletteHighlight(${i})"
+          class="flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-2 text-left ${highlighted ? "bg-surface-3" : ""}"
         >
           <input type="checkbox" class="pointer-events-none shrink-0 accent-series-blue" ${checked ? "checked" : ""} />
           ${dot}
