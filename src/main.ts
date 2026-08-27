@@ -504,6 +504,8 @@ let claudeDiagnoseToken = 0;
 /** rAF-batches streamed token appends, same as the log-follow path. */
 let claudeRenderScheduled = false;
 let logRenderScheduled = false;
+/** rAF-batches the cluster palette's hover-driven re-renders, same idea as the log-follow path — a fast mouse sweep across several rows shouldn't force a full render() per row. */
+let clusterPaletteHoverRenderScheduled = false;
 /**
  * Set only by an explicit search action (typing a query, next/prev), so the
  * post-render scroll-to-current-match doesn't also fire on an unrelated
@@ -1499,7 +1501,18 @@ function setClusterPaletteHighlight(index: number) {
   const palette = state.clusterPalette;
   if (!palette || palette.highlightedIndex === index) return;
   palette.highlightedIndex = index;
-  render();
+  // render() rebuilds the whole app's innerHTML, not just the palette; a
+  // fast mouse sweep can fire mouseenter once per row in a handful of
+  // milliseconds, so batch those into at most one render per frame instead
+  // of one full-app rebuild per row crossed. highlightedIndex itself is
+  // still updated synchronously above, so click/Enter always act on the
+  // current row even before the next paint.
+  if (clusterPaletteHoverRenderScheduled) return;
+  clusterPaletteHoverRenderScheduled = true;
+  requestAnimationFrame(() => {
+    clusterPaletteHoverRenderScheduled = false;
+    render();
+  });
 }
 
 /** Toggles the highlighted cluster without closing the palette, so several can be picked in one session. */
