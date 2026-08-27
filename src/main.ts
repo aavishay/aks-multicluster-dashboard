@@ -504,6 +504,8 @@ let claudeDiagnoseToken = 0;
 /** rAF-batches streamed token appends, same as the log-follow path. */
 let claudeRenderScheduled = false;
 let logRenderScheduled = false;
+/** rAF-batches the cluster palette's hover-driven re-renders, same idea as the log-follow path — a fast mouse sweep across several rows shouldn't force a full render() per row. */
+let clusterPaletteHoverRenderScheduled = false;
 /**
  * Set only by an explicit search action (typing a query, next/prev), so the
  * post-render scroll-to-current-match doesn't also fire on an unrelated
@@ -1492,6 +1494,25 @@ function moveClusterPaletteHighlight(delta: number) {
   palette.highlightedIndex = Math.max(0, Math.min(visible.length - 1, palette.highlightedIndex + delta));
   pendingClusterPaletteScroll = true;
   render();
+}
+
+/** Mouse hover takes over the highlight rather than drawing its own separate hover state, so there's only ever one highlighted row, whether it got there by keyboard or mouse. */
+function setClusterPaletteHighlight(index: number) {
+  const palette = state.clusterPalette;
+  if (!palette || palette.highlightedIndex === index) return;
+  palette.highlightedIndex = index;
+  // render() rebuilds the whole app's innerHTML, not just the palette; a
+  // fast mouse sweep can fire mouseenter once per row in a handful of
+  // milliseconds, so batch those into at most one render per frame instead
+  // of one full-app rebuild per row crossed. highlightedIndex itself is
+  // still updated synchronously above, so click/Enter always act on the
+  // current row even before the next paint.
+  if (clusterPaletteHoverRenderScheduled) return;
+  clusterPaletteHoverRenderScheduled = true;
+  requestAnimationFrame(() => {
+    clusterPaletteHoverRenderScheduled = false;
+    render();
+  });
 }
 
 /** Toggles the highlighted cluster without closing the palette, so several can be picked in one session. */
@@ -2620,6 +2641,7 @@ function setMetricsRange(minutes: number) {
   closeClusterPalette,
   setClusterPaletteQuery,
   moveClusterPaletteHighlight,
+  setClusterPaletteHighlight,
   toggleClusterPaletteHighlighted,
   selectTab,
   viewPodsForWorkload,
@@ -3055,7 +3077,8 @@ function renderClusterPalette(): string {
         <div
           ${highlighted ? "data-cluster-palette-current" : ""}
           onclick="window.__app.toggleCluster(${jsArg(c.context_name)})"
-          class="flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-2 text-left ${highlighted ? "bg-surface-3" : "hover:bg-surface-2"}"
+          onmouseenter="window.__app.setClusterPaletteHighlight(${i})"
+          class="flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-2 text-left ${highlighted ? "bg-surface-3" : ""}"
         >
           <input type="checkbox" class="pointer-events-none shrink-0 accent-series-blue" ${checked ? "checked" : ""} />
           ${dot}
