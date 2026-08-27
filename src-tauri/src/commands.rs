@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::{claude, helm, k8s, kubeconfig, metrics_backend};
+use crate::{claude, helm, k8s, kubeconfig, metrics_backend, retry};
 use std::future::Future;
 use std::time::Duration;
 
@@ -45,70 +45,19 @@ async fn with_deadline<T>(
     }
 }
 
-/// Extra attempts `with_retry` gets beyond the first, for a failure that
-/// looks transient. Kept small — this is papering over a momentary network
-/// blip (a VPN hiccup, a dropped TCP connection), not standing in for a
-/// cluster that's genuinely unreachable, which should still surface promptly
-/// rather than making the user wait through several multiplied timeouts.
-const MAX_RETRIES: u32 = 2;
-const RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// Substrings of the lower-cased error text that mark a failure as a
-/// transport-level blip worth retrying, rather than something retrying won't
-/// fix (auth failure, RBAC denial, a resource that doesn't exist, or the
-/// deadline in `with_deadline` above — re-issuing a request right after a
-/// full `OPERATION_TIMEOUT` wait would just make a genuinely slow/unreachable
-/// cluster take several times as long to report that, for no benefit).
-/// Matched against the fully-formatted error string rather than a structured
-/// error type, since every call site in `k8s.rs` already collapses its
-/// `kube::Error` into a `String` before it reaches here — a pragmatic
-/// tradeoff, not a precise classification.
-const TRANSIENT_ERROR_MARKERS: &[&str] = &[
-    "connection reset",
-    "connection refused",
-    "connection closed",
-    "broken pipe",
-    "unexpected eof",
-    "eof while parsing",
-    "end of file before message length reached",
-    "error trying to connect",
-    "dns error",
-    "failed to lookup address",
-    "temporary failure in name resolution",
-    "tls handshake",
-    "os error 54", // ECONNRESET
-    "os error 32", // EPIPE
-];
-
-fn is_transient_error(message: &str) -> bool {
-    if message.starts_with("Timed out after") {
-        return false;
-    }
-    let lower = message.to_lowercase();
-    TRANSIENT_ERROR_MARKERS.iter().any(|marker| lower.contains(marker))
-}
-
 /// Wraps `with_deadline`, re-running `operation` a couple of times if it
-/// fails with what looks like a transient network error. Safe to layer over
-/// every command in this file: each one is a read-only GET/LIST (or, for the
-/// log-follow streams, has its own independent per-line error handling), so
-/// re-issuing a request after a blip can't cause any duplicated side effect.
+/// fails with what looks like a transient network error (see
+/// `retry::retry_transient` for the classification and backoff). Safe to
+/// layer over every command in this file: each one is a read-only GET/LIST
+/// (or, for the log-follow streams, has its own independent per-line error
+/// handling), so re-issuing a request after a blip can't cause any
+/// duplicated side effect.
 async fn with_retry<T, F, Fut>(context_name: &str, mut operation: F) -> Result<T, String>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, String>>,
 {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match with_deadline(context_name, operation()).await {
-            Ok(value) => return Ok(value),
-            Err(e) if attempt <= MAX_RETRIES && is_transient_error(&e) => {
-                tokio::time::sleep(RETRY_DELAY).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    retry::retry_transient(|| with_deadline(context_name, operation())).await
 }
 
 #[tauri::command]
@@ -456,28 +405,6 @@ pub fn kubeconfig_path() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_transient_error_matches_common_network_blips() {
-        assert!(is_transient_error("Failed to list pods: error trying to connect: dns error: failed to lookup address information"));
-        assert!(is_transient_error("Failed to get node 'x': connection reset by peer (os error 54)"));
-        assert!(is_transient_error("Failed to list events: IO error: broken pipe"));
-        assert!(is_transient_error("SOME WRAPPER: Connection Refused"));
-    }
-
-    #[test]
-    fn is_transient_error_rejects_the_deadline_timeout_message() {
-        assert!(!is_transient_error(
-            "Timed out after 60s talking to 'aks-dev-weu-ng'. If this is a private cluster, check that you're connected to the VPN."
-        ));
-    }
-
-    #[test]
-    fn is_transient_error_rejects_non_network_failures() {
-        assert!(!is_transient_error("Failed to get pod 'x': pods \"x\" not found"));
-        assert!(!is_transient_error("Failed to list nodes: Unauthorized"));
-        assert!(!is_transient_error("Unsupported workload kind 'CronJob'"));
-    }
 
     #[tokio::test]
     async fn with_retry_recovers_from_a_transient_failure() {
