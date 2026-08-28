@@ -70,22 +70,6 @@ pub struct PodInfo {
     pub status_reason: Option<String>,
 }
 
-/// One page of a paginated pods fetch, plus what the API server said about
-/// how much is left — so a caller streaming pages can show real progress
-/// instead of an indeterminate spinner.
-#[derive(Serialize, Clone, Debug)]
-pub struct PodPage {
-    pub pods: Vec<PodInfo>,
-    /// The API server's own estimate of items not yet returned, straight from
-    /// the list response's `metadata.remainingItemCount`. `None` on the last
-    /// page (Kubernetes omits it when the list is complete), and also `None`
-    /// if the server declines to provide it — the docs are explicit that it's
-    /// an estimate clients "should not rely on to be set or to be exact", so
-    /// treat it as a display hint, never as a count to compute correctness
-    /// from.
-    pub remaining: Option<i64>,
-}
-
 #[derive(Serialize, Clone, Debug)]
 pub struct PodManifest {
     pub containers: Vec<String>,
