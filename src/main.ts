@@ -393,6 +393,21 @@ interface AppState {
    * as if it were the whole cluster.
    */
   podsLoadedComplete: Set<string>;
+  /**
+   * Per-context progress of an in-flight paginated pods fetch: how many pods
+   * have arrived so far, and the best known total for this fetch. Cleared
+   * for a context once its fetch settles (either way).
+   *
+   * `total` is derived from the API server's own `remainingItemCount`, which
+   * it omits on the final page — so the total is carried forward from
+   * whichever earlier page last reported one, letting the bar actually reach
+   * 100% on that final page instead of going blank right at the finish. It's
+   * `null` only when no page ever supplied an estimate (servers are allowed
+   * to omit it entirely). Display only: Kubernetes documents the field as an
+   * estimate, so it drives a progress bar and nothing that decides
+   * correctness.
+   */
+  podsLoadProgress: Map<string, { loaded: number; total: number | null }>;
   workloads: Map<string, WorkloadInfo[]>;
   events: Map<string, EventInfo[]>;
   eventsWarningsOnly: boolean;
@@ -457,6 +472,7 @@ const state: AppState = {
   nodes: new Map(),
   pods: new Map(),
   podsLoadedComplete: new Set(),
+  podsLoadProgress: new Map(),
   workloads: new Map(),
   events: new Map(),
   eventsWarningsOnly: true,
@@ -1275,11 +1291,17 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       let pods: PodInfo[] = [];
       try {
         await api.streamPods(ctx, undefined, (page) => {
-          pods = pods.concat(page);
-          if (isFirstLoad) {
-            state.pods.set(ctx, pods);
-            render();
-          }
+          pods = pods.concat(page.pods);
+          // Tracked on every load, not just a first one: a refresh renders
+          // atomically (see above) but still takes many seconds on a large
+          // cluster, and that's exactly when a progress bar is worth having.
+          // The final page carries no remaining-count, so fall back to the
+          // total an earlier page established rather than losing it.
+          const known = state.podsLoadProgress.get(ctx)?.total ?? null;
+          const total = page.remaining !== null ? pods.length + page.remaining : known;
+          state.podsLoadProgress.set(ctx, { loaded: pods.length, total });
+          if (isFirstLoad) state.pods.set(ctx, pods);
+          render();
         });
       } catch (e) {
         // A failure partway through a first load can leave state.pods
@@ -1299,6 +1321,7 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
         // pods !== state.pods.get(ctx) means someone else has already
         // written over this attempt's own progress.
         if (isFirstLoad && state.pods.get(ctx) === pods) state.pods.delete(ctx);
+        state.podsLoadProgress.delete(ctx);
         throw e;
       }
       if (!isFirstLoad) state.pods.set(ctx, pods);
@@ -1306,6 +1329,7 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       // — this, not the presence of any data, is what "first load done"
       // means from here on.
       state.podsLoadedComplete.add(ctx);
+      state.podsLoadProgress.delete(ctx);
       break;
     }
     case "resources":
@@ -3511,6 +3535,84 @@ function renderLoadingState(): string {
     </div>`;
 }
 
+/**
+ * A slim progress bar above a table that already has rows on screen, for the
+ * stretch where a fetch is still running — the gap `renderLoadingState`
+ * doesn't cover, since that one only shows when there's no data at all yet.
+ *
+ * Two different sources of truth, by tab, rather than one invented number:
+ *
+ * - Pods is the only genuinely paginated fetch, so it gets a real
+ *   pod-level percentage from the API server's own `remainingItemCount`.
+ *   That field is explicitly an estimate that servers may omit, so when no
+ *   in-flight cluster reports one there's nothing honest to compute a
+ *   percentage from and this falls through to the cluster-level bar below.
+ * - Every other tab is one atomic request per cluster — there is no
+ *   meaningful "43% of the nodes list" to report, and faking one from
+ *   elapsed time would be inventing data. What is real there is how many of
+ *   the selected clusters have finished, which is what the bar shows.
+ *
+ * With a single cluster and no pod estimate available, neither number
+ * exists, so it stays indeterminate rather than implying precision.
+ */
+function renderTableLoadProgress(): string {
+  if (!state.tabLoading) return "";
+
+  const ctxs = selectedContextsList();
+  let label = "";
+  let pct: number | null = null;
+
+  if (state.activeTab === "pods") {
+    let loaded = 0;
+    let total = 0;
+    let sawEstimate = false;
+    for (const ctx of ctxs) {
+      const progress = state.podsLoadProgress.get(ctx);
+      if (!progress) continue;
+      loaded += progress.loaded;
+      if (progress.total !== null) {
+        total += progress.total;
+        sawEstimate = true;
+      } else {
+        // No estimate from this cluster's server. Counting what it has
+        // already delivered keeps it from dragging the shared percentage
+        // down, without inventing a number for pods that may not exist.
+        total += progress.loaded;
+      }
+    }
+    if (sawEstimate) {
+      pct = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+      label = `Loading pods… ${loaded} of ~${total}`;
+    }
+  }
+
+  if (pct === null) {
+    const progress = state.tabLoadProgress;
+    if (progress && progress.total > 1) {
+      const done = progress.total - progress.pending.size;
+      pct = Math.round((done / progress.total) * 100);
+      label = `Loading ${progress.total} clusters… (${done}/${progress.total})`;
+    } else {
+      label = "Loading…";
+    }
+  }
+
+  return `
+    <div class="mb-3 flex flex-col gap-1.5">
+      <div class="flex items-center justify-between text-xs text-ink-muted">
+        <span>${esc(label)}</span>
+        ${pct !== null ? `<span class="tabular">${pct}%</span>` : ""}
+      </div>
+      <div class="relative h-1 w-full overflow-hidden rounded-full bg-surface-3">
+        ${
+          pct !== null
+            ? `<div class="h-full rounded-full bg-series-blue transition-all duration-300" style="width: ${pct}%"></div>`
+            : `<div class="progress-indeterminate"></div>`
+        }
+      </div>
+    </div>`;
+}
+
 function renderTabContent(): string {
   const errorBanner = state.tabError
     ? `<div class="mb-4 whitespace-pre-line rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(state.tabError)}</div>`
@@ -3521,7 +3623,7 @@ function renderTabContent(): string {
   if (state.tabError && !hasAnyDataForTab()) {
     return errorBanner;
   }
-  return errorBanner + renderTabContentBody();
+  return errorBanner + renderTableLoadProgress() + renderTabContentBody();
 }
 
 function renderTabContentBody(): string {
