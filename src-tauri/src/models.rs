@@ -243,6 +243,76 @@ pub struct GitOpsResult {
     pub apps: Vec<GitOpsAppInfo>,
 }
 
+/// Azure Node Auto Provisioning (NAP) is AKS's managed Karpenter, so the
+/// resources are Karpenter's own CRDs rather than anything Azure-specific.
+/// `installed: false` distinguishes "this cluster has no NAP" from "NAP is on
+/// but has no node pools", which look identical from an empty list.
+#[derive(Serialize, Clone, Debug)]
+pub struct NapResult {
+    pub installed: bool,
+    pub error: Option<String>,
+    pub node_pools: Vec<NapNodePoolInfo>,
+}
+
+/// One Karpenter `NodePool` — the provisioning policy — plus how many
+/// `NodeClaim`s currently reference it, which is the closest thing to "how
+/// many nodes has this pool actually produced".
+#[derive(Serialize, Clone, Debug)]
+pub struct NapNodePoolInfo {
+    pub name: String,
+    /// `spec.template.spec.nodeClassRef.name` — the AKSNodeClass supplying the
+    /// image/VM configuration for nodes this pool creates.
+    pub node_class: String,
+    pub ready: bool,
+    /// Why the pool isn't ready, when it isn't; empty otherwise.
+    pub status_reason: String,
+    pub node_claims: i64,
+    /// `spec.limits.cpu` / `.memory` verbatim, since Karpenter accepts any
+    /// Kubernetes quantity and these are for display, not arithmetic.
+    pub cpu_limit: String,
+    pub memory_limit: String,
+    pub weight: i64,
+    /// Capacity types the pool may provision ("spot", "on-demand"), from the
+    /// `karpenter.sh/capacity-type` requirement.
+    pub capacity_types: String,
+    pub age_days: i64,
+    pub age_seconds: i64,
+}
+
+/// KEDA autoscalers. Same `installed` reasoning as `NapResult`.
+#[derive(Serialize, Clone, Debug)]
+pub struct KedaResult {
+    pub installed: bool,
+    pub error: Option<String>,
+    pub scaled_objects: Vec<KedaScaledObjectInfo>,
+}
+
+/// A KEDA `ScaledObject` or `ScaledJob`. Both are listed together with `kind`
+/// telling them apart: they answer the same operational question ("what is
+/// event-scaling here, and is it working"), and separating them into two
+/// tables would split that view for no benefit.
+#[derive(Serialize, Clone, Debug)]
+pub struct KedaScaledObjectInfo {
+    pub namespace: String,
+    pub name: String,
+    pub kind: String,
+    /// What's being scaled. For a ScaledJob this is the Job template rather
+    /// than an existing workload, so `target_kind` is "Job".
+    pub target_kind: String,
+    pub target_name: String,
+    pub min_replicas: i64,
+    pub max_replicas: i64,
+    /// Trigger types in declaration order, comma-joined (e.g. "azure-servicebus, cron").
+    pub triggers: String,
+    pub ready: bool,
+    /// KEDA reports Active separately from Ready: Ready means the autoscaler
+    /// is wired up, Active means a trigger is currently firing.
+    pub active: bool,
+    pub paused: bool,
+    pub age_days: i64,
+    pub age_seconds: i64,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct GitOpsAppManifest {
     pub yaml_full: String,

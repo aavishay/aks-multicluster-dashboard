@@ -9,9 +9,11 @@ import type {
   GitOpsResult,
   HelmReleaseDetail,
   HelmReleaseInfo,
+  KedaResult,
   MetricsBackendInfo,
   MetricsBackendTestResult,
   MetricsOverTimeResult,
+  NapResult,
   NodeInfo,
   NodeManifest,
   PodInfo,
@@ -146,6 +148,8 @@ export const api = {
     channel.onmessage = onToken;
     return invoke<void>("claude_explain_error", { errorText, onToken: channel });
   },
+  getNapNodePools: (contextName: string) => invoke<NapResult>("get_nap_node_pools", { contextName }),
+  getKedaScaledObjects: (contextName: string) => invoke<KedaResult>("get_keda_scaled_objects", { contextName }),
   getGitOpsApps: (contextName: string) => invoke<GitOpsResult>("get_gitops_apps", { contextName }),
   getGitOpsManifest: (contextName: string, namespace: string, name: string) =>
     invoke<GitOpsAppManifest>("get_gitops_manifest", { contextName, namespace, name }),
