@@ -320,6 +320,16 @@ pub async fn get_helm_release_detail(
 }
 
 #[tauri::command]
+pub async fn get_nap_node_pools(context_name: String) -> Result<NapResult, String> {
+    with_retry(&context_name, || k8s::get_nap_node_pools(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_keda_scaled_objects(context_name: String) -> Result<KedaResult, String> {
+    with_retry(&context_name, || k8s::get_keda_scaled_objects(&context_name)).await
+}
+
+#[tauri::command]
 pub async fn get_gitops_apps(context_name: String) -> Result<GitOpsResult, String> {
     with_retry(&context_name, || k8s::get_gitops_apps(&context_name)).await
 }

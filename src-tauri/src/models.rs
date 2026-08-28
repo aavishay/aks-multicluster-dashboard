@@ -243,6 +243,86 @@ pub struct GitOpsResult {
     pub apps: Vec<GitOpsAppInfo>,
 }
 
+/// Azure Node Auto Provisioning (NAP) is AKS's managed Karpenter, so the
+/// resources are Karpenter's own CRDs rather than anything Azure-specific.
+/// `installed: false` distinguishes "this cluster has no NAP" from "NAP is on
+/// but has no node pools", which look identical from an empty list.
+#[derive(Serialize, Clone, Debug)]
+pub struct NapResult {
+    pub installed: bool,
+    pub error: Option<String>,
+    pub node_pools: Vec<NapNodePoolInfo>,
+}
+
+/// One Karpenter `NodePool` — the provisioning policy — plus its own live
+/// rollup of what it has actually provisioned (`status.resources`), which is
+/// both the node count and the "used" side of the usage/limit columns below.
+#[derive(Serialize, Clone, Debug)]
+pub struct NapNodePoolInfo {
+    pub name: String,
+    /// `spec.template.spec.nodeClassRef.name` — the AKSNodeClass supplying the
+    /// image/VM configuration for nodes this pool creates.
+    pub node_class: String,
+    pub ready: bool,
+    /// Why the pool isn't ready, when it isn't; empty otherwise.
+    pub status_reason: String,
+    /// `status.resources.nodes` — the pool's own count of what it has
+    /// provisioned.
+    pub nodes: i64,
+    /// Provisioned capacity vs the cap, both normalised to millicores/KiB so
+    /// the UI can format them the way the Nodes tab does.
+    ///
+    /// "Used" is `status.resources`, the aggregate capacity of the nodes this
+    /// pool owns — which is precisely what Karpenter's limits bound, and what
+    /// it stops provisioning against. It is not live utilisation.
+    pub cpu_used_millicores: i64,
+    /// `None` when the pool sets no limit, which Karpenter treats as
+    /// unbounded — distinct from a limit of zero.
+    pub cpu_limit_millicores: Option<i64>,
+    pub memory_used_ki: i64,
+    pub memory_limit_ki: Option<i64>,
+    pub weight: i64,
+    /// Capacity types the pool may provision ("spot", "on-demand"), from the
+    /// `karpenter.sh/capacity-type` requirement.
+    pub capacity_types: String,
+    pub age_days: i64,
+    pub age_seconds: i64,
+}
+
+/// KEDA autoscalers. Same `installed` reasoning as `NapResult`.
+#[derive(Serialize, Clone, Debug)]
+pub struct KedaResult {
+    pub installed: bool,
+    pub error: Option<String>,
+    pub scaled_objects: Vec<KedaScaledObjectInfo>,
+}
+
+/// A KEDA `ScaledObject` or `ScaledJob`. Both are listed together with `kind`
+/// telling them apart: they answer the same operational question ("what is
+/// event-scaling here, and is it working"), and separating them into two
+/// tables would split that view for no benefit.
+#[derive(Serialize, Clone, Debug)]
+pub struct KedaScaledObjectInfo {
+    pub namespace: String,
+    pub name: String,
+    pub kind: String,
+    /// What's being scaled. For a ScaledJob this is the Job template rather
+    /// than an existing workload, so `target_kind` is "Job".
+    pub target_kind: String,
+    pub target_name: String,
+    pub min_replicas: i64,
+    pub max_replicas: i64,
+    /// Trigger types in declaration order, comma-joined (e.g. "azure-servicebus, cron").
+    pub triggers: String,
+    pub ready: bool,
+    /// KEDA reports Active separately from Ready: Ready means the autoscaler
+    /// is wired up, Active means a trigger is currently firing.
+    pub active: bool,
+    pub paused: bool,
+    pub age_days: i64,
+    pub age_seconds: i64,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct GitOpsAppManifest {
     pub yaml_full: String,
