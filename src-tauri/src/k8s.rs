@@ -514,7 +514,20 @@ async fn list_pods_page(pods_api: &Api<Pod>, lp: &ListParams) -> Result<ObjectLi
 /// before the caller sees anything. Built for large clusters (some in this
 /// fleet run well past a thousand pods) where that single-shot wait was the
 /// entire time-to-first-row.
-pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page: Channel<PodPage>) -> Result<(), String> {
+///
+/// Returns the complete list as well as streaming it, and that return value —
+/// not the sum of the channel messages — is what a caller must treat as
+/// authoritative. The two travel over different IPC paths with different
+/// latencies: a `Channel` payload over 8KB (which every pod page is, by a
+/// wide margin) is delivered by evaluating JS that performs a *second*
+/// async round trip to fetch the body before invoking the callback, whereas
+/// a command's return value resolves its promise directly. The awaited
+/// promise therefore resolves *before* the last page's callback runs, so a
+/// caller that totals up the channel messages at await-time reliably loses
+/// the final page — which showed up as a Pods table stuck at exactly 1000
+/// of 1065. Streaming stays useful for progressive display; the return
+/// value is what's correct.
+pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page: Channel<Vec<PodInfo>>) -> Result<Vec<PodInfo>, String> {
     let client = client_for_context(context_name).await?;
     let pods_api: Api<Pod> = match &namespace {
         Some(ns) => Api::namespaced(client.clone(), ns),
@@ -532,15 +545,16 @@ pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page:
         fetch_replicaset_owners(&replicasets_api),
     );
 
+    let mut all = Vec::new();
     let mut page = first_page_result?;
     loop {
-        let remaining = page.metadata.remaining_item_count;
         let mapped: Vec<PodInfo> = page.items.drain(..).map(|p| build_pod_info(p, &metrics, &rs_owner)).collect();
+        all.extend_from_slice(&mapped);
         // Sending is best-effort: if the frontend has already torn down the
         // channel (e.g. the user switched clusters mid-fetch), there's no one
         // left to deliver a page to, but the fetch itself is cheap enough to
         // let finish rather than plumbing a cancellation path for it.
-        let _ = on_page.send(PodPage { pods: mapped, remaining });
+        let _ = on_page.send(mapped);
 
         let Some(token) = page.metadata.continue_.clone() else {
             break;
@@ -549,7 +563,7 @@ pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page:
         page = list_pods_page(&pods_api, &next_lp).await?;
     }
 
-    Ok(())
+    Ok(all)
 }
 
 /// Renders a pod as YAML the way `kubectl get pod -o yaml` would present it —
