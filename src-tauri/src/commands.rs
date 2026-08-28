@@ -107,8 +107,8 @@ pub async fn get_pods(context_name: String, namespace: Option<String>) -> Result
 pub async fn stream_pods(
     context_name: String,
     namespace: Option<String>,
-    on_page: tauri::ipc::Channel<PodPage>,
-) -> Result<(), String> {
+    on_page: tauri::ipc::Channel<Vec<PodInfo>>,
+) -> Result<Vec<PodInfo>, String> {
     // Not wrapped in with_retry, same reasoning as the log streams below: a
     // retry that re-runs the whole operation from scratch would re-send
     // pages the frontend already appended, double-counting pods rather than

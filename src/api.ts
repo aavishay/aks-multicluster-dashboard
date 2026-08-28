@@ -16,7 +16,6 @@ import type {
   NodeManifest,
   PodInfo,
   PodManifest,
-  PodPage,
   ResourceUsageSummary,
   WorkloadInfo,
   WorkloadManifest,
@@ -33,11 +32,22 @@ export const api = {
   getNodeEvents: (contextName: string, nodeName: string) =>
     invoke<EventInfo[]>("get_node_events", { contextName, nodeName }),
   getPods: (contextName: string, namespace?: string) => invoke<PodInfo[]>("get_pods", { contextName, namespace }),
-  /** Same data as `getPods`, but paged server-side; `onPage` fires once per page as it arrives instead of waiting for the whole cluster's pods to load before resolving. Each page carries the server's own estimate of how much is left, for progress display. */
-  streamPods: (contextName: string, namespace: string | undefined, onPage: (page: PodPage) => void) => {
-    const channel = new Channel<PodPage>();
+  /**
+   * Same data as `getPods`, but paged server-side. `onPage` fires per page as
+   * it arrives, for progressive display.
+   *
+   * The RESOLVED VALUE is the authoritative complete list — never total up the
+   * `onPage` pages instead. Tauri delivers a channel payload over 8KB (which
+   * every pod page is) by evaluating JS that makes a second async round trip
+   * to fetch the body before invoking the callback, while a command's return
+   * value resolves its promise directly. This promise therefore resolves
+   * before the final page's callback runs, so page-summing silently loses the
+   * last page.
+   */
+  streamPods: (contextName: string, namespace: string | undefined, onPage: (page: PodInfo[]) => void) => {
+    const channel = new Channel<PodInfo[]>();
     channel.onmessage = onPage;
-    return invoke<void>("stream_pods", { contextName, namespace, onPage: channel });
+    return invoke<PodInfo[]>("stream_pods", { contextName, namespace, onPage: channel });
   },
   getWorkloads: (contextName: string) => invoke<WorkloadInfo[]>("get_workloads", { contextName }),
   getWorkloadManifest: (contextName: string, kind: string, namespace: string, name: string) =>
