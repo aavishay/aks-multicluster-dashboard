@@ -1278,20 +1278,28 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       // committed is streamPods' RESOLVED VALUE, the backend's own complete
       // list — see api.streamPods for why summing the pages here instead
       // would deterministically drop the last one.
-      let preview: PodInfo[] = [];
+      const preview: PodInfo[] = [];
       let pods: PodInfo[] = [];
       try {
         pods = await api.streamPods(ctx, undefined, (page) => {
-          preview = preview.concat(page);
-          if (isFirstLoad) {
-            state.pods.set(ctx, preview);
-            // rAF-batched: render() rebuilds the whole app's innerHTML, and
-            // on a multi-thousand-pod cluster each rebuild is already the
-            // most expensive thing on the main thread. Pages can land within
-            // a few hundred ms of each other, so coalesce to at most one
-            // repaint per frame rather than one per page.
-            schedulePodsStreamRender();
-          }
+          // The preview exists only to get rows on screen during a first
+          // load. A refresh already has a full table up and commits the
+          // return value atomically at the end, so there's nothing to
+          // accumulate for — bail before doing the work at all.
+          if (!isFirstLoad) return;
+          // Appended in place rather than `preview = preview.concat(page)`:
+          // concat copies the whole accumulated array per page, which is
+          // quadratic across a many-page cluster. Pushed element-wise rather
+          // than spread, so this stays correct if POD_PAGE_SIZE is ever
+          // raised past the argument-count ceiling a spread would hit.
+          for (const pod of page) preview.push(pod);
+          state.pods.set(ctx, preview);
+          // rAF-batched: render() rebuilds the whole app's innerHTML, and
+          // on a multi-thousand-pod cluster each rebuild is already the
+          // most expensive thing on the main thread. Pages can land within
+          // a few hundred ms of each other, so coalesce to at most one
+          // repaint per frame rather than one per page.
+          schedulePodsStreamRender();
         });
       } catch (e) {
         // A failure partway through a first load can leave state.pods
