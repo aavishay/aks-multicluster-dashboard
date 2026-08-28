@@ -1516,10 +1516,27 @@ async fn list_karpenter(
     Ok(None)
 }
 
-fn dynamic_object_to_nap_node_pool(obj: DynamicObject, node_claims: i64) -> NapNodePoolInfo {
+/// A quantity-shaped field nested in `status`/`spec` JSON — `spec.limits.cpu`,
+/// `status.resources.memory`, etc. — read out as `&str`, since every one of
+/// these (including integer-looking counts like `status.resources.nodes` and
+/// `.pods`) is a `resource.Quantity` and therefore ALWAYS a JSON *string* on
+/// the wire, never a JSON number. `json_i64`'s `.as_i64()` looks like the
+/// obvious tool for `status.resources.nodes` but silently returns 0 for
+/// every pool against it, since `as_i64` only matches an actual JSON number.
+fn json_quantity<'a>(value: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    let s = json_str(value, key);
+    (!s.is_empty()).then_some(s)
+}
+
+fn dynamic_object_to_nap_node_pool(obj: DynamicObject) -> NapNodePoolInfo {
     let spec = obj.data.get("spec");
     let template_spec = spec.and_then(|s| s.get("template")).and_then(|t| t.get("spec"));
     let limits = spec.and_then(|s| s.get("limits"));
+    let status = obj.data.get("status");
+    // Karpenter's own rollup of what this pool has actually provisioned —
+    // reconciled by the controller itself, so it's both the node count and
+    // the "used" side of the usage/limit columns without a second API call.
+    let resources = status.and_then(|s| s.get("resources"));
 
     // Capacity type lives in the requirement list rather than a dedicated
     // field, since Karpenter models it as just another node selector term.
@@ -1537,7 +1554,6 @@ fn dynamic_object_to_nap_node_pool(obj: DynamicObject, node_claims: i64) -> NapN
         })
         .unwrap_or_default();
 
-    let status = obj.data.get("status");
     let (ready, reason) = json_condition(status, "Ready");
 
     NapNodePoolInfo {
@@ -1545,9 +1561,17 @@ fn dynamic_object_to_nap_node_pool(obj: DynamicObject, node_claims: i64) -> NapN
         node_class: json_str(template_spec.and_then(|t| t.get("nodeClassRef")), "name").to_string(),
         ready,
         status_reason: if ready { String::new() } else { reason },
-        node_claims,
-        cpu_limit: json_str(limits, "cpu").to_string(),
-        memory_limit: json_str(limits, "memory").to_string(),
+        // Absent (a brand new pool with nothing provisioned yet) reads the
+        // same as explicit "0", so this stays a plain parse-or-zero rather
+        // than an Option.
+        nodes: json_quantity(resources, "nodes").and_then(|s| s.parse().ok()).unwrap_or(0),
+        cpu_used_millicores: json_quantity(resources, "cpu").map(parse_cpu_millicores).unwrap_or(0),
+        // Absent here means Karpenter enforces no cap at all, which reads
+        // very differently from a cap of zero — kept as `None` rather than
+        // collapsing both to 0.
+        cpu_limit_millicores: json_quantity(limits, "cpu").map(parse_cpu_millicores),
+        memory_used_ki: json_quantity(resources, "memory").map(parse_memory_ki).unwrap_or(0),
+        memory_limit_ki: json_quantity(limits, "memory").map(parse_memory_ki),
         weight: json_i64(spec, "weight"),
         capacity_types,
         age_days: age_days(obj.metadata.creation_timestamp.clone()),
@@ -1562,34 +1586,14 @@ pub async fn get_nap_node_pools(context_name: &str) -> Result<NapResult, String>
         return Ok(NapResult { installed: false, error: None, node_pools: Vec::new() });
     };
 
-    // NodeClaims are how many nodes each pool actually produced. A failure
-    // here is not fatal to the tab — the pools themselves are still worth
-    // showing, just with a zero count — so it degrades rather than erroring.
-    let mut claims_per_pool: HashMap<String, i64> = HashMap::new();
-    if let Ok(Some(claims)) = list_karpenter(&client, "NodeClaim", "nodeclaims").await {
-        for claim in claims {
-            let pool = claim.metadata.labels.as_ref().and_then(|l| l.get("karpenter.sh/nodepool")).cloned();
-            if let Some(pool) = pool {
-                *claims_per_pool.entry(pool).or_insert(0) += 1;
-            }
-        }
-    }
-
+    // No separate NodeClaim list needed: status.resources on the NodePool
+    // itself already carries the node count (and the provisioned CPU/memory
+    // the usage/limit columns need), reconciled by Karpenter's own
+    // controller rather than re-derived here by matching labels.
     Ok(NapResult {
         installed: true,
         error: None,
-        node_pools: pools
-            .into_iter()
-            .map(|p| {
-                let claims = p
-                    .metadata
-                    .name
-                    .as_ref()
-                    .and_then(|n| claims_per_pool.get(n).copied())
-                    .unwrap_or(0);
-                dynamic_object_to_nap_node_pool(p, claims)
-            })
-            .collect(),
+        node_pools: pools.into_iter().map(dynamic_object_to_nap_node_pool).collect(),
     })
 }
 
@@ -1724,6 +1728,11 @@ mod tests {
 
     #[test]
     fn nap_node_pool_reads_the_karpenter_v1_shape() {
+        // Every field under status.resources — including the integer-looking
+        // "nodes" and "cpu" — is a JSON STRING on the real API server, since
+        // all of them are resource.Quantity. Deliberately shaped as strings
+        // here (not JSON numbers) so this fixture would catch a regression
+        // back to `.as_i64()`-style number-only reads.
         let obj = dynamic(serde_json::json!({
             "metadata": { "name": "general" },
             "spec": {
@@ -1736,23 +1745,54 @@ mod tests {
                         ]
                     }
                 },
-                "limits": { "cpu": "1000", "memory": "1000Gi" },
+                "limits": { "cpu": "500", "memory": "1392Gi" },
                 "weight": 10
             },
-            "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
+            "status": {
+                "conditions": [{ "type": "Ready", "status": "True" }],
+                "resources": { "cpu": "224", "memory": "469314727936", "nodes": "29", "pods": "3190" }
+            }
         }));
 
-        let pool = dynamic_object_to_nap_node_pool(obj, 7);
+        let pool = dynamic_object_to_nap_node_pool(obj);
         assert_eq!(pool.name, "general");
         assert_eq!(pool.node_class, "default");
-        assert_eq!(pool.cpu_limit, "1000");
-        assert_eq!(pool.memory_limit, "1000Gi");
         assert_eq!(pool.weight, 10);
-        assert_eq!(pool.node_claims, 7);
         assert!(pool.ready);
         assert_eq!(pool.status_reason, "");
         // Only the capacity-type requirement is surfaced, not every requirement.
         assert_eq!(pool.capacity_types, "on-demand, spot");
+
+        // The subtle part: "nodes" parses as the string "29", not a JSON
+        // number 29 — this is what `json_i64` would have silently read as 0.
+        assert_eq!(pool.nodes, 29);
+        assert_eq!(pool.cpu_used_millicores, 224_000); // bare "224" = 224 whole cores
+        assert_eq!(pool.cpu_limit_millicores, Some(500_000));
+        // "469314727936" bytes, no suffix, same shape the real API server
+        // uses for a large exact value rather than a Gi-rounded one.
+        assert_eq!(pool.memory_used_ki, 469_314_727_936 / 1024);
+        assert_eq!(pool.memory_limit_ki, Some(1392 * 1024 * 1024));
+    }
+
+    #[test]
+    fn nap_node_pool_treats_absent_limit_as_unbounded_not_zero() {
+        // Karpenter treats a NodePool with no spec.limits as uncapped. That
+        // must come through as `None`, not as a limit of literal zero — the
+        // two render completely differently ("no limit" vs "0 allowed").
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "name": "unbounded" },
+            "spec": {},
+            "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
+        }));
+
+        let pool = dynamic_object_to_nap_node_pool(obj);
+        assert_eq!(pool.cpu_limit_millicores, None);
+        assert_eq!(pool.memory_limit_ki, None);
+        // Nothing provisioned yet reads as zero, not as absent — there's no
+        // "unbounded" reading for how much is currently in use.
+        assert_eq!(pool.nodes, 0);
+        assert_eq!(pool.cpu_used_millicores, 0);
+        assert_eq!(pool.memory_used_ki, 0);
     }
 
     #[test]
@@ -1763,7 +1803,7 @@ mod tests {
             "status": { "conditions": [{ "type": "Ready", "status": "False", "reason": "NodeClassNotReady" }] }
         }));
 
-        let pool = dynamic_object_to_nap_node_pool(obj, 0);
+        let pool = dynamic_object_to_nap_node_pool(obj);
         assert!(!pool.ready);
         assert_eq!(pool.status_reason, "NodeClassNotReady");
         // A pool with no spec at all must not panic, just report empties.

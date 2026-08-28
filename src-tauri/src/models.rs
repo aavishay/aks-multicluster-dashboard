@@ -254,9 +254,9 @@ pub struct NapResult {
     pub node_pools: Vec<NapNodePoolInfo>,
 }
 
-/// One Karpenter `NodePool` — the provisioning policy — plus how many
-/// `NodeClaim`s currently reference it, which is the closest thing to "how
-/// many nodes has this pool actually produced".
+/// One Karpenter `NodePool` — the provisioning policy — plus its own live
+/// rollup of what it has actually provisioned (`status.resources`), which is
+/// both the node count and the "used" side of the usage/limit columns below.
 #[derive(Serialize, Clone, Debug)]
 pub struct NapNodePoolInfo {
     pub name: String,
@@ -266,11 +266,21 @@ pub struct NapNodePoolInfo {
     pub ready: bool,
     /// Why the pool isn't ready, when it isn't; empty otherwise.
     pub status_reason: String,
-    pub node_claims: i64,
-    /// `spec.limits.cpu` / `.memory` verbatim, since Karpenter accepts any
-    /// Kubernetes quantity and these are for display, not arithmetic.
-    pub cpu_limit: String,
-    pub memory_limit: String,
+    /// `status.resources.nodes` — the pool's own count of what it has
+    /// provisioned.
+    pub nodes: i64,
+    /// Provisioned capacity vs the cap, both normalised to millicores/KiB so
+    /// the UI can format them the way the Nodes tab does.
+    ///
+    /// "Used" is `status.resources`, the aggregate capacity of the nodes this
+    /// pool owns — which is precisely what Karpenter's limits bound, and what
+    /// it stops provisioning against. It is not live utilisation.
+    pub cpu_used_millicores: i64,
+    /// `None` when the pool sets no limit, which Karpenter treats as
+    /// unbounded — distinct from a limit of zero.
+    pub cpu_limit_millicores: Option<i64>,
+    pub memory_used_ki: i64,
+    pub memory_limit_ki: Option<i64>,
     pub weight: i64,
     /// Capacity types the pool may provision ("spot", "on-demand"), from the
     /// `karpenter.sh/capacity-type` requirement.

@@ -6225,9 +6225,21 @@ function renderNap(): string {
     { key: "name", label: "Name", value: (r) => r.p.name, filter: "string" },
     { key: "nodeclass", label: "Node class", value: (r) => r.p.node_class, filter: "enum" },
     { key: "capacity", label: "Capacity", value: (r) => r.p.capacity_types, filter: "enum" },
-    { key: "nodes", label: "Nodes", value: (r) => r.p.node_claims, filter: "number" },
-    { key: "cpulimit", label: "CPU limit", value: (r) => r.p.cpu_limit, filter: "string" },
-    { key: "memlimit", label: "Memory limit", value: (r) => r.p.memory_limit, filter: "string" },
+    { key: "nodes", label: "Nodes", value: (r) => r.p.nodes, filter: "number" },
+    {
+      key: "cpu",
+      label: "CPU Usage/Limit",
+      value: (r) => r.p.cpu_used_millicores,
+      filter: "number",
+      copyText: (r) => `${formatMillicores(r.p.cpu_used_millicores)} / ${formatMillicores(r.p.cpu_limit_millicores)}`,
+    },
+    {
+      key: "memory",
+      label: "Memory Usage/Limit",
+      value: (r) => r.p.memory_used_ki,
+      filter: "number",
+      copyText: (r) => `${formatKi(r.p.memory_used_ki)} / ${formatKi(r.p.memory_limit_ki)}`,
+    },
     { key: "weight", label: "Weight", value: (r) => r.p.weight, filter: "number" },
     {
       key: "age",
@@ -6276,9 +6288,9 @@ function renderNap(): string {
               <td class="text-ink-primary">${esc(p.name)}</td>
               <td>${esc(p.node_class) || "—"}</td>
               <td>${esc(p.capacity_types) || "—"}</td>
-              <td class="tabular">${p.node_claims}</td>
-              <td class="tabular">${esc(p.cpu_limit) || "—"}</td>
-              <td class="tabular">${esc(p.memory_limit) || "—"}</td>
+              <td class="tabular">${p.nodes}</td>
+              <td class="tabular">${formatMillicores(p.cpu_used_millicores)} / ${formatMillicores(p.cpu_limit_millicores)}</td>
+              <td class="tabular">${formatKi(p.memory_used_ki)} / ${formatKi(p.memory_limit_ki)}</td>
               <td class="tabular">${p.weight}</td>
               <td class="tabular">${formatAgeDetailed(p.age_days, p.age_seconds)}</td>
             </tr>`;
