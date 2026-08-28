@@ -514,7 +514,7 @@ async fn list_pods_page(pods_api: &Api<Pod>, lp: &ListParams) -> Result<ObjectLi
 /// before the caller sees anything. Built for large clusters (some in this
 /// fleet run well past a thousand pods) where that single-shot wait was the
 /// entire time-to-first-row.
-pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page: Channel<Vec<PodInfo>>) -> Result<(), String> {
+pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page: Channel<PodPage>) -> Result<(), String> {
     let client = client_for_context(context_name).await?;
     let pods_api: Api<Pod> = match &namespace {
         Some(ns) => Api::namespaced(client.clone(), ns),
@@ -534,12 +534,13 @@ pub async fn stream_pods(context_name: &str, namespace: Option<String>, on_page:
 
     let mut page = first_page_result?;
     loop {
+        let remaining = page.metadata.remaining_item_count;
         let mapped: Vec<PodInfo> = page.items.drain(..).map(|p| build_pod_info(p, &metrics, &rs_owner)).collect();
         // Sending is best-effort: if the frontend has already torn down the
         // channel (e.g. the user switched clusters mid-fetch), there's no one
         // left to deliver a page to, but the fetch itself is cheap enough to
         // let finish rather than plumbing a cancellation path for it.
-        let _ = on_page.send(mapped);
+        let _ = on_page.send(PodPage { pods: mapped, remaining });
 
         let Some(token) = page.metadata.continue_.clone() else {
             break;
