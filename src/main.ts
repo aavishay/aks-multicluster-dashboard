@@ -6208,7 +6208,13 @@ function renderNap(): string {
         ctxs.length > 1,
       );
     }
-    return `<div class="text-sm text-ink-muted">No NAP node pools found.</div>`;
+    // Some clusters have the addon and simply have nothing to show, while
+    // others may not have it at all — keep naming the latter, or this mixed
+    // case reads as "nothing is configured anywhere". Renders to nothing
+    // when every answering cluster does have the addon.
+    return `
+      ${addonPartialNotice('Karpenter / NAP', notInstalled)}
+      <div class="text-sm text-ink-muted">No NAP node pools found.</div>`;
   }
 
   const rows = state.unhealthyOnly.nap ? allRows.filter((r) => !r.p.ready) : allRows;
@@ -6298,7 +6304,13 @@ function renderKeda(): string {
     if (notInstalled.length > 0 && notInstalled.length === answered.length) {
       return addonNotInstalledPanel("KEDA not enabled", "KEDA", "scaledobjects.keda.sh", ctxs.length > 1);
     }
-    return `<div class="text-sm text-ink-muted">No KEDA scaled objects found.</div>`;
+    // Some clusters have the addon and simply have nothing to show, while
+    // others may not have it at all — keep naming the latter, or this mixed
+    // case reads as "nothing is configured anywhere". Renders to nothing
+    // when every answering cluster does have the addon.
+    return `
+      ${addonPartialNotice('KEDA', notInstalled)}
+      <div class="text-sm text-ink-muted">No KEDA scaled objects found.</div>`;
   }
 
   const rows = state.unhealthyOnly.keda ? allRows.filter((r) => !r.s.ready) : allRows;
