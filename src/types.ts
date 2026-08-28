@@ -213,4 +213,49 @@ export interface ClaudeDiagnosisPayload {
   approx_tokens: number;
 }
 
-export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "gitops" | "helm" | "cost";
+export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "nap" | "keda" | "gitops" | "helm" | "cost";
+
+/** Azure Node Auto Provisioning (managed Karpenter). `installed: false` means the CRDs aren't registered, i.e. NAP is off for this cluster. */
+export interface NapResult {
+  installed: boolean;
+  error: string | null;
+  node_pools: NapNodePoolInfo[];
+}
+
+export interface NapNodePoolInfo {
+  name: string;
+  node_class: string;
+  ready: boolean;
+  status_reason: string;
+  node_claims: number;
+  cpu_limit: string;
+  memory_limit: string;
+  weight: number;
+  capacity_types: string;
+  age_days: number;
+  age_seconds: number;
+}
+
+/** KEDA autoscalers. Same `installed` semantics as `NapResult`. */
+export interface KedaResult {
+  installed: boolean;
+  error: string | null;
+  scaled_objects: KedaScaledObjectInfo[];
+}
+
+export interface KedaScaledObjectInfo {
+  namespace: string;
+  name: string;
+  kind: string;
+  target_kind: string;
+  target_name: string;
+  min_replicas: number;
+  max_replicas: number;
+  triggers: string;
+  ready: boolean;
+  /** Distinct from `ready`: Ready means wired up, Active means a trigger is currently firing. */
+  active: boolean;
+  paused: boolean;
+  age_days: number;
+  age_seconds: number;
+}

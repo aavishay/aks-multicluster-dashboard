@@ -10,12 +10,16 @@ import type {
   GitOpsAppInfo,
   GitOpsAppManifest,
   GitOpsResult,
+  KedaResult,
+  KedaScaledObjectInfo,
   HelmReleaseDetail,
   MetricsBackendInfo,
   MetricsBackendTestResult,
   HelmReleaseInfo,
   MetricSample,
   MetricsOverTimeResult,
+  NapNodePoolInfo,
+  NapResult,
   NodeInfo,
   NodeManifest,
   PodInfo,
@@ -396,6 +400,8 @@ interface AppState {
   workloads: Map<string, WorkloadInfo[]>;
   events: Map<string, EventInfo[]>;
   eventsWarningsOnly: boolean;
+  nap: Map<string, NapResult>;
+  keda: Map<string, KedaResult>;
   gitops: Map<string, GitOpsResult>;
   helm: Map<string, HelmReleaseInfo[]>;
   resourceUsage: Map<string, ResourceUsageSummary>;
@@ -460,6 +466,8 @@ const state: AppState = {
   workloads: new Map(),
   events: new Map(),
   eventsWarningsOnly: true,
+  nap: new Map(),
+  keda: new Map(),
   gitops: new Map(),
   helm: new Map(),
   resourceUsage: new Map(),
@@ -1177,6 +1185,8 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "resources", label: "Resource Usage" },
   { id: "metrics", label: "Metrics" },
   { id: "events", label: "Events" },
+  { id: "nap", label: "NAP" },
+  { id: "keda", label: "KEDA" },
   { id: "gitops", label: "GitOps" },
   { id: "helm", label: "Helm" },
   { id: "cost", label: "Cost" },
@@ -1339,6 +1349,12 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
     case "events":
       state.events.set(ctx, await api.getEvents(ctx, state.eventsWarningsOnly));
       break;
+    case "nap":
+      state.nap.set(ctx, await api.getNapNodePools(ctx));
+      break;
+    case "keda":
+      state.keda.set(ctx, await api.getKedaScaledObjects(ctx));
+      break;
     case "gitops":
       state.gitops.set(ctx, await api.getGitOpsApps(ctx));
       break;
@@ -1366,6 +1382,10 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
       return state.metricsOverTime.has(ctx);
     case "events":
       return state.events.has(ctx);
+    case "nap":
+      return state.nap.has(ctx);
+    case "keda":
+      return state.keda.has(ctx);
     case "gitops":
       return state.gitops.has(ctx);
     case "helm":
@@ -3572,6 +3592,10 @@ function renderTabContentBody(): string {
       return renderMetrics();
     case "events":
       return renderEvents();
+    case "nap":
+      return renderNap();
+    case "keda":
+      return renderKeda();
     case "gitops":
       return renderGitOps();
     case "helm":
@@ -6142,6 +6166,215 @@ function renderEvents(): string {
 
 function gitOpsAppHealthy(a: GitOpsAppInfo): boolean {
   return a.sync_status === "Synced" && a.health_status === "Healthy";
+}
+
+/** Shared "the CRDs aren't there" panel for the addon-backed tabs, so NAP and KEDA explain an empty table the same way GitOps does rather than looking broken. */
+function addonNotInstalledPanel(title: string, product: string, crds: string, multi: boolean): string {
+  return `
+    <div class="rounded-lg border border-gridline bg-surface-1 p-5 text-sm text-ink-secondary">
+      <div class="mb-2 text-sm font-medium text-ink-primary">${esc(title)}</div>
+      <p>
+        No <span class="text-ink-primary">${esc(product)}</span> (<code class="rounded bg-surface-2 px-1 py-0.5">${esc(crds)}</code>)
+        was found in ${multi ? "any of the selected clusters" : "this cluster"}.
+      </p>
+    </div>`;
+}
+
+/** Banner for the mixed case: some selected clusters have the addon, some don't. */
+function addonPartialNotice(product: string, missing: string[]): string {
+  if (missing.length === 0) return "";
+  return `
+    <div class="mb-3 rounded-md border border-gridline bg-surface-2 px-3 py-2 text-xs text-ink-secondary">
+      No ${esc(product)} in ${missing.map(esc).join(", ")}.
+    </div>`;
+}
+
+function renderNap(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  const results = ctxs.map((ctx) => ({ ctx, result: state.nap.get(ctx) }));
+  const answered = results.filter((r) => r.result);
+  const notInstalled = answered.filter((r) => !r.result!.installed).map((r) => r.ctx);
+
+  type NapRow = { ctx: string; p: NapNodePoolInfo };
+  const allRows: NapRow[] = results.flatMap((r) => (r.result?.node_pools ?? []).map((p) => ({ ctx: r.ctx, p })));
+
+  if (allRows.length === 0 && !state.tabLoading) {
+    if (notInstalled.length > 0 && notInstalled.length === answered.length) {
+      return addonNotInstalledPanel(
+        "Node Auto Provisioning not enabled",
+        "Karpenter / NAP",
+        "nodepools.karpenter.sh",
+        ctxs.length > 1,
+      );
+    }
+    return `<div class="text-sm text-ink-muted">No NAP node pools found.</div>`;
+  }
+
+  const rows = state.unhealthyOnly.nap ? allRows.filter((r) => !r.p.ready) : allRows;
+  const keyOf = (r: NapRow) => `${r.ctx}:${r.p.name}`;
+
+  const columns: ColumnDef<NapRow>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: NapRow) => r.ctx, filter: "enum" as const }] : []),
+    { key: "name", label: "Name", value: (r) => r.p.name, filter: "string" },
+    { key: "nodeclass", label: "Node class", value: (r) => r.p.node_class, filter: "enum" },
+    { key: "capacity", label: "Capacity", value: (r) => r.p.capacity_types, filter: "enum" },
+    { key: "nodes", label: "Nodes", value: (r) => r.p.node_claims, filter: "number" },
+    { key: "cpulimit", label: "CPU limit", value: (r) => r.p.cpu_limit, filter: "string" },
+    { key: "memlimit", label: "Memory limit", value: (r) => r.p.memory_limit, filter: "string" },
+    { key: "weight", label: "Weight", value: (r) => r.p.weight, filter: "number" },
+    {
+      key: "age",
+      label: "Age",
+      value: (r) => r.p.age_days,
+      filter: "number",
+      copyText: (r) => formatAgeDetailed(r.p.age_days, r.p.age_seconds),
+      sortValue: (r) => r.p.age_seconds,
+    },
+  ];
+  const filtered = applyFilters("nap", rows, columns);
+  const sorted = sortRows("nap", filtered, columns);
+  recordTableSnapshot("nap", columns, sorted, keyOf, {
+    header: "Status",
+    text: (r) => (r.p.ready ? "Ready" : r.p.status_reason || "Not ready"),
+  });
+
+  return `
+    ${addonPartialNotice("Karpenter / NAP", notInstalled)}
+    <div class="mb-2 flex items-center justify-between">
+      <div class="text-xs text-ink-muted">${state.unhealthyOnly.nap ? `${rows.length} of ${allRows.length} not ready` : ""}</div>
+      ${unhealthyOnlyToggle("nap")}
+    </div>
+    ${filterSummary("nap", rows.length, filtered.length)}
+    ${selectionToolbar("nap")}
+    <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:nap">
+      <table class="data-table">
+        ${renderColGroup("nap", columns, [32, 36])}
+        <thead>
+          <tr>${selectAllCheckboxHeader("nap", sorted, keyOf)}<th></th>${sortableHeaderRow("nap", columns)}</tr>
+          <tr class="filter-row"><th></th><th></th>${filterRowCells("nap", columns, rows)}</tr>
+        </thead>
+        <tbody>
+          ${sorted
+            .map((row) => {
+              const { ctx, p } = row;
+              return `
+            <tr>
+              ${rowCheckboxCell("nap", keyOf(row))}
+              <td title="${esc(p.ready ? "Ready" : p.status_reason || "Not ready")}">${statusDot(p.ready)}</td>
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter by this cluster" onclick="window.__app.setEnumFilter('nap','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
+              <td class="text-ink-primary">${esc(p.name)}</td>
+              <td>${esc(p.node_class) || "—"}</td>
+              <td>${esc(p.capacity_types) || "—"}</td>
+              <td class="tabular">${p.node_claims}</td>
+              <td class="tabular">${esc(p.cpu_limit) || "—"}</td>
+              <td class="tabular">${esc(p.memory_limit) || "—"}</td>
+              <td class="tabular">${p.weight}</td>
+              <td class="tabular">${formatAgeDetailed(p.age_days, p.age_seconds)}</td>
+            </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+      ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching node pools.</div>' : ""}
+    </div>`;
+}
+
+function renderKeda(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  const results = ctxs.map((ctx) => ({ ctx, result: state.keda.get(ctx) }));
+  const answered = results.filter((r) => r.result);
+  const notInstalled = answered.filter((r) => !r.result!.installed).map((r) => r.ctx);
+
+  type KedaRow = { ctx: string; s: KedaScaledObjectInfo };
+  const allRows: KedaRow[] = results.flatMap((r) => (r.result?.scaled_objects ?? []).map((s) => ({ ctx: r.ctx, s })));
+
+  if (allRows.length === 0 && !state.tabLoading) {
+    if (notInstalled.length > 0 && notInstalled.length === answered.length) {
+      return addonNotInstalledPanel("KEDA not enabled", "KEDA", "scaledobjects.keda.sh", ctxs.length > 1);
+    }
+    return `<div class="text-sm text-ink-muted">No KEDA scaled objects found.</div>`;
+  }
+
+  const rows = state.unhealthyOnly.keda ? allRows.filter((r) => !r.s.ready) : allRows;
+  const keyOf = (r: KedaRow) => `${r.ctx}:${r.s.namespace}:${r.s.kind}:${r.s.name}`;
+
+  const columns: ColumnDef<KedaRow>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: KedaRow) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.s.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.s.name, filter: "string" },
+    { key: "kind", label: "Kind", value: (r) => r.s.kind, filter: "enum" },
+    { key: "target", label: "Target", value: (r) => (r.s.target_name ? `${r.s.target_kind}/${r.s.target_name}` : r.s.target_kind), filter: "string" },
+    { key: "triggers", label: "Triggers", value: (r) => r.s.triggers, filter: "string" },
+    { key: "min", label: "Min", value: (r) => r.s.min_replicas, filter: "number" },
+    { key: "max", label: "Max", value: (r) => r.s.max_replicas, filter: "number" },
+    { key: "active", label: "Active", value: (r) => (r.s.active ? "Active" : "Idle"), filter: "enum" },
+    {
+      key: "age",
+      label: "Age",
+      value: (r) => r.s.age_days,
+      filter: "number",
+      copyText: (r) => formatAgeDetailed(r.s.age_days, r.s.age_seconds),
+      sortValue: (r) => r.s.age_seconds,
+    },
+  ];
+  const filtered = applyFilters("keda", rows, columns);
+  const sorted = sortRows("keda", filtered, columns);
+  recordTableSnapshot("keda", columns, sorted, keyOf, {
+    header: "Status",
+    text: (r) => (r.s.paused ? "Paused" : r.s.ready ? "Ready" : "Not ready"),
+  });
+
+  return `
+    ${addonPartialNotice("KEDA", notInstalled)}
+    <div class="mb-2 flex items-center justify-between">
+      <div class="text-xs text-ink-muted">${state.unhealthyOnly.keda ? `${rows.length} of ${allRows.length} not ready` : ""}</div>
+      ${unhealthyOnlyToggle("keda")}
+    </div>
+    ${filterSummary("keda", rows.length, filtered.length)}
+    ${selectionToolbar("keda")}
+    <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:keda">
+      <table class="data-table">
+        ${renderColGroup("keda", columns, [32, 36])}
+        <thead>
+          <tr>${selectAllCheckboxHeader("keda", sorted, keyOf)}<th></th>${sortableHeaderRow("keda", columns)}</tr>
+          <tr class="filter-row"><th></th><th></th>${filterRowCells("keda", columns, rows)}</tr>
+        </thead>
+        <tbody>
+          ${sorted
+            .map((row) => {
+              const { ctx, s: so } = row;
+              const status = so.paused ? "Paused" : so.ready ? "Ready" : "Not ready";
+              return `
+            <tr>
+              ${rowCheckboxCell("keda", keyOf(row))}
+              <td title="${esc(status)}">${statusDot(so.ready, so.paused)}</td>
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter by this cluster" onclick="window.__app.setEnumFilter('keda','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
+              <td><button type="button" title="Filter by this namespace" onclick="window.__app.setEnumFilter('keda','namespace',[${jsArg(so.namespace)}])" class="hover:text-series-blue hover:underline">${esc(so.namespace)}</button></td>
+              <td class="text-ink-primary">${esc(so.name)}</td>
+              <td>${esc(so.kind)}</td>
+              <td>${esc(so.target_name ? `${so.target_kind}/${so.target_name}` : so.target_kind)}</td>
+              <td class="max-w-md truncate" title="${esc(so.triggers)}">${esc(so.triggers) || "—"}</td>
+              <td class="tabular">${so.min_replicas}</td>
+              <td class="tabular">${so.max_replicas}</td>
+              <td><span class="${so.active ? "text-status-good" : "text-ink-muted"}">${so.active ? "Active" : "Idle"}</span></td>
+              <td class="tabular">${formatAgeDetailed(so.age_days, so.age_seconds)}</td>
+            </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+      ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching scaled objects.</div>' : ""}
+    </div>`;
 }
 
 function renderGitOps(): string {
