@@ -1470,6 +1470,220 @@ pub async fn get_gitops_apps(context_name: &str) -> Result<GitOpsResult, String>
     })
 }
 
+/// Reads a `status.conditions[]` entry by type, the shape both Karpenter and
+/// KEDA use. Returns (status == "True", reason).
+fn json_condition(status: Option<&serde_json::Value>, want: &str) -> (bool, String) {
+    let found = status
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.iter().find(|c| json_str(Some(c), "type") == want));
+    match found {
+        Some(c) => (json_str(Some(c), "status") == "True", json_str(Some(c), "reason").to_string()),
+        None => (false, String::new()),
+    }
+}
+
+fn json_i64(value: Option<&serde_json::Value>, key: &str) -> i64 {
+    value.and_then(|v| v.get(key)).and_then(|v| v.as_i64()).unwrap_or_default()
+}
+
+/// Karpenter promoted these CRDs from `v1beta1` to `v1` in Karpenter 1.0, and
+/// AKS clusters are on both depending on when NAP was enabled — so each list
+/// is attempted newest-first rather than pinning one version and reporting a
+/// perfectly healthy older cluster as "not installed".
+const KARPENTER_VERSIONS: &[&str] = &["v1", "v1beta1"];
+
+fn karpenter_resource(version: &str, kind: &str, plural: &str) -> ApiResource {
+    ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk("karpenter.sh", version, kind), plural)
+}
+
+/// Lists a Karpenter resource across its known API versions. `Ok(None)` means
+/// every version answered 404 — the CRD isn't registered, i.e. NAP is off.
+async fn list_karpenter(
+    client: &Client,
+    kind: &str,
+    plural: &str,
+) -> Result<Option<Vec<DynamicObject>>, String> {
+    for version in KARPENTER_VERSIONS {
+        let ar = karpenter_resource(version, kind, plural);
+        let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+        match api.list(&ListParams::default()).await {
+            Ok(list) => return Ok(Some(list.items)),
+            Err(kube::Error::Api(resp)) if resp.code == 404 => continue,
+            Err(e) => return Err(format!("Failed to list Karpenter {plural}: {e}")),
+        }
+    }
+    Ok(None)
+}
+
+/// A quantity-shaped field nested in `status`/`spec` JSON — `spec.limits.cpu`,
+/// `status.resources.memory`, etc. — read out as `&str`, since every one of
+/// these (including integer-looking counts like `status.resources.nodes` and
+/// `.pods`) is a `resource.Quantity` and therefore ALWAYS a JSON *string* on
+/// the wire, never a JSON number. `json_i64`'s `.as_i64()` looks like the
+/// obvious tool for `status.resources.nodes` but silently returns 0 for
+/// every pool against it, since `as_i64` only matches an actual JSON number.
+fn json_quantity<'a>(value: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    let s = json_str(value, key);
+    (!s.is_empty()).then_some(s)
+}
+
+fn dynamic_object_to_nap_node_pool(obj: DynamicObject) -> NapNodePoolInfo {
+    let spec = obj.data.get("spec");
+    let template_spec = spec.and_then(|s| s.get("template")).and_then(|t| t.get("spec"));
+    let limits = spec.and_then(|s| s.get("limits"));
+    let status = obj.data.get("status");
+    // Karpenter's own rollup of what this pool has actually provisioned —
+    // reconciled by the controller itself, so it's both the node count and
+    // the "used" side of the usage/limit columns without a second API call.
+    let resources = status.and_then(|s| s.get("resources"));
+
+    // Capacity type lives in the requirement list rather than a dedicated
+    // field, since Karpenter models it as just another node selector term.
+    let capacity_types = template_spec
+        .and_then(|t| t.get("requirements"))
+        .and_then(|r| r.as_array())
+        .map(|reqs| {
+            reqs.iter()
+                .filter(|r| json_str(Some(r), "key") == "karpenter.sh/capacity-type")
+                .filter_map(|r| r.get("values").and_then(|v| v.as_array()))
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+
+    let (ready, reason) = json_condition(status, "Ready");
+
+    NapNodePoolInfo {
+        name: obj.metadata.name.clone().unwrap_or_default(),
+        node_class: json_str(template_spec.and_then(|t| t.get("nodeClassRef")), "name").to_string(),
+        ready,
+        status_reason: if ready { String::new() } else { reason },
+        // Absent (a brand new pool with nothing provisioned yet) reads the
+        // same as explicit "0", so this stays a plain parse-or-zero rather
+        // than an Option.
+        nodes: json_quantity(resources, "nodes").and_then(|s| s.parse().ok()).unwrap_or(0),
+        cpu_used_millicores: json_quantity(resources, "cpu").map(parse_cpu_millicores).unwrap_or(0),
+        // Absent here means Karpenter enforces no cap at all, which reads
+        // very differently from a cap of zero — kept as `None` rather than
+        // collapsing both to 0.
+        cpu_limit_millicores: json_quantity(limits, "cpu").map(parse_cpu_millicores),
+        memory_used_ki: json_quantity(resources, "memory").map(parse_memory_ki).unwrap_or(0),
+        memory_limit_ki: json_quantity(limits, "memory").map(parse_memory_ki),
+        weight: json_i64(spec, "weight"),
+        capacity_types,
+        age_days: age_days(obj.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(obj.metadata.creation_timestamp.clone()),
+    }
+}
+
+pub async fn get_nap_node_pools(context_name: &str) -> Result<NapResult, String> {
+    let client = client_for_context(context_name).await?;
+
+    let Some(pools) = list_karpenter(&client, "NodePool", "nodepools").await? else {
+        return Ok(NapResult { installed: false, error: None, node_pools: Vec::new() });
+    };
+
+    // No separate NodeClaim list needed: status.resources on the NodePool
+    // itself already carries the node count (and the provisioned CPU/memory
+    // the usage/limit columns need), reconciled by Karpenter's own
+    // controller rather than re-derived here by matching labels.
+    Ok(NapResult {
+        installed: true,
+        error: None,
+        node_pools: pools.into_iter().map(dynamic_object_to_nap_node_pool).collect(),
+    })
+}
+
+fn keda_resource(kind: &str, plural: &str) -> ApiResource {
+    ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk("keda.sh", "v1alpha1", kind), plural)
+}
+
+fn dynamic_object_to_keda(obj: DynamicObject, kind: &str) -> KedaScaledObjectInfo {
+    let spec = obj.data.get("spec");
+    let status = obj.data.get("status");
+    let is_job = kind == "ScaledJob";
+
+    // ScaledJob templates a Job rather than pointing at an existing workload,
+    // so it has no scaleTargetRef kind/name to read.
+    let target = spec.and_then(|s| s.get("scaleTargetRef"));
+    let target_kind = if is_job {
+        "Job".to_string()
+    } else {
+        match json_str(target, "kind") {
+            "" => "Deployment".to_string(), // KEDA's documented default
+            k => k.to_string(),
+        }
+    };
+
+    let triggers = spec
+        .and_then(|s| s.get("triggers"))
+        .and_then(|t| t.as_array())
+        .map(|ts| ts.iter().map(|t| json_str(Some(t), "type")).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+
+    // Both kinds use the same field names for their replica bounds.
+    let (min_replicas, max_replicas) = (json_i64(spec, "minReplicaCount"), json_i64(spec, "maxReplicaCount"));
+
+    let (ready, _) = json_condition(status, "Ready");
+    let (active, _) = json_condition(status, "Active");
+    let (paused, _) = json_condition(status, "Paused");
+
+    KedaScaledObjectInfo {
+        namespace: obj.metadata.namespace.clone().unwrap_or_default(),
+        name: obj.metadata.name.clone().unwrap_or_default(),
+        kind: kind.to_string(),
+        target_kind,
+        target_name: if is_job { String::new() } else { json_str(target, "name").to_string() },
+        min_replicas,
+        max_replicas,
+        triggers,
+        ready,
+        active,
+        paused,
+        age_days: age_days(obj.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(obj.metadata.creation_timestamp.clone()),
+    }
+}
+
+pub async fn get_keda_scaled_objects(context_name: &str) -> Result<KedaResult, String> {
+    let client = client_for_context(context_name).await?;
+
+    // Both kinds are listed concurrently; ScaledJob is far rarer than
+    // ScaledObject, and a cluster can legitimately have the CRD for one and
+    // not the other, so each 404s independently.
+    let so_ar = keda_resource("ScaledObject", "scaledobjects");
+    let sj_ar = keda_resource("ScaledJob", "scaledjobs");
+    let so_api: Api<DynamicObject> = Api::all_with(client.clone(), &so_ar);
+    let sj_api: Api<DynamicObject> = Api::all_with(client.clone(), &sj_ar);
+    let lp = ListParams::default();
+    let (so, sj) = tokio::join!(so_api.list(&lp), sj_api.list(&lp));
+
+    let mut installed = false;
+    let mut out = Vec::new();
+
+    match so {
+        Ok(list) => {
+            installed = true;
+            out.extend(list.items.into_iter().map(|o| dynamic_object_to_keda(o, "ScaledObject")));
+        }
+        Err(kube::Error::Api(resp)) if resp.code == 404 => {}
+        Err(e) => return Err(format!("Failed to list KEDA scaled objects: {e}")),
+    }
+    match sj {
+        Ok(list) => {
+            installed = true;
+            out.extend(list.items.into_iter().map(|o| dynamic_object_to_keda(o, "ScaledJob")));
+        }
+        Err(kube::Error::Api(resp)) if resp.code == 404 => {}
+        Err(e) => return Err(format!("Failed to list KEDA scaled jobs: {e}")),
+    }
+
+    Ok(KedaResult { installed, error: None, scaled_objects: out })
+}
+
 pub async fn get_gitops_manifest(context_name: &str, namespace: &str, name: &str) -> Result<GitOpsAppManifest, String> {
     let client = client_for_context(context_name).await?;
     let ar = argocd_application_resource();
@@ -1504,6 +1718,156 @@ pub async fn get_gitops_events(context_name: &str, namespace: &str, name: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a `DynamicObject` from the JSON shape the API server actually
+    /// returns, so the parsers are exercised against real CRD layout rather
+    /// than hand-built structs that could drift from it.
+    fn dynamic(json: serde_json::Value) -> DynamicObject {
+        serde_json::from_value(json).expect("valid DynamicObject")
+    }
+
+    #[test]
+    fn nap_node_pool_reads_the_karpenter_v1_shape() {
+        // Every field under status.resources — including the integer-looking
+        // "nodes" and "cpu" — is a JSON STRING on the real API server, since
+        // all of them are resource.Quantity. Deliberately shaped as strings
+        // here (not JSON numbers) so this fixture would catch a regression
+        // back to `.as_i64()`-style number-only reads.
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "name": "general" },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "nodeClassRef": { "group": "karpenter.azure.com", "kind": "AKSNodeClass", "name": "default" },
+                        "requirements": [
+                            { "key": "kubernetes.io/arch", "operator": "In", "values": ["amd64"] },
+                            { "key": "karpenter.sh/capacity-type", "operator": "In", "values": ["on-demand", "spot"] }
+                        ]
+                    }
+                },
+                "limits": { "cpu": "500", "memory": "1392Gi" },
+                "weight": 10
+            },
+            "status": {
+                "conditions": [{ "type": "Ready", "status": "True" }],
+                "resources": { "cpu": "224", "memory": "469314727936", "nodes": "29", "pods": "3190" }
+            }
+        }));
+
+        let pool = dynamic_object_to_nap_node_pool(obj);
+        assert_eq!(pool.name, "general");
+        assert_eq!(pool.node_class, "default");
+        assert_eq!(pool.weight, 10);
+        assert!(pool.ready);
+        assert_eq!(pool.status_reason, "");
+        // Only the capacity-type requirement is surfaced, not every requirement.
+        assert_eq!(pool.capacity_types, "on-demand, spot");
+
+        // The subtle part: "nodes" parses as the string "29", not a JSON
+        // number 29 — this is what `json_i64` would have silently read as 0.
+        assert_eq!(pool.nodes, 29);
+        assert_eq!(pool.cpu_used_millicores, 224_000); // bare "224" = 224 whole cores
+        assert_eq!(pool.cpu_limit_millicores, Some(500_000));
+        // "469314727936" bytes, no suffix, same shape the real API server
+        // uses for a large exact value rather than a Gi-rounded one.
+        assert_eq!(pool.memory_used_ki, 469_314_727_936 / 1024);
+        assert_eq!(pool.memory_limit_ki, Some(1392 * 1024 * 1024));
+    }
+
+    #[test]
+    fn nap_node_pool_treats_absent_limit_as_unbounded_not_zero() {
+        // Karpenter treats a NodePool with no spec.limits as uncapped. That
+        // must come through as `None`, not as a limit of literal zero — the
+        // two render completely differently ("no limit" vs "0 allowed").
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "name": "unbounded" },
+            "spec": {},
+            "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
+        }));
+
+        let pool = dynamic_object_to_nap_node_pool(obj);
+        assert_eq!(pool.cpu_limit_millicores, None);
+        assert_eq!(pool.memory_limit_ki, None);
+        // Nothing provisioned yet reads as zero, not as absent — there's no
+        // "unbounded" reading for how much is currently in use.
+        assert_eq!(pool.nodes, 0);
+        assert_eq!(pool.cpu_used_millicores, 0);
+        assert_eq!(pool.memory_used_ki, 0);
+    }
+
+    #[test]
+    fn nap_node_pool_surfaces_why_it_is_not_ready() {
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "name": "gpu" },
+            "spec": {},
+            "status": { "conditions": [{ "type": "Ready", "status": "False", "reason": "NodeClassNotReady" }] }
+        }));
+
+        let pool = dynamic_object_to_nap_node_pool(obj);
+        assert!(!pool.ready);
+        assert_eq!(pool.status_reason, "NodeClassNotReady");
+        // A pool with no spec at all must not panic, just report empties.
+        assert_eq!(pool.node_class, "");
+        assert_eq!(pool.capacity_types, "");
+        assert_eq!(pool.weight, 0);
+    }
+
+    #[test]
+    fn keda_scaled_object_defaults_its_target_kind_to_deployment() {
+        // KEDA treats an omitted scaleTargetRef.kind as Deployment, so a
+        // ScaledObject that leaves it out must not render a blank target.
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "namespace": "prod", "name": "queue-worker" },
+            "spec": {
+                "scaleTargetRef": { "name": "worker" },
+                "minReplicaCount": 1,
+                "maxReplicaCount": 30,
+                "triggers": [{ "type": "azure-servicebus" }, { "type": "cron" }]
+            },
+            "status": { "conditions": [
+                { "type": "Ready", "status": "True" },
+                { "type": "Active", "status": "False" }
+            ]}
+        }));
+
+        let so = dynamic_object_to_keda(obj, "ScaledObject");
+        assert_eq!(so.namespace, "prod");
+        assert_eq!(so.name, "queue-worker");
+        assert_eq!(so.kind, "ScaledObject");
+        assert_eq!(so.target_kind, "Deployment");
+        assert_eq!(so.target_name, "worker");
+        assert_eq!(so.min_replicas, 1);
+        assert_eq!(so.max_replicas, 30);
+        assert_eq!(so.triggers, "azure-servicebus, cron");
+        // Ready and Active are independent: wired up, but nothing firing.
+        assert!(so.ready);
+        assert!(!so.active);
+        assert!(!so.paused);
+    }
+
+    #[test]
+    fn keda_scaled_job_reports_a_job_target_rather_than_a_workload() {
+        // A ScaledJob templates its own Job, so there's no scaleTargetRef to
+        // read — it must not fall through to the Deployment default.
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "namespace": "batch", "name": "importer" },
+            "spec": {
+                "jobTargetRef": { "template": {} },
+                "maxReplicaCount": 5,
+                "triggers": [{ "type": "azure-queue" }]
+            },
+            "status": { "conditions": [{ "type": "Paused", "status": "True" }] }
+        }));
+
+        let sj = dynamic_object_to_keda(obj, "ScaledJob");
+        assert_eq!(sj.kind, "ScaledJob");
+        assert_eq!(sj.target_kind, "Job");
+        assert_eq!(sj.target_name, "");
+        assert_eq!(sj.max_replicas, 5);
+        assert_eq!(sj.triggers, "azure-queue");
+        assert!(sj.paused);
+        assert!(!sj.ready);
+    }
 
     #[test]
     fn split_log_timestamp_separates_kubelet_prefixed_lines() {

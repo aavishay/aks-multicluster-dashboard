@@ -132,6 +132,8 @@ pub fn run() {
             commands::get_workload_metrics_over_time,
             commands::get_helm_releases,
             commands::get_helm_release_detail,
+            commands::get_nap_node_pools,
+            commands::get_keda_scaled_objects,
             commands::get_gitops_apps,
             commands::get_gitops_manifest,
             commands::get_gitops_events,
