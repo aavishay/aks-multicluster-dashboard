@@ -59,6 +59,12 @@ export interface PodInfo {
   status_reason: string | null;
 }
 
+/** One page of a paginated pods fetch. `remaining` is the API server's own estimate of items not yet returned — null on the last page, and explicitly documented as an estimate, so use it for display only, never to decide whether a fetch is complete. */
+export interface PodPage {
+  pods: PodInfo[];
+  remaining: number | null;
+}
+
 export interface PodManifest {
   containers: string[];
   yaml_full: string;
