@@ -210,6 +210,8 @@ function toggleSidebar() {
 
 const PAGE_SIZE_STORAGE_KEY = "aks-dashboard-page-size";
 const PAGE_SIZE_OPTIONS = [50, 100, 200];
+/** Derived rather than assuming `PAGE_SIZE_OPTIONS[0]`, so reordering the options for display can't silently move the visibility threshold. */
+const MIN_PAGE_SIZE = Math.min(...PAGE_SIZE_OPTIONS);
 const DEFAULT_PAGE_SIZE = 100;
 
 function getInitialPageSize(): number {
@@ -229,7 +231,14 @@ function setPageSize(size: number) {
   render();
 }
 
-/** Total pages for `total` rows at the current page size; always at least 1 so an empty table reads as "page 1 of 1". */
+/**
+ * Total pages for `total` rows at the current page size.
+ *
+ * Floored at 1 so an empty table can't report 0 pages, which would clamp
+ * `currentPage` to 0 and hand `pageSlice` a negative start offset. Nothing
+ * renders it at that size — the control hides at or below `MIN_PAGE_SIZE` —
+ * but the arithmetic still has to hold for callers that slice regardless.
+ */
 function pageCount(total: number): number {
   return Math.max(1, Math.ceil(total / state.pageSize));
 }
@@ -262,7 +271,7 @@ function pageSlice<T>(tab: TabId, rows: T[]): T[] {
  * paginated at any available setting, so the control would be dead chrome.
  */
 function renderPagination(tab: TabId, total: number): string {
-  if (total <= PAGE_SIZE_OPTIONS[0]) return "";
+  if (total <= MIN_PAGE_SIZE) return "";
   const pages = pageCount(total);
   const page = currentPage(tab, total);
   const first = total === 0 ? 0 : (page - 1) * state.pageSize + 1;
