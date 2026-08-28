@@ -227,9 +227,13 @@ export interface NapNodePoolInfo {
   node_class: string;
   ready: boolean;
   status_reason: string;
-  node_claims: number;
-  cpu_limit: string;
-  memory_limit: string;
+  /** From the pool's own `status.resources.nodes` — how many nodes it has actually provisioned. */
+  nodes: number;
+  cpu_used_millicores: number;
+  /** `null` means Karpenter enforces no cap at all — distinct from a cap of zero. */
+  cpu_limit_millicores: number | null;
+  memory_used_ki: number;
+  memory_limit_ki: number | null;
   weight: number;
   capacity_types: string;
   age_days: number;
