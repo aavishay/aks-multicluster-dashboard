@@ -199,6 +199,115 @@ function toggleSidebar() {
 }
 
 // ---------------------------------------------------------------------------
+// Table pagination
+//
+// Display-only, deliberately: `recordTableSnapshot` keeps recording the whole
+// filtered set, so "select all" and "Copy to clipboard" still cover every
+// matching row and not just the visible page. Paging that too would quietly
+// cap an export at the page size, which is the opposite of what the tables
+// are for.
+// ---------------------------------------------------------------------------
+
+const PAGE_SIZE_STORAGE_KEY = "aks-dashboard-page-size";
+const PAGE_SIZE_OPTIONS = [50, 100, 200];
+/** Derived rather than assuming `PAGE_SIZE_OPTIONS[0]`, so reordering the options for display can't silently move the visibility threshold. */
+const MIN_PAGE_SIZE = Math.min(...PAGE_SIZE_OPTIONS);
+const DEFAULT_PAGE_SIZE = 100;
+
+function getInitialPageSize(): number {
+  const stored = Number(localStorage.getItem(PAGE_SIZE_STORAGE_KEY));
+  // Anything unrecognised (an older build's value, a hand-edited entry) falls
+  // back rather than leaving a table stuck on a size the picker can't show.
+  return PAGE_SIZE_OPTIONS.includes(stored) ? stored : DEFAULT_PAGE_SIZE;
+}
+
+function setPageSize(size: number) {
+  if (!PAGE_SIZE_OPTIONS.includes(size)) return;
+  state.pageSize = size;
+  localStorage.setItem(PAGE_SIZE_STORAGE_KEY, String(size));
+  // Page 3 of 50 and page 3 of 200 point at completely different rows, so
+  // every table restarts rather than jumping somewhere arbitrary.
+  state.tablePage = {};
+  render();
+}
+
+/**
+ * Total pages for `total` rows at the current page size.
+ *
+ * Floored at 1 so an empty table can't report 0 pages, which would clamp
+ * `currentPage` to 0 and hand `pageSlice` a negative start offset. Nothing
+ * renders it at that size — the control hides at or below `MIN_PAGE_SIZE` —
+ * but the arithmetic still has to hold for callers that slice regardless.
+ */
+function pageCount(total: number): number {
+  return Math.max(1, Math.ceil(total / state.pageSize));
+}
+
+/** The stored page clamped into range for `total` rows — a filter that shrinks the table can leave it past the end. Pure: never writes state mid-render. */
+function currentPage(tab: TabId, total: number): number {
+  return Math.min(Math.max(1, state.tablePage[tab] ?? 1), pageCount(total));
+}
+
+function setTablePage(tab: TabId, page: number) {
+  state.tablePage[tab] = Math.max(1, page);
+  render();
+}
+
+/** Back to page 1, for when the row set changes under the reader (a filter edit, say) and holding the old page would land them somewhere unrelated. */
+function resetTablePage(tab: TabId) {
+  delete state.tablePage[tab];
+}
+
+/** The slice of `rows` belonging to this tab's current page. */
+function pageSlice<T>(tab: TabId, rows: T[]): T[] {
+  const start = (currentPage(tab, rows.length) - 1) * state.pageSize;
+  return rows.slice(start, start + state.pageSize);
+}
+
+/**
+ * The page-size picker plus range readout and prev/next.
+ *
+ * Hidden entirely below the smallest page size: a table of 12 nodes can't be
+ * paginated at any available setting, so the control would be dead chrome.
+ */
+function renderPagination(tab: TabId, total: number): string {
+  if (total <= MIN_PAGE_SIZE) return "";
+  const pages = pageCount(total);
+  const page = currentPage(tab, total);
+  const first = total === 0 ? 0 : (page - 1) * state.pageSize + 1;
+  const last = Math.min(total, page * state.pageSize);
+
+  const options = PAGE_SIZE_OPTIONS.map(
+    (n) => `<option value="${n}" ${state.pageSize === n ? "selected" : ""}>${n} per page</option>`,
+  ).join("");
+
+  const step = (label: string, target: number, disabled: boolean, title: string) =>
+    `<button type="button" title="${esc(title)}" ${disabled ? "disabled" : ""}
+       onclick="window.__app.setTablePage('${tab}', ${target})"
+       class="rounded border border-gridline px-2 py-1 ${
+         disabled ? "cursor-default text-ink-muted opacity-40" : "text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+       }">${label}</button>`;
+
+  return `
+    <div class="mt-2 flex items-center justify-between text-xs text-ink-muted">
+      <span class="tabular">${first}–${last} of ${total}</span>
+      <span class="flex items-center gap-2">
+        ${
+          pages > 1
+            ? `${step("‹", page - 1, page <= 1, "Previous page")}
+               <span class="tabular">Page ${page} of ${pages}</span>
+               ${step("›", page + 1, page >= pages, "Next page")}`
+            : ""
+        }
+        <select onchange="window.__app.setPageSize(Number(this.value))"
+                class="rounded border border-gridline bg-surface-2 px-1.5 py-1 text-xs text-ink-primary outline-none focus:border-series-blue">
+          ${options}
+        </select>
+      </span>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
@@ -422,6 +531,15 @@ interface AppState {
   columnWidths: Partial<Record<TabId, Record<string, number>>>;
   /** Row keys checked for clipboard copy, per tab. */
   selectedRows: Partial<Record<TabId, Set<string>>>;
+  /** How many rows each table shows at once. One global preference rather than per-tab, persisted across launches. */
+  pageSize: number;
+  /**
+   * Current page per table, 1-based. Not persisted: a page number is only
+   * meaningful against a particular row set, and both the data and the
+   * filters are gone by the next launch. Absent means page 1, and readers
+   * clamp it into range rather than writing back during a render.
+   */
+  tablePage: Partial<Record<TabId, number>>;
   /** When true for a tab, only unhealthy rows (the red status dot) are shown — nodes/pods/workloads. */
   unhealthyOnly: Partial<Record<TabId, boolean>>;
   /** Transient "Copied N rows" / "Copy failed" message, cleared after a couple seconds. */
@@ -480,6 +598,8 @@ const state: AppState = {
   openEnumFilter: null,
   columnWidths: {},
   selectedRows: {},
+  pageSize: getInitialPageSize(),
+  tablePage: {},
   unhealthyOnly: {},
   copyToast: null,
   tabError: null,
@@ -944,6 +1064,7 @@ async function copySelectedRows(tab: TabId) {
 
 function toggleUnhealthyOnly(tab: TabId) {
   state.unhealthyOnly[tab] = !state.unhealthyOnly[tab];
+  resetTablePage(tab);
   render();
 }
 
@@ -1006,6 +1127,7 @@ function hasActiveFilters(tab: TabId): boolean {
 
 function setStringFilter(tab: TabId, key: string, text: string) {
   tabFilters(tab)[key] = { ...tabFilters(tab)[key], text: text || undefined };
+  resetTablePage(tab);
   render();
 }
 
@@ -1016,11 +1138,13 @@ function setNumberFilter(tab: TabId, key: string, bound: "min" | "max", raw: str
   // back into the input's rendered value as the literal text "NaN".
   const value = raw !== "" && Number.isFinite(parsed) ? parsed : undefined;
   tabFilters(tab)[key] = { ...tabFilters(tab)[key], [bound]: value };
+  resetTablePage(tab);
   render();
 }
 
 function setEnumFilter(tab: TabId, key: string, values: string[]) {
   tabFilters(tab)[key] = { ...tabFilters(tab)[key], enumValues: values.length > 0 ? new Set(values) : undefined };
+  resetTablePage(tab);
   render();
 }
 
@@ -1044,6 +1168,7 @@ function closeEnumDropdown() {
 
 function clearFilters(tab: TabId) {
   state.filterState[tab] = {};
+  resetTablePage(tab);
   render();
 }
 
@@ -2700,6 +2825,8 @@ function setMetricsRange(minutes: number) {
 }
 
 (window as any).__app = {
+  setPageSize,
+  setTablePage,
   setClusterFilter,
   toggleCluster,
   selectAllClusters,
@@ -3726,6 +3853,7 @@ function renderNodes(): string {
     header: "Status",
     text: (r) => (r.n.ready ? "Ready" : "Not ready"),
   });
+  const paged = pageSlice("nodes", sorted);
 
   return `
     <div class="mb-2 flex items-center justify-between">
@@ -3742,7 +3870,7 @@ function renderNodes(): string {
           <tr class="filter-row"><th></th><th></th>${filterRowCells("nodes", columns, rows)}</tr>
         </thead>
         <tbody>
-          ${sorted
+          ${paged
             .map(
               (row) => {
                 const { ctx, n } = row;
@@ -3798,7 +3926,8 @@ function renderNodes(): string {
         </tbody>
       </table>
       ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching nodes.</div>' : ""}
-    </div>`;
+    </div>
+    ${renderPagination("nodes", sorted.length)}`;
 }
 
 function renderWorkloads(): string {
@@ -3842,6 +3971,7 @@ function renderWorkloads(): string {
     header: "Status",
     text: (r) => (r.w.healthy ? "Healthy" : "Unhealthy"),
   });
+  const paged = pageSlice("workloads", sorted);
 
   return `
     <div class="mb-2 flex items-center justify-between">
@@ -3858,7 +3988,7 @@ function renderWorkloads(): string {
           <tr class="filter-row"><th></th><th></th>${filterRowCells("workloads", columns, rows)}</tr>
         </thead>
         <tbody>
-          ${sorted
+          ${paged
             .map(
               (row) => {
                 const { ctx, w } = row;
@@ -3917,7 +4047,8 @@ function renderWorkloads(): string {
         </tbody>
       </table>
       ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching workloads.</div>' : ""}
-    </div>`;
+    </div>
+    ${renderPagination("workloads", sorted.length)}`;
 }
 
 /**
@@ -3983,6 +4114,7 @@ function renderPods(): string {
     header: "Phase",
     text: (r) => r.p.phase,
   });
+  const paged = pageSlice("pods", sorted);
 
   return `
     <div class="mb-2 flex items-center justify-between">
@@ -3999,7 +4131,7 @@ function renderPods(): string {
           <tr class="filter-row"><th></th><th></th>${filterRowCells("pods", columns, rows)}</tr>
         </thead>
         <tbody>
-          ${sorted
+          ${paged
             .map((row) => {
               const { ctx, p } = row;
               return `
@@ -4065,7 +4197,8 @@ function renderPods(): string {
         </tbody>
       </table>
       ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching pods.</div>' : ""}
-    </div>`;
+    </div>
+    ${renderPagination("pods", sorted.length)}`;
 }
 
 function usageBar(pct: number): string {
@@ -6078,6 +6211,7 @@ function renderEvents(): string {
   const filtered = applyFilters("events", rows, columns);
   const sorted = sortRows("events", filtered, columns);
   recordTableSnapshot("events", columns, sorted, keyOf);
+  const paged = pageSlice("events", sorted);
 
   return `
     <div class="mb-3 flex items-center justify-between">
@@ -6097,7 +6231,7 @@ function renderEvents(): string {
           <tr class="filter-row"><th></th>${filterRowCells("events", columns, rows)}</tr>
         </thead>
         <tbody>
-          ${sorted
+          ${paged
             .map(
               (row) => {
                 const { ctx, e } = row;
@@ -6137,7 +6271,8 @@ function renderEvents(): string {
         </tbody>
       </table>
       ${filtered.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching events.</div>' : ""}
-    </div>`;
+    </div>
+    ${renderPagination("events", sorted.length)}`;
 }
 
 function gitOpsAppHealthy(a: GitOpsAppInfo): boolean {
@@ -6195,6 +6330,7 @@ function renderGitOps(): string {
     header: "Status",
     text: (r) => (gitOpsAppHealthy(r.a) ? "Healthy" : `${r.a.sync_status}/${r.a.health_status}`),
   });
+  const paged = pageSlice("gitops", sorted);
 
   const notice =
     notInstalled.length > 0
@@ -6217,7 +6353,7 @@ function renderGitOps(): string {
           <tr class="filter-row"><th></th><th></th>${filterRowCells("gitops", columns, rows)}</tr>
         </thead>
         <tbody>
-          ${sorted
+          ${paged
             .map((row) => {
               const { ctx, a } = row;
               return `
@@ -6251,7 +6387,8 @@ function renderGitOps(): string {
         </tbody>
       </table>
       ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching applications.</div>' : ""}
-    </div>`;
+    </div>
+    ${renderPagination("gitops", sorted.length)}`;
 }
 
 /** `deployed` is Helm's own success status; everything else (failed, pending-*, superseded, unknown) is worth flagging. */
@@ -6311,6 +6448,7 @@ function renderHelm(): string {
     header: "Health",
     text: (row) => (helmReleaseHealthy(row.r) ? "Healthy" : row.r.status),
   });
+  const paged = pageSlice("helm", sorted);
 
   return `
     <div class="mb-2 flex items-center justify-between">
@@ -6327,7 +6465,7 @@ function renderHelm(): string {
           <tr class="filter-row"><th></th><th></th>${filterRowCells("helm", columns, rows)}</tr>
         </thead>
         <tbody>
-          ${sorted
+          ${paged
             .map((row) => {
               const { ctx, r } = row;
               return `
@@ -6366,7 +6504,8 @@ function renderHelm(): string {
         </tbody>
       </table>
       ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching releases.</div>' : ""}
-    </div>`;
+    </div>
+    ${renderPagination("helm", sorted.length)}`;
 }
 
 // ---------------------------------------------------------------------------
