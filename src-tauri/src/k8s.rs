@@ -1435,6 +1435,13 @@ fn dynamic_object_to_gitops_app(obj: DynamicObject) -> GitOpsAppInfo {
         s => s.to_string(),
     };
 
+    let operation_state = status.and_then(|s| s.get("operationState"));
+    // A sync currently in flight has startedAt but no finishedAt yet, so
+    // fall back to that rather than showing nothing while one is running.
+    let last_synced_at = json_str_opt(operation_state, "finishedAt")
+        .or_else(|| json_str_opt(operation_state, "startedAt"))
+        .map(str::to_string);
+
     GitOpsAppInfo {
         namespace,
         destination_namespace: json_str(spec.and_then(|s| s.get("destination")), "namespace").to_string(),
@@ -1444,6 +1451,7 @@ fn dynamic_object_to_gitops_app(obj: DynamicObject) -> GitOpsAppInfo {
         path,
         target_revision: json_str(source, "targetRevision").to_string(),
         revision: revision.get(..revision.len().min(7)).unwrap_or_default().to_string(),
+        last_synced_at,
         age_days: age_days(obj.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(obj.metadata.creation_timestamp.clone()),
         name,
@@ -1516,14 +1524,18 @@ async fn list_karpenter(
     Ok(None)
 }
 
-/// A quantity-shaped field nested in `status`/`spec` JSON — `spec.limits.cpu`,
-/// `status.resources.memory`, etc. — read out as `&str`, since every one of
-/// these (including integer-looking counts like `status.resources.nodes` and
-/// `.pods`) is a `resource.Quantity` and therefore ALWAYS a JSON *string* on
-/// the wire, never a JSON number. `json_i64`'s `.as_i64()` looks like the
-/// obvious tool for `status.resources.nodes` but silently returns 0 for
-/// every pool against it, since `as_i64` only matches an actual JSON number.
-fn json_quantity<'a>(value: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+/// `json_str`, but `None` rather than `""` for a missing/empty field —
+/// for a caller that needs to tell "absent" apart from "empty" (an `Option`
+/// output, or `unwrap_or` with a non-empty-string default).
+///
+/// Doubles as the fix for a real gotcha with Kubernetes `resource.Quantity`
+/// fields specifically (`spec.limits.cpu`, `status.resources.memory`, and
+/// even integer-looking counts like `status.resources.nodes`/`.pods`): every
+/// one of them is ALWAYS a JSON *string* on the wire, never a JSON number.
+/// `json_i64`'s `.as_i64()` looks like the obvious tool for
+/// `status.resources.nodes` but silently returns 0 for every pool against
+/// it, since `as_i64` only matches an actual JSON number.
+fn json_str_opt<'a>(value: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
     let s = json_str(value, key);
     (!s.is_empty()).then_some(s)
 }
@@ -1564,14 +1576,14 @@ fn dynamic_object_to_nap_node_pool(obj: DynamicObject) -> NapNodePoolInfo {
         // Absent (a brand new pool with nothing provisioned yet) reads the
         // same as explicit "0", so this stays a plain parse-or-zero rather
         // than an Option.
-        nodes: json_quantity(resources, "nodes").and_then(|s| s.parse().ok()).unwrap_or(0),
-        cpu_used_millicores: json_quantity(resources, "cpu").map(parse_cpu_millicores).unwrap_or(0),
+        nodes: json_str_opt(resources, "nodes").and_then(|s| s.parse().ok()).unwrap_or(0),
+        cpu_used_millicores: json_str_opt(resources, "cpu").map(parse_cpu_millicores).unwrap_or(0),
         // Absent here means Karpenter enforces no cap at all, which reads
         // very differently from a cap of zero — kept as `None` rather than
         // collapsing both to 0.
-        cpu_limit_millicores: json_quantity(limits, "cpu").map(parse_cpu_millicores),
-        memory_used_ki: json_quantity(resources, "memory").map(parse_memory_ki).unwrap_or(0),
-        memory_limit_ki: json_quantity(limits, "memory").map(parse_memory_ki),
+        cpu_limit_millicores: json_str_opt(limits, "cpu").map(parse_cpu_millicores),
+        memory_used_ki: json_str_opt(resources, "memory").map(parse_memory_ki).unwrap_or(0),
+        memory_limit_ki: json_str_opt(limits, "memory").map(parse_memory_ki),
         weight: json_i64(spec, "weight"),
         capacity_types,
         age_days: age_days(obj.metadata.creation_timestamp.clone()),
@@ -1724,6 +1736,56 @@ mod tests {
     /// than hand-built structs that could drift from it.
     fn dynamic(json: serde_json::Value) -> DynamicObject {
         serde_json::from_value(json).expect("valid DynamicObject")
+    }
+
+    #[test]
+    fn gitops_app_reads_last_synced_from_operation_state_finished_at() {
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "namespace": "argocd", "name": "aks-nodepool-exporter" },
+            "spec": { "source": { "repoURL": "https://example/repo.git", "path": "chart" } },
+            "status": {
+                "sync": { "status": "Synced" },
+                "health": { "status": "Healthy" },
+                "reconciledAt": "2026-08-30T07:32:58Z",
+                "operationState": {
+                    "phase": "Succeeded",
+                    "startedAt": "2026-08-26T07:54:55Z",
+                    "finishedAt": "2026-08-26T07:55:00Z"
+                }
+            }
+        }));
+
+        let app = dynamic_object_to_gitops_app(obj);
+        // finishedAt, not the much-more-recent reconciledAt — reconciledAt
+        // advances on every diff pass regardless of whether a sync happened,
+        // so using it would make a genuinely-stale app read as just-synced.
+        assert_eq!(app.last_synced_at, Some("2026-08-26T07:55:00Z".to_string()));
+    }
+
+    #[test]
+    fn gitops_app_falls_back_to_started_at_for_a_sync_still_running() {
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "namespace": "argocd", "name": "in-flight" },
+            "spec": {},
+            "status": {
+                "operationState": { "phase": "Running", "startedAt": "2026-08-30T09:00:00Z" }
+            }
+        }));
+
+        let app = dynamic_object_to_gitops_app(obj);
+        assert_eq!(app.last_synced_at, Some("2026-08-30T09:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn gitops_app_never_synced_reports_none_not_empty_string() {
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "namespace": "argocd", "name": "never-synced" },
+            "spec": {},
+            "status": {}
+        }));
+
+        let app = dynamic_object_to_gitops_app(obj);
+        assert_eq!(app.last_synced_at, None);
     }
 
     #[test]
