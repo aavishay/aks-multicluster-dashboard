@@ -228,6 +228,13 @@ pub struct GitOpsAppInfo {
     pub path: String,
     pub target_revision: String,
     pub revision: String,
+    /// `status.operationState.finishedAt`, falling back to `.startedAt` for a
+    /// sync still in progress. Deliberately not `status.reconciledAt`: that
+    /// timestamp advances on every diff/comparison pass ArgoCD runs (every
+    /// few minutes, regardless of whether anything was actually synced), so
+    /// it would read as "a few minutes ago" for nearly every app and make
+    /// this column useless for spotting one that's gone stale.
+    pub last_synced_at: Option<String>,
     pub age_days: i64,
     pub age_seconds: i64,
 }

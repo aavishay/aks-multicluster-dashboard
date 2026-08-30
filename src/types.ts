@@ -162,6 +162,8 @@ export interface GitOpsAppInfo {
   path: string;
   target_revision: string;
   revision: string;
+  /** When the last sync operation completed (or started, if one is still running). Not ArgoCD's `reconciledAt` — that advances on every diff pass regardless of whether a sync happened, so it can't tell a fresh app from a stale one. */
+  last_synced_at: string | null;
   age_days: number;
   age_seconds: number;
 }
