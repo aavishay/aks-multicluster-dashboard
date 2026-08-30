@@ -6646,7 +6646,7 @@ function renderGitOps(): string {
               </td>
               <td>${esc(a.destination_namespace)}</td>
               <td class="${a.sync_status === "Synced" ? "" : "text-status-warning"}" title="${esc(a.last_synced_at ?? "")}">
-                ${esc(a.sync_status)}${a.last_synced_at ? ` <span class="text-ink-muted">· ${relativeTime(a.last_synced_at)}</span>` : ""}
+                ${esc(a.sync_status)}${a.last_synced_at ? ` <span class="tabular text-ink-muted">· ${relativeTime(a.last_synced_at)}</span>` : ""}
               </td>
               <td class="${a.health_status === "Healthy" ? "" : a.health_status === "Degraded" ? "text-status-critical" : "text-status-warning"}">${esc(a.health_status)}</td>
               <td class="max-w-xs truncate" title="${esc(a.repo_url)}">${esc(a.repo_url)}</td>
