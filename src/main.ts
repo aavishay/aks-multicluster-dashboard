@@ -489,6 +489,8 @@ interface AppState {
   /** Substring filter over the sidebar's cluster list (context/cluster name); purely a display filter, doesn't affect selection. */
   clusterFilter: string;
   selectedContexts: Set<string>;
+  /** Contexts currently retrying a failed connection via the sidebar's Reconnect button. */
+  reconnecting: Set<string>;
   /** Cmd+K cluster quick-switcher; null when closed. Toggling a cluster doesn't close it, so several can be picked in one go. */
   clusterPalette: { query: string; highlightedIndex: number } | null;
   activeTab: TabId;
@@ -551,6 +553,15 @@ interface AppState {
   /** Transient "Copied N rows" / "Copy failed" message, cleared after a couple seconds. */
   copyToast: string | null;
   tabError: string | null;
+  /**
+   * Source of truth behind `tabError`, one entry per context that failed the
+   * current active tab's last fetch attempt. Reconnecting a single cluster
+   * needs to update just that context's line without disturbing any other
+   * selected cluster's still-valid error — a plain joined string can't do
+   * that once it's been concatenated, so this stays structured and
+   * `recomputeTabError` derives the display string from it.
+   */
+  tabErrorsByContext: Map<string, string>;
   tabLoading: boolean;
   /** Which of the selected clusters' fetches haven't settled yet for the tab currently loading, shrinking as each one resolves. */
   tabLoadProgress: { total: number; pending: Set<string> } | null;
@@ -575,6 +586,7 @@ const state: AppState = {
   clusters: [],
   clusterFilter: "",
   selectedContexts: new Set(),
+  reconnecting: new Set(),
   clusterPalette: null,
   activeTab: "overview",
   overviews: new Map(),
@@ -611,6 +623,7 @@ const state: AppState = {
   unhealthyOnly: {},
   copyToast: null,
   tabError: null,
+  tabErrorsByContext: new Map(),
   tabLoading: false,
   tabLoadProgress: null,
   tabLoadStartedAt: null,
@@ -1520,6 +1533,61 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
   }
 }
 
+/**
+ * Rebuilds `state.tabError` (the string the error banner actually renders)
+ * from `state.tabErrorsByContext`. A single failing cluster is shown bare
+ * when it's the only one selected, since there's nothing to disambiguate;
+ * with more than one selected, every line is prefixed with its context even
+ * if only one of them currently has an error, so it's clear which cluster it
+ * is without having to cross-reference the sidebar.
+ */
+function recomputeTabError() {
+  if (state.tabErrorsByContext.size === 0) {
+    state.tabError = null;
+    return;
+  }
+  const multi = state.selectedContexts.size > 1;
+  state.tabError = [...state.tabErrorsByContext.entries()].map(([ctx, msg]) => (multi ? `${ctx}: ${msg}` : msg)).join("\n");
+}
+
+/**
+ * Retries one cluster's connection from the sidebar's Reconnect button,
+ * without disturbing any other selected cluster's already-good data — unlike
+ * `loadTabData()`, which re-fetches the whole current selection.
+ *
+ * Refreshes the overview (so the sidebar dot/badge updates) and, if some
+ * other tab is active, that tab's data for this context too — reconnecting
+ * should mean "this cluster's data comes back", not just "the dot turns
+ * green while the table stays empty until the next auto-refresh".
+ */
+async function reconnectCluster(contextName: string) {
+  if (state.reconnecting.has(contextName)) return;
+  state.reconnecting.add(contextName);
+  render();
+
+  try {
+    state.overviews.set(contextName, await api.getOverview(contextName));
+  } catch {
+    // get_cluster_overview reports a failure in-band (reachable: false)
+    // rather than rejecting; a rejection here means the IPC call itself
+    // failed, which leaves the previous overview in place — still better
+    // than discarding a last-known-good status over a one-off glitch.
+  }
+
+  if (state.activeTab !== "overview") {
+    try {
+      await fetchTabDataForContext(state.activeTab, contextName);
+      state.tabErrorsByContext.delete(contextName);
+    } catch (e) {
+      state.tabErrorsByContext.set(contextName, String(e));
+    }
+    recomputeTabError();
+  }
+
+  state.reconnecting.delete(contextName);
+  render();
+}
+
 async function loadTabData() {
   const ctxs = selectedContextsList();
   const gen = ++requestGeneration;
@@ -1531,19 +1599,19 @@ async function loadTabData() {
     return;
   }
   state.tabLoading = true;
+  state.tabErrorsByContext.clear();
   state.tabError = null;
   state.tabLoadProgress = { total: ctxs.length, pending: new Set(ctxs) };
   state.tabLoadStartedAt = Date.now();
   startLoadingTicker();
   render();
 
-  const errors: string[] = [];
-
   const fetchOne = async (ctx: string) => {
     try {
       await fetchTabDataForContext(state.activeTab, ctx);
+      state.tabErrorsByContext.delete(ctx);
     } catch (e) {
-      errors.push(ctxs.length > 1 ? `${ctx}: ${e}` : String(e));
+      state.tabErrorsByContext.set(ctx, String(e));
     } finally {
       // Reflects real per-cluster completion (not a simulated/animated
       // fill), so it stays honest even when one cluster is much slower
@@ -1559,7 +1627,7 @@ async function loadTabData() {
   await Promise.all(ctxs.map(fetchOne));
 
   if (gen !== requestGeneration) return;
-  state.tabError = errors.length > 0 ? errors.join("\n") : null;
+  recomputeTabError();
   state.lastUpdated = new Date();
   state.tabLoading = false;
   state.tabLoadProgress = null;
@@ -2849,6 +2917,7 @@ function setMetricsRange(minutes: number) {
   setTablePage,
   setClusterFilter,
   toggleCluster,
+  reconnectCluster,
   selectAllClusters,
   clearClusterSelection,
   openClusterPalette,
@@ -3195,14 +3264,21 @@ function renderSidebar(): string {
     .map((c) => {
       const checked = state.selectedContexts.has(c.context_name);
       const ov = checked ? state.overviews.get(c.context_name) : undefined;
+      const reconnecting = state.reconnecting.has(c.context_name);
       const dot = ov ? statusDot(ov.reachable && ov.nodes_ready === ov.node_count) : statusDot(false, true);
       const statusText = !checked
         ? "not connected"
-        : ov
-          ? ov.reachable
-            ? `${ov.nodes_ready}/${ov.node_count} nodes ready`
-            : "unreachable"
-          : "checking…";
+        : reconnecting
+          ? "reconnecting…"
+          : ov
+            ? ov.reachable
+              ? `${ov.nodes_ready}/${ov.node_count} nodes ready`
+              : "unreachable"
+            : "checking…";
+      // Only once a fetch has actually come back unreachable — not while
+      // still "checking…" on a first load, which looks the same as
+      // "unreachable" for an instant but isn't something to retry yet.
+      const showReconnect = checked && !reconnecting && ov && !ov.reachable;
       return `
         <label
           class="flex w-full cursor-pointer items-start gap-2 rounded-md px-3 py-2 text-left transition-colors ${
@@ -3220,7 +3296,19 @@ function renderSidebar(): string {
               ${dot}
               <span class="truncate">${esc(c.context_name)}</span>
             </span>
-            <span class="ml-4 truncate text-xs text-ink-muted">${statusText}</span>
+            <span class="ml-4 flex min-w-0 items-center gap-1.5 text-xs text-ink-muted">
+              <span class="min-w-0 truncate">${statusText}</span>
+              ${
+                showReconnect
+                  ? `<button
+                       type="button"
+                       onclick="event.stopPropagation(); window.__app.reconnectCluster('${esc(c.context_name)}')"
+                       class="shrink-0 font-medium text-series-blue hover:underline"
+                       title="Retry connecting to this cluster"
+                     >Reconnect</button>`
+                  : ""
+              }
+            </span>
           </span>
         </label>`;
     })
@@ -6646,7 +6734,7 @@ function renderGitOps(): string {
               </td>
               <td>${esc(a.destination_namespace)}</td>
               <td class="${a.sync_status === "Synced" ? "" : "text-status-warning"}" title="${esc(a.last_synced_at ?? "")}">
-                ${esc(a.sync_status)}${a.last_synced_at ? ` <span class="text-ink-muted">· ${relativeTime(a.last_synced_at)}</span>` : ""}
+                ${esc(a.sync_status)}${a.last_synced_at ? ` <span class="tabular text-ink-muted">· ${relativeTime(a.last_synced_at)}</span>` : ""}
               </td>
               <td class="${a.health_status === "Healthy" ? "" : a.health_status === "Degraded" ? "text-status-critical" : "text-status-warning"}">${esc(a.health_status)}</td>
               <td class="max-w-xs truncate" title="${esc(a.repo_url)}">${esc(a.repo_url)}</td>
