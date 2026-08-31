@@ -334,6 +334,7 @@ pub async fn get_nodes(context_name: &str) -> Result<Vec<NodeInfo>, String> {
                 .or_else(|| labels.get("failure-domain.beta.kubernetes.io/zone"))
                 .cloned();
             let instance_type = labels.get("node.kubernetes.io/instance-type").cloned();
+            let node_pool = labels.get("karpenter.sh/nodepool").cloned();
             let conditions: Vec<String> = status
                 .conditions
                 .clone()
@@ -352,6 +353,7 @@ pub async fn get_nodes(context_name: &str) -> Result<Vec<NodeInfo>, String> {
                 kubelet_version: node_info.as_ref().map(|i| i.kubelet_version.clone()).unwrap_or_default(),
                 os_image: node_info.as_ref().map(|i| i.os_image.clone()).unwrap_or_default(),
                 instance_type,
+                node_pool,
                 zone,
                 cpu_capacity: cap.get("cpu").map(|q| q.0.clone()).unwrap_or_default(),
                 cpu_allocatable: alloc.get("cpu").map(|q| q.0.clone()).unwrap_or_default(),
@@ -1607,6 +1609,50 @@ pub async fn get_nap_node_pools(context_name: &str) -> Result<NapResult, String>
         error: None,
         node_pools: pools.into_iter().map(dynamic_object_to_nap_node_pool).collect(),
     })
+}
+
+/// Same version-fallback reasoning as `list_karpenter` (Karpenter 1.0
+/// promoted these CRDs from v1beta1 to v1, and this fleet has clusters on
+/// both), applied to fetching one named object instead of listing all of
+/// them.
+async fn get_karpenter(client: &Client, kind: &str, plural: &str, name: &str) -> Result<DynamicObject, String> {
+    let mut not_found_on = Vec::new();
+    for version in KARPENTER_VERSIONS {
+        let ar = karpenter_resource(version, kind, plural);
+        let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+        match api.get(name).await {
+            Ok(obj) => return Ok(obj),
+            Err(kube::Error::Api(resp)) if resp.code == 404 => not_found_on.push(*version),
+            Err(e) => return Err(format!("Failed to get {plural} '{name}': {e}")),
+        }
+    }
+    Err(format!("{plural} '{name}' not found (tried {})", not_found_on.join(", ")))
+}
+
+pub async fn get_nap_node_pool_manifest(context_name: &str, name: &str) -> Result<NapNodePoolManifest, String> {
+    let client = client_for_context(context_name).await?;
+    let obj = get_karpenter(&client, "NodePool", "nodepools", name).await?;
+
+    let yaml_full = serde_yaml::to_string(&obj).map_err(|e| format!("Failed to render YAML: {e}"))?;
+
+    let mut stripped = obj;
+    stripped.metadata.managed_fields = None;
+    let yaml_without_managed_fields = serde_yaml::to_string(&stripped).map_err(|e| format!("Failed to render YAML: {e}"))?;
+
+    Ok(NapNodePoolManifest { yaml_full, yaml_without_managed_fields })
+}
+
+/// Same reasoning as `get_node_events`: a NodePool is cluster-scoped, so
+/// there's no namespace to match against.
+pub async fn get_nap_node_pool_events(context_name: &str, name: &str) -> Result<Vec<EventInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    let items = list_events_sorted(&client).await?;
+
+    Ok(items
+        .into_iter()
+        .filter(|e| e.involved_object.kind.as_deref() == Some("NodePool") && e.involved_object.name.as_deref() == Some(name))
+        .map(event_to_info)
+        .collect())
 }
 
 fn keda_resource(kind: &str, plural: &str) -> ApiResource {
