@@ -4113,7 +4113,7 @@ function renderWorkloads(): string {
                   ? `<td class="text-ink-muted"><button type="button" title="Filter workloads by this cluster" onclick="window.__app.setEnumFilter('workloads','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
                   : ""
               }
-              <td>${esc(w.kind)}</td>
+              <td><button type="button" title="Filter workloads by this kind" onclick="window.__app.setEnumFilter('workloads','kind',[${jsArg(w.kind)}])" class="hover:text-series-blue hover:underline">${esc(w.kind)}</button></td>
               <td><button type="button" title="Filter workloads by this namespace" onclick="window.__app.setEnumFilter('workloads','namespace',[${jsArg(w.namespace)}])" class="hover:text-series-blue hover:underline">${esc(w.namespace)}</button></td>
               <td>
                 <span class="inline-flex items-center gap-1.5">
