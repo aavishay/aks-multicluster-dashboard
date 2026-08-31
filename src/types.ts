@@ -29,6 +29,8 @@ export interface NodeInfo {
   kubelet_version: string;
   os_image: string;
   instance_type: string | null;
+  /** `karpenter.sh/nodepool` label — null on a node NAP didn't provision. */
+  node_pool: string | null;
   zone: string | null;
   cpu_capacity: string;
   cpu_allocatable: string;
@@ -222,6 +224,12 @@ export interface NapResult {
   installed: boolean;
   error: string | null;
   node_pools: NapNodePoolInfo[];
+}
+
+/** A Karpenter NodePool's manifest — same shape as GitOpsAppManifest. */
+export interface NapNodePoolManifest {
+  yaml_full: string;
+  yaml_without_managed_fields: string;
 }
 
 export interface NapNodePoolInfo {
