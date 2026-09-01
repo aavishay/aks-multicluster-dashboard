@@ -856,7 +856,7 @@ function sortableHeaderRow<T>(tab: TabId, columns: ColumnDef<T>[]): string {
     .map((c) => {
       const indicator = spec && spec.column === c.key ? (spec.direction === "asc" ? " ▲" : " ▼") : "";
       return `
-        <th class="relative cursor-pointer select-none hover:text-ink-secondary" onclick="window.__app.setSort('${tab}','${esc(c.key)}')">
+        <th class="relative cursor-pointer select-none hover:text-ink-secondary" onclick="window.__app.setSort(${jsArg(tab)},${jsArg(c.key)})">
           <span class="block truncate pr-2">${esc(c.label)}${indicator}</span>
           <span
             onmousedown="event.stopPropagation(); window.__app.startColumnResize(event,'${tab}','${esc(c.key)}')"
@@ -3502,7 +3502,7 @@ function renderSidebar(): string {
             type="checkbox"
             class="mt-0.5 shrink-0 accent-series-blue"
             ${checked ? "checked" : ""}
-            onchange="window.__app.toggleCluster('${esc(c.context_name)}')"
+            onchange="window.__app.toggleCluster(${jsArg(c.context_name)})"
           />
           <span class="flex min-w-0 flex-1 flex-col gap-0.5">
             <span class="flex items-center gap-2 text-sm font-medium text-ink-primary">
