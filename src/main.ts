@@ -6785,7 +6785,7 @@ function renderNap(): string {
                   <button
                     type="button"
                     title="View node pool details (YAML, Events, Graph)"
-                    onclick="window.__app.openNapDetail('${esc(ctx)}','${esc(p.name)}')"
+                    onclick="window.__app.openNapDetail(${jsArg(ctx)},${jsArg(p.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
@@ -6793,7 +6793,7 @@ function renderNap(): string {
                   <button
                     type="button"
                     title="View nodes provisioned by this pool"
-                    onclick="window.__app.viewNodesForNodePool('${esc(ctx)}','${esc(p.name)}')"
+                    onclick="window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(p.name)})"
                     class="text-ink-primary hover:text-series-blue hover:underline"
                   >${esc(p.name)}</button>
                 </span>
@@ -7285,14 +7285,32 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return target instanceof HTMLElement && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
 }
 
+/**
+ * Every full-screen detail panel, in the priority order `closeOpenDetailPanel`
+ * closes them in. Single source of truth for that and for
+ * `isAnyDetailPanelOpen` below — adding a panel means adding one entry here,
+ * not hand-updating every place that used to enumerate them separately. That
+ * duplication is exactly what let the NAP panel ship without being wired
+ * into Escape/Cmd+Left or the Cmd+Right guard.
+ */
+const DETAIL_PANEL_CLOSERS: { isOpen: () => boolean; close: () => void }[] = [
+  { isOpen: () => !!state.podDetail, close: closePodDetail },
+  { isOpen: () => !!state.nodeDetail, close: closeNodeDetail },
+  { isOpen: () => !!state.workloadDetail, close: closeWorkloadDetail },
+  { isOpen: () => !!state.gitOpsDetail, close: closeGitOpsDetail },
+  { isOpen: () => !!state.helmDetail, close: closeHelmDetail },
+  { isOpen: () => !!state.napDetail, close: closeNapDetail },
+];
+
+function isAnyDetailPanelOpen(): boolean {
+  return DETAIL_PANEL_CLOSERS.some((p) => p.isOpen());
+}
+
 /** Closes whichever detail panel is open, reporting whether there was one. */
 function closeOpenDetailPanel(): boolean {
-  if (state.podDetail) closePodDetail();
-  else if (state.nodeDetail) closeNodeDetail();
-  else if (state.workloadDetail) closeWorkloadDetail();
-  else if (state.gitOpsDetail) closeGitOpsDetail();
-  else if (state.helmDetail) closeHelmDetail();
-  else return false;
+  const panel = DETAIL_PANEL_CLOSERS.find((p) => p.isOpen());
+  if (!panel) return false;
+  panel.close();
   return true;
 }
 
@@ -7327,7 +7345,7 @@ document.addEventListener("keydown", (e) => {
   // reader can't see. Cmd+Left closing a panel is an Escape-like convenience
   // that costs no history, which is why it has no forward counterpart.
   if (e.key === "ArrowRight" && !isEditableTarget(e.target)) {
-    if (!state.podDetail && !state.nodeDetail && !state.workloadDetail && !state.gitOpsDetail && !state.helmDetail) goForwardView();
+    if (!isAnyDetailPanelOpen()) goForwardView();
     return;
   }
   // "=" is the unshifted key that carries "+" on a US layout, and some layouts
