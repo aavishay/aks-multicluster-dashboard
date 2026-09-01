@@ -7352,6 +7352,13 @@ function isAnyDetailPanelOpen(): boolean {
  */
 function consumesPlainNavKeys(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
+  if (target instanceof HTMLInputElement && (target.type === "checkbox" || target.type === "radio")) {
+    // Neither has any arrow/Home/End behavior of its own, and the row-select
+    // checkbox is focusable — so treating every <input> alike would leave the
+    // row cursor dead after tabbing onto one. They do still consume Enter and
+    // Space, which `consumesActivationKeys` accounts for separately.
+    return false;
+  }
   return (
     target.tagName === "INPUT" ||
     target.tagName === "TEXTAREA" ||
@@ -7385,7 +7392,15 @@ function isAnyOverlayOpen(): boolean {
  */
 function consumesActivationKeys(target: EventTarget | null): boolean {
   if (consumesPlainNavKeys(target)) return true;
-  return target instanceof HTMLElement && (target.tagName === "BUTTON" || target.tagName === "A");
+  if (!(target instanceof HTMLElement)) return false;
+  // Checkbox and radio are deliberately re-included here after being excluded
+  // from the nav guard: they ignore the arrows but do act on Enter/Space, so
+  // the row cursor must not fire on top of them.
+  return (
+    target.tagName === "BUTTON" ||
+    target.tagName === "A" ||
+    (target instanceof HTMLInputElement && (target.type === "checkbox" || target.type === "radio"))
+  );
 }
 
 /** The `<tr>` the row cursor currently sits on, clamped to the rows actually rendered. */
@@ -7440,13 +7455,26 @@ function extendRowSelection(delta: number): boolean {
   const to = current === undefined ? from : Math.min(count - 1, Math.max(0, from + delta));
 
   const selection = rowSelection(state.activeTab);
+  let selectionGrew = false;
   for (const index of new Set([from, to])) {
     const key = renderedRowKey(index);
-    if (key) selection.add(key);
+    if (key && !selection.has(key)) {
+      selection.add(key);
+      selectionGrew = true;
+    }
   }
-  state.focusedRow[state.activeTab] = to;
-  pendingRowFocusScroll = true;
-  render();
+
+  // Held at an end with everything already picked, repeated Shift+Arrow has
+  // nothing to show — and render() replaces the whole app's innerHTML, so
+  // skipping it there keeps a held key from rebuilding the table per repeat.
+  const cursorMoved = to !== current;
+  if (cursorMoved) state.focusedRow[state.activeTab] = to;
+  if (cursorMoved || selectionGrew) {
+    // Only a moved cursor needs scrolling into view; a selection change
+    // alone happens on a row already on screen.
+    if (cursorMoved) pendingRowFocusScroll = true;
+    render();
+  }
   return true;
 }
 
