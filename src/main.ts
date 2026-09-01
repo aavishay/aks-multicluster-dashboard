@@ -7285,15 +7285,32 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return target instanceof HTMLElement && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
 }
 
+/**
+ * Every full-screen detail panel, in the priority order `closeOpenDetailPanel`
+ * closes them in. Single source of truth for that and for
+ * `isAnyDetailPanelOpen` below — adding a panel means adding one entry here,
+ * not hand-updating every place that used to enumerate them separately. That
+ * duplication is exactly what let the NAP panel ship without being wired
+ * into Escape/Cmd+Left or the Cmd+Right guard.
+ */
+const DETAIL_PANEL_CLOSERS: { isOpen: () => boolean; close: () => void }[] = [
+  { isOpen: () => !!state.podDetail, close: closePodDetail },
+  { isOpen: () => !!state.nodeDetail, close: closeNodeDetail },
+  { isOpen: () => !!state.workloadDetail, close: closeWorkloadDetail },
+  { isOpen: () => !!state.gitOpsDetail, close: closeGitOpsDetail },
+  { isOpen: () => !!state.helmDetail, close: closeHelmDetail },
+  { isOpen: () => !!state.napDetail, close: closeNapDetail },
+];
+
+function isAnyDetailPanelOpen(): boolean {
+  return DETAIL_PANEL_CLOSERS.some((p) => p.isOpen());
+}
+
 /** Closes whichever detail panel is open, reporting whether there was one. */
 function closeOpenDetailPanel(): boolean {
-  if (state.podDetail) closePodDetail();
-  else if (state.nodeDetail) closeNodeDetail();
-  else if (state.workloadDetail) closeWorkloadDetail();
-  else if (state.gitOpsDetail) closeGitOpsDetail();
-  else if (state.helmDetail) closeHelmDetail();
-  else if (state.napDetail) closeNapDetail();
-  else return false;
+  const panel = DETAIL_PANEL_CLOSERS.find((p) => p.isOpen());
+  if (!panel) return false;
+  panel.close();
   return true;
 }
 
@@ -7328,7 +7345,7 @@ document.addEventListener("keydown", (e) => {
   // reader can't see. Cmd+Left closing a panel is an Escape-like convenience
   // that costs no history, which is why it has no forward counterpart.
   if (e.key === "ArrowRight" && !isEditableTarget(e.target)) {
-    if (!state.podDetail && !state.nodeDetail && !state.workloadDetail && !state.gitOpsDetail && !state.helmDetail && !state.napDetail) goForwardView();
+    if (!isAnyDetailPanelOpen()) goForwardView();
     return;
   }
   // "=" is the unshifted key that carries "+" on a US layout, and some layouts
