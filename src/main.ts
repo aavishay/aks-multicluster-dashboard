@@ -5935,7 +5935,7 @@ function renderPodDetailPanel(): string {
           </div>
           ${pd.view !== "graph" ? containerSelector : ""}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -6051,7 +6051,7 @@ function renderNodeDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -6452,7 +6452,7 @@ function renderWorkloadDetailPanel(): string {
           </div>
           ${wd.view === "logs" ? `<div class="flex min-w-0 items-center gap-2">${podSelector}${containerSelector}</div>` : ""}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -6561,7 +6561,7 @@ function renderNapDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -6600,7 +6600,7 @@ function renderGitOpsDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -7282,7 +7282,7 @@ function renderHelmDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${renderHelmDetailBody(hd)}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${renderHelmDetailBody(hd)}</div>
       </div>
     </div>`;
 }
@@ -7405,6 +7405,21 @@ function isAnyOverlayOpen(): boolean {
 const DETAIL_SCROLL_LINE_PX = 40;
 
 /**
+ * Whether `el` can actually be scrolled by setting `scrollTop`.
+ *
+ * Overflowing is not enough: an element with `overflow: visible` still
+ * reports a scrollHeight larger than its clientHeight, but silently ignores
+ * scrollTop because it is not a scroll container. Treating that as scrollable
+ * would make the caller claim the key and then do nothing — worse than not
+ * handling it, since preventDefault also stops the browser's own scrolling.
+ */
+function isScrollable(el: HTMLElement): boolean {
+  if (el.scrollHeight <= el.clientHeight + 1) return false;
+  const overflowY = getComputedStyle(el).overflowY;
+  return overflowY !== "visible" && overflowY !== "clip";
+}
+
+/**
  * The scrollable region of the open detail panel, if it has one.
  *
  * Needed because the panes that actually overflow — the YAML `<pre>`, the log
@@ -7421,9 +7436,8 @@ const DETAIL_SCROLL_LINE_PX = 40;
 function detailPanelScroller(): HTMLElement | null {
   const body = document.querySelector<HTMLElement>("[data-detail-body]");
   if (!body) return null;
-  const overflows = (el: HTMLElement) => el.scrollHeight > el.clientHeight + 1;
-  const pane = [...body.querySelectorAll<HTMLElement>("[data-scroll-id]")].find(overflows);
-  return pane ?? (overflows(body) ? body : null);
+  const pane = [...body.querySelectorAll<HTMLElement>("[data-scroll-id]")].find(isScrollable);
+  return pane ?? (isScrollable(body) ? body : null);
 }
 
 /** Scrolls the open detail panel by a line, a near-full page, or to either edge. */
