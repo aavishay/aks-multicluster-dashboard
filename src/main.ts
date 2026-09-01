@@ -5927,6 +5927,7 @@ function renderPodDetailPanel(): string {
               <button
                 type="button"
                 onclick="window.__app.setPodDetailView('${t.id}')"
+                data-detail-tab ${pd.view === t.id ? "data-detail-tab-active" : ""}
                 class="rounded-md px-3 py-1.5 text-xs font-medium ${pd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
               >${t.label}</button>`,
               )
@@ -6044,6 +6045,7 @@ function renderNodeDetailPanel(): string {
             <button
               type="button"
               onclick="window.__app.setNodeDetailView('${t.id}')"
+              data-detail-tab ${nd.view === t.id ? "data-detail-tab-active" : ""}
               class="rounded-md px-3 py-1.5 text-xs font-medium ${nd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
             >${t.label}</button>`,
             )
@@ -6442,6 +6444,7 @@ function renderWorkloadDetailPanel(): string {
               <button
                 type="button"
                 onclick="window.__app.setWorkloadDetailView('${t.id}')"
+                data-detail-tab ${wd.view === t.id ? "data-detail-tab-active" : ""}
                 class="rounded-md px-3 py-1.5 text-xs font-medium ${wd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
               >${t.label}</button>`,
               )
@@ -6552,6 +6555,7 @@ function renderNapDetailPanel(): string {
             <button
               type="button"
               onclick="window.__app.setNapDetailView('${t.id}')"
+              data-detail-tab ${nd.view === t.id ? "data-detail-tab-active" : ""}
               class="rounded-md px-3 py-1.5 text-xs font-medium ${nd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
             >${t.label}</button>`,
             )
@@ -6590,6 +6594,7 @@ function renderGitOpsDetailPanel(): string {
             <button
               type="button"
               onclick="window.__app.setGitOpsDetailView('${t.id}')"
+              data-detail-tab ${gd.view === t.id ? "data-detail-tab-active" : ""}
               class="rounded-md px-3 py-1.5 text-xs font-medium ${gd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
             >${t.label}</button>`,
             )
@@ -7271,6 +7276,7 @@ function renderHelmDetailPanel(): string {
             <button
               type="button"
               onclick="window.__app.setHelmDetailView('${t.id}')"
+              data-detail-tab ${hd.view === t.id ? "data-detail-tab-active" : ""}
               class="rounded-md px-3 py-1.5 text-xs font-medium ${hd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
             >${t.label}</button>`,
             )
@@ -7368,21 +7374,53 @@ function consumesPlainNavKeys(target: EventTarget | null): boolean {
 }
 
 /**
- * True while anything is layered over the tab content — a plain arrow key
- * belongs to whatever is on top, not to the tab bar underneath it. Switching
- * tabs behind a full-screen overlay would change something the reader can't
- * see, the same reasoning the Cmd+Right guard already uses.
+ * True while something is layered over the tab content that fully *takes*
+ * a plain arrow key: the cluster palette, Claude's panel/explain/diagnose
+ * views, the metrics-backend editor, or an open enum dropdown.
+ *
+ * Detail panels are deliberately excluded, which is the whole reason this is
+ * separate from `isAnyOverlayOpen`. A panel doesn't swallow Left/Right, it
+ * redirects them to its own tab bar (see `stepDetailTab`) — so adding panels
+ * back into this predicate would silently kill that. Use `isAnyOverlayOpen`
+ * for the "is anything at all on top" question; use this one only where a
+ * detail panel should still get a say.
  */
-function isAnyOverlayOpen(): boolean {
+function isNonPanelOverlayOpen(): boolean {
   return (
     !!state.clusterPalette ||
     !!state.claudeExplain ||
     !!state.claudeDiagnose ||
     state.claudePanelOpen ||
     !!state.metricsBackendEditor ||
-    state.openEnumFilter !== null ||
-    isAnyDetailPanelOpen()
+    state.openEnumFilter !== null
   );
+}
+
+/** True while anything at all covers the tab content, detail panels included — the broad guard for keys that no overlay should let through. */
+function isAnyOverlayOpen(): boolean {
+  return isNonPanelOverlayOpen() || isAnyDetailPanelOpen();
+}
+
+/**
+ * Left/Right inside an open detail panel step that panel's own tabs (YAML /
+ * Events / Graph, and the wider sets Pods and Workloads carry) rather than
+ * the main tab bar hidden behind it.
+ *
+ * Reads the rendered buttons instead of consulting each panel's tab list:
+ * six panels define those lists locally, with different lengths and members,
+ * and a second copy here would be six chances to drift. Only one panel is
+ * ever open — they close each other — so a document-wide query is
+ * unambiguous, and a panel added later is picked up with no change here.
+ */
+function stepDetailTab(delta: number): boolean {
+  const tabs = [...document.querySelectorAll<HTMLElement>("[data-detail-tab]")];
+  if (tabs.length === 0) return false;
+  const active = tabs.findIndex((t) => t.hasAttribute("data-detail-tab-active"));
+  const from = active === -1 ? 0 : active;
+  // Clamped, like the main tab bar it mirrors.
+  const next = Math.min(tabs.length - 1, Math.max(0, from + delta));
+  if (next !== active) tabs[next].click();
+  return true;
 }
 
 /**
@@ -7624,10 +7662,18 @@ document.addEventListener("keydown", (e) => {
   // is a text-selection gesture, and Alt/Ctrl+Arrow are word-wise or
   // platform-level movement.
   if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
+    // Deliberately not `isAnyOverlayOpen`: a detail panel doesn't swallow the
+    // key, it redirects it to its own tabs. Only the things layered *above* a
+    // panel take it away entirely.
+    if (consumesPlainNavKeys(e.target) || isNonPanelOverlayOpen()) return;
+    const delta = e.key === "ArrowRight" ? 1 : -1;
+    if (isAnyDetailPanelOpen()) {
+      if (stepDetailTab(delta)) e.preventDefault();
+      return;
+    }
     // Prevents the key also scrolling a horizontally-scrollable table.
     e.preventDefault();
-    stepTab(e.key === "ArrowRight" ? 1 : -1);
+    stepTab(delta);
     return;
   }
   // Plain Up/Down step the active table's row cursor, the vertical
