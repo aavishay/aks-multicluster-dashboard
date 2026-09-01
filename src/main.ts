@@ -7292,6 +7292,7 @@ function closeOpenDetailPanel(): boolean {
   else if (state.workloadDetail) closeWorkloadDetail();
   else if (state.gitOpsDetail) closeGitOpsDetail();
   else if (state.helmDetail) closeHelmDetail();
+  else if (state.napDetail) closeNapDetail();
   else return false;
   return true;
 }
@@ -7327,7 +7328,7 @@ document.addEventListener("keydown", (e) => {
   // reader can't see. Cmd+Left closing a panel is an Escape-like convenience
   // that costs no history, which is why it has no forward counterpart.
   if (e.key === "ArrowRight" && !isEditableTarget(e.target)) {
-    if (!state.podDetail && !state.nodeDetail && !state.workloadDetail && !state.gitOpsDetail && !state.helmDetail) goForwardView();
+    if (!state.podDetail && !state.nodeDetail && !state.workloadDetail && !state.gitOpsDetail && !state.helmDetail && !state.napDetail) goForwardView();
     return;
   }
   // "=" is the unshifted key that carries "+" on a US layout, and some layouts
