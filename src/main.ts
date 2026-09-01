@@ -4182,7 +4182,7 @@ function renderNodes(): string {
                   <button
                     type="button"
                     title="View node details (YAML, Events, Graph)"
-                    onclick="window.__app.openNodeDetail('${esc(ctx)}','${esc(n.name)}')"
+                    onclick="window.__app.openNodeDetail(${jsArg(ctx)},${jsArg(n.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
@@ -4190,7 +4190,7 @@ function renderNodes(): string {
                   <button
                     type="button"
                     title="View pods on this node"
-                    onclick="window.__app.viewPodsForNode('${esc(ctx)}','${esc(n.name)}')"
+                    onclick="window.__app.viewPodsForNode(${jsArg(ctx)},${jsArg(n.name)})"
                     class="text-ink-primary hover:text-series-blue hover:underline"
                   >${esc(n.name)}</button>${n.unschedulable ? ' <span class="text-status-warning">(cordoned)</span>' : ""}
                 </span>
@@ -4314,7 +4314,7 @@ function renderWorkloads(): string {
                   <button
                     type="button"
                     title="View workload details (YAML, Events)"
-                    onclick="window.__app.openWorkloadDetail('${esc(ctx)}','${esc(w.kind)}','${esc(w.namespace)}','${esc(w.name)}')"
+                    onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
@@ -4322,7 +4322,7 @@ function renderWorkloads(): string {
                   <button
                     type="button"
                     title="View pods for this workload"
-                    onclick="window.__app.viewPodsForWorkload('${esc(ctx)}','${esc(w.kind)}','${esc(w.namespace)}','${esc(w.name)}')"
+                    onclick="window.__app.viewPodsForWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})"
                     class="text-ink-primary hover:text-series-blue hover:underline"
                   >${esc(w.name)}</button>
                 </span>
@@ -4469,7 +4469,7 @@ function renderPods(): string {
                         <button
                           type="button"
                           title="View node details (YAML, Events, Graph)"
-                          onclick="window.__app.openNodeDetail('${esc(ctx)}','${esc(p.node)}')"
+                          onclick="window.__app.openNodeDetail(${jsArg(ctx)},${jsArg(p.node)})"
                           class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                         >
                           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
@@ -4477,7 +4477,7 @@ function renderPods(): string {
                         <button
                           type="button"
                           title="View pods on this node"
-                          onclick="window.__app.viewPodsForNode('${esc(ctx)}','${esc(p.node)}')"
+                          onclick="window.__app.viewPodsForNode(${jsArg(ctx)},${jsArg(p.node)})"
                           class="text-ink-primary hover:text-series-blue hover:underline"
                         >${esc(p.node)}</button>
                       </span>`
@@ -7017,7 +7017,7 @@ function renderGitOps(): string {
                 <button
                   type="button"
                   title="View Application details (YAML, Events)"
-                  onclick="window.__app.openGitOpsDetail('${esc(ctx)}','${esc(a.namespace)}','${esc(a.name)}')"
+                  onclick="window.__app.openGitOpsDetail(${jsArg(ctx)},${jsArg(a.namespace)},${jsArg(a.name)})"
                   class="text-ink-primary hover:text-series-blue hover:underline"
                 >${esc(a.name)}</button>
               </td>
@@ -7131,7 +7131,7 @@ function renderHelm(): string {
                 <button
                   type="button"
                   title="View release details (Values, Manifest, Notes)"
-                  onclick="window.__app.openHelmDetail('${esc(ctx)}','${esc(r.namespace)}','${esc(r.name)}',${r.revision})"
+                  onclick="window.__app.openHelmDetail(${jsArg(ctx)},${jsArg(r.namespace)},${jsArg(r.name)},${r.revision})"
                   class="text-ink-primary hover:text-series-blue hover:underline"
                 >${esc(r.name)}</button>
               </td>
