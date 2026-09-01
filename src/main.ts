@@ -7306,6 +7306,61 @@ function isAnyDetailPanelOpen(): boolean {
   return DETAIL_PANEL_CLOSERS.some((p) => p.isOpen());
 }
 
+/**
+ * Elements that give an *unmodified* Left/Right its own meaning, so tab
+ * stepping must not steal the key.
+ *
+ * Deliberately broader than `isEditableTarget`: a focused `<select>` (the
+ * auto-refresh interval, page size, metrics range, pod/container pickers)
+ * changes its own value on Left/Right, whereas Cmd+Left/Right — which
+ * `isEditableTarget` guards — has no competing meaning there, so widening
+ * that helper instead would needlessly disable view-history navigation while
+ * a dropdown happens to hold focus.
+ */
+function consumesPlainArrowKeys(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.tagName === "INPUT" ||
+    target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT" ||
+    target.isContentEditable
+  );
+}
+
+/**
+ * True while anything is layered over the tab content — a plain arrow key
+ * belongs to whatever is on top, not to the tab bar underneath it. Switching
+ * tabs behind a full-screen overlay would change something the reader can't
+ * see, the same reasoning the Cmd+Right guard already uses.
+ */
+function isAnyOverlayOpen(): boolean {
+  return (
+    !!state.clusterPalette ||
+    !!state.claudeExplain ||
+    !!state.claudeDiagnose ||
+    state.claudePanelOpen ||
+    !!state.metricsBackendEditor ||
+    state.openEnumFilter !== null ||
+    isAnyDetailPanelOpen()
+  );
+}
+
+/**
+ * Steps the active tab along the visible tab bar.
+ *
+ * Clamped rather than wrapped: both directions are always available, so each
+ * end stays one keypress away without wrapping, and a Cost -> Overview jump
+ * from one extra keypress reads as a mis-key rather than a shortcut.
+ * `selectTab` no-ops when the target equals the current tab, so the clamped
+ * ends cost nothing.
+ */
+function stepTab(delta: number) {
+  const ids = TABS.map((t) => t.id);
+  const current = ids.indexOf(state.activeTab);
+  if (current === -1) return;
+  selectTab(ids[Math.min(ids.length - 1, Math.max(0, current + delta))]);
+}
+
 /** Closes whichever detail panel is open, reporting whether there was one. */
 function closeOpenDetailPanel(): boolean {
   const panel = DETAIL_PANEL_CLOSERS.find((p) => p.isOpen());
@@ -7323,6 +7378,18 @@ document.addEventListener("keydown", (e) => {
     else if (state.metricsBackendEditor) closeMetricsBackendEditor();
     else if (state.openEnumFilter !== null) closeEnumDropdown();
     else if (!closeOpenDetailPanel() && hasActiveFilters(state.activeTab)) clearFilters(state.activeTab);
+    return;
+  }
+  // Plain Left/Right step the tab bar. Checked before the Cmd gate below,
+  // since this is the unmodified key — Cmd+Left/Right keep their existing
+  // view-history meaning. Any other modifier is left alone too: Shift+Arrow
+  // is a text-selection gesture, and Alt/Ctrl+Arrow are word-wise or
+  // platform-level movement.
+  if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    if (consumesPlainArrowKeys(e.target) || isAnyOverlayOpen()) return;
+    // Prevents the key also scrolling a horizontally-scrollable table.
+    e.preventDefault();
+    stepTab(e.key === "ArrowRight" ? 1 : -1);
     return;
   }
   if (!e.metaKey) return;
