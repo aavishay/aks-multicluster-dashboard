@@ -7374,10 +7374,16 @@ function consumesPlainNavKeys(target: EventTarget | null): boolean {
 }
 
 /**
- * True while anything is layered over the tab content — a plain arrow key
- * belongs to whatever is on top, not to the tab bar underneath it. Switching
- * tabs behind a full-screen overlay would change something the reader can't
- * see, the same reasoning the Cmd+Right guard already uses.
+ * True while something is layered over the tab content that fully *takes*
+ * a plain arrow key: the cluster palette, Claude's panel/explain/diagnose
+ * views, the metrics-backend editor, or an open enum dropdown.
+ *
+ * Detail panels are deliberately excluded, which is the whole reason this is
+ * separate from `isAnyOverlayOpen`. A panel doesn't swallow Left/Right, it
+ * redirects them to its own tab bar (see `stepDetailTab`) — so adding panels
+ * back into this predicate would silently kill that. Use `isAnyOverlayOpen`
+ * for the "is anything at all on top" question; use this one only where a
+ * detail panel should still get a say.
  */
 function isNonPanelOverlayOpen(): boolean {
   return (
@@ -7390,6 +7396,7 @@ function isNonPanelOverlayOpen(): boolean {
   );
 }
 
+/** True while anything at all covers the tab content, detail panels included — the broad guard for keys that no overlay should let through. */
 function isAnyOverlayOpen(): boolean {
   return isNonPanelOverlayOpen() || isAnyDetailPanelOpen();
 }
