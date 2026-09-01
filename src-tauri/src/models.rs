@@ -37,6 +37,8 @@ pub struct NodeInfo {
     pub kubelet_version: String,
     pub os_image: String,
     pub instance_type: Option<String>,
+    /// `karpenter.sh/nodepool` label — absent on a node NAP didn't provision.
+    pub node_pool: Option<String>,
     pub zone: Option<String>,
     pub cpu_capacity: String,
     pub cpu_allocatable: String,
@@ -264,6 +266,14 @@ pub struct NapResult {
 /// One Karpenter `NodePool` — the provisioning policy — plus its own live
 /// rollup of what it has actually provisioned (`status.resources`), which is
 /// both the node count and the "used" side of the usage/limit columns below.
+/// A Karpenter NodePool's manifest. Same shape as `GitOpsAppManifest` since
+/// both are DynamicObject-backed CRDs rendered to YAML the same way.
+#[derive(Serialize, Clone, Debug)]
+pub struct NapNodePoolManifest {
+    pub yaml_full: String,
+    pub yaml_without_managed_fields: String,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct NapNodePoolInfo {
     pub name: String,
