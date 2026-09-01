@@ -6785,7 +6785,7 @@ function renderNap(): string {
                   <button
                     type="button"
                     title="View node pool details (YAML, Events, Graph)"
-                    onclick="window.__app.openNapDetail('${esc(ctx)}','${esc(p.name)}')"
+                    onclick="window.__app.openNapDetail(${jsArg(ctx)},${jsArg(p.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
@@ -6793,7 +6793,7 @@ function renderNap(): string {
                   <button
                     type="button"
                     title="View nodes provisioned by this pool"
-                    onclick="window.__app.viewNodesForNodePool('${esc(ctx)}','${esc(p.name)}')"
+                    onclick="window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(p.name)})"
                     class="text-ink-primary hover:text-series-blue hover:underline"
                   >${esc(p.name)}</button>
                 </span>
