@@ -158,6 +158,17 @@ table.data-table tbody tr:hover td {
   background: var(--surface-2);
 }
 
+/* The Up/Down keyboard row cursor. Deliberately reads differently from the
+   hover state above — a full-width row tinted one step darker is easy to
+   confuse with "the pointer happens to be resting here", so the cursor also
+   carries a left accent bar that hover never draws. */
+table.data-table tbody tr[data-row-focused] td {
+  background: var(--surface-3);
+}
+table.data-table tbody tr[data-row-focused] td:first-child {
+  box-shadow: inset 2px 0 0 var(--series-blue);
+}
+
 /* A single cluster's fetch has no real sub-progress to report, so its
    loading bar slides indefinitely rather than faking a percentage. */
 @keyframes progress-indeterminate-slide {
