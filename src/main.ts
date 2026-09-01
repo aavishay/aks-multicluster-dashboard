@@ -563,6 +563,18 @@ interface AppState {
    * clamp it into range rather than writing back during a render.
    */
   tablePage: Partial<Record<TabId, number>>;
+  /**
+   * Keyboard row cursor per table, as an index into the rows currently
+   * RENDERED in that table's `<tbody>` — not into the full filtered set.
+   *
+   * Indexing what's actually on screen keeps this free of any pagination
+   * knowledge: six of the ten tables paginate and four don't, so an index
+   * into the filtered set would need to know which is which and offset
+   * accordingly — one more parallel list to forget to update. Undefined
+   * until the reader first presses Up/Down, so no cursor is drawn before
+   * then.
+   */
+  focusedRow: Partial<Record<TabId, number>>;
   /** When true for a tab, only unhealthy rows (the red status dot) are shown — nodes/pods/workloads. */
   unhealthyOnly: Partial<Record<TabId, boolean>>;
   /** Transient "Copied N rows" / "Copy failed" message, cleared after a couple seconds. */
@@ -636,6 +648,7 @@ const state: AppState = {
   selectedRows: {},
   pageSize: getInitialPageSize(),
   tablePage: {},
+  focusedRow: {},
   unhealthyOnly: {},
   copyToast: null,
   tabError: null,
@@ -689,6 +702,8 @@ let podsStreamRenderScheduled = false;
 let pendingSearchScroll = false;
 /** Same idea as `pendingSearchScroll`, for the cluster palette's arrow-key navigation scrolling its highlighted row into view. */
 let pendingClusterPaletteScroll = false;
+/** Set when the row cursor moves, so the post-render pass scrolls it into view — but only then, never on an ordinary auto-refresh re-render. */
+let pendingRowFocusScroll = false;
 /**
  * `data-scroll-id` -> edge to snap a log view to on the next render, set
  * whenever fresh Head/Tail content just loaded: "bottom" for Tail, so the
@@ -3382,6 +3397,21 @@ function render() {
     pendingClusterPaletteScroll = false;
     app.querySelector<HTMLElement>("[data-cluster-palette-current]")?.scrollIntoView({ block: "nearest" });
   }
+
+  // The row cursor is marked here rather than inside each table's row
+  // template: one insertion point instead of ten, and it survives the
+  // re-render an auto-refresh triggers. Clamped against the rows actually
+  // present, so a cursor left pointing past the end — a filter narrowed the
+  // table under it, say — lands on the last row instead of disappearing.
+  const focusedTbody = app.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const focusedIndex = state.focusedRow[state.activeTab];
+  if (focusedTbody && focusedIndex !== undefined && focusedTbody.children.length > 0) {
+    const row = focusedTbody.children[Math.min(focusedIndex, focusedTbody.children.length - 1)];
+    row.setAttribute("data-row-focused", "");
+    // Runs after the scroll-position restore above, so it wins over it.
+    if (pendingRowFocusScroll) row.scrollIntoView({ block: "nearest" });
+  }
+  pendingRowFocusScroll = false;
 
   if (activeKey) {
     // `preventScroll` matters here: without it, re-focusing an input that's
@@ -7354,6 +7384,38 @@ function isAnyOverlayOpen(): boolean {
  * `selectTab` no-ops when the target equals the current tab, so the clamped
  * ends cost nothing.
  */
+/**
+ * Moves the active table's keyboard row cursor by `delta`.
+ *
+ * Returns whether the key was consumed: false when the active tab has no
+ * table on screen (Metrics, Cost) so Up/Down still scroll those normally,
+ * true whenever a table is present — including at the clamped ends, where a
+ * list cursor stopping dead is less jarring than the page suddenly scrolling
+ * instead.
+ */
+function moveTableRowFocus(delta: number): boolean {
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const count = tbody?.children.length ?? 0;
+  if (count === 0) return false;
+
+  const current = state.focusedRow[state.activeTab];
+  // A first press lands on the near end rather than stepping one row from an
+  // imagined position just off the table.
+  const next =
+    current === undefined
+      ? delta > 0
+        ? 0
+        : count - 1
+      : Math.min(count - 1, Math.max(0, current + delta));
+
+  if (next !== current) {
+    state.focusedRow[state.activeTab] = next;
+    pendingRowFocusScroll = true;
+    render();
+  }
+  return true;
+}
+
 function stepTab(delta: number) {
   const ids = TABS.map((t) => t.id);
   const current = ids.indexOf(state.activeTab);
@@ -7390,6 +7452,16 @@ document.addEventListener("keydown", (e) => {
     // Prevents the key also scrolling a horizontally-scrollable table.
     e.preventDefault();
     stepTab(e.key === "ArrowRight" ? 1 : -1);
+    return;
+  }
+  // Plain Up/Down step the active table's row cursor, the vertical
+  // counterpart to Left/Right above and gated on exactly the same two
+  // guards.
+  if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    if (consumesPlainArrowKeys(e.target) || isAnyOverlayOpen()) return;
+    // Conditional, unlike the horizontal case: a tab with no table (Metrics,
+    // Cost) must keep Up/Down as ordinary scrolling.
+    if (moveTableRowFocus(e.key === "ArrowDown" ? 1 : -1)) e.preventDefault();
     return;
   }
   if (!e.metaKey) return;
