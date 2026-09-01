@@ -288,7 +288,7 @@ function renderPagination(tab: TabId, total: number): string {
 
   const step = (label: string, target: number, disabled: boolean, title: string) =>
     `<button type="button" title="${esc(title)}" ${disabled ? "disabled" : ""}
-       onclick="window.__app.setTablePage('${tab}', ${target})"
+       onclick="window.__app.setTablePage(${jsArg(tab)}, ${target})"
        class="rounded border border-gridline px-2 py-1 ${
          disabled ? "cursor-default text-ink-muted opacity-40" : "text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
        }">${label}</button>`;
@@ -859,7 +859,7 @@ function sortableHeaderRow<T>(tab: TabId, columns: ColumnDef<T>[]): string {
         <th class="relative cursor-pointer select-none hover:text-ink-secondary" onclick="window.__app.setSort(${jsArg(tab)},${jsArg(c.key)})">
           <span class="block truncate pr-2">${esc(c.label)}${indicator}</span>
           <span
-            onmousedown="event.stopPropagation(); window.__app.startColumnResize(event,'${tab}','${esc(c.key)}')"
+            onmousedown="event.stopPropagation(); window.__app.startColumnResize(event,${jsArg(tab)},${jsArg(c.key)})"
             onclick="event.stopPropagation()"
             title="Drag to resize"
             class="absolute right-0 top-0 h-full w-2 cursor-col-resize select-none hover:bg-series-blue/50"
@@ -1102,7 +1102,7 @@ function renderCopyButton(scrollId: string): string {
     <button
       type="button"
       title="Copy to clipboard"
-      onclick="window.__app.copyPreToClipboard('${scrollId}')"
+      onclick="window.__app.copyPreToClipboard(${jsArg(scrollId)})"
       class="rounded px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
     >Copy</button>`;
 }
@@ -1127,7 +1127,7 @@ function unhealthyOnlyToggle(tab: TabId): string {
   const checked = !!state.unhealthyOnly[tab];
   return `
     <label class="flex items-center gap-2 text-xs text-ink-secondary">
-      <input type="checkbox" ${checked ? "checked" : ""} onchange="window.__app.toggleUnhealthyOnly('${tab}')" />
+      <input type="checkbox" ${checked ? "checked" : ""} onchange="window.__app.toggleUnhealthyOnly(${jsArg(tab)})" />
       <span class="flex items-center gap-1.5">${statusDot(false)} Unhealthy only</span>
     </label>`;
 }
@@ -1139,8 +1139,8 @@ function selectionToolbar(tab: TabId): string {
     <div class="mb-2 flex items-center justify-between rounded-md border border-gridline bg-surface-2 px-3 py-1.5 text-xs text-ink-secondary">
       <span>${count} row${count === 1 ? "" : "s"} selected</span>
       <span class="flex items-center gap-3">
-        <button onclick="window.__app.copySelectedRows('${tab}')" class="font-medium text-ink-primary hover:underline">Copy to clipboard</button>
-        <button onclick="window.__app.clearRowSelection('${tab}')" class="hover:text-ink-primary hover:underline">Clear</button>
+        <button onclick="window.__app.copySelectedRows(${jsArg(tab)})" class="font-medium text-ink-primary hover:underline">Copy to clipboard</button>
+        <button onclick="window.__app.clearRowSelection(${jsArg(tab)})" class="hover:text-ink-primary hover:underline">Clear</button>
       </span>
     </div>`;
 }
@@ -1151,7 +1151,7 @@ function selectAllCheckboxHeader<T>(tab: TabId, rows: T[], keyOf: (row: T) => st
   return `
     <th>
       <input type="checkbox" class="accent-series-blue" title="Select all" ${allSelected ? "checked" : ""}
-             onchange="window.__app.toggleAllRowsSelected('${tab}', this.checked)" />
+             onchange="window.__app.toggleAllRowsSelected(${jsArg(tab)}, this.checked)" />
     </th>`;
 }
 
@@ -1164,7 +1164,7 @@ function rowCheckboxCell(tab: TabId, key: string): string {
   return `
     <td>
       <input type="checkbox" class="accent-series-blue" data-row-key="${esc(key)}" ${checked ? "checked" : ""}
-             onchange="window.__app.toggleRowSelected('${tab}',${jsArg(key)}, this.checked)" />
+             onchange="window.__app.toggleRowSelected(${jsArg(tab)},${jsArg(key)}, this.checked)" />
     </td>`;
 }
 
@@ -1273,9 +1273,9 @@ function filterRowCells<T>(tab: TabId, columns: ColumnDef<T>[], allRows: T[]): s
           <th>
             <div class="flex gap-1">
               <input type="number" placeholder="min" value="${current?.min ?? ""}" data-filter-key="${filterKey}:min"
-                     oninput="window.__app.setNumberFilter('${tab}','${col.key}','min',this.value)" class="${FILTER_INPUT_CLASS}" />
+                     oninput="window.__app.setNumberFilter(${jsArg(tab)},${jsArg(col.key)},'min',this.value)" class="${FILTER_INPUT_CLASS}" />
               <input type="number" placeholder="max" value="${current?.max ?? ""}" data-filter-key="${filterKey}:max"
-                     oninput="window.__app.setNumberFilter('${tab}','${col.key}','max',this.value)" class="${FILTER_INPUT_CLASS}" />
+                     oninput="window.__app.setNumberFilter(${jsArg(tab)},${jsArg(col.key)},'max',this.value)" class="${FILTER_INPUT_CLASS}" />
             </div>
           </th>`;
       }
@@ -1299,7 +1299,7 @@ function filterRowCells<T>(tab: TabId, columns: ColumnDef<T>[], allRows: T[]): s
                 type="button"
                 data-filter-key="${filterKey}"
                 title="Filter by ${esc(col.label)}; empty selection shows all"
-                onclick="window.__app.toggleEnumDropdown('${filterKey}')"
+                onclick="window.__app.toggleEnumDropdown(${jsArg(filterKey)})"
                 class="${FILTER_INPUT_CLASS} flex items-center justify-between gap-1 text-left"
               >
                 <span class="truncate">${esc(summary)}</span>
@@ -1310,7 +1310,7 @@ function filterRowCells<T>(tab: TabId, columns: ColumnDef<T>[], allRows: T[]): s
                   ? `
                 <div class="fixed z-20 max-h-56 w-48 overflow-auto rounded-md border border-gridline bg-surface-2 py-1 shadow-lg" data-scroll-id="enum-dropdown:${filterKey}" data-enum-dropdown-panel="${filterKey}">
                   <div class="flex items-center justify-end border-b border-gridline px-2 pb-1.5 mb-0.5 text-[11px] normal-case">
-                    <button type="button" onclick="window.__app.setEnumFilter('${tab}','${col.key}', [])" class="text-ink-secondary hover:text-ink-primary hover:underline">Clear</button>
+                    <button type="button" onclick="window.__app.setEnumFilter(${jsArg(tab)},${jsArg(col.key)}, [])" class="text-ink-secondary hover:text-ink-primary hover:underline">Clear</button>
                   </div>
                   ${distinct
                     .map(
@@ -1321,7 +1321,7 @@ function filterRowCells<T>(tab: TabId, columns: ColumnDef<T>[], allRows: T[]): s
                         value="${esc(v)}"
                         class="accent-series-blue"
                         ${selected?.has(v) ? "checked" : ""}
-                        onchange="window.__app.toggleEnumFilterValue('${tab}','${col.key}', this.value, this.checked)"
+                        onchange="window.__app.toggleEnumFilterValue(${jsArg(tab)},${jsArg(col.key)}, this.value, this.checked)"
                       />
                       <span class="truncate">${esc(v) || "(none)"}</span>
                     </label>`,
@@ -1337,7 +1337,7 @@ function filterRowCells<T>(tab: TabId, columns: ColumnDef<T>[], allRows: T[]): s
       return `
         <th>
           <input type="text" placeholder="Filter…" value="${esc(current?.text ?? "")}" data-filter-key="${filterKey}"
-                 oninput="window.__app.setStringFilter('${tab}','${col.key}', this.value)" class="${FILTER_INPUT_CLASS}" />
+                 oninput="window.__app.setStringFilter(${jsArg(tab)},${jsArg(col.key)}, this.value)" class="${FILTER_INPUT_CLASS}" />
         </th>`;
     })
     .join("");
@@ -1348,7 +1348,7 @@ function filterSummary(tab: TabId, totalCount: number, filteredCount: number): s
   return `
     <div class="mb-2 flex items-center justify-between text-xs text-ink-muted">
       <span>Showing ${filteredCount} of ${totalCount}</span>
-      <button onclick="window.__app.clearFilters('${tab}')" class="text-ink-secondary hover:text-ink-primary hover:underline">Clear filters</button>
+      <button onclick="window.__app.clearFilters(${jsArg(tab)})" class="text-ink-secondary hover:text-ink-primary hover:underline">Clear filters</button>
     </div>`;
 }
 
@@ -3515,7 +3515,7 @@ function renderSidebar(): string {
                 showReconnect
                   ? `<button
                        type="button"
-                       onclick="event.stopPropagation(); window.__app.reconnectCluster('${esc(c.context_name)}')"
+                       onclick="event.stopPropagation(); window.__app.reconnectCluster(${jsArg(c.context_name)})"
                        class="shrink-0 font-medium text-series-blue hover:underline"
                        title="Retry connecting to this cluster"
                      >Reconnect</button>`
@@ -3923,7 +3923,7 @@ function renderTabs(): string {
       ${TABS.map(
         (t) => `
         <button
-          onclick="window.__app.selectTab('${t.id}')"
+          onclick="window.__app.selectTab(${jsArg(t.id)})"
           class="border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
             state.activeTab === t.id
               ? "border-series-blue text-ink-primary"
@@ -4855,8 +4855,8 @@ function renderTimeSeriesChart(
         <div
           class="relative"
           data-chart-id="${chartId}"
-          onmousemove="window.__app.handleChartHover(event,'${chartId}')"
-          onmouseleave="window.__app.handleChartHoverEnd('${chartId}')"
+          onmousemove="window.__app.handleChartHover(event,${jsArg(chartId)})"
+          onmouseleave="window.__app.handleChartHoverEnd(${jsArg(chartId)})"
         >
           <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" class="h-[140px] w-full cursor-crosshair" data-chart-svg>
             <line x1="0" y1="0" x2="${width}" y2="0" stroke="var(--gridline)" stroke-width="1" />
@@ -5223,7 +5223,7 @@ function renderMetricsBackendEditor(): string {
         value="${esc(value)}"
         placeholder="${esc(placeholder)}"
         data-filter-key="metrics-backend:${key}"
-        oninput="window.__app.setMetricsBackendField('${key}', this.value)"
+        oninput="window.__app.setMetricsBackendField(${jsArg(key)}, this.value)"
         class="rounded border border-gridline bg-surface-2 px-2 py-1 text-ink-primary outline-none focus:border-series-blue"
       />
     </label>`;
@@ -5926,7 +5926,7 @@ function renderPodDetailPanel(): string {
                 (t) => `
               <button
                 type="button"
-                onclick="window.__app.setPodDetailView('${t.id}')"
+                onclick="window.__app.setPodDetailView(${jsArg(t.id)})"
                 data-detail-tab ${pd.view === t.id ? "data-detail-tab-active" : ""}
                 class="rounded-md px-3 py-1.5 text-xs font-medium ${pd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
               >${t.label}</button>`,
@@ -6044,7 +6044,7 @@ function renderNodeDetailPanel(): string {
               (t) => `
             <button
               type="button"
-              onclick="window.__app.setNodeDetailView('${t.id}')"
+              onclick="window.__app.setNodeDetailView(${jsArg(t.id)})"
               data-detail-tab ${nd.view === t.id ? "data-detail-tab-active" : ""}
               class="rounded-md px-3 py-1.5 text-xs font-medium ${nd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
             >${t.label}</button>`,
@@ -6443,7 +6443,7 @@ function renderWorkloadDetailPanel(): string {
                 (t) => `
               <button
                 type="button"
-                onclick="window.__app.setWorkloadDetailView('${t.id}')"
+                onclick="window.__app.setWorkloadDetailView(${jsArg(t.id)})"
                 data-detail-tab ${wd.view === t.id ? "data-detail-tab-active" : ""}
                 class="rounded-md px-3 py-1.5 text-xs font-medium ${wd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
               >${t.label}</button>`,
@@ -6554,7 +6554,7 @@ function renderNapDetailPanel(): string {
               (t) => `
             <button
               type="button"
-              onclick="window.__app.setNapDetailView('${t.id}')"
+              onclick="window.__app.setNapDetailView(${jsArg(t.id)})"
               data-detail-tab ${nd.view === t.id ? "data-detail-tab-active" : ""}
               class="rounded-md px-3 py-1.5 text-xs font-medium ${nd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
             >${t.label}</button>`,
@@ -6593,7 +6593,7 @@ function renderGitOpsDetailPanel(): string {
               (t) => `
             <button
               type="button"
-              onclick="window.__app.setGitOpsDetailView('${t.id}')"
+              onclick="window.__app.setGitOpsDetailView(${jsArg(t.id)})"
               data-detail-tab ${gd.view === t.id ? "data-detail-tab-active" : ""}
               class="rounded-md px-3 py-1.5 text-xs font-medium ${gd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
             >${t.label}</button>`,
@@ -7275,7 +7275,7 @@ function renderHelmDetailPanel(): string {
               (t) => `
             <button
               type="button"
-              onclick="window.__app.setHelmDetailView('${t.id}')"
+              onclick="window.__app.setHelmDetailView(${jsArg(t.id)})"
               data-detail-tab ${hd.view === t.id ? "data-detail-tab-active" : ""}
               class="rounded-md px-3 py-1.5 text-xs font-medium ${hd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
             >${t.label}</button>`,
