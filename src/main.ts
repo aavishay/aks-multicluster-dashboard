@@ -7375,15 +7375,6 @@ function isAnyOverlayOpen(): boolean {
 }
 
 /**
- * Steps the active tab along the visible tab bar.
- *
- * Clamped rather than wrapped: both directions are always available, so each
- * end stays one keypress away without wrapping, and a Cost -> Overview jump
- * from one extra keypress reads as a mis-key rather than a shortcut.
- * `selectTab` no-ops when the target equals the current tab, so the clamped
- * ends cost nothing.
- */
-/**
  * Adds the natively-clickable elements to `consumesPlainNavKeys`. A focused
  * `<button>` or link already responds to Enter and Space on its own, so the
  * row cursor must not act on top of it and fire two things at once.
@@ -7474,11 +7465,12 @@ function toggleFocusedRowSelection(): boolean {
 /**
  * Moves the active table's keyboard row cursor by `delta`.
  *
- * Returns whether the key was consumed: false when the active tab has no
- * table on screen (Metrics, Cost) so Up/Down still scroll those normally,
- * true whenever a table is present — including at the clamped ends, where a
- * list cursor stopping dead is less jarring than the page suddenly scrolling
- * instead.
+ * Returns whether the key was consumed: false when there is no row to move
+ * to — the tab has no table at all (Metrics, Cost), or its table is filtered
+ * down to nothing — so Up/Down still scroll normally in exactly the cases
+ * where a cursor would have nowhere to go. True once the table has rows,
+ * including at the clamped ends, where a list cursor stopping dead is less
+ * jarring than the page suddenly scrolling instead.
  */
 function moveTableRowFocus(delta: number): boolean {
   const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
@@ -7503,6 +7495,15 @@ function moveTableRowFocus(delta: number): boolean {
   return true;
 }
 
+/**
+ * Steps the active tab along the visible tab bar.
+ *
+ * Clamped rather than wrapped: both directions are always available, so each
+ * end stays one keypress away without wrapping, and a Cost -> Overview jump
+ * from one extra keypress reads as a mis-key rather than a shortcut.
+ * `selectTab` no-ops when the target equals the current tab, so the clamped
+ * ends cost nothing.
+ */
 function stepTab(delta: number) {
   const ids = TABS.map((t) => t.id);
   const current = ids.indexOf(state.activeTab);
