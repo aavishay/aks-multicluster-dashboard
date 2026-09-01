@@ -1157,10 +1157,14 @@ function selectAllCheckboxHeader<T>(tab: TabId, rows: T[], keyOf: (row: T) => st
 
 function rowCheckboxCell(tab: TabId, key: string): string {
   const checked = rowSelection(tab).has(key);
+  // `data-row-key` is what the keyboard selection shortcuts read to identify a
+  // row. Living on this one shared helper means all ten tables get it without
+  // ten separate edits — and without the shortcuts having to map a cursor's
+  // on-screen index back through pagination to a row identity.
   return `
     <td>
-      <input type="checkbox" class="accent-series-blue" ${checked ? "checked" : ""}
-             onchange="window.__app.toggleRowSelected('${tab}','${esc(key)}', this.checked)" />
+      <input type="checkbox" class="accent-series-blue" data-row-key="${esc(key)}" ${checked ? "checked" : ""}
+             onchange="window.__app.toggleRowSelected('${tab}',${jsArg(key)}, this.checked)" />
     </td>`;
 }
 
@@ -3403,13 +3407,11 @@ function render() {
   // re-render an auto-refresh triggers. Clamped against the rows actually
   // present, so a cursor left pointing past the end — a filter narrowed the
   // table under it, say — lands on the last row instead of disappearing.
-  const focusedTbody = app.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
-  const focusedIndex = state.focusedRow[state.activeTab];
-  if (focusedTbody && focusedIndex !== undefined && focusedTbody.children.length > 0) {
-    const row = focusedTbody.children[Math.min(focusedIndex, focusedTbody.children.length - 1)];
-    row.setAttribute("data-row-focused", "");
+  const focusedRow = focusedRowElement();
+  if (focusedRow) {
+    focusedRow.setAttribute("data-row-focused", "");
     // Runs after the scroll-position restore above, so it wins over it.
-    if (pendingRowFocusScroll) row.scrollIntoView({ block: "nearest" });
+    if (pendingRowFocusScroll) focusedRow.scrollIntoView({ block: "nearest" });
   }
   pendingRowFocusScroll = false;
 
@@ -3674,7 +3676,7 @@ function claudeExplainButton(subject: string, errorText: string): string {
       type="button"
       title="${esc(title)}"
       ${signedIn ? "" : "disabled"}
-      onclick="window.__app.explainError('${esc(subject)}', this.dataset.err)"
+      onclick="window.__app.explainError(${jsArg(subject)}, this.dataset.err)"
       data-err="${esc(errorText)}"
       class="shrink-0 rounded border border-gridline px-1.5 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
     >Explain</button>`;
@@ -4212,7 +4214,7 @@ function renderNodes(): string {
                   <button
                     type="button"
                     title="View node details (YAML, Events, Graph)"
-                    onclick="window.__app.openNodeDetail(${jsArg(ctx)},${jsArg(n.name)})"
+                    data-row-open onclick="window.__app.openNodeDetail(${jsArg(ctx)},${jsArg(n.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
@@ -4344,7 +4346,7 @@ function renderWorkloads(): string {
                   <button
                     type="button"
                     title="View workload details (YAML, Events)"
-                    onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})"
+                    data-row-open onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
@@ -4484,7 +4486,7 @@ function renderPods(): string {
                 <button
                   type="button"
                   title="View pod details"
-                  onclick="window.__app.openPodDetail('${esc(ctx)}','${esc(p.namespace)}','${esc(p.name)}')"
+                  data-row-open onclick="window.__app.openPodDetail(${jsArg(ctx)},${jsArg(p.namespace)},${jsArg(p.name)})"
                   class="text-ink-primary hover:text-series-blue hover:underline"
                 >${esc(p.name)}</button>
               </td>
@@ -5157,7 +5159,7 @@ function datasourceEditButton(ctx: string, label: string): string {
   return `
     <button
       type="button"
-      onclick="window.__app.openMetricsBackendEditor('${esc(ctx)}')"
+      onclick="window.__app.openMetricsBackendEditor(${jsArg(ctx)})"
       class="rounded border border-gridline px-2 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
     >${esc(label)}</button>`;
 }
@@ -6815,7 +6817,7 @@ function renderNap(): string {
                   <button
                     type="button"
                     title="View node pool details (YAML, Events, Graph)"
-                    onclick="window.__app.openNapDetail(${jsArg(ctx)},${jsArg(p.name)})"
+                    data-row-open onclick="window.__app.openNapDetail(${jsArg(ctx)},${jsArg(p.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
@@ -7047,7 +7049,7 @@ function renderGitOps(): string {
                 <button
                   type="button"
                   title="View Application details (YAML, Events)"
-                  onclick="window.__app.openGitOpsDetail(${jsArg(ctx)},${jsArg(a.namespace)},${jsArg(a.name)})"
+                  data-row-open onclick="window.__app.openGitOpsDetail(${jsArg(ctx)},${jsArg(a.namespace)},${jsArg(a.name)})"
                   class="text-ink-primary hover:text-series-blue hover:underline"
                 >${esc(a.name)}</button>
               </td>
@@ -7161,7 +7163,7 @@ function renderHelm(): string {
                 <button
                   type="button"
                   title="View release details (Values, Manifest, Notes)"
-                  onclick="window.__app.openHelmDetail(${jsArg(ctx)},${jsArg(r.namespace)},${jsArg(r.name)},${r.revision})"
+                  data-row-open onclick="window.__app.openHelmDetail(${jsArg(ctx)},${jsArg(r.namespace)},${jsArg(r.name)},${r.revision})"
                   class="text-ink-primary hover:text-series-blue hover:underline"
                 >${esc(r.name)}</button>
               </td>
@@ -7337,18 +7339,26 @@ function isAnyDetailPanelOpen(): boolean {
 }
 
 /**
- * Elements that give an *unmodified* Left/Right its own meaning, so tab
- * stepping must not steal the key.
+ * Elements that give the *unmodified* navigation keys — the four arrows,
+ * PageUp/PageDown and Home/End — their own meaning, so tab stepping and the
+ * row cursor must not steal them.
  *
  * Deliberately broader than `isEditableTarget`: a focused `<select>` (the
  * auto-refresh interval, page size, metrics range, pod/container pickers)
- * changes its own value on Left/Right, whereas Cmd+Left/Right — which
- * `isEditableTarget` guards — has no competing meaning there, so widening
- * that helper instead would needlessly disable view-history navigation while
- * a dropdown happens to hold focus.
+ * moves through its own options on every one of these keys, whereas
+ * Cmd+Left/Right — which `isEditableTarget` guards — has no competing
+ * meaning there, so widening that helper instead would needlessly disable
+ * view-history navigation while a dropdown happens to hold focus.
  */
-function consumesPlainArrowKeys(target: EventTarget | null): boolean {
+function consumesPlainNavKeys(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
+  if (target instanceof HTMLInputElement && (target.type === "checkbox" || target.type === "radio")) {
+    // Neither has any arrow/Home/End behavior of its own, and the row-select
+    // checkbox is focusable — so treating every <input> alike would leave the
+    // row cursor dead after tabbing onto one. They do still consume Enter and
+    // Space, which `consumesActivationKeys` accounts for separately.
+    return false;
+  }
   return (
     target.tagName === "INPUT" ||
     target.tagName === "TEXTAREA" ||
@@ -7376,22 +7386,179 @@ function isAnyOverlayOpen(): boolean {
 }
 
 /**
- * Steps the active tab along the visible tab bar.
- *
- * Clamped rather than wrapped: both directions are always available, so each
- * end stays one keypress away without wrapping, and a Cost -> Overview jump
- * from one extra keypress reads as a mis-key rather than a shortcut.
- * `selectTab` no-ops when the target equals the current tab, so the clamped
- * ends cost nothing.
+ * Adds the natively-clickable elements to `consumesPlainNavKeys`. A focused
+ * `<button>` or link already responds to Enter and Space on its own, so the
+ * row cursor must not act on top of it and fire two things at once.
  */
+function consumesActivationKeys(target: EventTarget | null): boolean {
+  if (consumesPlainNavKeys(target)) return true;
+  if (!(target instanceof HTMLElement)) return false;
+  // Checkbox and radio are deliberately re-included here after being excluded
+  // from the nav guard: they ignore the arrows but do act on Enter/Space, so
+  // the row cursor must not fire on top of them.
+  return (
+    target.tagName === "BUTTON" ||
+    target.tagName === "A" ||
+    (target instanceof HTMLInputElement && (target.type === "checkbox" || target.type === "radio"))
+  );
+}
+
+/** The `<tr>` the row cursor currently sits on, clamped to the rows actually rendered. */
+function focusedRowElement(): HTMLElement | null {
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const index = state.focusedRow[state.activeTab];
+  if (!tbody || index === undefined || tbody.children.length === 0) return null;
+  return tbody.children[Math.min(index, tbody.children.length - 1)] as HTMLElement;
+}
+
+/** The selection key of the row at `index` among those currently rendered, read off the shared checkbox cell. */
+function renderedRowKey(index: number): string | null {
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const row = tbody?.children[index];
+  return row?.querySelector<HTMLElement>("[data-row-key]")?.dataset.rowKey ?? null;
+}
+
+/** Home/End: jumps the cursor to the first or last row on screen. Shared with `pageTableRows`, which falls back to exactly this once there is no page left to turn. */
+function jumpRowFocus(toEnd: boolean): boolean {
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const count = tbody?.children.length ?? 0;
+  if (count === 0) return false;
+  const target = toEnd ? count - 1 : 0;
+  if (state.focusedRow[state.activeTab] !== target) {
+    state.focusedRow[state.activeTab] = target;
+    pendingRowFocusScroll = true;
+    render();
+  }
+  return true;
+}
+
+/**
+ * Shift+Up/Down: moves the cursor and selects what it passes over, so a run
+ * of rows can be picked without reaching for the mouse.
+ *
+ * Additive rather than a true anchored range: reversing direction leaves the
+ * rows already picked selected instead of deselecting them. That keeps the
+ * behavior honest about what the model underneath actually is — a set of
+ * selected keys with no anchor — rather than implying a range that
+ * `toggleAllRowsSelected` and the header checkbox would then contradict.
+ * Space still un-picks any single row, and the toolbar's Clear resets.
+ */
+function extendRowSelection(delta: number): boolean {
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const count = tbody?.children.length ?? 0;
+  if (count === 0) return false;
+
+  const current = state.focusedRow[state.activeTab];
+  // A first Shift+Arrow selects where the cursor lands rather than sweeping
+  // from an imagined position off the end of the table.
+  const from = current ?? (delta > 0 ? 0 : count - 1);
+  const to = current === undefined ? from : Math.min(count - 1, Math.max(0, from + delta));
+
+  const selection = rowSelection(state.activeTab);
+  let selectionGrew = false;
+  for (const index of new Set([from, to])) {
+    const key = renderedRowKey(index);
+    if (key && !selection.has(key)) {
+      selection.add(key);
+      selectionGrew = true;
+    }
+  }
+
+  // Held at an end with everything already picked, repeated Shift+Arrow has
+  // nothing to show — and render() replaces the whole app's innerHTML, so
+  // skipping it there keeps a held key from rebuilding the table per repeat.
+  const cursorMoved = to !== current;
+  if (cursorMoved) state.focusedRow[state.activeTab] = to;
+  if (cursorMoved || selectionGrew) {
+    // Only a moved cursor needs scrolling into view; a selection change
+    // alone happens on a row already on screen.
+    if (cursorMoved) pendingRowFocusScroll = true;
+    render();
+  }
+  return true;
+}
+
+/** Cmd+A: selects every row the current filters match, not just the page on screen — the same set the header's select-all checkbox covers. */
+function selectAllRowsInTable(): boolean {
+  const tab = state.activeTab;
+  if (!tableSnapshots[tab]?.rows.length) return false;
+  toggleAllRowsSelected(tab, true);
+  return true;
+}
+
+/**
+ * PageUp/PageDown.
+ *
+ * Where the table holds more rows than are on screen, these step the app's
+ * own pagination — the most literal reading of the key when the pager
+ * already says "Page 3 of 11", and the only way to cross a page boundary
+ * from the keyboard, which the row cursor deliberately can't do. Whether a
+ * table paginates is derived from the row counts rather than a list of which
+ * tabs do: fewer rows rendered than the snapshot holds is exactly what "there
+ * are other pages" means, and it stays right if a table's pagination is
+ * later added or removed.
+ *
+ * Otherwise — every row already on screen, or already on the last/first page
+ * — the cursor jumps to the far end instead, so the key always does
+ * something rather than silently no-opping on the short tables.
+ */
+function pageTableRows(delta: number): boolean {
+  const tab = state.activeTab;
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${tab}"] tbody`);
+  const visible = tbody?.children.length ?? 0;
+  if (visible === 0) return false;
+
+  const total = tableSnapshots[tab]?.rows.length ?? visible;
+  if (total > visible) {
+    const current = currentPage(tab, total);
+    const next = Math.min(pageCount(total), Math.max(1, current + delta));
+    if (next !== current) {
+      // Set before `setTablePage`, whose render then draws the cursor on the
+      // newly shown page in the same pass rather than needing a second one.
+      state.focusedRow[tab] = 0;
+      pendingRowFocusScroll = true;
+      setTablePage(tab, next);
+      return true;
+    }
+  }
+
+  return jumpRowFocus(delta > 0);
+}
+
+/**
+ * Enter: opens the focused row's detail panel.
+ *
+ * Dispatched by clicking the row's own marked button rather than
+ * reconstructing the call — that button already carries the right
+ * identifiers, so this needs no row-key lookup and, crucially, no mapping
+ * from the cursor's on-screen index back to a paginated offset. Tables whose
+ * rows have no detail panel (Overview, Resource Usage, Events, KEDA) simply
+ * have nothing to find, so Enter is a no-op there by construction.
+ */
+function activateFocusedRow(): boolean {
+  const open = focusedRowElement()?.querySelector<HTMLElement>("[data-row-open]");
+  if (!open) return false;
+  open.click();
+  return true;
+}
+
+/** Space: toggles the focused row's selection — the same checkbox the "N rows selected" toolbar and its Copy to clipboard act on. Clicked rather than called directly, for the same reason as `activateFocusedRow`. */
+function toggleFocusedRowSelection(): boolean {
+  const box = focusedRowElement()?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+  if (!box) return false;
+  box.click();
+  return true;
+}
+
 /**
  * Moves the active table's keyboard row cursor by `delta`.
  *
- * Returns whether the key was consumed: false when the active tab has no
- * table on screen (Metrics, Cost) so Up/Down still scroll those normally,
- * true whenever a table is present — including at the clamped ends, where a
- * list cursor stopping dead is less jarring than the page suddenly scrolling
- * instead.
+ * Returns whether the key was consumed: false when there is no row to move
+ * to — the tab has no table at all (Metrics, Cost), or its table is filtered
+ * down to nothing — so Up/Down still scroll normally in exactly the cases
+ * where a cursor would have nowhere to go. True once the table has rows,
+ * including at the clamped ends, where a list cursor stopping dead is less
+ * jarring than the page suddenly scrolling instead.
  */
 function moveTableRowFocus(delta: number): boolean {
   const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
@@ -7416,6 +7583,15 @@ function moveTableRowFocus(delta: number): boolean {
   return true;
 }
 
+/**
+ * Steps the active tab along the visible tab bar.
+ *
+ * Clamped rather than wrapped: both directions are always available, so each
+ * end stays one keypress away without wrapping, and a Cost -> Overview jump
+ * from one extra keypress reads as a mis-key rather than a shortcut.
+ * `selectTab` no-ops when the target equals the current tab, so the clamped
+ * ends cost nothing.
+ */
 function stepTab(delta: number) {
   const ids = TABS.map((t) => t.id);
   const current = ids.indexOf(state.activeTab);
@@ -7448,7 +7624,7 @@ document.addEventListener("keydown", (e) => {
   // is a text-selection gesture, and Alt/Ctrl+Arrow are word-wise or
   // platform-level movement.
   if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainArrowKeys(e.target) || isAnyOverlayOpen()) return;
+    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
     // Prevents the key also scrolling a horizontally-scrollable table.
     e.preventDefault();
     stepTab(e.key === "ArrowRight" ? 1 : -1);
@@ -7458,10 +7634,37 @@ document.addEventListener("keydown", (e) => {
   // counterpart to Left/Right above and gated on exactly the same two
   // guards.
   if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainArrowKeys(e.target) || isAnyOverlayOpen()) return;
+    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
     // Conditional, unlike the horizontal case: a tab with no table (Metrics,
     // Cost) must keep Up/Down as ordinary scrolling.
     if (moveTableRowFocus(e.key === "ArrowDown" ? 1 : -1)) e.preventDefault();
+    return;
+  }
+  // Shift+Up/Down carry the selection along with the cursor.
+  if ((e.key === "ArrowUp" || e.key === "ArrowDown") && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
+    if (extendRowSelection(e.key === "ArrowDown" ? 1 : -1)) e.preventDefault();
+    return;
+  }
+  // Home/End jump the cursor to the ends of what's on screen.
+  if ((e.key === "Home" || e.key === "End") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
+    if (jumpRowFocus(e.key === "End")) e.preventDefault();
+    return;
+  }
+  // PageUp/PageDown step the table's pagination where there is any, else
+  // jump the cursor to the far end. Same two guards as the arrows.
+  if ((e.key === "PageUp" || e.key === "PageDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
+    if (pageTableRows(e.key === "PageDown" ? 1 : -1)) e.preventDefault();
+    return;
+  }
+  // Enter opens the cursor's row; Space selects it. Guarded one step wider
+  // than the navigation keys, since a focused button or link already handles
+  // both of these itself.
+  if ((e.key === "Enter" || e.key === " ") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    if (consumesActivationKeys(e.target) || isAnyOverlayOpen()) return;
+    if (e.key === "Enter" ? activateFocusedRow() : toggleFocusedRowSelection()) e.preventDefault();
     return;
   }
   if (!e.metaKey) return;
@@ -7472,6 +7675,15 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "k" || e.key === "K") {
     e.preventDefault();
     openClusterPalette();
+    return;
+  }
+
+  // Cmd+A selects every matching row. Guarded on `isEditableTarget` rather
+  // than the wider activation set: Cmd+A inside a text field is select-all-
+  // text and must stay that way, but a focused button has no such meaning.
+  if (e.key === "a" || e.key === "A") {
+    if (isEditableTarget(e.target) || isAnyOverlayOpen()) return;
+    if (selectAllRowsInTable()) e.preventDefault();
     return;
   }
 
