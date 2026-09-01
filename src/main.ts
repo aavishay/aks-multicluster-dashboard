@@ -1157,10 +1157,14 @@ function selectAllCheckboxHeader<T>(tab: TabId, rows: T[], keyOf: (row: T) => st
 
 function rowCheckboxCell(tab: TabId, key: string): string {
   const checked = rowSelection(tab).has(key);
+  // `data-row-key` is what the keyboard selection shortcuts read to identify a
+  // row. Living on this one shared helper means all ten tables get it without
+  // ten separate edits — and without the shortcuts having to map a cursor's
+  // on-screen index back through pagination to a row identity.
   return `
     <td>
-      <input type="checkbox" class="accent-series-blue" ${checked ? "checked" : ""}
-             onchange="window.__app.toggleRowSelected('${tab}','${esc(key)}', this.checked)" />
+      <input type="checkbox" class="accent-series-blue" data-row-key="${esc(key)}" ${checked ? "checked" : ""}
+             onchange="window.__app.toggleRowSelected('${tab}',${jsArg(key)}, this.checked)" />
     </td>`;
 }
 
@@ -7335,9 +7339,9 @@ function isAnyDetailPanelOpen(): boolean {
 }
 
 /**
- * Elements that give the *unmodified* navigation keys — the four arrows and
- * PageUp/PageDown — their own meaning, so tab stepping and the row cursor
- * must not steal them.
+ * Elements that give the *unmodified* navigation keys — the four arrows,
+ * PageUp/PageDown and Home/End — their own meaning, so tab stepping and the
+ * row cursor must not steal them.
  *
  * Deliberately broader than `isEditableTarget`: a focused `<select>` (the
  * auto-refresh interval, page size, metrics range, pod/container pickers)
@@ -7392,6 +7396,68 @@ function focusedRowElement(): HTMLElement | null {
   return tbody.children[Math.min(index, tbody.children.length - 1)] as HTMLElement;
 }
 
+/** The selection key of the row at `index` among those currently rendered, read off the shared checkbox cell. */
+function renderedRowKey(index: number): string | null {
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const row = tbody?.children[index];
+  return row?.querySelector<HTMLElement>("[data-row-key]")?.dataset.rowKey ?? null;
+}
+
+/** Home/End: jumps the cursor to the first or last row on screen. Shared with `pageTableRows`, which falls back to exactly this once there is no page left to turn. */
+function jumpRowFocus(toEnd: boolean): boolean {
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const count = tbody?.children.length ?? 0;
+  if (count === 0) return false;
+  const target = toEnd ? count - 1 : 0;
+  if (state.focusedRow[state.activeTab] !== target) {
+    state.focusedRow[state.activeTab] = target;
+    pendingRowFocusScroll = true;
+    render();
+  }
+  return true;
+}
+
+/**
+ * Shift+Up/Down: moves the cursor and selects what it passes over, so a run
+ * of rows can be picked without reaching for the mouse.
+ *
+ * Additive rather than a true anchored range: reversing direction leaves the
+ * rows already picked selected instead of deselecting them. That keeps the
+ * behavior honest about what the model underneath actually is — a set of
+ * selected keys with no anchor — rather than implying a range that
+ * `toggleAllRowsSelected` and the header checkbox would then contradict.
+ * Space still un-picks any single row, and the toolbar's Clear resets.
+ */
+function extendRowSelection(delta: number): boolean {
+  const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
+  const count = tbody?.children.length ?? 0;
+  if (count === 0) return false;
+
+  const current = state.focusedRow[state.activeTab];
+  // A first Shift+Arrow selects where the cursor lands rather than sweeping
+  // from an imagined position off the end of the table.
+  const from = current ?? (delta > 0 ? 0 : count - 1);
+  const to = current === undefined ? from : Math.min(count - 1, Math.max(0, from + delta));
+
+  const selection = rowSelection(state.activeTab);
+  for (const index of new Set([from, to])) {
+    const key = renderedRowKey(index);
+    if (key) selection.add(key);
+  }
+  state.focusedRow[state.activeTab] = to;
+  pendingRowFocusScroll = true;
+  render();
+  return true;
+}
+
+/** Cmd+A: selects every row the current filters match, not just the page on screen — the same set the header's select-all checkbox covers. */
+function selectAllRowsInTable(): boolean {
+  const tab = state.activeTab;
+  if (!tableSnapshots[tab]?.rows.length) return false;
+  toggleAllRowsSelected(tab, true);
+  return true;
+}
+
 /**
  * PageUp/PageDown.
  *
@@ -7428,13 +7494,7 @@ function pageTableRows(delta: number): boolean {
     }
   }
 
-  const target = delta > 0 ? visible - 1 : 0;
-  if (state.focusedRow[tab] !== target) {
-    state.focusedRow[tab] = target;
-    pendingRowFocusScroll = true;
-    render();
-  }
-  return true;
+  return jumpRowFocus(delta > 0);
 }
 
 /**
@@ -7552,6 +7612,18 @@ document.addEventListener("keydown", (e) => {
     if (moveTableRowFocus(e.key === "ArrowDown" ? 1 : -1)) e.preventDefault();
     return;
   }
+  // Shift+Up/Down carry the selection along with the cursor.
+  if ((e.key === "ArrowUp" || e.key === "ArrowDown") && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
+    if (extendRowSelection(e.key === "ArrowDown" ? 1 : -1)) e.preventDefault();
+    return;
+  }
+  // Home/End jump the cursor to the ends of what's on screen.
+  if ((e.key === "Home" || e.key === "End") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
+    if (jumpRowFocus(e.key === "End")) e.preventDefault();
+    return;
+  }
   // PageUp/PageDown step the table's pagination where there is any, else
   // jump the cursor to the far end. Same two guards as the arrows.
   if ((e.key === "PageUp" || e.key === "PageDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
@@ -7575,6 +7647,15 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "k" || e.key === "K") {
     e.preventDefault();
     openClusterPalette();
+    return;
+  }
+
+  // Cmd+A selects every matching row. Guarded on `isEditableTarget` rather
+  // than the wider activation set: Cmd+A inside a text field is select-all-
+  // text and must stay that way, but a focused button has no such meaning.
+  if (e.key === "a" || e.key === "A") {
+    if (isEditableTarget(e.target) || isAnyOverlayOpen()) return;
+    if (selectAllRowsInTable()) e.preventDefault();
     return;
   }
 
