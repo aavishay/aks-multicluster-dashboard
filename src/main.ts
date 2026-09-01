@@ -5935,7 +5935,7 @@ function renderPodDetailPanel(): string {
           </div>
           ${pd.view !== "graph" ? containerSelector : ""}
         </div>
-        <div class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -6051,7 +6051,7 @@ function renderNodeDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -6452,7 +6452,7 @@ function renderWorkloadDetailPanel(): string {
           </div>
           ${wd.view === "logs" ? `<div class="flex min-w-0 items-center gap-2">${podSelector}${containerSelector}</div>` : ""}
         </div>
-        <div class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -6561,7 +6561,7 @@ function renderNapDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -6600,7 +6600,7 @@ function renderGitOpsDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -7282,7 +7282,7 @@ function renderHelmDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div class="flex min-h-0 flex-1 flex-col p-4">${renderHelmDetailBody(hd)}</div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col p-4">${renderHelmDetailBody(hd)}</div>
       </div>
     </div>`;
 }
@@ -7399,6 +7399,44 @@ function isNonPanelOverlayOpen(): boolean {
 /** True while anything at all covers the tab content, detail panels included — the broad guard for keys that no overlay should let through. */
 function isAnyOverlayOpen(): boolean {
   return isNonPanelOverlayOpen() || isAnyDetailPanelOpen();
+}
+
+/** How far one arrow press scrolls a detail panel, in px — roughly what a browser's own arrow scrolling moves, since that's the feel this is standing in for. */
+const DETAIL_SCROLL_LINE_PX = 40;
+
+/**
+ * The scrollable region of the open detail panel, if it has one.
+ *
+ * Needed because the panes that actually overflow — the YAML `<pre>`, the log
+ * `<pre>`, the events list — aren't focusable, so the browser's own arrow
+ * scrolling never reaches them: it scrolls the focused element's nearest
+ * scrollable ancestor, and with focus on `<body>` that isn't the panel at all.
+ * Hence scrolling it explicitly.
+ *
+ * Prefers a `data-scroll-id` descendant, since those are the panes built to
+ * scroll (and whose position render() already preserves), falling back to the
+ * panel body itself. Returns null when nothing overflows — the Graph tab,
+ * or a short manifest — so the caller can leave the key alone.
+ */
+function detailPanelScroller(): HTMLElement | null {
+  const body = document.querySelector<HTMLElement>("[data-detail-body]");
+  if (!body) return null;
+  const overflows = (el: HTMLElement) => el.scrollHeight > el.clientHeight + 1;
+  const pane = [...body.querySelectorAll<HTMLElement>("[data-scroll-id]")].find(overflows);
+  return pane ?? (overflows(body) ? body : null);
+}
+
+/** Scrolls the open detail panel by a line, a near-full page, or to either edge. */
+function scrollDetailPanel(mode: "line" | "page" | "edge", direction: 1 | -1): boolean {
+  const el = detailPanelScroller();
+  if (!el) return false;
+  if (mode === "edge") {
+    el.scrollTop = direction > 0 ? el.scrollHeight : 0;
+  } else {
+    // A page leaves a sliver of overlap so the reader keeps their place.
+    el.scrollTop += direction * (mode === "page" ? el.clientHeight * 0.9 : DETAIL_SCROLL_LINE_PX);
+  }
+  return true;
 }
 
 /**
@@ -7680,29 +7718,49 @@ document.addEventListener("keydown", (e) => {
   // counterpart to Left/Right above and gated on exactly the same two
   // guards.
   if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
+    if (consumesPlainNavKeys(e.target) || isNonPanelOverlayOpen()) return;
+    const delta = e.key === "ArrowDown" ? 1 : -1;
+    // With a panel open these scroll its content instead of moving the row
+    // cursor hidden behind it — see `detailPanelScroller` for why the browser
+    // won't do this on its own.
+    if (isAnyDetailPanelOpen()) {
+      if (scrollDetailPanel("line", delta)) e.preventDefault();
+      return;
+    }
     // Conditional, unlike the horizontal case: a tab with no table (Metrics,
     // Cost) must keep Up/Down as ordinary scrolling.
-    if (moveTableRowFocus(e.key === "ArrowDown" ? 1 : -1)) e.preventDefault();
+    if (moveTableRowFocus(delta)) e.preventDefault();
     return;
   }
   // Shift+Up/Down carry the selection along with the cursor.
   if ((e.key === "ArrowUp" || e.key === "ArrowDown") && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    // Still the broad guard: a panel has no row selection to extend, and
+    // Shift+Arrow is a text-selection gesture worth leaving to the pane.
     if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
     if (extendRowSelection(e.key === "ArrowDown" ? 1 : -1)) e.preventDefault();
     return;
   }
   // Home/End jump the cursor to the ends of what's on screen.
   if ((e.key === "Home" || e.key === "End") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
-    if (jumpRowFocus(e.key === "End")) e.preventDefault();
+    if (consumesPlainNavKeys(e.target) || isNonPanelOverlayOpen()) return;
+    const toEnd = e.key === "End";
+    if (isAnyDetailPanelOpen()) {
+      if (scrollDetailPanel("edge", toEnd ? 1 : -1)) e.preventDefault();
+      return;
+    }
+    if (jumpRowFocus(toEnd)) e.preventDefault();
     return;
   }
   // PageUp/PageDown step the table's pagination where there is any, else
   // jump the cursor to the far end. Same two guards as the arrows.
   if ((e.key === "PageUp" || e.key === "PageDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
-    if (pageTableRows(e.key === "PageDown" ? 1 : -1)) e.preventDefault();
+    if (consumesPlainNavKeys(e.target) || isNonPanelOverlayOpen()) return;
+    const delta = e.key === "PageDown" ? 1 : -1;
+    if (isAnyDetailPanelOpen()) {
+      if (scrollDetailPanel("page", delta)) e.preventDefault();
+      return;
+    }
+    if (pageTableRows(delta)) e.preventDefault();
     return;
   }
   // Enter opens the cursor's row; Space selects it. Guarded one step wider
