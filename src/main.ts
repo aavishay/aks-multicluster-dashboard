@@ -19,6 +19,7 @@ import type {
   MetricSample,
   MetricsOverTimeResult,
   NapNodePoolInfo,
+  NapNodePoolManifest,
   NapResult,
   NodeInfo,
   NodeManifest,
@@ -430,6 +431,20 @@ interface GitOpsDetailState {
   eventsLoading: boolean;
 }
 
+interface NapDetailState extends MetricsViewState {
+  ctx: string;
+  name: string;
+  view: "yaml" | "events" | "graph";
+  manifest: NapNodePoolManifest | null;
+  manifestError: string | null;
+  showManagedFields: boolean;
+  yamlSearch: string;
+  yamlSearchIndex: number;
+  events: EventInfo[] | null;
+  eventsError: string | null;
+  eventsLoading: boolean;
+}
+
 interface HelmDetailState {
   ctx: string;
   namespace: string;
@@ -573,6 +588,7 @@ interface AppState {
   nodeDetail: NodeDetailState | null;
   workloadDetail: WorkloadDetailState | null;
   gitOpsDetail: GitOpsDetailState | null;
+  napDetail: NapDetailState | null;
   helmDetail: HelmDetailState | null;
 }
 
@@ -633,6 +649,7 @@ const state: AppState = {
   nodeDetail: null,
   workloadDetail: null,
   gitOpsDetail: null,
+  napDetail: null,
   helmDetail: null,
 };
 
@@ -648,6 +665,7 @@ let nodeDetailToken = 0;
 let workloadDetailToken = 0;
 /** Same idea as `podDetailToken`, for the GitOps app detail panel. */
 let gitOpsDetailToken = 0;
+let napDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
 let helmDetailToken = 0;
 /** Bumped per explain request, so a stale stream can't append to a newer one. */
@@ -1901,6 +1919,19 @@ function viewPodsForNode(ctx: string, nodeName: string) {
   loadTabData();
 }
 
+/** Drill down from a NAP row into the nodes it actually provisioned. */
+function viewNodesForNodePool(ctx: string, poolName: string) {
+  pushViewHistory();
+  state.filterState.nodes = {
+    cluster: { enumValues: new Set([ctx]) },
+    node_pool: { enumValues: new Set([poolName]) },
+  };
+  state.unhealthyOnly.nodes = false;
+  state.activeTab = "nodes";
+  render();
+  loadTabData();
+}
+
 // ---------------------------------------------------------------------------
 // Node detail panel (YAML / Events)
 // ---------------------------------------------------------------------------
@@ -1910,6 +1941,7 @@ function openNodeDetail(ctx: string, name: string) {
   closeWorkloadDetail();
   closeGitOpsDetail();
   closeHelmDetail();
+  closeNapDetail();
   const token = ++nodeDetailToken;
   state.nodeDetail = {
     ctx,
@@ -2045,6 +2077,7 @@ function openHelmDetail(ctx: string, namespace: string, name: string, revision: 
   closeNodeDetail();
   closeWorkloadDetail();
   closeGitOpsDetail();
+  closeNapDetail();
   const token = ++helmDetailToken;
   state.helmDetail = {
     ctx,
@@ -2140,6 +2173,7 @@ function openGitOpsDetail(ctx: string, namespace: string, name: string) {
   closeNodeDetail();
   closeWorkloadDetail();
   closeHelmDetail();
+  closeNapDetail();
   const token = ++gitOpsDetailToken;
   state.gitOpsDetail = {
     ctx,
@@ -2237,6 +2271,142 @@ function moveGitOpsSearch(_view: string, delta: number) {
 }
 
 // ---------------------------------------------------------------------------
+// NAP node pool detail panel (YAML / Events / Graph)
+// ---------------------------------------------------------------------------
+
+function openNapDetail(ctx: string, name: string) {
+  closePodDetail();
+  closeNodeDetail();
+  closeWorkloadDetail();
+  closeGitOpsDetail();
+  closeHelmDetail();
+  const token = ++napDetailToken;
+  state.napDetail = {
+    ctx,
+    name,
+    view: "yaml",
+    manifest: null,
+    manifestError: null,
+    showManagedFields: false,
+    yamlSearch: "",
+    yamlSearchIndex: 0,
+    events: null,
+    eventsError: null,
+    eventsLoading: false,
+    ...EMPTY_METRICS_VIEW_STATE,
+  };
+  render();
+
+  api
+    .getNapNodePoolManifest(ctx, name)
+    .then((manifest) => {
+      if (token !== napDetailToken || !state.napDetail) return;
+      state.napDetail.manifest = manifest;
+      render();
+    })
+    .catch((e) => {
+      if (token !== napDetailToken || !state.napDetail) return;
+      state.napDetail.manifestError = String(e);
+      render();
+    });
+}
+
+function closeNapDetail() {
+  napDetailToken += 1;
+  state.napDetail = null;
+  render();
+}
+
+function setNapDetailView(view: NapDetailState["view"]) {
+  if (!state.napDetail) return;
+  state.napDetail.view = view;
+  render();
+  if (view === "events" && !state.napDetail.events && !state.napDetail.eventsLoading) {
+    fetchNapEvents();
+  }
+  if (view === "graph" && !state.napDetail.metrics && !state.napDetail.metricsLoading) {
+    fetchNapMetrics();
+  }
+}
+
+function setNapMetricsRange(minutes: number) {
+  if (!state.napDetail) return;
+  state.napDetail.metricsRangeMinutes = minutes;
+  render();
+  fetchNapMetrics();
+}
+
+async function fetchNapEvents() {
+  const nd = state.napDetail;
+  if (!nd) return;
+  const token = napDetailToken;
+  nd.eventsLoading = true;
+  nd.eventsError = null;
+  render();
+  try {
+    const events = await api.getNapNodePoolEvents(nd.ctx, nd.name);
+    if (token !== napDetailToken || !state.napDetail) return;
+    state.napDetail.events = events;
+  } catch (e) {
+    if (token !== napDetailToken || !state.napDetail) return;
+    state.napDetail.eventsError = String(e);
+  } finally {
+    if (token === napDetailToken && state.napDetail) state.napDetail.eventsLoading = false;
+    render();
+  }
+}
+
+async function fetchNapMetrics() {
+  const nd = state.napDetail;
+  if (!nd) return;
+  const token = napDetailToken;
+  nd.metricsLoading = true;
+  nd.metricsError = null;
+  render();
+  try {
+    const result = await api.getNapNodePoolMetricsOverTime(nd.ctx, nd.name, nd.metricsRangeMinutes, metricsBackendFor(nd.ctx));
+    if (token !== napDetailToken || !state.napDetail) return;
+    state.napDetail.metrics = result;
+  } catch (e) {
+    if (token !== napDetailToken || !state.napDetail) return;
+    state.napDetail.metricsError = String(e);
+  } finally {
+    if (token === napDetailToken && state.napDetail) state.napDetail.metricsLoading = false;
+    render();
+  }
+}
+
+function toggleNapManagedFields() {
+  if (!state.napDetail) return;
+  state.napDetail.showManagedFields = !state.napDetail.showManagedFields;
+  render();
+}
+
+/** The YAML text currently on screen — whichever of the two cached variants the toggle selects. */
+function currentNapYamlText(nd: NapDetailState): string {
+  if (!nd.manifest) return "";
+  return nd.showManagedFields ? nd.manifest.yaml_full : nd.manifest.yaml_without_managed_fields;
+}
+
+function setNapSearch(_view: string, query: string) {
+  if (!state.napDetail) return;
+  state.napDetail.yamlSearch = query;
+  state.napDetail.yamlSearchIndex = 0;
+  pendingSearchScroll = true;
+  render();
+}
+
+function moveNapSearch(_view: string, delta: number) {
+  const nd = state.napDetail;
+  if (!nd || !nd.yamlSearch) return;
+  const count = countSearchMatches(currentNapYamlText(nd), nd.yamlSearch);
+  if (count === 0) return;
+  nd.yamlSearchIndex = (((nd.yamlSearchIndex + delta) % count) + count) % count;
+  pendingSearchScroll = true;
+  render();
+}
+
+// ---------------------------------------------------------------------------
 // Workload detail panel (YAML / Events)
 // ---------------------------------------------------------------------------
 
@@ -2245,6 +2415,7 @@ function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: 
   closeNodeDetail();
   closeGitOpsDetail();
   closeHelmDetail();
+  closeNapDetail();
   stopWorkloadLogFollow();
   const token = ++workloadDetailToken;
   state.workloadDetail = {
@@ -2637,6 +2808,7 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
   closeWorkloadDetail();
   closeGitOpsDetail();
   closeHelmDetail();
+  closeNapDetail();
   stopPodLogFollow();
   const token = ++podDetailToken;
   state.podDetail = {
@@ -2970,6 +3142,14 @@ function setMetricsRange(minutes: number) {
   toggleGitOpsManagedFields,
   setGitOpsSearch,
   moveGitOpsSearch,
+  openNapDetail,
+  closeNapDetail,
+  setNapDetailView,
+  setNapMetricsRange,
+  toggleNapManagedFields,
+  setNapSearch,
+  moveNapSearch,
+  viewNodesForNodePool,
   openHelmDetail,
   closeHelmDetail,
   setHelmDetailView,
@@ -3130,6 +3310,7 @@ function render() {
     ${renderPodDetailPanel()}
     ${renderNodeDetailPanel()}
     ${renderWorkloadDetailPanel()}
+    ${renderNapDetailPanel()}
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
     ${renderMetricsBackendEditor()}
@@ -3949,6 +4130,7 @@ function renderNodes(): string {
     },
     { key: "zone", label: "Zone", value: (r) => r.n.zone ?? "", filter: "enum" },
     { key: "instance_type", label: "Instance type", value: (r) => r.n.instance_type ?? "", filter: "enum" },
+    { key: "node_pool", label: "Node Pool", value: (r) => r.n.node_pool ?? "", filter: "enum" },
     { key: "kubelet", label: "Kubelet", value: (r) => r.n.kubelet_version, filter: "enum" },
     {
       key: "age",
@@ -4026,6 +4208,18 @@ function renderNodes(): string {
                         onclick="window.__app.setEnumFilter('nodes','instance_type',[${jsArg(n.instance_type)}])"
                         class="hover:text-series-blue hover:underline"
                       >${esc(n.instance_type)}</button>`
+                    : "—"
+                }
+              </td>
+              <td>
+                ${
+                  n.node_pool
+                    ? `<button
+                        type="button"
+                        title="Filter nodes by this node pool"
+                        onclick="window.__app.setEnumFilter('nodes','node_pool',[${jsArg(n.node_pool)}])"
+                        class="hover:text-series-blue hover:underline"
+                      >${esc(n.node_pool)}</button>`
                     : "—"
                 }
               </td>
@@ -5424,7 +5618,7 @@ function highlightSearchMatches(html: string, query: string, currentIndex: numbe
  * to be unique within that panel for the `data-filter-key` focus-restore tag.
  */
 function renderSearchBox(
-  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm",
+  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap",
   view: string,
   query: string,
   matchCount: number,
@@ -6258,6 +6452,84 @@ function renderGitOpsYamlView(gd: GitOpsDetailState): string {
     </div>`;
 }
 
+function renderNapYamlView(nd: NapDetailState): string {
+  if (nd.manifestError) {
+    return `<div class="text-sm text-status-critical">${esc(nd.manifestError)}</div>`;
+  }
+  if (!nd.manifest) {
+    return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  }
+  const yaml = currentNapYamlText(nd);
+  const matchCount = countSearchMatches(yaml, nd.yamlSearch);
+  const scrollId = `nap-yaml:${esc(nd.ctx)}:${esc(nd.name)}`;
+  return `
+    <div class="flex h-full min-h-0 flex-col gap-2">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="flex items-center gap-3">
+          <label class="flex items-center gap-2 text-xs text-ink-secondary">
+            <input type="checkbox" ${nd.showManagedFields ? "checked" : ""} onchange="window.__app.toggleNapManagedFields()" />
+            Show managed fields
+          </label>
+          ${renderCopyButton(scrollId)}
+        </div>
+        ${renderSearchBox("Nap", "yaml", nd.yamlSearch, matchCount, nd.yamlSearchIndex)}
+      </div>
+      <pre data-scroll-id="${scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(yaml), nd.yamlSearch, nd.yamlSearchIndex)}</pre>
+    </div>`;
+}
+
+function renderNapGraphView(nd: NapDetailState): string {
+  const note = `
+    <div class="mb-3 text-xs text-ink-muted">
+      Summed across every node this pool currently owns — excludes kubelet, runtime and OS overhead, same as the Node detail Graph.
+    </div>`;
+  return renderMetricsGraphView(nd, "setNapMetricsRange", `nap:${nd.ctx}:${nd.name}`, note);
+}
+
+function renderNapDetailPanel(): string {
+  const nd = state.napDetail;
+  if (!nd) return "";
+
+  const tabs: { id: NapDetailState["view"]; label: string }[] = [
+    { id: "yaml", label: "YAML" },
+    { id: "events", label: "Events" },
+    { id: "graph", label: "Graph" },
+  ];
+
+  const body =
+    nd.view === "yaml"
+      ? renderNapYamlView(nd)
+      : nd.view === "events"
+        ? renderEventsList(`nap-events:${nd.ctx}:${nd.name}`, nd.events, nd.eventsError)
+        : renderNapGraphView(nd);
+
+  return `
+    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeNapDetail()">
+      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">${esc(nd.name)}</div>
+            <div class="truncate text-xs text-ink-muted">${esc(nd.ctx)}</div>
+          </div>
+          <button type="button" onclick="window.__app.closeNapDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+        </div>
+        <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
+          ${tabs
+            .map(
+              (t) => `
+            <button
+              type="button"
+              onclick="window.__app.setNapDetailView('${t.id}')"
+              class="rounded-md px-3 py-1.5 text-xs font-medium ${nd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
+            >${t.label}</button>`,
+            )
+            .join("")}
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col p-4">${body}</div>
+      </div>
+    </div>`;
+}
+
 function renderGitOpsDetailPanel(): string {
   const gd = state.gitOpsDetail;
   if (!gd) return "";
@@ -6508,7 +6780,24 @@ function renderNap(): string {
                   ? `<td class="text-ink-muted"><button type="button" title="Filter by this cluster" onclick="window.__app.setEnumFilter('nap','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
                   : ""
               }
-              <td class="text-ink-primary">${esc(p.name)}</td>
+              <td>
+                <span class="inline-flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    title="View node pool details (YAML, Events, Graph)"
+                    onclick="window.__app.openNapDetail('${esc(ctx)}','${esc(p.name)}')"
+                    class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
+                  >
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
+                  </button>
+                  <button
+                    type="button"
+                    title="View nodes provisioned by this pool"
+                    onclick="window.__app.viewNodesForNodePool('${esc(ctx)}','${esc(p.name)}')"
+                    class="text-ink-primary hover:text-series-blue hover:underline"
+                  >${esc(p.name)}</button>
+                </span>
+              </td>
               <td>${esc(p.node_class) || "—"}</td>
               <td>${esc(p.capacity_types) || "—"}</td>
               <td class="tabular">${p.nodes}</td>

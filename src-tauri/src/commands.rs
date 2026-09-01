@@ -330,6 +330,29 @@ pub async fn get_keda_scaled_objects(context_name: String) -> Result<KedaResult,
 }
 
 #[tauri::command]
+pub async fn get_nap_node_pool_manifest(context_name: String, name: String) -> Result<NapNodePoolManifest, String> {
+    with_retry(&context_name, || k8s::get_nap_node_pool_manifest(&context_name, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_nap_node_pool_events(context_name: String, name: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || k8s::get_nap_node_pool_events(&context_name, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_nap_node_pool_metrics_over_time(
+    context_name: String,
+    name: String,
+    range_minutes: i64,
+    override_backend: Option<MetricsBackendInfo>,
+) -> Result<MetricsOverTimeResult, String> {
+    with_retry(&context_name, || {
+        metrics_backend::get_nap_node_pool_metrics_over_time(&context_name, &name, range_minutes, override_backend.clone())
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn get_gitops_apps(context_name: String) -> Result<GitOpsResult, String> {
     with_retry(&context_name, || k8s::get_gitops_apps(&context_name)).await
 }

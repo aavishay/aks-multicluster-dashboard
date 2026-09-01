@@ -11,6 +11,7 @@ import type {
   HelmReleaseInfo,
   KedaResult,
   MetricsBackendInfo,
+  NapNodePoolManifest,
   MetricsBackendTestResult,
   MetricsOverTimeResult,
   NapResult,
@@ -149,6 +150,12 @@ export const api = {
     return invoke<void>("claude_explain_error", { errorText, onToken: channel });
   },
   getNapNodePools: (contextName: string) => invoke<NapResult>("get_nap_node_pools", { contextName }),
+  getNapNodePoolManifest: (contextName: string, name: string) =>
+    invoke<NapNodePoolManifest>("get_nap_node_pool_manifest", { contextName, name }),
+  getNapNodePoolEvents: (contextName: string, name: string) =>
+    invoke<EventInfo[]>("get_nap_node_pool_events", { contextName, name }),
+  getNapNodePoolMetricsOverTime: (contextName: string, name: string, rangeMinutes: number, overrideBackend?: MetricsBackendInfo | null) =>
+    invoke<MetricsOverTimeResult>("get_nap_node_pool_metrics_over_time", { contextName, name, rangeMinutes, overrideBackend }),
   getKedaScaledObjects: (contextName: string) => invoke<KedaResult>("get_keda_scaled_objects", { contextName }),
   getGitOpsApps: (contextName: string) => invoke<GitOpsResult>("get_gitops_apps", { contextName }),
   getGitOpsManifest: (contextName: string, namespace: string, name: string) =>
