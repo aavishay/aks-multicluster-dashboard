@@ -5663,6 +5663,7 @@ function renderSearchBox(
         type="text"
         placeholder="Search…"
         value="${esc(query)}"
+        data-detail-search
         data-filter-key="${kind.toLowerCase()}-detail-search:${view}"
         oninput="window.__app.set${kind}Search('${view}', this.value)"
         onkeydown="if (event.key === 'Enter') { event.preventDefault(); window.__app.move${kind}Search('${view}', event.shiftKey ? -1 : 1); }"
@@ -7454,6 +7455,26 @@ function scrollDetailPanel(mode: "line" | "page" | "edge", direction: 1 | -1): b
 }
 
 /**
+ * Cmd+F: puts the cursor in the open detail panel's search box.
+ *
+ * Only some views have one — YAML and the log panes do, Events and Graph
+ * don't — so this reports whether it found one, letting the caller leave the
+ * key alone rather than swallowing it on a view with nothing to search.
+ *
+ * Selects the existing query so a second Cmd+F retypes rather than appends,
+ * which is what the browser's own find bar does. The input already carries a
+ * `data-filter-key`, so `render()`'s focus restoration keeps the caret there
+ * across the re-render that typing triggers.
+ */
+function focusDetailSearch(): boolean {
+  const input = document.querySelector<HTMLInputElement>("[data-detail-search]");
+  if (!input) return false;
+  input.focus();
+  input.select();
+  return true;
+}
+
+/**
  * Left/Right inside an open detail panel step that panel's own tabs (YAML /
  * Events / Graph, and the wider sets Pods and Workloads carry) rather than
  * the main tab bar hidden behind it.
@@ -7793,6 +7814,35 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "k" || e.key === "K") {
     e.preventDefault();
     openClusterPalette();
+    return;
+  }
+
+  // Cmd+F focuses an open detail panel's search box. Not gated on
+  // isEditableTarget, for the same reason as Cmd+K above: there's no
+  // competing meaning inside a text field, and re-pressing it to reselect
+  // the current query is useful rather than surprising.
+  //
+  // It is gated on isNonPanelOverlayOpen, though: the palette and Claude's
+  // views don't close a detail panel when they open, so both can be up at
+  // once. Without this, Cmd+F would move focus into the panel's search box
+  // *behind* the overlay — every subsequent keystroke would vanish into a
+  // hidden input while the overlay looked focused.
+  if (e.key === "f" || e.key === "F") {
+    if (isNonPanelOverlayOpen()) return;
+    if (focusDetailSearch()) e.preventDefault();
+    return;
+  }
+
+  // Cmd+R refreshes the fleet, matching the "Refresh now" button.
+  //
+  // Always claimed, overlay or not: the alternative is the webview's own
+  // reload, which throws away the entire session — selected clusters, every
+  // cached tab, scroll positions, an open panel — to fetch the same data
+  // this does in place. Refreshing behind an overlay is harmless, since it
+  // re-fetches data rather than changing what's on screen.
+  if (e.key === "r" || e.key === "R") {
+    e.preventDefault();
+    manualRefresh();
     return;
   }
 
