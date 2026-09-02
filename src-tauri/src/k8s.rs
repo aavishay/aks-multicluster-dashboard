@@ -1775,6 +1775,13 @@ pub async fn get_keda_manifest(context_name: &str, namespace: &str, kind: &str, 
 /// misbehaving autoscaler — a trigger that cannot authenticate to its scaler
 /// reports it here and nowhere in the object's status.
 pub async fn get_keda_events(context_name: &str, namespace: &str, kind: &str, name: &str) -> Result<Vec<EventInfo>, String> {
+    // Called for its validation, not its result: events are matched on the
+    // involvedObject kind string rather than fetched from a collection, so the
+    // plural is unused here. Without this an unexpected kind would filter
+    // everything out and report a healthy "No events found", hiding the
+    // caller bug that `get_keda_manifest` would have surfaced outright.
+    keda_plural(kind)?;
+
     let client = client_for_context(context_name).await?;
     let items = list_events_sorted(&client).await?;
 
@@ -2015,6 +2022,18 @@ mod tests {
         assert_eq!(sj.triggers, "azure-queue");
         assert!(sj.paused);
         assert!(!sj.ready);
+    }
+
+    /// Both KEDA detail fetches route their `kind` through this, so an
+    /// unexpected one fails loudly instead of the events filter quietly
+    /// matching nothing and reporting a healthy "No events found".
+    #[test]
+    fn keda_plural_rejects_a_kind_it_does_not_serve() {
+        assert_eq!(keda_plural("ScaledObject").unwrap(), "scaledobjects");
+        assert_eq!(keda_plural("ScaledJob").unwrap(), "scaledjobs");
+        assert!(keda_plural("Deployment").is_err());
+        assert!(keda_plural("scaledobject").is_err(), "kind is case-sensitive");
+        assert!(keda_plural("").is_err());
     }
 
     #[test]
