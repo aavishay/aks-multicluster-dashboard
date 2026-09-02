@@ -7484,6 +7484,19 @@ function sizeTableScrollBox(app: HTMLElement) {
   for (const th of box.querySelectorAll<HTMLElement>("tr.filter-row th")) {
     th.style.top = `${offset}px`;
   }
+
+  // scrollIntoView is not sticky-aware: `block: "nearest"` aligns the target
+  // row's top with the scrollport's top, which is precisely where the frozen
+  // header sits — so every keyboard move parked its row *underneath* the
+  // header. Measured in a browser: from scrollTop 200, revealing row 1 landed
+  // at scrollTop 62, exactly the header's height, leaving the first two rows
+  // above the fold and unreachable by arrowing up.
+  //
+  // scroll-padding-top is the mechanism built for this: it tells programmatic
+  // scrolling to treat the top N pixels of the scrollport as occupied,
+  // without affecting manual scrolling, so row 1 now resolves to scrollTop 0.
+  const thead = box.querySelector<HTMLElement>("thead");
+  box.style.scrollPaddingTop = `${thead?.getBoundingClientRect().height ?? 0}px`;
 }
 
 /** How far one arrow press scrolls a detail panel, in px — roughly what a browser's own arrow scrolling moves, since that's the feel this is standing in for. */
