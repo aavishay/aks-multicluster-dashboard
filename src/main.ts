@@ -7432,6 +7432,16 @@ function sizeTableScrollBox(app: HTMLElement) {
   const main = app.querySelector<HTMLElement>('[data-scroll-id="main"]');
   if (!main) return;
 
+  // Collapsing the box below its scrolled position forces scrollTop to 0 —
+  // the browser clamps it, since there is briefly nothing to scroll — and
+  // restoring the height does not bring it back. Left unsaved, every render
+  // (each 30s auto-refresh, and each keystroke that re-renders) snapped the
+  // table back to the top, losing both the reading position and the row
+  // cursor. Saved here rather than relying on render()'s scroll restore,
+  // which runs earlier and so cannot undo this, and which the resize path
+  // doesn't go through at all.
+  const { scrollTop, scrollLeft } = box;
+
   // What the table would occupy unconstrained, so a short table can hug its
   // rows instead of padding a bordered box with dead space.
   box.style.height = "auto";
@@ -7455,6 +7465,9 @@ function sizeTableScrollBox(app: HTMLElement) {
 
   // No paint happens between these writes, so the measuring doesn't flicker.
   box.style.height = `${Math.min(natural, Math.max(TABLE_MIN_HEIGHT_REM * rootFontPx, usable - occupied))}px`;
+
+  box.scrollTop = scrollTop;
+  box.scrollLeft = scrollLeft;
 
   // The title row's height is only knowable once rendered at the current
   // scale, so the filter row's offset is set from it here rather than in CSS.
