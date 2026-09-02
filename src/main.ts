@@ -3415,6 +3415,9 @@ function render() {
   }
   pendingRowFocusScroll = false;
 
+  // Last, so it measures the finished layout.
+  sizeTableScrollBox(app);
+
   if (activeKey) {
     // `preventScroll` matters here: without it, re-focusing an input that's
     // currently scrolled out of view (e.g. a filter box for a column
@@ -7402,6 +7405,46 @@ function isAnyOverlayOpen(): boolean {
   return isNonPanelOverlayOpen() || isAnyDetailPanelOpen();
 }
 
+/**
+ * Makes the active table's own box the vertical scroller, and offsets the
+ * filter row below the title row.
+ *
+ * Both header rows are `position: sticky`, but sticky only holds against the
+ * nearest scrolling ancestor — and the table box, while it carries
+ * `overflow-auto` for wide tables, has no height of its own, so it never
+ * scrolls vertically. `main` scrolls instead and carries the whole box, stuck
+ * header and all, up out of view. Giving the box a height moves the vertical
+ * scrolling into it, which is what the header needs to stick to.
+ *
+ * The height is measured rather than a `calc()` guess: what sits above and
+ * below the table varies at runtime — the filter summary and selection
+ * toolbar appear only sometimes, the pagination bar only past 50 rows — and
+ * all of it grows with the UI scale. Collapsing the box first and reading
+ * what `main` then needs gives the exact remainder, whatever is present.
+ */
+function sizeTableScrollBox(app: HTMLElement) {
+  const box = app.querySelector<HTMLElement>('[data-scroll-id^="table:"]');
+  if (!box) return; // Metrics and Cost have no table.
+
+  const main = app.querySelector<HTMLElement>('[data-scroll-id="main"]');
+  if (!main) return;
+
+  // Collapse the box so main.scrollHeight reports everything *except* it,
+  // then hand back the difference. No paint happens between the two writes,
+  // so this doesn't flicker.
+  box.style.height = "0px";
+  const others = main.scrollHeight;
+  box.style.height = `${Math.max(0, main.clientHeight - others)}px`;
+
+  // The title row's height is only knowable once rendered at the current
+  // scale, so the filter row's offset is set from it here rather than in CSS.
+  const titleRow = box.querySelector<HTMLElement>("thead tr:first-child");
+  const offset = titleRow?.getBoundingClientRect().height ?? 0;
+  for (const th of box.querySelectorAll<HTMLElement>("tr.filter-row th")) {
+    th.style.top = `${offset}px`;
+  }
+}
+
 /** How far one arrow press scrolls a detail panel, in px — roughly what a browser's own arrow scrolling moves, since that's the feel this is standing in for. */
 const DETAIL_SCROLL_LINE_PX = 40;
 
@@ -7885,6 +7928,11 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     resetUiScale();
   }
+});
+
+window.addEventListener("resize", () => {
+  const app = document.getElementById("app");
+  if (app) sizeTableScrollBox(app);
 });
 
 init();
