@@ -3339,6 +3339,16 @@ function render() {
     ${renderClusterPalette()}
   `;
 
+  // Before the scroll restore below, not after: innerHTML hands back a table
+  // box with no inline height, so until this runs the box is unbounded and
+  // therefore not vertically scrollable — and assigning scrollTop to a box
+  // that cannot scroll is silently clamped to 0. Restoring first would throw
+  // the position away every render, which is what made scrolling a long table
+  // feel like it kept jumping back to the top. Safe to measure this early:
+  // the sizing reads geometry via rect deltas, which don't depend on scroll
+  // offsets or on anything the later passes do.
+  sizeTableScrollBox(app);
+
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
     const pos = scrollPositions.get(el.dataset.scrollId!);
     if (pos) {
@@ -3415,8 +3425,6 @@ function render() {
   }
   pendingRowFocusScroll = false;
 
-  // Last, so it measures the finished layout.
-  sizeTableScrollBox(app);
 
   if (activeKey) {
     // `preventScroll` matters here: without it, re-focusing an input that's
@@ -7422,6 +7430,9 @@ function isAnyOverlayOpen(): boolean {
  * all of it grows with the UI scale. Collapsing the box first and reading
  * what `main` then needs gives the exact remainder, whatever is present.
  */
+/** Floor for the table box on a very short window, so it degrades to a small scrolling table rather than a sliver. In rem-equivalents so it tracks the UI scale; applied here rather than as a CSS min-height, which would also floor the deliberate collapse used for measuring below. */
+const TABLE_MIN_HEIGHT_REM = 10;
+
 function sizeTableScrollBox(app: HTMLElement) {
   const box = app.querySelector<HTMLElement>('[data-scroll-id^="table:"]');
   if (!box) return; // Metrics and Cost have no table.
@@ -7429,12 +7440,42 @@ function sizeTableScrollBox(app: HTMLElement) {
   const main = app.querySelector<HTMLElement>('[data-scroll-id="main"]');
   if (!main) return;
 
-  // Collapse the box so main.scrollHeight reports everything *except* it,
-  // then hand back the difference. No paint happens between the two writes,
-  // so this doesn't flicker.
+  // Collapsing the box below its scrolled position forces scrollTop to 0 —
+  // the browser clamps it, since there is briefly nothing to scroll — and
+  // restoring the height does not bring it back. Left unsaved, every render
+  // (each 30s auto-refresh, and each keystroke that re-renders) snapped the
+  // table back to the top, losing both the reading position and the row
+  // cursor. Saved here rather than relying on render()'s scroll restore,
+  // which runs earlier and so cannot undo this, and which the resize path
+  // doesn't go through at all.
+  const { scrollTop, scrollLeft } = box;
+
+  // What the table would occupy unconstrained, so a short table can hug its
+  // rows instead of padding a bordered box with dead space.
+  box.style.height = "auto";
+  const natural = box.scrollHeight;
+
+  // How much room is left once the box takes none.
+  //
+  // Measured as the geometric span of main's children, NOT via
+  // main.scrollHeight: scrollHeight never reports less than clientHeight, so
+  // with the box collapsed and the rest of the content short it returns the
+  // full viewport height — making `clientHeight - scrollHeight` zero and
+  // collapsing every table onto its floor, about three rows. Rect deltas have
+  // no such floor and are unaffected by however far main is scrolled.
   box.style.height = "0px";
-  const others = main.scrollHeight;
-  box.style.height = `${Math.max(0, main.clientHeight - others)}px`;
+  const kids = [...main.children].map((k) => k.getBoundingClientRect());
+  const occupied = kids.length > 0 ? Math.max(...kids.map((r) => r.bottom)) - Math.min(...kids.map((r) => r.top)) : 0;
+
+  const mainStyle = getComputedStyle(main);
+  const usable = main.clientHeight - parseFloat(mainStyle.paddingTop) - parseFloat(mainStyle.paddingBottom);
+  const rootFontPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+
+  // No paint happens between these writes, so the measuring doesn't flicker.
+  box.style.height = `${Math.min(natural, Math.max(TABLE_MIN_HEIGHT_REM * rootFontPx, usable - occupied))}px`;
+
+  box.scrollTop = scrollTop;
+  box.scrollLeft = scrollLeft;
 
   // The title row's height is only knowable once rendered at the current
   // scale, so the filter row's offset is set from it here rather than in CSS.
@@ -7443,6 +7484,19 @@ function sizeTableScrollBox(app: HTMLElement) {
   for (const th of box.querySelectorAll<HTMLElement>("tr.filter-row th")) {
     th.style.top = `${offset}px`;
   }
+
+  // scrollIntoView is not sticky-aware: `block: "nearest"` aligns the target
+  // row's top with the scrollport's top, which is precisely where the frozen
+  // header sits — so every keyboard move parked its row *underneath* the
+  // header. Measured in a browser: from scrollTop 200, revealing row 1 landed
+  // at scrollTop 62, exactly the header's height, leaving the first two rows
+  // above the fold and unreachable by arrowing up.
+  //
+  // scroll-padding-top is the mechanism built for this: it tells programmatic
+  // scrolling to treat the top N pixels of the scrollport as occupied,
+  // without affecting manual scrolling, so row 1 now resolves to scrollTop 0.
+  const thead = box.querySelector<HTMLElement>("thead");
+  box.style.scrollPaddingTop = `${thead?.getBoundingClientRect().height ?? 0}px`;
 }
 
 /** How far one arrow press scrolls a detail panel, in px — roughly what a browser's own arrow scrolling moves, since that's the feel this is standing in for. */
