@@ -330,6 +330,26 @@ pub async fn get_keda_scaled_objects(context_name: String) -> Result<KedaResult,
 }
 
 #[tauri::command]
+pub async fn get_keda_manifest(
+    context_name: String,
+    namespace: String,
+    kind: String,
+    name: String,
+) -> Result<ObjectManifest, String> {
+    with_retry(&context_name, || k8s::get_keda_manifest(&context_name, &namespace, &kind, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_keda_events(
+    context_name: String,
+    namespace: String,
+    kind: String,
+    name: String,
+) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || k8s::get_keda_events(&context_name, &namespace, &kind, &name)).await
+}
+
+#[tauri::command]
 pub async fn get_nap_node_pool_manifest(context_name: String, name: String) -> Result<NapNodePoolManifest, String> {
     with_retry(&context_name, || k8s::get_nap_node_pool_manifest(&context_name, &name)).await
 }
