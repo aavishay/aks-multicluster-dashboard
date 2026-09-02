@@ -131,20 +131,34 @@ table.data-table th {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 8px 12px;
-  border-bottom: 1px solid var(--gridline);
   position: sticky;
   top: 0;
+  /* Above the body cells, which are unpositioned, so rows pass underneath a
+     stuck header instead of over it. */
+  z-index: 2;
   background: var(--surface-1);
   white-space: nowrap;
+  /* An inset shadow rather than `border-bottom`: with `border-collapse:
+     collapse` the table owns the border, and it does not travel with a stuck
+     cell — so the separating line would disappear precisely while scrolling,
+     which is the one moment it is doing real work. */
+  box-shadow: inset 0 -1px 0 var(--gridline);
 }
-/* The sort/label header row above stays pinned at top:0 via the sticky rule
-   above; this row of per-column filter controls sits directly beneath it in
-   the same <thead> and would otherwise also stick to top:0 and overlap it. */
+/* The filter row sticks too, offset below the title row rather than left
+   unstuck. Its `top` is assigned at runtime from the measured title-row
+   height: it cannot be a constant, because that row grows with the UI scale
+   (which sets the root font-size), and a stale constant would either overlap
+   the title row or leave a gap the body shows through.
+   Ranked below the title row so a tall filter control loses to it. */
 table.data-table tr.filter-row th {
-  position: static;
-  top: auto;
+  z-index: 1;
   padding: 4px 8px 8px;
   white-space: normal;
+}
+/* A floor so a very short window still leaves a usable table rather than a
+   sliver; below this the page scrolls instead. */
+[data-scroll-id^="table:"] {
+  min-height: 10rem;
 }
 table.data-table td {
   padding: 7px 12px;
