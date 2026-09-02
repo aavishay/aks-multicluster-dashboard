@@ -213,36 +213,20 @@ function toggleSidebar() {
 // are for.
 // ---------------------------------------------------------------------------
 
-const PAGE_SIZE_STORAGE_KEY = "aks-dashboard-page-size";
-const PAGE_SIZE_OPTIONS = [50, 100, 200];
-/** Derived rather than assuming `PAGE_SIZE_OPTIONS[0]`, so reordering the options for display can't silently move the visibility threshold. */
-const MIN_PAGE_SIZE = Math.min(...PAGE_SIZE_OPTIONS);
-const DEFAULT_PAGE_SIZE = 100;
-
-function getInitialPageSize(): number {
-  const stored = Number(localStorage.getItem(PAGE_SIZE_STORAGE_KEY));
-  // Anything unrecognised (an older build's value, a hand-edited entry) falls
-  // back rather than leaving a table stuck on a size the picker can't show.
-  return PAGE_SIZE_OPTIONS.includes(stored) ? stored : DEFAULT_PAGE_SIZE;
-}
-
-function setPageSize(size: number) {
-  if (!PAGE_SIZE_OPTIONS.includes(size)) return;
-  state.pageSize = size;
-  localStorage.setItem(PAGE_SIZE_STORAGE_KEY, String(size));
-  // Page 3 of 50 and page 3 of 200 point at completely different rows, so
-  // every table restarts rather than jumping somewhere arbitrary.
-  state.tablePage = {};
-  render();
-}
+/**
+ * A page holds exactly the rows that fit the table on screen, so there is no
+ * page-size setting and nothing to choose. `state.pageSize` is derived from
+ * the rendered layout after each render — see `settleAutoPageSize` — and this
+ * provisional value only has to survive the very first render, before
+ * anything has been measured.
+ */
+const PROVISIONAL_PAGE_SIZE = 25;
 
 /**
  * Total pages for `total` rows at the current page size.
  *
  * Floored at 1 so an empty table can't report 0 pages, which would clamp
- * `currentPage` to 0 and hand `pageSlice` a negative start offset. Nothing
- * renders it at that size — the control hides at or below `MIN_PAGE_SIZE` —
- * but the arithmetic still has to hold for callers that slice regardless.
+ * `currentPage` to 0 and hand `pageSlice` a negative start offset.
  */
 function pageCount(total: number): number {
   return Math.max(1, Math.ceil(total / state.pageSize));
@@ -270,21 +254,21 @@ function pageSlice<T>(tab: TabId, rows: T[]): T[] {
 }
 
 /**
- * The page-size picker plus range readout and prev/next.
+ * The range readout plus prev/next.
  *
- * Hidden entirely below the smallest page size: a table of 12 nodes can't be
- * paginated at any available setting, so the control would be dead chrome.
+ * Rendered for any non-empty table, even one that fits on a single page.
+ * That is deliberate: the page size is computed from the height left over
+ * for the table, so a bar that appeared and disappeared with the page size
+ * would change the very measurement it depends on, and the two could chase
+ * each other between renders. Occupying the same space always makes the
+ * measurement stable, and the readout is worth showing regardless.
  */
 function renderPagination(tab: TabId, total: number): string {
-  if (total <= MIN_PAGE_SIZE) return "";
+  if (total === 0) return "";
   const pages = pageCount(total);
   const page = currentPage(tab, total);
-  const first = total === 0 ? 0 : (page - 1) * state.pageSize + 1;
+  const first = (page - 1) * state.pageSize + 1;
   const last = Math.min(total, page * state.pageSize);
-
-  const options = PAGE_SIZE_OPTIONS.map(
-    (n) => `<option value="${n}" ${state.pageSize === n ? "selected" : ""}>${n} per page</option>`,
-  ).join("");
 
   const step = (label: string, target: number, disabled: boolean, title: string) =>
     `<button type="button" title="${esc(title)}" ${disabled ? "disabled" : ""}
@@ -304,10 +288,6 @@ function renderPagination(tab: TabId, total: number): string {
                ${step("›", page + 1, page >= pages, "Next page")}`
             : ""
         }
-        <select onchange="window.__app.setPageSize(Number(this.value))"
-                class="rounded border border-gridline bg-surface-2 px-1.5 py-1 text-xs text-ink-primary outline-none focus:border-series-blue">
-          ${options}
-        </select>
       </span>
     </div>`;
 }
@@ -554,7 +534,10 @@ interface AppState {
   columnWidths: Partial<Record<TabId, Record<string, number>>>;
   /** Row keys checked for clipboard copy, per tab. */
   selectedRows: Partial<Record<TabId, Set<string>>>;
-  /** How many rows each table shows at once. One global preference rather than per-tab, persisted across launches. */
+  /**
+   * How many rows fit the table on screen. Derived from the rendered layout
+   * rather than chosen or persisted — see `settleAutoPageSize`.
+   */
   pageSize: number;
   /**
    * Current page per table, 1-based. Not persisted: a page number is only
@@ -646,7 +629,7 @@ const state: AppState = {
   openEnumFilter: null,
   columnWidths: {},
   selectedRows: {},
-  pageSize: getInitialPageSize(),
+  pageSize: PROVISIONAL_PAGE_SIZE,
   tablePage: {},
   focusedRow: {},
   unhealthyOnly: {},
@@ -3104,7 +3087,6 @@ function setMetricsRange(minutes: number) {
 }
 
 (window as any).__app = {
-  setPageSize,
   setTablePage,
   setClusterFilter,
   toggleCluster,
@@ -3347,7 +3329,10 @@ function render() {
   // feel like it kept jumping back to the top. Safe to measure this early:
   // the sizing reads geometry via rect deltas, which don't depend on scroll
   // offsets or on anything the later passes do.
-  sizeTableScrollBox(app);
+  const tableAvailable = sizeTableScrollBox(app);
+  // Abandon this pass if the page size changed: the nested render has already
+  // redrawn everything at the corrected size.
+  if (settleAutoPageSize(app, tableAvailable)) return;
 
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
     const pos = scrollPositions.get(el.dataset.scrollId!);
@@ -7430,15 +7415,69 @@ function isAnyOverlayOpen(): boolean {
  * all of it grows with the UI scale. Collapsing the box first and reading
  * what `main` then needs gives the exact remainder, whatever is present.
  */
+/**
+ * Re-derives how many rows fit the table and, if that changed, re-renders at
+ * the new size. Returns whether it did, so the caller can abandon the render
+ * it is in the middle of.
+ *
+ * Measured from the rendered layout rather than set by the reader: the row
+ * height moves with the UI scale, and the height left for the table moves
+ * with the window and with whichever toolbars a tab happens to show.
+ *
+ * This converges rather than oscillating, which is the thing worth being
+ * careful about when a render feeds back into its own input. The height the
+ * box gets is `min(natural, available)`; once the page holds the rows that
+ * fit, `natural` and `available` agree and the next measurement returns the
+ * same count. The pagination bar is always rendered for the same reason — if
+ * it came and went with the page size, it would move `available` underneath
+ * the answer. `settleDepth` is a backstop against a layout that still
+ * refuses to settle: a couple of corrective renders, then leave it be rather
+ * than spin.
+ */
+let settleDepth = 0;
+const MAX_SETTLE_RENDERS = 3;
+
+function settleAutoPageSize(app: HTMLElement, available: number | null): boolean {
+  if (settleDepth >= MAX_SETTLE_RENDERS || available === null) return false;
+
+  const box = app.querySelector<HTMLElement>('[data-scroll-id^="table:"]');
+  const row = box?.querySelector<HTMLElement>("tbody tr");
+  const thead = box?.querySelector<HTMLElement>("thead");
+  // Nothing to measure from: no table on this tab, or a table with no rows
+  // (filtered to nothing). Keep whatever size is in hand.
+  if (!box || !row || !thead) return false;
+
+  const rowHeight = row.getBoundingClientRect().height;
+  if (rowHeight <= 0) return false;
+
+  const room = available - thead.getBoundingClientRect().height;
+  const fits = Math.max(1, Math.floor(room / rowHeight));
+  if (fits === state.pageSize) return false;
+
+  // Keep the reader roughly where they were: hold the first visible row
+  // rather than the page number, which means something different at a
+  // different size. Resizing the window then scrolls the page under them by
+  // at most a row, instead of jumping them somewhere unrelated.
+  const tab = state.activeTab;
+  const anchorRow = (currentPage(tab, tableSnapshots[tab]?.rows.length ?? 0) - 1) * state.pageSize;
+  state.pageSize = fits;
+  state.tablePage[tab] = Math.floor(anchorRow / fits) + 1;
+
+  settleDepth += 1;
+  render();
+  settleDepth -= 1;
+  return true;
+}
+
 /** Floor for the table box on a very short window, so it degrades to a small scrolling table rather than a sliver. In rem-equivalents so it tracks the UI scale; applied here rather than as a CSS min-height, which would also floor the deliberate collapse used for measuring below. */
 const TABLE_MIN_HEIGHT_REM = 10;
 
-function sizeTableScrollBox(app: HTMLElement) {
+function sizeTableScrollBox(app: HTMLElement): number | null {
   const box = app.querySelector<HTMLElement>('[data-scroll-id^="table:"]');
-  if (!box) return; // Metrics and Cost have no table.
+  if (!box) return null; // Metrics and Cost have no table.
 
   const main = app.querySelector<HTMLElement>('[data-scroll-id="main"]');
-  if (!main) return;
+  if (!main) return null;
 
   // Collapsing the box below its scrolled position forces scrollTop to 0 —
   // the browser clamps it, since there is briefly nothing to scroll — and
@@ -7471,8 +7510,15 @@ function sizeTableScrollBox(app: HTMLElement) {
   const usable = main.clientHeight - parseFloat(mainStyle.paddingTop) - parseFloat(mainStyle.paddingBottom);
   const rootFontPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
 
+  // The height the table may occupy, before capping it to what it needs.
+  // Returned for the row-fit calculation, which has to reason about the space
+  // available rather than the height the box settles on: a box hugging a
+  // short page would otherwise report that only that page's rows fit, and the
+  // page size could never grow again.
+  const available = Math.max(TABLE_MIN_HEIGHT_REM * rootFontPx, usable - occupied);
+
   // No paint happens between these writes, so the measuring doesn't flicker.
-  box.style.height = `${Math.min(natural, Math.max(TABLE_MIN_HEIGHT_REM * rootFontPx, usable - occupied))}px`;
+  box.style.height = `${Math.min(natural, available)}px`;
 
   box.scrollTop = scrollTop;
   box.scrollLeft = scrollLeft;
@@ -7497,6 +7543,8 @@ function sizeTableScrollBox(app: HTMLElement) {
   // without affecting manual scrolling, so row 1 now resolves to scrollTop 0.
   const thead = box.querySelector<HTMLElement>("thead");
   box.style.scrollPaddingTop = `${thead?.getBoundingClientRect().height ?? 0}px`;
+
+  return available;
 }
 
 /** How far one arrow press scrolls a detail panel, in px — roughly what a browser's own arrow scrolling moves, since that's the feel this is standing in for. */
@@ -7985,8 +8033,9 @@ document.addEventListener("keydown", (e) => {
 });
 
 window.addEventListener("resize", () => {
-  const app = document.getElementById("app");
-  if (app) sizeTableScrollBox(app);
+  // A full render, not just a re-size: the window changing shape also changes
+  // how many rows fit, and `settleAutoPageSize` runs as part of rendering.
+  render();
 });
 
 init();
