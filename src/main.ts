@@ -3273,30 +3273,57 @@ function restoreSelectionSnapshot(app: HTMLElement, snapshot: SelectionSnapshot 
   sel?.addRange(range);
 }
 
+/** Where the reader was, gathered into one value so a corrective re-render can be handed the original instead of re-reading a DOM that has already been replaced. */
+interface PreRenderState {
+  activeKey: string | undefined;
+  selStart: number | null;
+  selEnd: number | null;
+  scrollPositions: Map<string, { top: number; left: number }>;
+  selectionSnapshot: SelectionSnapshot | null;
+}
+
 // Every render() replaces the whole #app subtree, which would normally steal
 // focus/cursor position out from under a filter `<input>` on each keystroke.
 // `data-filter-key` tags each filter control with an identity that's stable
 // across re-renders (same tab+column always renders to the same key), so we
 // can find "the same" input in the new DOM and restore focus + selection.
-function render() {
-  const app = document.getElementById("app");
-  if (!app) return;
-
+//
+// Replacing that subtree also silently resets scrollTop to 0 on every
+// scrollable pane — `data-scroll-id` tags each one with an identity that's
+// stable across re-renders (same id always refers to "the same" pane, e.g.
+// "table:pods"), so we can restore its scroll position afterwards.
+function capturePreRenderState(app: HTMLElement): PreRenderState {
   const active = document.activeElement;
-  const activeKey = active instanceof HTMLElement ? active.dataset.filterKey : undefined;
-  const selStart = active instanceof HTMLInputElement ? active.selectionStart : null;
-  const selEnd = active instanceof HTMLInputElement ? active.selectionEnd : null;
-
-  // Replacing #app's innerHTML on every render (including background
-  // auto-refresh) would otherwise silently reset scrollTop to 0 on every
-  // scrollable pane — `data-scroll-id` tags each one with an identity that's
-  // stable across re-renders (same id always refers to "the same" pane, e.g.
-  // "table:pods"), so we can restore its scroll position afterwards.
   const scrollPositions = new Map<string, { top: number; left: number }>();
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
     scrollPositions.set(el.dataset.scrollId!, { top: el.scrollTop, left: el.scrollLeft });
   });
-  const selectionSnapshot = captureSelectionSnapshot(app);
+  return {
+    activeKey: active instanceof HTMLElement ? active.dataset.filterKey : undefined,
+    selStart: active instanceof HTMLInputElement ? active.selectionStart : null,
+    selEnd: active instanceof HTMLInputElement ? active.selectionEnd : null,
+    scrollPositions,
+    selectionSnapshot: captureSelectionSnapshot(app),
+  };
+}
+
+/**
+ * @param carried where the reader was before the render that triggered this
+ *   one, when `settleAutoPageSize` is re-rendering at a corrected page size.
+ *   #app has already been replaced by the time it calls back in, so capturing
+ *   afresh here would read that blank slate — no focused input, every pane at
+ *   scrollTop 0, the text selection already dropped by the browser as its
+ *   nodes left the document — and would then faithfully restore it, throwing
+ *   away the reading position, the filter box's cursor and the selection on
+ *   every settle. Every window resize settles, and so does the first
+ *   keystroke into a filter box, which is where losing the cursor shows most.
+ */
+function render(carried?: PreRenderState) {
+  const app = document.getElementById("app");
+  if (!app) return;
+
+  const pre = carried ?? capturePreRenderState(app);
+  const { activeKey, selStart, selEnd, scrollPositions, selectionSnapshot } = pre;
 
   app.innerHTML = `
     ${renderSidebar()}
@@ -3331,8 +3358,9 @@ function render() {
   // offsets or on anything the later passes do.
   const tableAvailable = sizeTableScrollBox(app);
   // Abandon this pass if the page size changed: the nested render has already
-  // redrawn everything at the corrected size.
-  if (settleAutoPageSize(app, tableAvailable)) return;
+  // redrawn everything at the corrected size, and carries `pre` so that it,
+  // not this abandoned pass, does the restoring below.
+  if (settleAutoPageSize(app, tableAvailable, pre)) return;
 
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
     const pos = scrollPositions.get(el.dataset.scrollId!);
@@ -7398,23 +7426,9 @@ function isAnyOverlayOpen(): boolean {
   return isNonPanelOverlayOpen() || isAnyDetailPanelOpen();
 }
 
-/**
- * Makes the active table's own box the vertical scroller, and offsets the
- * filter row below the title row.
- *
- * Both header rows are `position: sticky`, but sticky only holds against the
- * nearest scrolling ancestor — and the table box, while it carries
- * `overflow-auto` for wide tables, has no height of its own, so it never
- * scrolls vertically. `main` scrolls instead and carries the whole box, stuck
- * header and all, up out of view. Giving the box a height moves the vertical
- * scrolling into it, which is what the header needs to stick to.
- *
- * The height is measured rather than a `calc()` guess: what sits above and
- * below the table varies at runtime — the filter summary and selection
- * toolbar appear only sometimes, the pagination bar only past 50 rows — and
- * all of it grows with the UI scale. Collapsing the box first and reading
- * what `main` then needs gives the exact remainder, whatever is present.
- */
+let settleDepth = 0;
+const MAX_SETTLE_RENDERS = 3;
+
 /**
  * Re-derives how many rows fit the table and, if that changed, re-renders at
  * the new size. Returns whether it did, so the caller can abandon the render
@@ -7433,11 +7447,12 @@ function isAnyOverlayOpen(): boolean {
  * the answer. `settleDepth` is a backstop against a layout that still
  * refuses to settle: a couple of corrective renders, then leave it be rather
  * than spin.
+ *
+ * @param pre where the reader was before the caller's render, passed straight
+ *   through to the corrective one — see render()'s own note on why it cannot
+ *   be re-captured at that point.
  */
-let settleDepth = 0;
-const MAX_SETTLE_RENDERS = 3;
-
-function settleAutoPageSize(app: HTMLElement, available: number | null): boolean {
+function settleAutoPageSize(app: HTMLElement, available: number | null, pre: PreRenderState): boolean {
   if (settleDepth >= MAX_SETTLE_RENDERS || available === null) return false;
 
   const box = app.querySelector<HTMLElement>('[data-scroll-id^="table:"]');
@@ -7464,7 +7479,7 @@ function settleAutoPageSize(app: HTMLElement, available: number | null): boolean
   state.tablePage[tab] = Math.floor(anchorRow / fits) + 1;
 
   settleDepth += 1;
-  render();
+  render(pre);
   settleDepth -= 1;
   return true;
 }
@@ -7472,6 +7487,23 @@ function settleAutoPageSize(app: HTMLElement, available: number | null): boolean
 /** Floor for the table box on a very short window, so it degrades to a small scrolling table rather than a sliver. In rem-equivalents so it tracks the UI scale; applied here rather than as a CSS min-height, which would also floor the deliberate collapse used for measuring below. */
 const TABLE_MIN_HEIGHT_REM = 10;
 
+/**
+ * Makes the active table's own box the vertical scroller, and offsets the
+ * filter row below the title row.
+ *
+ * Both header rows are `position: sticky`, but sticky only holds against the
+ * nearest scrolling ancestor — and the table box, while it carries
+ * `overflow-auto` for wide tables, has no height of its own, so it never
+ * scrolls vertically. `main` scrolls instead and carries the whole box, stuck
+ * header and all, up out of view. Giving the box a height moves the vertical
+ * scrolling into it, which is what the header needs to stick to.
+ *
+ * The height is measured rather than a `calc()` guess: what sits above and
+ * below the table varies at runtime — the filter summary and selection
+ * toolbar appear only sometimes — and all of it grows with the UI scale.
+ * Collapsing the box first and reading what `main` then needs gives the exact
+ * remainder, whatever is present.
+ */
 function sizeTableScrollBox(app: HTMLElement): number | null {
   const box = app.querySelector<HTMLElement>('[data-scroll-id^="table:"]');
   if (!box) return null; // Metrics and Cost have no table.
@@ -8032,10 +8064,22 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+let resizeFrame: number | null = null;
 window.addEventListener("resize", () => {
   // A full render, not just a re-size: the window changing shape also changes
   // how many rows fit, and `settleAutoPageSize` runs as part of rendering.
-  render();
+  //
+  // Coalesced to one render per frame, because that render rebuilds all of
+  // #app's innerHTML: dragging a window edge fires resize far faster than the
+  // display refreshes, so rendering per event would spend the drag rebuilding
+  // DOM that is already stale before it paints. Dropping the extra events
+  // costs nothing — the render reads live geometry rather than the event, so
+  // the one that survives sees the size the window ended the frame at.
+  if (resizeFrame !== null) return;
+  resizeFrame = requestAnimationFrame(() => {
+    resizeFrame = null;
+    render();
+  });
 });
 
 init();
