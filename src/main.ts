@@ -3339,6 +3339,16 @@ function render() {
     ${renderClusterPalette()}
   `;
 
+  // Before the scroll restore below, not after: innerHTML hands back a table
+  // box with no inline height, so until this runs the box is unbounded and
+  // therefore not vertically scrollable — and assigning scrollTop to a box
+  // that cannot scroll is silently clamped to 0. Restoring first would throw
+  // the position away every render, which is what made scrolling a long table
+  // feel like it kept jumping back to the top. Safe to measure this early:
+  // the sizing reads geometry via rect deltas, which don't depend on scroll
+  // offsets or on anything the later passes do.
+  sizeTableScrollBox(app);
+
   app.querySelectorAll<HTMLElement>("[data-scroll-id]").forEach((el) => {
     const pos = scrollPositions.get(el.dataset.scrollId!);
     if (pos) {
@@ -3415,8 +3425,6 @@ function render() {
   }
   pendingRowFocusScroll = false;
 
-  // Last, so it measures the finished layout.
-  sizeTableScrollBox(app);
 
   if (activeKey) {
     // `preventScroll` matters here: without it, re-focusing an input that's
