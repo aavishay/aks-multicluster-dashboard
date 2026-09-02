@@ -1629,17 +1629,25 @@ async fn get_karpenter(client: &Client, kind: &str, plural: &str, name: &str) ->
     Err(format!("{plural} '{name}' not found (tried {})", not_found_on.join(", ")))
 }
 
-pub async fn get_nap_node_pool_manifest(context_name: &str, name: &str) -> Result<NapNodePoolManifest, String> {
-    let client = client_for_context(context_name).await?;
-    let obj = get_karpenter(&client, "NodePool", "nodepools", name).await?;
-
+/// Renders one object to YAML both with and without `metadata.managedFields`.
+///
+/// Both variants are produced in one go rather than re-fetching when the
+/// panel's toggle flips: managedFields is pure server bookkeeping that often
+/// dwarfs the spec, so it is hidden by default, but the object has already
+/// been fetched and stripping a field is far cheaper than another API call.
+fn object_manifest(obj: DynamicObject) -> Result<ObjectManifest, String> {
     let yaml_full = serde_yaml::to_string(&obj).map_err(|e| format!("Failed to render YAML: {e}"))?;
 
     let mut stripped = obj;
     stripped.metadata.managed_fields = None;
     let yaml_without_managed_fields = serde_yaml::to_string(&stripped).map_err(|e| format!("Failed to render YAML: {e}"))?;
 
-    Ok(NapNodePoolManifest { yaml_full, yaml_without_managed_fields })
+    Ok(ObjectManifest { yaml_full, yaml_without_managed_fields })
+}
+
+pub async fn get_nap_node_pool_manifest(context_name: &str, name: &str) -> Result<NapNodePoolManifest, String> {
+    let client = client_for_context(context_name).await?;
+    object_manifest(get_karpenter(&client, "NodePool", "nodepools", name).await?)
 }
 
 /// Same reasoning as `get_node_events`: a NodePool is cluster-scoped, so
@@ -1742,19 +1750,58 @@ pub async fn get_keda_scaled_objects(context_name: &str) -> Result<KedaResult, S
     Ok(KedaResult { installed, error: None, scaled_objects: out })
 }
 
+/// The plural for a KEDA kind. The panel is always opened from a row that
+/// already knows which of the two kinds it is, so an unknown kind here means
+/// a caller bug rather than a cluster that answered oddly.
+fn keda_plural(kind: &str) -> Result<&'static str, String> {
+    match kind {
+        "ScaledObject" => Ok("scaledobjects"),
+        "ScaledJob" => Ok("scaledjobs"),
+        other => Err(format!("Unknown KEDA kind '{other}'")),
+    }
+}
+
+pub async fn get_keda_manifest(context_name: &str, namespace: &str, kind: &str, name: &str) -> Result<ObjectManifest, String> {
+    let client = client_for_context(context_name).await?;
+    let ar = keda_resource(kind, keda_plural(kind)?);
+    let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &ar);
+    let obj = api.get(name).await.map_err(|e| format!("Failed to get {kind} '{name}': {e}"))?;
+    object_manifest(obj)
+}
+
+/// Same reasoning as `get_workload_events` (filter by involved object before
+/// the cluster-wide cap, and match the namespace since both KEDA kinds are
+/// namespaced). KEDA's own events are the useful half of diagnosing a
+/// misbehaving autoscaler — a trigger that cannot authenticate to its scaler
+/// reports it here and nowhere in the object's status.
+pub async fn get_keda_events(context_name: &str, namespace: &str, kind: &str, name: &str) -> Result<Vec<EventInfo>, String> {
+    // Called for its validation, not its result: events are matched on the
+    // involvedObject kind string rather than fetched from a collection, so the
+    // plural is unused here. Without this an unexpected kind would filter
+    // everything out and report a healthy "No events found", hiding the
+    // caller bug that `get_keda_manifest` would have surfaced outright.
+    keda_plural(kind)?;
+
+    let client = client_for_context(context_name).await?;
+    let items = list_events_sorted(&client).await?;
+
+    Ok(items
+        .into_iter()
+        .filter(|e| {
+            e.involved_object.kind.as_deref() == Some(kind)
+                && e.involved_object.name.as_deref() == Some(name)
+                && e.metadata.namespace.as_deref() == Some(namespace)
+        })
+        .map(event_to_info)
+        .collect())
+}
+
 pub async fn get_gitops_manifest(context_name: &str, namespace: &str, name: &str) -> Result<GitOpsAppManifest, String> {
     let client = client_for_context(context_name).await?;
     let ar = argocd_application_resource();
     let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &ar);
     let obj = api.get(name).await.map_err(|e| format!("Failed to get Application '{name}': {e}"))?;
-
-    let yaml_full = serde_yaml::to_string(&obj).map_err(|e| format!("Failed to render YAML: {e}"))?;
-
-    let mut stripped = obj;
-    stripped.metadata.managed_fields = None;
-    let yaml_without_managed_fields = serde_yaml::to_string(&stripped).map_err(|e| format!("Failed to render YAML: {e}"))?;
-
-    Ok(GitOpsAppManifest { yaml_full, yaml_without_managed_fields })
+    object_manifest(obj)
 }
 
 /// Same reasoning as `get_workload_events` (filter before the cap).
@@ -1975,6 +2022,18 @@ mod tests {
         assert_eq!(sj.triggers, "azure-queue");
         assert!(sj.paused);
         assert!(!sj.ready);
+    }
+
+    /// Both KEDA detail fetches route their `kind` through this, so an
+    /// unexpected one fails loudly instead of the events filter quietly
+    /// matching nothing and reporting a healthy "No events found".
+    #[test]
+    fn keda_plural_rejects_a_kind_it_does_not_serve() {
+        assert_eq!(keda_plural("ScaledObject").unwrap(), "scaledobjects");
+        assert_eq!(keda_plural("ScaledJob").unwrap(), "scaledjobs");
+        assert!(keda_plural("Deployment").is_err());
+        assert!(keda_plural("scaledobject").is_err(), "kind is case-sensitive");
+        assert!(keda_plural("").is_err());
     }
 
     #[test]

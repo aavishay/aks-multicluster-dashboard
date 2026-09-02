@@ -12,6 +12,7 @@ import type {
   KedaResult,
   MetricsBackendInfo,
   NapNodePoolManifest,
+  ObjectManifest,
   MetricsBackendTestResult,
   MetricsOverTimeResult,
   NapResult,
@@ -157,6 +158,10 @@ export const api = {
   getNapNodePoolMetricsOverTime: (contextName: string, name: string, rangeMinutes: number, overrideBackend?: MetricsBackendInfo | null) =>
     invoke<MetricsOverTimeResult>("get_nap_node_pool_metrics_over_time", { contextName, name, rangeMinutes, overrideBackend }),
   getKedaScaledObjects: (contextName: string) => invoke<KedaResult>("get_keda_scaled_objects", { contextName }),
+  getKedaManifest: (contextName: string, namespace: string, kind: string, name: string) =>
+    invoke<ObjectManifest>("get_keda_manifest", { contextName, namespace, kind, name }),
+  getKedaEvents: (contextName: string, namespace: string, kind: string, name: string) =>
+    invoke<EventInfo[]>("get_keda_events", { contextName, namespace, kind, name }),
   getGitOpsApps: (contextName: string) => invoke<GitOpsResult>("get_gitops_apps", { contextName }),
   getGitOpsManifest: (contextName: string, namespace: string, name: string) =>
     invoke<GitOpsAppManifest>("get_gitops_manifest", { contextName, namespace, name }),

@@ -134,6 +134,8 @@ pub fn run() {
             commands::get_helm_release_detail,
             commands::get_nap_node_pools,
             commands::get_keda_scaled_objects,
+            commands::get_keda_manifest,
+            commands::get_keda_events,
             commands::get_nap_node_pool_manifest,
             commands::get_nap_node_pool_events,
             commands::get_nap_node_pool_metrics_over_time,
