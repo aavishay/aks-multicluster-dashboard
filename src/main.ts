@@ -21,6 +21,7 @@ import type {
   NapNodePoolInfo,
   NapNodePoolManifest,
   NapResult,
+  ObjectManifest,
   NodeInfo,
   NodeManifest,
   PodInfo,
@@ -425,6 +426,31 @@ interface NapDetailState extends MetricsViewState {
   eventsLoading: boolean;
 }
 
+/**
+ * A KEDA ScaledObject or ScaledJob's detail panel.
+ *
+ * `targetKind`/`targetName` are copied off the row rather than re-read from
+ * the manifest: they decide whether the Graph tab is offered at all, which
+ * has to be known before the manifest arrives.
+ */
+interface KedaDetailState extends MetricsViewState {
+  ctx: string;
+  namespace: string;
+  kind: string;
+  name: string;
+  targetKind: string;
+  targetName: string;
+  view: "yaml" | "events" | "graph";
+  manifest: ObjectManifest | null;
+  manifestError: string | null;
+  showManagedFields: boolean;
+  yamlSearch: string;
+  yamlSearchIndex: number;
+  events: EventInfo[] | null;
+  eventsError: string | null;
+  eventsLoading: boolean;
+}
+
 interface HelmDetailState {
   ctx: string;
   namespace: string;
@@ -584,6 +610,7 @@ interface AppState {
   workloadDetail: WorkloadDetailState | null;
   gitOpsDetail: GitOpsDetailState | null;
   napDetail: NapDetailState | null;
+  kedaDetail: KedaDetailState | null;
   helmDetail: HelmDetailState | null;
 }
 
@@ -646,6 +673,7 @@ const state: AppState = {
   workloadDetail: null,
   gitOpsDetail: null,
   napDetail: null,
+  kedaDetail: null,
   helmDetail: null,
 };
 
@@ -662,6 +690,8 @@ let workloadDetailToken = 0;
 /** Same idea as `podDetailToken`, for the GitOps app detail panel. */
 let gitOpsDetailToken = 0;
 let napDetailToken = 0;
+/** Same idea as `podDetailToken`, for the KEDA scaled object detail panel. */
+let kedaDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
 let helmDetailToken = 0;
 /** Bumped per explain request, so a stale stream can't append to a newer one. */
@@ -1944,6 +1974,7 @@ function openNodeDetail(ctx: string, name: string) {
   closeGitOpsDetail();
   closeHelmDetail();
   closeNapDetail();
+  closeKedaDetail();
   const token = ++nodeDetailToken;
   state.nodeDetail = {
     ctx,
@@ -2080,6 +2111,7 @@ function openHelmDetail(ctx: string, namespace: string, name: string, revision: 
   closeWorkloadDetail();
   closeGitOpsDetail();
   closeNapDetail();
+  closeKedaDetail();
   const token = ++helmDetailToken;
   state.helmDetail = {
     ctx,
@@ -2176,6 +2208,7 @@ function openGitOpsDetail(ctx: string, namespace: string, name: string) {
   closeWorkloadDetail();
   closeHelmDetail();
   closeNapDetail();
+  closeKedaDetail();
   const token = ++gitOpsDetailToken;
   state.gitOpsDetail = {
     ctx,
@@ -2282,6 +2315,7 @@ function openNapDetail(ctx: string, name: string) {
   closeWorkloadDetail();
   closeGitOpsDetail();
   closeHelmDetail();
+  closeKedaDetail();
   const token = ++napDetailToken;
   state.napDetail = {
     ctx,
@@ -2409,6 +2443,177 @@ function moveNapSearch(_view: string, delta: number) {
 }
 
 // ---------------------------------------------------------------------------
+// KEDA scaled object detail panel (YAML / Events / Graph)
+// ---------------------------------------------------------------------------
+
+/**
+ * Target kinds whose pods the metrics backend can actually find.
+ *
+ * Mirrors `workload_pod_regex` on the Rust side, which derives each kind's
+ * pod-naming pattern and errors on anything else. Checked here so the Graph
+ * tab is simply not offered for a target it could never plot, rather than
+ * offered and then failing — KEDA can scale any resource exposing a `/scale`
+ * subresource, including CRDs whose pods follow no known naming rule.
+ */
+const GRAPHABLE_KEDA_TARGET_KINDS = ["Deployment", "StatefulSet", "DaemonSet"];
+
+/** Whether this autoscaler's target is one whose load can be graphed. A ScaledJob templates Jobs rather than scaling an existing workload, so it has no target to plot. */
+function kedaTargetIsGraphable(kd: KedaDetailState): boolean {
+  return kd.targetName !== "" && GRAPHABLE_KEDA_TARGET_KINDS.includes(kd.targetKind);
+}
+
+function openKedaDetail(ctx: string, namespace: string, kind: string, name: string) {
+  closePodDetail();
+  closeNodeDetail();
+  closeWorkloadDetail();
+  closeGitOpsDetail();
+  closeHelmDetail();
+  closeNapDetail();
+  const token = ++kedaDetailToken;
+  // The row already carries the resolved target — KEDA defaults an omitted
+  // `scaleTargetRef.kind` to Deployment and the backend applies that on the
+  // way in — so read it from there rather than waiting for the manifest.
+  const row = state.keda
+    .get(ctx)
+    ?.scaled_objects.find((s) => s.namespace === namespace && s.kind === kind && s.name === name);
+  state.kedaDetail = {
+    ctx,
+    namespace,
+    kind,
+    name,
+    targetKind: row?.target_kind ?? "",
+    targetName: row?.target_name ?? "",
+    view: "yaml",
+    manifest: null,
+    manifestError: null,
+    showManagedFields: false,
+    yamlSearch: "",
+    yamlSearchIndex: 0,
+    events: null,
+    eventsError: null,
+    eventsLoading: false,
+    ...EMPTY_METRICS_VIEW_STATE,
+  };
+  render();
+
+  api
+    .getKedaManifest(ctx, namespace, kind, name)
+    .then((manifest) => {
+      if (token !== kedaDetailToken || !state.kedaDetail) return;
+      state.kedaDetail.manifest = manifest;
+      render();
+    })
+    .catch((e) => {
+      if (token !== kedaDetailToken || !state.kedaDetail) return;
+      state.kedaDetail.manifestError = String(e);
+      render();
+    });
+}
+
+function closeKedaDetail() {
+  kedaDetailToken += 1;
+  state.kedaDetail = null;
+  render();
+}
+
+function setKedaDetailView(view: KedaDetailState["view"]) {
+  if (!state.kedaDetail) return;
+  state.kedaDetail.view = view;
+  render();
+  if (view === "events" && !state.kedaDetail.events && !state.kedaDetail.eventsLoading) {
+    fetchKedaEvents();
+  }
+  if (view === "graph" && !state.kedaDetail.metrics && !state.kedaDetail.metricsLoading) {
+    fetchKedaMetrics();
+  }
+}
+
+function setKedaMetricsRange(minutes: number) {
+  if (!state.kedaDetail) return;
+  state.kedaDetail.metricsRangeMinutes = minutes;
+  render();
+  fetchKedaMetrics();
+}
+
+async function fetchKedaEvents() {
+  const kd = state.kedaDetail;
+  if (!kd) return;
+  const token = kedaDetailToken;
+  kd.eventsLoading = true;
+  kd.eventsError = null;
+  render();
+  try {
+    const events = await api.getKedaEvents(kd.ctx, kd.namespace, kd.kind, kd.name);
+    if (token !== kedaDetailToken || !state.kedaDetail) return;
+    state.kedaDetail.events = events;
+  } catch (e) {
+    if (token !== kedaDetailToken || !state.kedaDetail) return;
+    state.kedaDetail.eventsError = String(e);
+  } finally {
+    if (token === kedaDetailToken && state.kedaDetail) state.kedaDetail.eventsLoading = false;
+    render();
+  }
+}
+
+/** Graphs the *target's* series, since a ScaledObject has no resource usage of its own — what's interesting is the load the autoscaler is reacting to. */
+async function fetchKedaMetrics() {
+  const kd = state.kedaDetail;
+  if (!kd || !kedaTargetIsGraphable(kd)) return;
+  const token = kedaDetailToken;
+  kd.metricsLoading = true;
+  kd.metricsError = null;
+  render();
+  try {
+    const result = await api.getWorkloadMetricsOverTime(
+      kd.ctx,
+      kd.targetKind,
+      kd.namespace,
+      kd.targetName,
+      kd.metricsRangeMinutes,
+      metricsBackendFor(kd.ctx),
+    );
+    if (token !== kedaDetailToken || !state.kedaDetail) return;
+    state.kedaDetail.metrics = result;
+  } catch (e) {
+    if (token !== kedaDetailToken || !state.kedaDetail) return;
+    state.kedaDetail.metricsError = String(e);
+  } finally {
+    if (token === kedaDetailToken && state.kedaDetail) state.kedaDetail.metricsLoading = false;
+    render();
+  }
+}
+
+function toggleKedaManagedFields() {
+  if (!state.kedaDetail) return;
+  state.kedaDetail.showManagedFields = !state.kedaDetail.showManagedFields;
+  render();
+}
+
+/** The YAML text currently on screen — whichever of the two cached variants the toggle selects. */
+function currentKedaYamlText(kd: KedaDetailState): string {
+  if (!kd.manifest) return "";
+  return kd.showManagedFields ? kd.manifest.yaml_full : kd.manifest.yaml_without_managed_fields;
+}
+
+function setKedaSearch(_view: string, query: string) {
+  if (!state.kedaDetail) return;
+  state.kedaDetail.yamlSearch = query;
+  state.kedaDetail.yamlSearchIndex = 0;
+  pendingSearchScroll = true;
+  render();
+}
+
+function moveKedaSearch(_view: string, delta: number) {
+  const kd = state.kedaDetail;
+  if (!kd || !kd.yamlSearch) return;
+  const count = countSearchMatches(currentKedaYamlText(kd), kd.yamlSearch);
+  if (count === 0) return;
+  kd.yamlSearchIndex = (((kd.yamlSearchIndex + delta) % count) + count) % count;
+  pendingSearchScroll = true;
+  render();
+}
+
+// ---------------------------------------------------------------------------
 // Workload detail panel (YAML / Events)
 // ---------------------------------------------------------------------------
 
@@ -2418,6 +2623,7 @@ function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: 
   closeGitOpsDetail();
   closeHelmDetail();
   closeNapDetail();
+  closeKedaDetail();
   stopWorkloadLogFollow();
   const token = ++workloadDetailToken;
   state.workloadDetail = {
@@ -2811,6 +3017,7 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
   closeGitOpsDetail();
   closeHelmDetail();
   closeNapDetail();
+  closeKedaDetail();
   stopPodLogFollow();
   const token = ++podDetailToken;
   state.podDetail = {
@@ -3150,6 +3357,13 @@ function setMetricsRange(minutes: number) {
   toggleNapManagedFields,
   setNapSearch,
   moveNapSearch,
+  openKedaDetail,
+  closeKedaDetail,
+  setKedaDetailView,
+  setKedaMetricsRange,
+  toggleKedaManagedFields,
+  setKedaSearch,
+  moveKedaSearch,
   viewNodesForNodePool,
   openHelmDetail,
   closeHelmDetail,
@@ -3312,6 +3526,7 @@ function render() {
     ${renderNodeDetailPanel()}
     ${renderWorkloadDetailPanel()}
     ${renderNapDetailPanel()}
+    ${renderKedaDetailPanel()}
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
     ${renderMetricsBackendEditor()}
@@ -5646,7 +5861,7 @@ function highlightSearchMatches(html: string, query: string, currentIndex: numbe
  * to be unique within that panel for the `data-filter-key` focus-restore tag.
  */
 function renderSearchBox(
-  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap",
+  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda",
   view: string,
   query: string,
   matchCount: number,
@@ -6563,6 +6778,91 @@ function renderNapDetailPanel(): string {
     </div>`;
 }
 
+function renderKedaYamlView(kd: KedaDetailState): string {
+  if (kd.manifestError) {
+    return `<div class="text-sm text-status-critical">${esc(kd.manifestError)}</div>`;
+  }
+  if (!kd.manifest) {
+    return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  }
+  const yaml = currentKedaYamlText(kd);
+  const matchCount = countSearchMatches(yaml, kd.yamlSearch);
+  const scrollId = `keda-yaml:${esc(kd.ctx)}:${esc(kd.namespace)}:${esc(kd.kind)}:${esc(kd.name)}`;
+  return `
+    <div class="flex h-full min-h-0 flex-col gap-2">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="flex items-center gap-3">
+          <label class="flex items-center gap-2 text-xs text-ink-secondary">
+            <input type="checkbox" ${kd.showManagedFields ? "checked" : ""} onchange="window.__app.toggleKedaManagedFields()" />
+            Show managed fields
+          </label>
+          ${renderCopyButton(scrollId)}
+        </div>
+        ${renderSearchBox("Keda", "yaml", kd.yamlSearch, matchCount, kd.yamlSearchIndex)}
+      </div>
+      <pre data-scroll-id="${scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(yaml), kd.yamlSearch, kd.yamlSearchIndex)}</pre>
+    </div>`;
+}
+
+function renderKedaGraphView(kd: KedaDetailState): string {
+  const note = `
+    <div class="mb-3 text-xs text-ink-muted">
+      ${esc(`${kd.targetKind}/${kd.targetName}`)} — the workload this autoscaler scales, summed across all its pods. A ScaledObject has no usage of its own; this is the load it reacts to.
+    </div>`;
+  return renderMetricsGraphView(
+    kd,
+    "setKedaMetricsRange",
+    `keda:${kd.ctx}:${kd.namespace}:${kd.kind}:${kd.name}`,
+    note,
+  );
+}
+
+function renderKedaDetailPanel(): string {
+  const kd = state.kedaDetail;
+  if (!kd) return "";
+
+  const tabs: { id: KedaDetailState["view"]; label: string }[] = [
+    { id: "yaml", label: "YAML" },
+    { id: "events", label: "Events" },
+    // Omitted rather than shown broken when there is no plottable target.
+    ...(kedaTargetIsGraphable(kd) ? [{ id: "graph" as const, label: "Graph" }] : []),
+  ];
+
+  const body =
+    kd.view === "yaml"
+      ? renderKedaYamlView(kd)
+      : kd.view === "events"
+        ? renderEventsList(`keda-events:${kd.ctx}:${kd.namespace}:${kd.kind}:${kd.name}`, kd.events, kd.eventsError)
+        : renderKedaGraphView(kd);
+
+  return `
+    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeKedaDetail()">
+      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">${esc(kd.name)}</div>
+            <div class="truncate text-xs text-ink-muted">${esc(kd.kind)} · ${esc(kd.namespace)} · ${esc(kd.ctx)}</div>
+          </div>
+          <button type="button" onclick="window.__app.closeKedaDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+        </div>
+        <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
+          ${tabs
+            .map(
+              (t) => `
+            <button
+              type="button"
+              onclick="window.__app.setKedaDetailView(${jsArg(t.id)})"
+              data-detail-tab ${kd.view === t.id ? "data-detail-tab-active" : ""}
+              class="rounded-md px-3 py-1.5 text-xs font-medium ${kd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
+            >${t.label}</button>`,
+            )
+            .join("")}
+        </div>
+        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+      </div>
+    </div>`;
+}
+
 function renderGitOpsDetailPanel(): string {
   const gd = state.gitOpsDetail;
   if (!gd) return "";
@@ -6930,7 +7230,19 @@ function renderKeda(): string {
                   : ""
               }
               <td><button type="button" title="Filter by this namespace" onclick="window.__app.setEnumFilter('keda','namespace',[${jsArg(so.namespace)}])" class="hover:text-series-blue hover:underline">${esc(so.namespace)}</button></td>
-              <td class="text-ink-primary">${esc(so.name)}</td>
+              <td>
+                <span class="inline-flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    title="View ${esc(so.kind.toLowerCase())} details (YAML, Events${so.target_name ? ", Graph" : ""})"
+                    data-row-open onclick="window.__app.openKedaDetail(${jsArg(ctx)},${jsArg(so.namespace)},${jsArg(so.kind)},${jsArg(so.name)})"
+                    class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
+                  >
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
+                  </button>
+                  <span class="truncate text-ink-primary">${esc(so.name)}</span>
+                </span>
+              </td>
               <td>${esc(so.kind)}</td>
               <td>${esc(so.target_name ? `${so.target_kind}/${so.target_name}` : so.target_kind)}</td>
               <td class="max-w-md truncate" title="${esc(so.triggers)}">${esc(so.triggers) || "—"}</td>
@@ -7335,6 +7647,7 @@ const DETAIL_PANEL_CLOSERS: { isOpen: () => boolean; close: () => void }[] = [
   { isOpen: () => !!state.gitOpsDetail, close: closeGitOpsDetail },
   { isOpen: () => !!state.helmDetail, close: closeHelmDetail },
   { isOpen: () => !!state.napDetail, close: closeNapDetail },
+  { isOpen: () => !!state.kedaDetail, close: closeKedaDetail },
 ];
 
 function isAnyDetailPanelOpen(): boolean {

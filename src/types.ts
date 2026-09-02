@@ -176,10 +176,18 @@ export interface GitOpsResult {
   apps: GitOpsAppInfo[];
 }
 
-export interface GitOpsAppManifest {
+/**
+ * One object rendered to YAML twice, so a detail panel's "show managed
+ * fields" toggle switches between them without a second round trip. Shared by
+ * every CRD-backed panel — ArgoCD Applications, Karpenter NodePools, KEDA
+ * ScaledObjects — with the aliases keeping the names their panels already use.
+ */
+export interface ObjectManifest {
   yaml_full: string;
   yaml_without_managed_fields: string;
 }
+
+export type GitOpsAppManifest = ObjectManifest;
 
 export interface HelmReleaseInfo {
   namespace: string;
@@ -226,11 +234,7 @@ export interface NapResult {
   node_pools: NapNodePoolInfo[];
 }
 
-/** A Karpenter NodePool's manifest — same shape as GitOpsAppManifest. */
-export interface NapNodePoolManifest {
-  yaml_full: string;
-  yaml_without_managed_fields: string;
-}
+export type NapNodePoolManifest = ObjectManifest;
 
 export interface NapNodePoolInfo {
   name: string;
