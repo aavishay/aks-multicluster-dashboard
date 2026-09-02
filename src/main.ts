@@ -7821,8 +7821,28 @@ document.addEventListener("keydown", (e) => {
   // isEditableTarget, for the same reason as Cmd+K above: there's no
   // competing meaning inside a text field, and re-pressing it to reselect
   // the current query is useful rather than surprising.
+  //
+  // It is gated on isNonPanelOverlayOpen, though: the palette and Claude's
+  // views don't close a detail panel when they open, so both can be up at
+  // once. Without this, Cmd+F would move focus into the panel's search box
+  // *behind* the overlay — every subsequent keystroke would vanish into a
+  // hidden input while the overlay looked focused.
   if (e.key === "f" || e.key === "F") {
+    if (isNonPanelOverlayOpen()) return;
     if (focusDetailSearch()) e.preventDefault();
+    return;
+  }
+
+  // Cmd+R refreshes the fleet, matching the "Refresh now" button.
+  //
+  // Always claimed, overlay or not: the alternative is the webview's own
+  // reload, which throws away the entire session — selected clusters, every
+  // cached tab, scroll positions, an open panel — to fetch the same data
+  // this does in place. Refreshing behind an overlay is harmless, since it
+  // re-fetches data rather than changing what's on screen.
+  if (e.key === "r" || e.key === "R") {
+    e.preventDefault();
+    manualRefresh();
     return;
   }
 
