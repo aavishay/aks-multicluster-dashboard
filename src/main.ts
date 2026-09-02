@@ -2457,9 +2457,17 @@ function moveNapSearch(_view: string, delta: number) {
  */
 const GRAPHABLE_KEDA_TARGET_KINDS = ["Deployment", "StatefulSet", "DaemonSet"];
 
-/** Whether this autoscaler's target is one whose load can be graphed. A ScaledJob templates Jobs rather than scaling an existing workload, so it has no target to plot. */
-function kedaTargetIsGraphable(kd: KedaDetailState): boolean {
-  return kd.targetName !== "" && GRAPHABLE_KEDA_TARGET_KINDS.includes(kd.targetKind);
+/**
+ * Whether this autoscaler's target is one whose load can be graphed. A
+ * ScaledJob templates Jobs rather than scaling an existing workload, so it has
+ * no target to plot at all.
+ *
+ * Takes the target rather than the panel state so the table row can ask the
+ * same question the panel does: the row's tooltip names the tabs the panel
+ * will offer, and deciding that twice is how the two drift apart.
+ */
+function kedaTargetIsGraphable(targetKind: string, targetName: string): boolean {
+  return targetName !== "" && GRAPHABLE_KEDA_TARGET_KINDS.includes(targetKind);
 }
 
 function openKedaDetail(ctx: string, namespace: string, kind: string, name: string) {
@@ -2558,7 +2566,7 @@ async function fetchKedaEvents() {
 /** Graphs the *target's* series, since a ScaledObject has no resource usage of its own — what's interesting is the load the autoscaler is reacting to. */
 async function fetchKedaMetrics() {
   const kd = state.kedaDetail;
-  if (!kd || !kedaTargetIsGraphable(kd)) return;
+  if (!kd || !kedaTargetIsGraphable(kd.targetKind, kd.targetName)) return;
   const token = kedaDetailToken;
   kd.metricsLoading = true;
   kd.metricsError = null;
@@ -6825,7 +6833,7 @@ function renderKedaDetailPanel(): string {
     { id: "yaml", label: "YAML" },
     { id: "events", label: "Events" },
     // Omitted rather than shown broken when there is no plottable target.
-    ...(kedaTargetIsGraphable(kd) ? [{ id: "graph" as const, label: "Graph" }] : []),
+    ...(kedaTargetIsGraphable(kd.targetKind, kd.targetName) ? [{ id: "graph" as const, label: "Graph" }] : []),
   ];
 
   const body =
@@ -7234,7 +7242,7 @@ function renderKeda(): string {
                 <span class="inline-flex items-center gap-1.5">
                   <button
                     type="button"
-                    title="View ${esc(so.kind.toLowerCase())} details (YAML, Events${so.target_name ? ", Graph" : ""})"
+                    title="View ${esc(so.kind.toLowerCase())} details (YAML, Events${kedaTargetIsGraphable(so.target_kind, so.target_name) ? ", Graph" : ""})"
                     data-row-open onclick="window.__app.openKedaDetail(${jsArg(ctx)},${jsArg(so.namespace)},${jsArg(so.kind)},${jsArg(so.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >
