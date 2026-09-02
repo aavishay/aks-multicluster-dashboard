@@ -263,17 +263,24 @@ pub struct NapResult {
     pub node_pools: Vec<NapNodePoolInfo>,
 }
 
-/// One Karpenter `NodePool` — the provisioning policy — plus its own live
-/// rollup of what it has actually provisioned (`status.resources`), which is
-/// both the node count and the "used" side of the usage/limit columns below.
-/// A Karpenter NodePool's manifest. Same shape as `GitOpsAppManifest` since
-/// both are DynamicObject-backed CRDs rendered to YAML the same way.
+/// One object rendered to YAML twice, so a detail panel's "show managed
+/// fields" toggle can switch between them without a second round trip.
+///
+/// Shared by every CRD-backed detail panel — ArgoCD Applications, Karpenter
+/// NodePools, KEDA ScaledObjects — which all reach the same DynamicObject and
+/// render it the same way. The two aliases below keep the per-domain names
+/// their panels already use.
 #[derive(Serialize, Clone, Debug)]
-pub struct NapNodePoolManifest {
+pub struct ObjectManifest {
     pub yaml_full: String,
     pub yaml_without_managed_fields: String,
 }
 
+pub type NapNodePoolManifest = ObjectManifest;
+
+/// One Karpenter `NodePool` — the provisioning policy — plus its own live
+/// rollup of what it has actually provisioned (`status.resources`), which is
+/// both the node count and the "used" side of the usage/limit columns below.
 #[derive(Serialize, Clone, Debug)]
 pub struct NapNodePoolInfo {
     pub name: String,
@@ -340,11 +347,7 @@ pub struct KedaScaledObjectInfo {
     pub age_seconds: i64,
 }
 
-#[derive(Serialize, Clone, Debug)]
-pub struct GitOpsAppManifest {
-    pub yaml_full: String,
-    pub yaml_without_managed_fields: String,
-}
+pub type GitOpsAppManifest = ObjectManifest;
 
 /// One Helm release at its latest revision, decoded out of the
 /// `helm.sh/release.v1` Secret that Helm uses as its storage backend.
