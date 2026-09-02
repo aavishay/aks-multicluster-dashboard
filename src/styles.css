@@ -155,11 +155,6 @@ table.data-table tr.filter-row th {
   padding: 4px 8px 8px;
   white-space: normal;
 }
-/* A floor so a very short window still leaves a usable table rather than a
-   sliver; below this the page scrolls instead. */
-[data-scroll-id^="table:"] {
-  min-height: 10rem;
-}
 table.data-table td {
   padding: 7px 12px;
   border-bottom: 1px solid var(--gridline);

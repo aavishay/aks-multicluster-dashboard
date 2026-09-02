@@ -7422,6 +7422,9 @@ function isAnyOverlayOpen(): boolean {
  * all of it grows with the UI scale. Collapsing the box first and reading
  * what `main` then needs gives the exact remainder, whatever is present.
  */
+/** Floor for the table box on a very short window, so it degrades to a small scrolling table rather than a sliver. In rem-equivalents so it tracks the UI scale; applied here rather than as a CSS min-height, which would also floor the deliberate collapse used for measuring below. */
+const TABLE_MIN_HEIGHT_REM = 10;
+
 function sizeTableScrollBox(app: HTMLElement) {
   const box = app.querySelector<HTMLElement>('[data-scroll-id^="table:"]');
   if (!box) return; // Metrics and Cost have no table.
@@ -7429,12 +7432,29 @@ function sizeTableScrollBox(app: HTMLElement) {
   const main = app.querySelector<HTMLElement>('[data-scroll-id="main"]');
   if (!main) return;
 
-  // Collapse the box so main.scrollHeight reports everything *except* it,
-  // then hand back the difference. No paint happens between the two writes,
-  // so this doesn't flicker.
+  // What the table would occupy unconstrained, so a short table can hug its
+  // rows instead of padding a bordered box with dead space.
+  box.style.height = "auto";
+  const natural = box.scrollHeight;
+
+  // How much room is left once the box takes none.
+  //
+  // Measured as the geometric span of main's children, NOT via
+  // main.scrollHeight: scrollHeight never reports less than clientHeight, so
+  // with the box collapsed and the rest of the content short it returns the
+  // full viewport height — making `clientHeight - scrollHeight` zero and
+  // collapsing every table onto its floor, about three rows. Rect deltas have
+  // no such floor and are unaffected by however far main is scrolled.
   box.style.height = "0px";
-  const others = main.scrollHeight;
-  box.style.height = `${Math.max(0, main.clientHeight - others)}px`;
+  const kids = [...main.children].map((k) => k.getBoundingClientRect());
+  const occupied = kids.length > 0 ? Math.max(...kids.map((r) => r.bottom)) - Math.min(...kids.map((r) => r.top)) : 0;
+
+  const mainStyle = getComputedStyle(main);
+  const usable = main.clientHeight - parseFloat(mainStyle.paddingTop) - parseFloat(mainStyle.paddingBottom);
+  const rootFontPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+
+  // No paint happens between these writes, so the measuring doesn't flicker.
+  box.style.height = `${Math.min(natural, Math.max(TABLE_MIN_HEIGHT_REM * rootFontPx, usable - occupied))}px`;
 
   // The title row's height is only knowable once rendered at the current
   // scale, so the filter row's offset is set from it here rather than in CSS.
