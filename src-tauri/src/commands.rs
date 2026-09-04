@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::{claude, helm, k8s, kubeconfig, metrics_backend, mutate, retry};
+use crate::{ai, claude, helm, k8s, kubeconfig, metrics_backend, mutate, retry};
 use std::future::Future;
 use std::time::Duration;
 
@@ -460,28 +460,37 @@ pub async fn test_metrics_backend(
 }
 
 #[tauri::command]
-pub fn claude_auth_status() -> ClaudeAuthState {
+pub fn ai_auth_status() -> ai::AiAuthState {
     // Infallible by design: "no key configured" is a state the UI renders,
     // not an error it has to handle.
-    claude::auth_status()
+    ai::auth_status()
+}
+
+/// Selects the provider and its model / base URL, and reports the resulting
+/// state — which is what the panel renders, so it can never show a provider
+/// the backend isn't actually pointed at.
+#[tauri::command]
+pub fn ai_set_settings(provider: String, model: String, base_url: String) -> Result<ai::AiAuthState, String> {
+    ai::set_settings(&provider, &model, &base_url)?;
+    Ok(ai::auth_status())
 }
 
 #[tauri::command]
-pub fn claude_set_api_key(api_key: String) -> Result<ClaudeAuthState, String> {
-    claude::set_api_key(&api_key)?;
-    Ok(claude::auth_status())
+pub fn ai_set_api_key(provider: String, api_key: String) -> Result<ai::AiAuthState, String> {
+    ai::set_api_key(&provider, &api_key)?;
+    Ok(ai::auth_status())
 }
 
 #[tauri::command]
-pub fn claude_clear_api_key() -> Result<ClaudeAuthState, String> {
-    claude::clear_api_key()?;
-    Ok(claude::auth_status())
+pub fn ai_clear_api_key(provider: String) -> Result<ai::AiAuthState, String> {
+    ai::clear_api_key(&provider)?;
+    Ok(ai::auth_status())
 }
 
 /// Assembles and returns the diagnosis payload *without* sending it, so the UI
 /// can show exactly what would leave the machine before anything does.
 #[tauri::command]
-pub async fn claude_build_diagnosis(
+pub async fn ai_build_diagnosis(
     context_name: String,
     namespace: String,
     pod_name: String,
@@ -494,12 +503,12 @@ pub async fn claude_build_diagnosis(
 }
 
 #[tauri::command]
-pub async fn claude_diagnose(prompt: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
+pub async fn ai_diagnose(prompt: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
     claude::diagnose(&prompt, on_token).await
 }
 
 #[tauri::command]
-pub async fn claude_explain_error(error_text: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
+pub async fn ai_explain_error(error_text: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
     // Not wrapped in `with_retry`/`with_deadline`: those are keyed to a cluster
     // context, and a streaming call already surfaces progress incrementally, so
     // a stall is visible rather than silent.

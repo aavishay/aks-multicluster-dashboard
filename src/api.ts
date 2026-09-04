@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
-  ClaudeAuthState,
+  AiAuthState,
+  AiProvider,
   ClaudeDiagnosisPayload,
   ClusterEntry,
   ClusterOverview,
@@ -147,24 +148,26 @@ export const api = {
     invoke<MetricsBackendInfo[]>("list_metrics_backends", { contextName }),
   testMetricsBackend: (contextName: string, backend: MetricsBackendInfo) =>
     invoke<MetricsBackendTestResult>("test_metrics_backend", { contextName, backend }),
-  claudeAuthStatus: () => invoke<ClaudeAuthState>("claude_auth_status"),
+  aiAuthStatus: () => invoke<AiAuthState>("ai_auth_status"),
+  aiSetSettings: (provider: AiProvider, model: string, baseUrl: string) =>
+    invoke<AiAuthState>("ai_set_settings", { provider, model, baseUrl }),
   /** Stores a pasted key in the OS keychain; the key is never persisted frontend-side. */
-  claudeSetApiKey: (apiKey: string) => invoke<ClaudeAuthState>("claude_set_api_key", { apiKey }),
-  claudeClearApiKey: () => invoke<ClaudeAuthState>("claude_clear_api_key"),
+  aiSetApiKey: (provider: AiProvider, apiKey: string) => invoke<AiAuthState>("ai_set_api_key", { provider, apiKey }),
+  aiClearApiKey: (provider: AiProvider) => invoke<AiAuthState>("ai_clear_api_key", { provider }),
   /** Assembles the redacted diagnosis payload without sending it, for preview. */
-  claudeBuildDiagnosis: (contextName: string, namespace: string, podName: string, container: string) =>
-    invoke<ClaudeDiagnosisPayload>("claude_build_diagnosis", { contextName, namespace, podName, container }),
+  aiBuildDiagnosis: (contextName: string, namespace: string, podName: string, container: string) =>
+    invoke<ClaudeDiagnosisPayload>("ai_build_diagnosis", { contextName, namespace, podName, container }),
   /** Sends an already-previewed diagnosis payload; `onToken` fires per text delta. */
-  claudeDiagnose: (prompt: string, onToken: (chunk: string) => void) => {
+  aiDiagnose: (prompt: string, onToken: (chunk: string) => void) => {
     const channel = new Channel<string>();
     channel.onmessage = onToken;
-    return invoke<void>("claude_diagnose", { prompt, onToken: channel });
+    return invoke<void>("ai_diagnose", { prompt, onToken: channel });
   },
   /** Streams an explanation of one error string; `onToken` fires per text delta. */
-  claudeExplainError: (errorText: string, onToken: (chunk: string) => void) => {
+  aiExplainError: (errorText: string, onToken: (chunk: string) => void) => {
     const channel = new Channel<string>();
     channel.onmessage = onToken;
-    return invoke<void>("claude_explain_error", { errorText, onToken: channel });
+    return invoke<void>("ai_explain_error", { errorText, onToken: channel });
   },
   getNapNodePools: (contextName: string) => invoke<NapResult>("get_nap_node_pools", { contextName }),
   getNapNodePoolManifest: (contextName: string, name: string) =>
