@@ -48,7 +48,8 @@ async fn with_deadline<T>(
 /// Wraps `with_deadline`, re-running `operation` a couple of times if it
 /// fails with what looks like a transient network error (see
 /// `retry::retry_transient` for the classification and backoff). Safe to
-/// layer over every command in this file: each one is a read-only GET/LIST
+/// layer over every *read* in this file — and only those; the write commands
+/// use `with_deadline` directly. Each read is a GET/LIST
 /// (or, for the log-follow streams, has its own independent per-line error
 /// handling), so re-issuing a request after a blip can't cause any
 /// duplicated side effect.
@@ -64,9 +65,13 @@ where
 // Write mode, and the operations it gates
 //
 // The switch is mirrored in the backend rather than kept in the frontend
-// alone: see `mutate::require_write`. `with_retry` is deliberately absent from
-// every one of these — retrying a read costs a round trip, retrying a write
-// risks doing it twice.
+// alone: see `mutate::require_write`.
+//
+// These take `with_deadline` but not `with_retry`, and the two halves have
+// different reasons. No retry: re-issuing a read costs a round trip, but
+// re-issuing a write risks doing it twice. Still a deadline: a private-link
+// cluster that accepts the connection and never answers would otherwise leave
+// the confirmation dialog on "Working…" with nothing to cancel it.
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
@@ -82,7 +87,7 @@ pub fn set_write_enabled(enabled: bool) -> bool {
 
 #[tauri::command]
 pub async fn delete_pod(context_name: String, namespace: String, name: String) -> Result<String, String> {
-    mutate::delete_pod(&context_name, &namespace, &name).await
+    with_deadline(&context_name, mutate::delete_pod(&context_name, &namespace, &name)).await
 }
 
 #[tauri::command]
@@ -92,7 +97,7 @@ pub async fn restart_workload(
     namespace: String,
     name: String,
 ) -> Result<String, String> {
-    mutate::restart_workload(&context_name, &kind, &namespace, &name).await
+    with_deadline(&context_name, mutate::restart_workload(&context_name, &kind, &namespace, &name)).await
 }
 
 #[tauri::command]
@@ -103,17 +108,17 @@ pub async fn scale_workload(
     name: String,
     replicas: i32,
 ) -> Result<String, String> {
-    mutate::scale_workload(&context_name, &kind, &namespace, &name, replicas).await
+    with_deadline(&context_name, mutate::scale_workload(&context_name, &kind, &namespace, &name, replicas)).await
 }
 
 #[tauri::command]
 pub async fn set_node_schedulable(context_name: String, name: String, schedulable: bool) -> Result<String, String> {
-    mutate::set_node_schedulable(&context_name, &name, schedulable).await
+    with_deadline(&context_name, mutate::set_node_schedulable(&context_name, &name, schedulable)).await
 }
 
 #[tauri::command]
 pub async fn drain_node(context_name: String, name: String) -> Result<DrainReport, String> {
-    mutate::drain_node(&context_name, &name).await
+    with_deadline(&context_name, mutate::drain_node(&context_name, &name)).await
 }
 
 #[tauri::command]
