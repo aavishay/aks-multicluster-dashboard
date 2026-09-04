@@ -2761,6 +2761,7 @@ function yamlWrapButton(): string {
     <button
       type="button"
       onclick="window.__app.toggleYamlWrap()"
+      aria-pressed="${state.yamlWrap}"
       title="${state.yamlWrap ? "Wrapping long lines — click for one line each" : "Long lines run off to the right — click to wrap them"}"
       class="shrink-0 rounded-md border px-2 py-1 text-xs font-medium ${
         state.yamlWrap
@@ -2876,6 +2877,7 @@ function writeModeToggle(compact = false): string {
     <button
       type="button"
       onclick="window.__app.toggleWriteMode()"
+      aria-pressed="${on}"
       title="${esc(title)}"
       class="flex shrink-0 items-center gap-1.5 rounded-md border ${compact ? "px-1.5 py-1" : "px-2 py-1.5"} text-xs font-medium ${
         on
