@@ -3983,6 +3983,13 @@ function restoreSelectionSnapshot(app: HTMLElement, snapshot: SelectionSnapshot 
   sel?.addRange(range);
 }
 
+/** The two element types that carry a text caret. `HTMLInputElement` alone would miss the YAML editor, whose textarea loses its cursor on every background re-render without this. */
+type TextEntry = HTMLInputElement | HTMLTextAreaElement;
+
+function asTextEntry(el: unknown): TextEntry | null {
+  return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el : null;
+}
+
 /** Where the reader was, gathered into one value so a corrective re-render can be handed the original instead of re-reading a DOM that has already been replaced. */
 interface PreRenderState {
   activeKey: string | undefined;
@@ -4010,8 +4017,8 @@ function capturePreRenderState(app: HTMLElement): PreRenderState {
   });
   return {
     activeKey: active instanceof HTMLElement ? active.dataset.filterKey : undefined,
-    selStart: active instanceof HTMLInputElement ? active.selectionStart : null,
-    selEnd: active instanceof HTMLInputElement ? active.selectionEnd : null,
+    selStart: asTextEntry(active)?.selectionStart ?? null,
+    selEnd: asTextEntry(active)?.selectionEnd ?? null,
     scrollPositions,
     selectionSnapshot: captureSelectionSnapshot(app),
   };
@@ -4157,9 +4164,10 @@ function render(carried?: PreRenderState) {
     // scrolled off-screen) snaps every scrollable ancestor back to make it
     // visible — silently undoing the scroll-position restore just above.
     const restored = app.querySelector<HTMLElement>(`[data-filter-key="${activeKey}"]`);
-    if (restored instanceof HTMLInputElement) {
-      restored.focus({ preventScroll: true });
-      if (selStart !== null && selEnd !== null) restored.setSelectionRange(selStart, selEnd);
+    const entry = asTextEntry(restored);
+    if (entry) {
+      entry.focus({ preventScroll: true });
+      if (selStart !== null && selEnd !== null) entry.setSelectionRange(selStart, selEnd);
     } else {
       restored?.focus({ preventScroll: true });
     }
@@ -6622,6 +6630,7 @@ function renderYamlPane(o: {
         <textarea
           spellcheck="false"
           data-filter-key="yaml-editor"
+          data-scroll-id="yaml-editor:${esc(o.target.ctx)}:${esc(o.target.kind)}:${esc(o.target.namespace)}:${esc(o.target.name)}"
           oninput="window.__app.setYamlDraft(this.value)"
           class="min-h-0 flex-1 resize-none rounded-md border border-series-blue bg-surface-2 p-3 font-mono text-xs leading-relaxed text-ink-primary outline-none"
         >${esc(edit.draft)}</textarea>
