@@ -373,17 +373,6 @@ pub struct HelmReleaseInfo {
     pub age_seconds: i64,
 }
 
-/// `helm get values` / `helm get manifest` / `helm get notes` for one release,
-/// fetched on demand rather than as part of the list.
-/// Whether Claude features are usable, and via which credential source.
-#[derive(Serialize, Clone, Debug)]
-pub struct ClaudeAuthState {
-    pub signed_in: bool,
-    /// Human-readable credential source ("API key (Keychain)", "environment variable").
-    pub source: Option<String>,
-    /// Extra context for the panel — e.g. which key is in use, by its last four.
-    pub detail: Option<String>,
-}
 
 /// Everything a pod diagnosis will send, assembled and redacted but not yet
 /// sent — returned to the frontend so the exact payload can be inspected
@@ -402,6 +391,8 @@ pub struct ClaudeDiagnosisPayload {
     pub approx_tokens: u32,
 }
 
+/// `helm get values` / `helm get manifest` / `helm get notes` for one release,
+/// fetched on demand rather than as part of the list.
 #[derive(Serialize, Clone, Debug)]
 pub struct HelmReleaseDetail {
     /// User-supplied values (Helm's `config`), rendered as YAML. Empty when

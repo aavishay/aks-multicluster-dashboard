@@ -212,11 +212,21 @@ export interface HelmReleaseDetail {
   notes: string;
 }
 
-export interface ClaudeAuthState {
+export type AiProvider = "claude" | "gemini" | "ollama";
+
+/** Which model answers, and whether it can be reached. */
+export interface AiAuthState {
+  provider: AiProvider;
+  label: string;
+  model: string;
+  base_url: string;
+  /** False for Ollama, which is local and takes no credential. */
+  needs_api_key: boolean;
   signed_in: boolean;
   source: string | null;
   detail: string | null;
 }
+
 
 export interface ClaudeDiagnosisPayload {
   prompt: string;

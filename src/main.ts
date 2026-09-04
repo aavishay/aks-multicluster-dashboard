@@ -2,7 +2,8 @@ import "./styles.css";
 import { api } from "./api";
 import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
 import type {
-  ClaudeAuthState,
+  AiAuthState,
+  AiProvider,
   ClaudeDiagnosisPayload,
   ClusterEntry,
   ClusterOverview,
@@ -548,7 +549,7 @@ interface AppState {
   metricsBackendDraft: MetricsBackendInfo | null;
   metricsBackendTest: MetricsBackendTestResult | null;
   metricsBackendTesting: boolean;
-  claudeAuth: ClaudeAuthState | null;
+  claudeAuth: AiAuthState | null;
   claudePanelOpen: boolean;
   claudeExplain: ClaudeExplainState | null;
   claudeDiagnose: ClaudeDiagnoseState | null;
@@ -1410,9 +1411,11 @@ async function init() {
   }
   render();
   scheduleAutoRefresh();
-  // Probed once at startup so the Claude affordances know whether to offer
-  // an explain button or a sign-in prompt.
-  refreshClaudeAuth();
+  // The backend starts on its own defaults, so push the stored preference
+  // before probing — otherwise the first status would describe Claude even
+  // when the reader last chose Ollama. `applyAiSettings` reports the result,
+  // which is the probe.
+  applyAiSettings({});
 }
 
 async function refreshSidebarBadges() {
@@ -3387,6 +3390,9 @@ function setMetricsRange(minutes: number) {
   refreshClaudeAuth,
   toggleClaudePanel,
   saveClaudeApiKey,
+  setAiProvider,
+  setAiModel,
+  setAiBaseUrl,
   clearClaudeApiKey,
   explainError,
   closeClaudeExplain,
@@ -3957,8 +3963,47 @@ function renderClaudePanel(): string {
   if (!state.claudePanelOpen) return "";
   const auth = state.claudeAuth;
   const signedIn = auth?.signed_in === true;
-
+  const provider = auth?.provider ?? aiProvider();
+  const meta = AI_PROVIDERS.find((p) => p.id === provider);
+  const needsKey = auth?.needs_api_key !== false;
   const usingKeychainKey = auth?.source === "API key (Keychain)";
+
+  const providerPicker = `
+    <div class="flex flex-col gap-2">
+      <div class="text-xs font-medium text-ink-primary">Provider</div>
+      <div class="flex gap-1">
+        ${AI_PROVIDERS.map(
+          (p) => `
+          <button
+            type="button"
+            onclick="window.__app.setAiProvider(${jsArg(p.id)})"
+            class="flex-1 rounded-md border px-2 py-1.5 text-xs font-medium ${
+              p.id === provider
+                ? "border-series-blue bg-surface-3 text-ink-primary"
+                : "border-gridline bg-surface-2 text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+            }"
+          >${esc(p.label)}</button>`,
+        ).join("")}
+      </div>
+      <div class="text-xs text-ink-muted">${esc(meta?.note ?? "")}</div>
+    </div>`;
+
+  // Committed on blur or Enter rather than per keystroke: each change is a
+  // round trip to the backend, and half a model name is never a valid one.
+  const textSetting = (label: string, value: string, placeholder: string, setter: string, key: string) => `
+    <div class="flex flex-col gap-1">
+      <label class="text-xs font-medium text-ink-primary">${esc(label)}</label>
+      <input
+        type="text"
+        spellcheck="false"
+        value="${esc(value)}"
+        placeholder="${esc(placeholder)}"
+        data-filter-key="${esc(key)}"
+        onchange="window.__app.${setter}(this.value)"
+        onkeydown="if (event.key === 'Enter') { event.preventDefault(); this.blur(); }"
+        class="rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none focus:border-series-blue"
+      />
+    </div>`;
 
   // Never rendered with a `value` — the key is read from the DOM on save and
   // never round-trips through app state, which matters because render()
@@ -3971,7 +4016,7 @@ function renderClaudePanel(): string {
           type="password"
           autocomplete="off"
           spellcheck="false"
-          placeholder="sk-ant-..."
+          placeholder="${provider === "gemini" ? "AIza..." : "sk-ant-..."}"
           data-claude-key-input
           data-filter-key="claude-api-key"
           onkeydown="if (event.key === 'Enter') { event.preventDefault(); window.__app.saveClaudeApiKey(); }"
@@ -3981,18 +4026,20 @@ function renderClaudePanel(): string {
       </div>
       <div class="text-xs text-ink-muted">
         Stored in your macOS Keychain, not in the app. Create one at
-        <span class="text-ink-secondary">console.anthropic.com &rarr; API keys</span>.
+        <span class="text-ink-secondary">${esc(meta?.note ?? "")}</span>.
       </div>
     </div>`;
 
-  const body = signedIn
-    ? `<div class="flex flex-col gap-3">
-        <div class="text-sm text-status-good">Connected${auth?.source ? ` via ${esc(auth.source)}` : ""}.</div>
+  const status = signedIn
+    ? `<div class="flex flex-col gap-2">
+        <div class="text-sm text-status-good">Ready${auth?.source ? ` via ${esc(auth.source)}` : ""}.</div>
         ${auth?.detail ? `<div class="text-xs text-ink-secondary">${esc(auth.detail)}</div>` : ""}
         ${
-          usingKeychainKey
-            ? `<button type="button" onclick="window.__app.clearClaudeApiKey()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Remove key</button>`
-            : `<div class="text-xs text-ink-muted">Unset the environment variable to use a Keychain key instead.</div>`
+          needsKey
+            ? usingKeychainKey
+              ? `<button type="button" onclick="window.__app.clearClaudeApiKey()" class="self-start rounded-md border border-gridline px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Remove key</button>`
+              : `<div class="text-xs text-ink-muted">Unset the environment variable to use a Keychain key instead.</div>`
+            : ""
         }
       </div>`
     : `<div class="flex flex-col gap-3">
@@ -4004,10 +4051,21 @@ function renderClaudePanel(): string {
     <div class="fixed inset-0 z-40 flex items-start justify-end bg-black/40 p-6" onclick="window.__app.toggleClaudePanel()">
       <div class="mt-12 flex w-full max-w-md flex-col rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
-          <div class="text-sm font-medium text-ink-primary">Claude</div>
+          <div class="text-sm font-medium text-ink-primary">AI assistant</div>
           <button type="button" onclick="window.__app.toggleClaudePanel()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
         </div>
-        <div class="p-4">${body}</div>
+        <div class="flex flex-col gap-4 p-4">
+          ${providerPicker}
+          ${textSetting("Model", auth?.model ?? "", "provider default", "setAiModel", "ai-model")}
+          ${
+            // Only worth showing where you can actually point it somewhere
+            // else; Claude's endpoint is fixed.
+            provider === "ollama"
+              ? textSetting("Server URL", auth?.base_url ?? "", "http://localhost:11434", "setAiBaseUrl", "ai-base-url")
+              : ""
+          }
+          <div class="border-t border-gridline pt-3">${status}</div>
+        </div>
       </div>
     </div>`;
 }
@@ -5141,13 +5199,81 @@ function toggleClaudePanel() {
   if (state.claudePanelOpen) refreshClaudeAuth();
 }
 
+const AI_PROVIDERS: { id: AiProvider; label: string; note: string }[] = [
+  { id: "claude", label: "Claude", note: "console.anthropic.com → API keys" },
+  { id: "gemini", label: "Gemini", note: "aistudio.google.com → Get API key" },
+  { id: "ollama", label: "Ollama", note: "Runs on your machine — no API key" },
+];
+
+const AI_SETTINGS_STORAGE_KEY = "aks-dashboard-ai-settings";
+
+/** The chosen provider and its two knobs. Kept here rather than in the backend because it is a preference, not a credential — the keys stay in the OS keychain. */
+function storedAiSettings(): { provider: AiProvider; model: string; baseUrl: string } {
+  try {
+    const raw = JSON.parse(localStorage.getItem(AI_SETTINGS_STORAGE_KEY) ?? "{}");
+    const provider = AI_PROVIDERS.some((p) => p.id === raw.provider) ? (raw.provider as AiProvider) : "claude";
+    return { provider, model: typeof raw.model === "string" ? raw.model : "", baseUrl: typeof raw.baseUrl === "string" ? raw.baseUrl : "" };
+  } catch {
+    return { provider: "claude", model: "", baseUrl: "" };
+  }
+}
+
+function aiProvider(): AiProvider {
+  return storedAiSettings().provider;
+}
+
+/**
+ * Pushes the preference to the backend and adopts what it reports.
+ *
+ * Blank model or URL means "use this provider's default", which the backend
+ * fills in — so the panel shows the value that will actually be used rather
+ * than an empty box.
+ */
+async function applyAiSettings(next: Partial<{ provider: AiProvider; model: string; baseUrl: string }>) {
+  const merged = { ...storedAiSettings(), ...next };
+  // Switching provider drops the previous one's model and URL: a Claude model
+  // name means nothing to Ollama, and carrying it over would fail confusingly.
+  if (next.provider && next.provider !== storedAiSettings().provider) {
+    merged.model = "";
+    merged.baseUrl = "";
+  }
+  localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(merged));
+  try {
+    state.claudeAuth = await api.aiSetSettings(merged.provider, merged.model, merged.baseUrl);
+  } catch (e) {
+    if (state.claudeAuth) state.claudeAuth.detail = String(e);
+  }
+  render();
+}
+
+function setAiProvider(provider: string) {
+  applyAiSettings({ provider: provider as AiProvider });
+}
+
+function setAiModel(model: string) {
+  applyAiSettings({ model });
+}
+
+function setAiBaseUrl(baseUrl: string) {
+  applyAiSettings({ baseUrl });
+}
+
 async function refreshClaudeAuth() {
   try {
-    state.claudeAuth = await api.claudeAuthStatus();
+    state.claudeAuth = await api.aiAuthStatus();
   } catch {
-    // Treated as "unavailable" rather than an error banner — Claude is an
-    // optional add-on, and a failure here shouldn't disrupt cluster work.
-    state.claudeAuth = { signed_in: false, source: null, detail: null };
+    // Treated as "unavailable" rather than an error banner — the AI features
+    // are an optional add-on, and a failure here shouldn't disrupt cluster work.
+    state.claudeAuth = {
+      provider: aiProvider(),
+      label: AI_PROVIDERS.find((p) => p.id === aiProvider())?.label ?? "AI",
+      model: "",
+      base_url: "",
+      needs_api_key: true,
+      signed_in: false,
+      source: null,
+      detail: null,
+    };
   }
   render();
 }
@@ -5157,7 +5283,7 @@ async function saveClaudeApiKey() {
   const key = input?.value?.trim();
   if (!key) return;
   try {
-    state.claudeAuth = await api.claudeSetApiKey(key);
+    state.claudeAuth = await api.aiSetApiKey(aiProvider(), key);
     // Clear the field immediately — the key lives in the Keychain now, and
     // leaving it in the DOM serves no purpose.
     if (input) input.value = "";
@@ -5169,7 +5295,7 @@ async function saveClaudeApiKey() {
 
 async function clearClaudeApiKey() {
   try {
-    state.claudeAuth = await api.claudeClearApiKey();
+    state.claudeAuth = await api.aiClearApiKey(aiProvider());
   } catch (e) {
     if (state.claudeAuth) state.claudeAuth.detail = String(e);
   }
@@ -5210,7 +5336,7 @@ async function diagnosePod(ctx: string, namespace: string, podName: string, cont
   render();
 
   try {
-    const payload = await api.claudeBuildDiagnosis(ctx, namespace, podName, container);
+    const payload = await api.aiBuildDiagnosis(ctx, namespace, podName, container);
     if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
     state.claudeDiagnose.payload = payload;
   } catch (e) {
@@ -5233,7 +5359,7 @@ async function confirmDiagnose() {
   try {
     // Sends the previewed prompt rather than re-gathering, so what goes out is
     // exactly what was shown.
-    await api.claudeDiagnose(d.payload.prompt, (chunk) => {
+    await api.aiDiagnose(d.payload.prompt, (chunk) => {
       if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
       state.claudeDiagnose.answer += chunk;
       if (!claudeRenderScheduled) {
@@ -5272,7 +5398,7 @@ async function explainError(subject: string, errorText: string) {
   render();
 
   try {
-    await api.claudeExplainError(errorText, (chunk) => {
+    await api.aiExplainError(errorText, (chunk) => {
       if (token !== claudeExplainToken || !state.claudeExplain) return;
       state.claudeExplain.answer += chunk;
       // Coalesce bursts of deltas into one render per frame — a full re-render
