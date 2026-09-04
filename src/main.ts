@@ -143,9 +143,14 @@ function resetUiScale() {
   setUiScale(DEFAULT_UI_SCALE);
 }
 
-/** The "A" button: wraps around, so the whole ladder stays reachable by clicking alone. */
-function cycleUiScale() {
-  setUiScale(UI_SCALE_STEPS[(currentUiScaleIndex() + 1) % UI_SCALE_STEPS.length]);
+/**
+ * The zoom button. Clicking resets to 100% rather than stepping to the next
+ * rung: the button now shows the current percentage, so its job is to say
+ * where you are and give you one click back to normal. Stepping stays on
+ * Cmd+ / Cmd−, which is where a reader reaches for it anyway.
+ */
+function resetUiScaleFromButton() {
+  setUiScale(DEFAULT_UI_SCALE);
 }
 
 // ---------------------------------------------------------------------------
@@ -3409,7 +3414,7 @@ function setMetricsRange(minutes: number) {
   toggleEnumDropdown,
   clearFilters,
   toggleTheme,
-  cycleUiScale,
+  resetUiScaleFromButton,
   toggleSidebar,
   startColumnResize,
   toggleRowSelected,
@@ -3893,17 +3898,18 @@ function themeToggleButton(): string {
 }
 
 function uiScaleButton(): string {
-  const index = currentUiScaleIndex();
-  const next = UI_SCALE_STEPS[(index + 1) % UI_SCALE_STEPS.length];
-  // Three glyph sizes across the whole ladder — enough for the button to hint
-  // at the current scale without needing a class per step.
-  const glyphClass = state.uiScale < DEFAULT_UI_SCALE ? "text-xs" : state.uiScale === DEFAULT_UI_SCALE ? "text-sm" : "text-base";
+  const atDefault = state.uiScale === DEFAULT_UI_SCALE;
+  // `125%` is wider than `75%`, and the button sits in a row that would jog
+  // sideways as the number changes — a min width holds its place.
   return `
     <button
-      onclick="window.__app.cycleUiScale()"
-      title="Zoom: ${state.uiScale}% (click for ${next}% · ⌘+ / ⌘− to step, ⌘0 to reset)"
-      class="flex items-center justify-center rounded-md border border-gridline bg-surface-2 px-2.5 py-1.5 text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
-    ><span class="${glyphClass} font-semibold leading-none">A</span></button>`;
+      onclick="window.__app.resetUiScaleFromButton()"
+      ${atDefault ? "disabled" : ""}
+      title="${atDefault ? "Zoom: 100% (⌘+ / ⌘− to change)" : `Zoom: ${state.uiScale}% — click to reset to ${DEFAULT_UI_SCALE}% (⌘+ / ⌘− to step)`}"
+      class="flex min-w-[3.25rem] items-center justify-center rounded-md border border-gridline bg-surface-2 px-2 py-1.5 text-xs font-semibold leading-none tabular ${
+        atDefault ? "text-ink-muted" : "text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+      }"
+    >${state.uiScale}%</button>`;
 }
 
 
@@ -3930,6 +3936,9 @@ function claudeExplainButton(subject: string, errorText: string): string {
 }
 
 /** Top-bar Claude status/auth control. Click cycles: re-probe, or open the setup panel. */
+/** Two inputs feeding a node — a model, rather than the sparkle that reads as one vendor's mark. */
+const aiIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="17" cy="12" r="2.6"/><line x1="8" y1="7.1" x2="14.6" y2="10.9"/><line x1="8" y1="16.9" x2="14.6" y2="13.1"/><line x1="6" y1="8.2" x2="6" y2="15.8"/></svg>`;
+
 function claudeAuthButton(): string {
   const auth = state.claudeAuth;
   const signedIn = auth?.signed_in === true;
@@ -3944,7 +3953,7 @@ function claudeAuthButton(): string {
       class="flex items-center justify-center rounded-md border border-gridline bg-surface-2 px-2.5 py-1.5 hover:bg-surface-3 ${
         signedIn ? "text-status-good" : "text-ink-muted"
       }"
-    ><span class="text-sm font-semibold leading-none">✦</span></button>`;
+    >${aiIcon}</button>`;
 }
 
 /**
