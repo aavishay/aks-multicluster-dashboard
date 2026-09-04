@@ -96,7 +96,7 @@ pub fn auth_status() -> ClaudeAuthState {
 fn resolve_api_key() -> Result<String, String> {
     env_api_key()
         .or_else(keychain_api_key)
-        .ok_or_else(|| "No Claude API key configured. Paste one in the Claude panel (✦).".to_string())
+        .ok_or_else(|| "No Claude API key configured. Paste one in the AI panel.".to_string())
 }
 
 // ---------------------------------------------------------------------------
