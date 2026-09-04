@@ -12,6 +12,7 @@ import type {
   HelmReleaseInfo,
   KedaResult,
   MetricsBackendInfo,
+  DrainReport,
   NapNodePoolManifest,
   ObjectManifest,
   MetricsBackendTestResult,
@@ -30,6 +31,21 @@ import type {
 export const api = {
   listClusters: () => invoke<ClusterEntry[]>("list_clusters"),
   kubeconfigPath: () => invoke<string | null>("kubeconfig_path"),
+
+  // Write mode. `setWriteEnabled` returns the backend's own view rather than
+  // echoing the argument, so the UI can only ever show a state the guard
+  // actually holds.
+  getWriteEnabled: () => invoke<boolean>("get_write_enabled"),
+  setWriteEnabled: (enabled: boolean) => invoke<boolean>("set_write_enabled", { enabled }),
+  deletePod: (contextName: string, namespace: string, name: string) =>
+    invoke<string>("delete_pod", { contextName, namespace, name }),
+  restartWorkload: (contextName: string, kind: string, namespace: string, name: string) =>
+    invoke<string>("restart_workload", { contextName, kind, namespace, name }),
+  scaleWorkload: (contextName: string, kind: string, namespace: string, name: string, replicas: number) =>
+    invoke<string>("scale_workload", { contextName, kind, namespace, name, replicas }),
+  setNodeSchedulable: (contextName: string, name: string, schedulable: boolean) =>
+    invoke<string>("set_node_schedulable", { contextName, name, schedulable }),
+  drainNode: (contextName: string, name: string) => invoke<DrainReport>("drain_node", { contextName, name }),
   getOverview: (contextName: string) => invoke<ClusterOverview>("get_cluster_overview", { contextName }),
   getNodes: (contextName: string) => invoke<NodeInfo[]>("get_nodes", { contextName }),
   getNodeManifest: (contextName: string, nodeName: string) =>

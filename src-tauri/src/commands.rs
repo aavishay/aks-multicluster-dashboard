@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::{ai, claude, helm, k8s, kubeconfig, metrics_backend, retry};
+use crate::{ai, claude, helm, k8s, kubeconfig, metrics_backend, mutate, retry};
 use std::future::Future;
 use std::time::Duration;
 
@@ -58,6 +58,62 @@ where
     Fut: Future<Output = Result<T, String>>,
 {
     retry::retry_transient(|| with_deadline(context_name, operation())).await
+}
+
+// ---------------------------------------------------------------------------
+// Write mode, and the operations it gates
+//
+// The switch is mirrored in the backend rather than kept in the frontend
+// alone: see `mutate::require_write`. `with_retry` is deliberately absent from
+// every one of these — retrying a read costs a round trip, retrying a write
+// risks doing it twice.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_write_enabled() -> bool {
+    mutate::write_enabled()
+}
+
+#[tauri::command]
+pub fn set_write_enabled(enabled: bool) -> bool {
+    mutate::set_write_enabled(enabled);
+    mutate::write_enabled()
+}
+
+#[tauri::command]
+pub async fn delete_pod(context_name: String, namespace: String, name: String) -> Result<String, String> {
+    mutate::delete_pod(&context_name, &namespace, &name).await
+}
+
+#[tauri::command]
+pub async fn restart_workload(
+    context_name: String,
+    kind: String,
+    namespace: String,
+    name: String,
+) -> Result<String, String> {
+    mutate::restart_workload(&context_name, &kind, &namespace, &name).await
+}
+
+#[tauri::command]
+pub async fn scale_workload(
+    context_name: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    replicas: i32,
+) -> Result<String, String> {
+    mutate::scale_workload(&context_name, &kind, &namespace, &name, replicas).await
+}
+
+#[tauri::command]
+pub async fn set_node_schedulable(context_name: String, name: String, schedulable: bool) -> Result<String, String> {
+    mutate::set_node_schedulable(&context_name, &name, schedulable).await
+}
+
+#[tauri::command]
+pub async fn drain_node(context_name: String, name: String) -> Result<DrainReport, String> {
+    mutate::drain_node(&context_name, &name).await
 }
 
 #[tauri::command]

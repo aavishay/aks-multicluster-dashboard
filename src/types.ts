@@ -189,6 +189,15 @@ export interface ObjectManifest {
 
 export type GitOpsAppManifest = ObjectManifest;
 
+/** What a drain asked the API server to do, and what it declined. */
+export interface DrainReport {
+  node: string;
+  cordoned: boolean;
+  evicting: string[];
+  skipped: string[];
+  failed: string[];
+}
+
 export interface HelmReleaseInfo {
   namespace: string;
   name: string;
