@@ -10,7 +10,8 @@ use crate::models::DrainReport;
 use chrono::Utc;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::{Node, Pod};
-use kube::api::{Api, DeleteParams, EvictParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, DynamicObject, EvictParams, GroupVersionKind, Patch, PatchParams, PostParams};
+use kube::discovery::{ApiCapabilities, Scope};
 use kube::Client;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -227,6 +228,126 @@ pub async fn drain_node(context_name: &str, name: &str) -> Result<DrainReport, S
     Ok(DrainReport { node: name.to_string(), cordoned: true, evicting, skipped, failed })
 }
 
+// ---------------------------------------------------------------------------
+// Editing a resource
+// ---------------------------------------------------------------------------
+
+/// Fields the server owns. Sending them back is either ignored or rejected,
+/// and `creationTimestamp: null` — what serde emits for an absent one — is a
+/// real rejection rather than a no-op.
+///
+/// `resourceVersion` is deliberately *not* here: keeping it is what makes this
+/// an optimistic-concurrency check. If the object changed between the panel
+/// reading it and the reader saving, the server answers 409 rather than
+/// quietly discarding whatever the other writer did.
+fn strip_server_owned(obj: &mut DynamicObject) {
+    obj.metadata.managed_fields = None;
+    obj.metadata.uid = None;
+    obj.metadata.creation_timestamp = None;
+    obj.metadata.generation = None;
+    obj.metadata.deletion_timestamp = None;
+    if let Some(map) = obj.data.as_object_mut() {
+        // A subresource: a replace ignores it, and a CRD without a status
+        // subresource would take it verbatim, which is not what an editor
+        // means by "save my spec".
+        map.remove("status");
+    }
+}
+
+/// Saves an edited manifest.
+///
+/// A replace (`PUT`) rather than a server-side apply, which is the choice
+/// worth explaining. Apply carries field ownership: this app would become a
+/// new field manager, and every field Helm or ArgoCD already owns would come
+/// back as a conflict — on the very objects most worth editing. Replace has no
+/// ownership semantics. It saves exactly what was typed, which is what an
+/// editor means, and leaves the question of whether GitOps will revert it
+/// where it belongs: with the reader, who can see the tracking annotations
+/// right there in the YAML.
+///
+/// The identity arguments are the panel's, not the manifest's. Editing the
+/// `name` or `kind` in the text would otherwise retarget the write at a
+/// different object entirely — creating one, or overwriting an unrelated one —
+/// from a dialog that said it was editing this one.
+pub async fn apply_manifest(
+    context_name: &str,
+    expect_api_version: &str,
+    expect_kind: &str,
+    expect_namespace: &str,
+    expect_name: &str,
+    yaml: &str,
+) -> Result<String, String> {
+    require_write()?;
+
+    let mut obj: DynamicObject =
+        serde_yaml::from_str(yaml).map_err(|e| format!("That isn't valid YAML: {e}"))?;
+
+    let types = obj
+        .types
+        .clone()
+        .ok_or_else(|| "The manifest needs both apiVersion and kind.".to_string())?;
+    let gvk = GroupVersionKind::try_from(&types).map_err(|e| format!("Unrecognised apiVersion/kind: {e}"))?;
+
+    let name = obj.metadata.name.clone().unwrap_or_default();
+    let namespace = obj.metadata.namespace.clone().unwrap_or_default();
+    if types.api_version != expect_api_version
+        || gvk.kind != expect_kind
+        || name != expect_name
+        || namespace != expect_namespace
+    {
+        return Err(format!(
+            "This editor is open on {expect_api_version} {expect_kind} {}, but the manifest describes {} {} {}. Change those back, or open the other object to edit it.",
+            describe(expect_namespace, expect_name),
+            types.api_version,
+            gvk.kind,
+            describe(&namespace, &name)
+        ));
+    }
+
+    let client = client_for_context(context_name).await?;
+    // Asked rather than guessed: the plural is not derivable from the kind for
+    // every resource, and this has to work for CRDs the app has never seen.
+    let (ar, caps): (_, ApiCapabilities) = kube::discovery::oneshot::pinned_kind(&client, &gvk)
+        .await
+        .map_err(|e| format!("The cluster doesn't recognise {}: {e}", gvk.kind))?;
+
+    strip_server_owned(&mut obj);
+
+    let api: Api<DynamicObject> = match caps.scope {
+        Scope::Namespaced => Api::namespaced_with(client, expect_namespace, &ar),
+        Scope::Cluster => Api::all_with(client, &ar),
+    };
+
+    api.replace(expect_name, &PostParams::default(), &obj).await.map_err(|e| describe_apply_error(&gvk.kind, e))?;
+
+    Ok(format!("Saved {} {}", gvk.kind, describe(expect_namespace, expect_name)))
+}
+
+fn describe(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        name.to_string()
+    } else {
+        format!("{namespace}/{name}")
+    }
+}
+
+/// The API server's own words, with the two cases worth naming spelled out —
+/// both arrive as a status code that says nothing on its own.
+fn describe_apply_error(kind: &str, e: kube::Error) -> String {
+    if let kube::Error::Api(resp) = &e {
+        return match resp.code {
+            409 => format!(
+                "This {kind} changed in the cluster while you were editing it. Close and reopen the panel to pick up the current version, then redo your change. ({})",
+                resp.message
+            ),
+            422 => format!("The cluster rejected this {kind}: {}", resp.message),
+            403 => format!("Not allowed to update this {kind}: {}", resp.message),
+            _ => format!("Failed to save the {kind}: {}", resp.message),
+        };
+    }
+    format!("Failed to save the {kind}: {e}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +401,82 @@ mod tests {
         assert!(is_scalable("StatefulSet"));
         // One pod per eligible node — the replica count isn't ours to set.
         assert!(!is_scalable("DaemonSet"));
+    }
+
+    /// The identity check is what keeps an edit an edit. Without it, changing
+    /// `name` in the text turns "save this Deployment" into "write a different
+    /// one", from a dialog that said otherwise.
+    #[tokio::test]
+    async fn an_edit_cannot_retarget_another_object() {
+        set_write_enabled(true);
+        let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: other\n  namespace: dev\n";
+        let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
+        assert!(err.contains("dev/mine") && err.contains("dev/other"), "{err}");
+
+        // Same for the kind, and for the namespace.
+        let yaml = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mine\n  namespace: dev\n";
+        assert!(apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.is_err());
+        let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mine\n  namespace: prod\n";
+        assert!(apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.is_err());
+
+        set_write_enabled(false);
+    }
+
+
+    /// A kind is unique only within its group: two CRDs can both call
+    /// themselves `Application`. Pinning the kind alone would let an edited
+    /// apiVersion send the write at whichever one shares the name.
+    #[tokio::test]
+    async fn an_edit_cannot_hop_api_groups_under_the_same_kind() {
+        set_write_enabled(true);
+        let yaml = "apiVersion: example.com/v1\nkind: Application\nmetadata:\n  name: mine\n  namespace: dev\n";
+        let err = apply_manifest("ctx", "argoproj.io/v1alpha1", "Application", "dev", "mine", yaml).await.unwrap_err();
+        assert!(err.contains("argoproj.io/v1alpha1") && err.contains("example.com/v1"), "{err}");
+
+        // A version change within one group counts too — v1beta1 and v1 of a
+        // CRD can be backed by different schemas.
+        let yaml = "apiVersion: karpenter.sh/v1beta1\nkind: NodePool\nmetadata:\n  name: infra\n";
+        assert!(apply_manifest("ctx", "karpenter.sh/v1", "NodePool", "", "infra", yaml).await.is_err());
+
+        set_write_enabled(false);
+    }
+
+    /// These messages are built from continued string literals, where a lost
+    /// `\`-escape turns the indentation into a run of real spaces that is
+    /// invisible in the source. Asserted rather than eyeballed.
+    #[tokio::test]
+    async fn error_messages_carry_no_accidental_whitespace() {
+        set_write_enabled(true);
+        let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: other\n  namespace: dev\n";
+        let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
+        assert!(!err.contains("  "), "double space in: {err}");
+        set_write_enabled(false);
+    }
+
+    /// Every check above sits behind the guard, or the editor becomes a way
+    /// around read-only mode.
+    #[tokio::test]
+    async fn editing_is_refused_while_read_only() {
+        set_write_enabled(false);
+        let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mine\n  namespace: dev\n";
+        let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
+        assert!(err.contains("Read-only"), "{err}");
+    }
+
+    #[test]
+    fn strip_removes_what_the_server_owns_and_keeps_the_concurrency_token() {
+        let mut obj: DynamicObject = serde_yaml::from_str(
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n  uid: abc\n  generation: 4\n  resourceVersion: '77'\nstatus:\n  phase: Bound\ndata:\n  k: v\n",
+        )
+        .unwrap();
+        strip_server_owned(&mut obj);
+
+        assert!(obj.metadata.uid.is_none());
+        assert!(obj.metadata.generation.is_none());
+        assert!(obj.data.get("status").is_none(), "status is a subresource, not ours to send");
+        assert!(obj.data.get("data").is_some(), "the actual content must survive");
+        // The whole point: this is what turns a save into an optimistic check.
+        assert_eq!(obj.metadata.resource_version.as_deref(), Some("77"));
     }
 
     /// The gate is the feature. If this ever defaults open, every other
