@@ -119,12 +119,17 @@ pub async fn set_node_schedulable(context_name: String, name: String, schedulabl
 #[tauri::command]
 pub async fn apply_manifest(
     context_name: String,
+    api_version: String,
     kind: String,
     namespace: String,
     name: String,
     yaml: String,
 ) -> Result<String, String> {
-    with_deadline(&context_name, mutate::apply_manifest(&context_name, &kind, &namespace, &name, &yaml)).await
+    with_deadline(
+        &context_name,
+        mutate::apply_manifest(&context_name, &api_version, &kind, &namespace, &name, &yaml),
+    )
+    .await
 }
 
 #[tauri::command]

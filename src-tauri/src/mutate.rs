@@ -271,6 +271,7 @@ fn strip_server_owned(obj: &mut DynamicObject) {
 /// from a dialog that said it was editing this one.
 pub async fn apply_manifest(
     context_name: &str,
+    expect_api_version: &str,
     expect_kind: &str,
     expect_namespace: &str,
     expect_name: &str,
@@ -289,10 +290,15 @@ pub async fn apply_manifest(
 
     let name = obj.metadata.name.clone().unwrap_or_default();
     let namespace = obj.metadata.namespace.clone().unwrap_or_default();
-    if gvk.kind != expect_kind || name != expect_name || namespace != expect_namespace {
+    if types.api_version != expect_api_version
+        || gvk.kind != expect_kind
+        || name != expect_name
+        || namespace != expect_namespace
+    {
         return Err(format!(
-            "This editor is open on {expect_kind} {}, but the manifest describes {} {}.              Change those back, or open the other object to edit it.",
+            "This editor is open on {expect_api_version} {expect_kind} {}, but the manifest describes {} {} {}. Change those back, or open the other object to edit it.",
             describe(expect_namespace, expect_name),
+            types.api_version,
             gvk.kind,
             describe(&namespace, &name)
         ));
@@ -331,7 +337,7 @@ fn describe_apply_error(kind: &str, e: kube::Error) -> String {
     if let kube::Error::Api(resp) = &e {
         return match resp.code {
             409 => format!(
-                "This {kind} changed in the cluster while you were editing it.                  Close and reopen the panel to pick up the current version, then redo your change. ({})",
+                "This {kind} changed in the cluster while you were editing it. Close and reopen the panel to pick up the current version, then redo your change. ({})",
                 resp.message
             ),
             422 => format!("The cluster rejected this {kind}: {}", resp.message),
@@ -404,25 +410,56 @@ mod tests {
     async fn an_edit_cannot_retarget_another_object() {
         set_write_enabled(true);
         let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: other\n  namespace: dev\n";
-        let err = apply_manifest("ctx", "Deployment", "dev", "mine", yaml).await.unwrap_err();
+        let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
         assert!(err.contains("dev/mine") && err.contains("dev/other"), "{err}");
 
         // Same for the kind, and for the namespace.
         let yaml = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mine\n  namespace: dev\n";
-        assert!(apply_manifest("ctx", "Deployment", "dev", "mine", yaml).await.is_err());
+        assert!(apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.is_err());
         let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mine\n  namespace: prod\n";
-        assert!(apply_manifest("ctx", "Deployment", "dev", "mine", yaml).await.is_err());
+        assert!(apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.is_err());
 
         set_write_enabled(false);
     }
 
-    /// Every check above must sit behind the guard, or the editor becomes a way
+
+    /// A kind is unique only within its group: two CRDs can both call
+    /// themselves `Application`. Pinning the kind alone would let an edited
+    /// apiVersion send the write at whichever one shares the name.
+    #[tokio::test]
+    async fn an_edit_cannot_hop_api_groups_under_the_same_kind() {
+        set_write_enabled(true);
+        let yaml = "apiVersion: example.com/v1\nkind: Application\nmetadata:\n  name: mine\n  namespace: dev\n";
+        let err = apply_manifest("ctx", "argoproj.io/v1alpha1", "Application", "dev", "mine", yaml).await.unwrap_err();
+        assert!(err.contains("argoproj.io/v1alpha1") && err.contains("example.com/v1"), "{err}");
+
+        // A version change within one group counts too — v1beta1 and v1 of a
+        // CRD can be backed by different schemas.
+        let yaml = "apiVersion: karpenter.sh/v1beta1\nkind: NodePool\nmetadata:\n  name: infra\n";
+        assert!(apply_manifest("ctx", "karpenter.sh/v1", "NodePool", "", "infra", yaml).await.is_err());
+
+        set_write_enabled(false);
+    }
+
+    /// These messages are built from continued string literals, where a lost
+    /// `\`-escape turns the indentation into a run of real spaces that is
+    /// invisible in the source. Asserted rather than eyeballed.
+    #[tokio::test]
+    async fn error_messages_carry_no_accidental_whitespace() {
+        set_write_enabled(true);
+        let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: other\n  namespace: dev\n";
+        let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
+        assert!(!err.contains("  "), "double space in: {err}");
+        set_write_enabled(false);
+    }
+
+    /// Every check above sits behind the guard, or the editor becomes a way
     /// around read-only mode.
     #[tokio::test]
     async fn editing_is_refused_while_read_only() {
         set_write_enabled(false);
         let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mine\n  namespace: dev\n";
-        let err = apply_manifest("ctx", "Deployment", "dev", "mine", yaml).await.unwrap_err();
+        let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
         assert!(err.contains("Read-only"), "{err}");
     }
 
