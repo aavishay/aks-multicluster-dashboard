@@ -473,6 +473,8 @@ interface YamlEditState {
   /** Empty for cluster-scoped kinds (Node, NodePool). */
   namespace: string;
   name: string;
+  /** Read off the manifest the server sent, and sent back so the save can be refused if the text now names a different resource. A kind alone is not unique — two CRDs can share one. */
+  apiVersion: string;
   /** What was on screen when editing began, so the diff has something to compare against. */
   original: string;
   draft: string;
@@ -2729,7 +2731,15 @@ function workloadRowFor(ctx: string, kind: string, namespace: string, name: stri
  * disabled while editing for the same reason.
  */
 function startYamlEdit(ctx: string, kind: string, namespace: string, name: string, yaml: string) {
-  state.yamlEdit = { ctx, kind, namespace, name, original: yaml, draft: yaml };
+  const apiVersion = yaml.match(/^apiVersion:\s*(\S+)/m)?.[1];
+  if (!apiVersion) {
+    // Every manifest the backend serialises carries one, so this means the
+    // text is not what we think it is — better to decline than to edit
+    // without the guard that keeps a save pointed at this object.
+    showCopyToast("Can't edit: this manifest has no apiVersion");
+    return;
+  }
+  state.yamlEdit = { ctx, kind, namespace, name, apiVersion, original: yaml, draft: yaml };
   render();
 }
 
@@ -2770,7 +2780,7 @@ function reviewYamlEdit() {
       diff: { before: e.original, after: e.draft },
     },
     async () => {
-      const message = await api.applyManifest(e.ctx, e.kind, e.namespace, e.name, e.draft);
+      const message = await api.applyManifest(e.ctx, e.apiVersion, e.kind, e.namespace, e.name, e.draft);
       // Leave edit mode only once it actually landed — a rejected save should
       // keep the draft, or the reader loses what they typed.
       state.yamlEdit = null;
