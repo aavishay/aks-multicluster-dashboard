@@ -2723,6 +2723,38 @@ function workloadRowFor(ctx: string, kind: string, namespace: string, name: stri
 // ---------------------------------------------------------------------------
 
 /**
+ * Every property that decides where a glyph lands, shared by the editor's two
+ * layers.
+ *
+ * The textarea is transparent and sits on top of a `<pre>` holding a
+ * highlighted copy of the same text — the only way to colour something you can
+ * still type into with a real caret, undo stack and IME. It works only while
+ * the two layers wrap identically: one differing padding or line-height and
+ * the colours slide off the characters. So the shared half lives here rather
+ * than being written out twice and drifting.
+ */
+const YAML_EDITOR_TEXT_CLASS = "whitespace-pre-wrap break-words p-3 font-mono text-xs leading-relaxed";
+
+/**
+ * Keeps the highlighted layer under the caret lined up with the text above it.
+ *
+ * The width is the part that isn't obvious. The textarea scrolls, so its
+ * scrollbar takes width out of its content box; the layer underneath never
+ * scrolls on its own and would keep that width. Measured here at ten pixels —
+ * enough to wrap one long line differently and slide every colour after it out
+ * of place. Copied from the textarea rather than assumed, because how much a
+ * scrollbar takes is the platform's business, and on a machine with overlay
+ * scrollbars it takes none.
+ */
+function syncYamlHighlight(ta: HTMLTextAreaElement) {
+  const pre = ta.parentElement?.querySelector<HTMLElement>("[data-yaml-highlight]");
+  if (!pre) return;
+  pre.style.width = `${ta.clientWidth}px`;
+  pre.scrollTop = ta.scrollTop;
+  pre.scrollLeft = ta.scrollLeft;
+}
+
+/**
  * Enters edit mode on whatever the open panel is showing.
  *
  * Always the managed-fields-stripped text, whatever the toggle says:
@@ -2755,8 +2787,18 @@ function cancelYamlEdit() {
  * every character. The draft is read back out of state when the edit is
  * reviewed, so nothing needs redrawing until then.
  */
-function setYamlDraft(text: string) {
-  if (state.yamlEdit) state.yamlEdit.draft = text;
+function setYamlDraft(text: string, ta?: HTMLTextAreaElement) {
+  if (!state.yamlEdit) return;
+  state.yamlEdit.draft = text;
+  if (!ta) return;
+  const pre = ta.parentElement?.querySelector<HTMLElement>("[data-yaml-highlight]");
+  if (!pre) return;
+  // Repainted in place rather than through render(), for the same reason the
+  // draft is kept out of it: rebuilding the textarea would drop the caret on
+  // every keystroke. The trailing newline gives the layer the height a
+  // textarea's own final empty line has, which a <pre> otherwise collapses.
+  pre.innerHTML = `${highlightYaml(text)}\n`;
+  syncYamlHighlight(ta);
 }
 
 /** Whether the draft still says what the cluster already has. */
@@ -3844,6 +3886,7 @@ function setMetricsRange(minutes: number) {
   startYamlEdit,
   cancelYamlEdit,
   setYamlDraft,
+  syncYamlHighlight,
   reviewYamlEdit,
   confirmDeletePod,
   confirmRestartWorkload,
@@ -4089,6 +4132,11 @@ function render(carried?: PreRenderState) {
     }
   });
   restoreSelectionSnapshot(app, selectionSnapshot);
+
+  // After the scroll restore above, so the layer is aligned to the position
+  // the textarea actually ended up at rather than the one it was rebuilt with.
+  const yamlEditor = app.querySelector<HTMLTextAreaElement>('[data-filter-key="yaml-editor"]');
+  if (yamlEditor) syncYamlHighlight(yamlEditor);
 
   // While following, new lines keep arriving — pin to the bottom instead of
   // the scroll-restore above (which would otherwise hold it at whatever
@@ -6627,13 +6675,21 @@ function renderYamlPane(o: {
             <button type="button" onclick="window.__app.reviewYamlEdit()" class="rounded-md bg-series-blue px-3 py-1 text-xs font-medium text-white">Review &amp; save…</button>
           </div>
         </div>
-        <textarea
-          spellcheck="false"
-          data-filter-key="yaml-editor"
-          data-scroll-id="yaml-editor:${esc(o.target.ctx)}:${esc(o.target.kind)}:${esc(o.target.namespace)}:${esc(o.target.name)}"
-          oninput="window.__app.setYamlDraft(this.value)"
-          class="min-h-0 flex-1 resize-none rounded-md border border-series-blue bg-surface-2 p-3 font-mono text-xs leading-relaxed text-ink-primary outline-none"
-        >${esc(edit.draft)}</textarea>
+        <div class="relative min-h-0 flex-1 overflow-hidden rounded-md border border-series-blue bg-surface-2">
+          <pre
+            data-yaml-highlight
+            aria-hidden="true"
+            class="${YAML_EDITOR_TEXT_CLASS} pointer-events-none absolute inset-0 overflow-hidden text-ink-primary"
+          >${highlightYaml(edit.draft)}\n</pre>
+          <textarea
+            spellcheck="false"
+            data-filter-key="yaml-editor"
+            data-scroll-id="yaml-editor:${esc(o.target.ctx)}:${esc(o.target.kind)}:${esc(o.target.namespace)}:${esc(o.target.name)}"
+            oninput="window.__app.setYamlDraft(this.value, this)"
+            onscroll="window.__app.syncYamlHighlight(this)"
+            class="${YAML_EDITOR_TEXT_CLASS} absolute inset-0 h-full w-full resize-none overflow-auto bg-transparent text-transparent caret-ink-primary outline-none"
+          >${esc(edit.draft)}</textarea>
+        </div>
       </div>`;
   }
 
