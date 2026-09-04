@@ -1,3 +1,4 @@
+mod ai;
 mod claude;
 mod commands;
 mod helm;
@@ -144,12 +145,13 @@ pub fn run() {
             commands::get_gitops_events,
             commands::list_metrics_backends,
             commands::test_metrics_backend,
-            commands::claude_auth_status,
-            commands::claude_set_api_key,
-            commands::claude_clear_api_key,
-            commands::claude_build_diagnosis,
-            commands::claude_diagnose,
-            commands::claude_explain_error,
+            commands::ai_auth_status,
+            commands::ai_set_settings,
+            commands::ai_set_api_key,
+            commands::ai_clear_api_key,
+            commands::ai_build_diagnosis,
+            commands::ai_diagnose,
+            commands::ai_explain_error,
             commands::kubeconfig_path,
         ])
         .run(tauri::generate_context!())
