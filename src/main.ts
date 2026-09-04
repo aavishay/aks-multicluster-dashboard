@@ -2487,6 +2487,8 @@ function moveNapSearch(_view: string, delta: number) {
 
 /** The action a confirmation dialog is holding. A closure, so it can capture what is being changed; the dialog's buttons can only pass strings. */
 let pendingConfirmAction: ((value: number) => Promise<string>) | null = null;
+/** Bumped on every open and close, so a request still in flight can tell whether the dialog it belongs to is still the one on screen. Same guard the detail panels use for their fetches. */
+let confirmToken = 0;
 
 async function toggleWriteMode() {
   const next = !state.writeEnabled;
@@ -2507,6 +2509,7 @@ function askConfirm(
   opts: { title: string; body: string; confirmLabel: string; danger?: boolean; numberInput?: { label: string; value: number } },
   run: (value: number) => Promise<string>,
 ) {
+  confirmToken += 1;
   pendingConfirmAction = run;
   state.confirm = {
     title: opts.title,
@@ -2521,25 +2524,55 @@ function askConfirm(
 }
 
 function cancelConfirm() {
+  confirmToken += 1;
   pendingConfirmAction = null;
   state.confirm = null;
   render();
 }
 
+/**
+ * Holds the replica count as an integer the backend can actually take.
+ *
+ * The field is `type="number"`, which does not stop `2.5` or an empty value:
+ * a fractional or NaN count would travel as far as Tauri and fail there on a
+ * deserialization error naming i32, which explains nothing to the reader.
+ * Clamped at zero for the same reason the backend rejects negatives.
+ */
 function setConfirmNumber(value: number) {
   if (!state.confirm?.numberInput) return;
-  state.confirm.numberInput.value = value;
+  state.confirm.numberInput.value = Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+}
+
+/**
+ * Normalises the field itself once the reader is done with it.
+ *
+ * `setConfirmNumber` keeps the value that will be *sent* correct on every
+ * keystroke, but leaves the box showing whatever was typed — so `2.7` would
+ * sit there while 2 was what got scaled to. Rewriting the box on each
+ * keystroke would fight the reader mid-type (a lone `-` would jump to 0), so
+ * this runs on change, i.e. blur or Enter, and reconciles the two.
+ */
+function commitConfirmNumber(el: HTMLInputElement) {
+  setConfirmNumber(Number(el.value));
+  const value = state.confirm?.numberInput?.value;
+  if (value !== undefined) el.value = String(value);
 }
 
 async function runConfirm() {
   const c = state.confirm;
   const action = pendingConfirmAction;
   if (!c || !action || c.busy) return;
+  // Captured before awaiting: cancelling, or opening another dialog, moves the
+  // token on, and this continuation must not then close or overwrite whatever
+  // is on screen by then. The request itself is already away either way —
+  // there is nothing to call back — so all that's left is to say nothing.
+  const token = confirmToken;
   c.busy = true;
   c.error = null;
   render();
   try {
     const message = await action(c.numberInput?.value ?? 0);
+    if (token !== confirmToken) return;
     pendingConfirmAction = null;
     state.confirm = null;
     showCopyToast(message);
@@ -2547,6 +2580,7 @@ async function runConfirm() {
     // whatever the cluster now reports rather than what it reported before.
     loadTabData();
   } catch (e) {
+    if (token !== confirmToken) return;
     // Kept open on failure: a PodDisruptionBudget refusing an eviction is
     // something to read, not something to dismiss.
     c.busy = false;
@@ -2694,6 +2728,7 @@ function renderConfirmDialog(): string {
                    value="${c.numberInput.value}"
                    data-filter-key="confirm-number"
                    oninput="window.__app.setConfirmNumber(Number(this.value))"
+                   onchange="window.__app.commitConfirmNumber(this)"
                    class="w-24 rounded-md border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none"
                  />
                </div>`
@@ -3642,6 +3677,7 @@ function setMetricsRange(minutes: number) {
   cancelConfirm,
   runConfirm,
   setConfirmNumber,
+  commitConfirmNumber,
   confirmDeletePod,
   confirmRestartWorkload,
   confirmScaleWorkload,
@@ -6728,14 +6764,17 @@ function renderNodeDetailPanel(): string {
           </div>
           <div class="flex shrink-0 items-center gap-2">
             ${(() => {
-              // Offer the direction the node isn't already in; unknown (the
-              // Nodes tab hasn't loaded this cluster) falls back to cordon,
+              // The state the button would move the node *to*, not the one it
+              // is in: offer the direction it isn't already in. Unknown (the
+              // Nodes tab hasn't loaded this cluster) falls back to cordoning,
               // which the backend will simply re-apply harmlessly.
-              const schedulable = nodeRowFor(nd.ctx, nd.name)?.unschedulable === true;
+              const makeSchedulable = nodeRowFor(nd.ctx, nd.name)?.unschedulable === true;
               return writeActionButton(
-                schedulable ? "Uncordon" : "Cordon",
-                schedulable ? "Allow new pods to schedule here again" : "Stop new pods scheduling here; running pods stay",
-                `window.__app.confirmSetNodeSchedulable(${jsArg(nd.ctx)},${jsArg(nd.name)},${schedulable})`,
+                makeSchedulable ? "Uncordon" : "Cordon",
+                makeSchedulable
+                  ? "Allow new pods to schedule here again"
+                  : "Stop new pods scheduling here; running pods stay",
+                `window.__app.confirmSetNodeSchedulable(${jsArg(nd.ctx)},${jsArg(nd.name)},${makeSchedulable})`,
               );
             })()}
             ${writeActionButton(
