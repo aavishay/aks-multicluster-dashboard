@@ -451,6 +451,24 @@ interface KedaDetailState extends MetricsViewState {
   eventsLoading: boolean;
 }
 
+/**
+ * A pending cluster change, held until the reader confirms it.
+ *
+ * The action itself lives in `pendingConfirmAction` rather than in this state:
+ * it is a closure over what is being changed, and inline handlers can only
+ * carry strings.
+ */
+interface ConfirmState {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  danger: boolean;
+  /** Present when the action needs a number — scaling, so far. */
+  numberInput: { label: string; value: number } | null;
+  busy: boolean;
+  error: string | null;
+}
+
 interface HelmDetailState {
   ctx: string;
   namespace: string;
@@ -609,6 +627,13 @@ interface AppState {
   nodeDetail: NodeDetailState | null;
   workloadDetail: WorkloadDetailState | null;
   gitOpsDetail: GitOpsDetailState | null;
+  /**
+   * Whether cluster-changing actions are allowed. Mirrors the backend guard —
+   * this copy only decides what the UI offers; `mutate::require_write` is what
+   * actually stops a write.
+   */
+  writeEnabled: boolean;
+  confirm: ConfirmState | null;
   napDetail: NapDetailState | null;
   kedaDetail: KedaDetailState | null;
   helmDetail: HelmDetailState | null;
@@ -672,6 +697,8 @@ const state: AppState = {
   nodeDetail: null,
   workloadDetail: null,
   gitOpsDetail: null,
+  writeEnabled: false,
+  confirm: null,
   napDetail: null,
   kedaDetail: null,
   helmDetail: null,
@@ -1397,6 +1424,9 @@ async function init() {
   render();
   try {
     state.kubeconfigPath = await api.kubeconfigPath();
+    // Read rather than assume: the guard is the backend's, and this is only a
+    // mirror of it.
+    state.writeEnabled = await api.getWriteEnabled();
     state.clusters = await api.listClusters();
     state.loadingClusters = false;
     if (state.clusters.length > 0) {
@@ -2443,6 +2473,244 @@ function moveNapSearch(_view: string, delta: number) {
 }
 
 // ---------------------------------------------------------------------------
+// Write mode
+//
+// Everything the app does is a read except the handful of actions below. They
+// are off by default and stay off until the reader arms them, because the
+// clusters on the other side of this window are production.
+// ---------------------------------------------------------------------------
+
+/** The action a confirmation dialog is holding. A closure, so it can capture what is being changed; the dialog's buttons can only pass strings. */
+let pendingConfirmAction: ((value: number) => Promise<string>) | null = null;
+
+async function toggleWriteMode() {
+  const next = !state.writeEnabled;
+  try {
+    // Trust the backend's answer rather than `next`: this flag decides what
+    // the UI offers, and it should never claim a permission the guard doesn't
+    // actually hold.
+    state.writeEnabled = await api.setWriteEnabled(next);
+    showCopyToast(state.writeEnabled ? "Write mode on — changes are now allowed" : "Read-only mode");
+  } catch (e) {
+    state.writeEnabled = false;
+    showCopyToast(`Could not change mode: ${String(e)}`);
+  }
+  render();
+}
+
+function askConfirm(
+  opts: { title: string; body: string; confirmLabel: string; danger?: boolean; numberInput?: { label: string; value: number } },
+  run: (value: number) => Promise<string>,
+) {
+  pendingConfirmAction = run;
+  state.confirm = {
+    title: opts.title,
+    body: opts.body,
+    confirmLabel: opts.confirmLabel,
+    danger: opts.danger ?? false,
+    numberInput: opts.numberInput ?? null,
+    busy: false,
+    error: null,
+  };
+  render();
+}
+
+function cancelConfirm() {
+  pendingConfirmAction = null;
+  state.confirm = null;
+  render();
+}
+
+function setConfirmNumber(value: number) {
+  if (!state.confirm?.numberInput) return;
+  state.confirm.numberInput.value = value;
+}
+
+async function runConfirm() {
+  const c = state.confirm;
+  const action = pendingConfirmAction;
+  if (!c || !action || c.busy) return;
+  c.busy = true;
+  c.error = null;
+  render();
+  try {
+    const message = await action(c.numberInput?.value ?? 0);
+    pendingConfirmAction = null;
+    state.confirm = null;
+    showCopyToast(message);
+    // The change is in flight, not done — reload so the table reflects
+    // whatever the cluster now reports rather than what it reported before.
+    loadTabData();
+  } catch (e) {
+    // Kept open on failure: a PodDisruptionBudget refusing an eviction is
+    // something to read, not something to dismiss.
+    c.busy = false;
+    c.error = String(e);
+    render();
+  }
+}
+
+function confirmDeletePod(ctx: string, namespace: string, name: string) {
+  askConfirm(
+    {
+      title: "Delete pod?",
+      body: `${namespace}/${name} on ${ctx}.\n\nIf a controller owns it, a replacement starts immediately. If nothing owns it, it is gone for good.`,
+      confirmLabel: "Delete pod",
+      danger: true,
+    },
+    () => api.deletePod(ctx, namespace, name),
+  );
+}
+
+function confirmRestartWorkload(ctx: string, kind: string, namespace: string, name: string) {
+  askConfirm(
+    {
+      title: `Restart ${kind.toLowerCase()}?`,
+      body: `${namespace}/${name} on ${ctx}.\n\nStamps the pod template so the controller replaces every pod through its normal rollout strategy — the same thing kubectl rollout restart does.`,
+      confirmLabel: "Restart",
+    },
+    () => api.restartWorkload(ctx, kind, namespace, name),
+  );
+}
+
+function confirmScaleWorkload(ctx: string, kind: string, namespace: string, name: string, current: number) {
+  askConfirm(
+    {
+      title: `Scale ${kind.toLowerCase()}?`,
+      body: `${namespace}/${name} on ${ctx} currently wants ${current} replica${current === 1 ? "" : "s"}.`,
+      confirmLabel: "Scale",
+      numberInput: { label: "Replicas", value: current },
+    },
+    (replicas) => api.scaleWorkload(ctx, kind, namespace, name, replicas),
+  );
+}
+
+function confirmSetNodeSchedulable(ctx: string, name: string, schedulable: boolean) {
+  askConfirm(
+    {
+      title: schedulable ? "Uncordon node?" : "Cordon node?",
+      body: schedulable
+        ? `${name} on ${ctx}.\n\nThe scheduler may place new pods here again.`
+        : `${name} on ${ctx}.\n\nStops new pods being scheduled here. Pods already running are left alone — use Drain to move those.`,
+      confirmLabel: schedulable ? "Uncordon" : "Cordon",
+    },
+    () => api.setNodeSchedulable(ctx, name, schedulable),
+  );
+}
+
+function confirmDrainNode(ctx: string, name: string) {
+  askConfirm(
+    {
+      title: "Drain node?",
+      body: `${name} on ${ctx}.\n\nCordons the node, then asks the API server to evict every pod a controller can replace. DaemonSet, mirror and unmanaged pods are left alone.\n\nEvictions are requested, not waited for — a PodDisruptionBudget can refuse one, and you will see which.`,
+      confirmLabel: "Drain",
+      danger: true,
+    },
+    async () => {
+      const r = await api.drainNode(ctx, name);
+      const parts = [`Cordoned ${r.node}`, `evicting ${r.evicting.length}`];
+      if (r.skipped.length > 0) parts.push(`${r.skipped.length} left in place`);
+      if (r.failed.length > 0) parts.push(`${r.failed.length} refused`);
+      // The refusals are the point of running a drain — surface them rather
+      // than folding them into a count that scrolls away with the toast.
+      if (r.failed.length > 0) console.warn("Drain refusals:", r.failed);
+      return parts.join(" · ");
+    },
+  );
+}
+
+/** The node as the Nodes tab last saw it — the detail panel carries only an identity, and cordon/uncordon needs to know which way to offer. */
+function nodeRowFor(ctx: string, name: string): NodeInfo | undefined {
+  return state.nodes.get(ctx)?.find((n) => n.name === name);
+}
+
+/** Same, for the replica count a scale dialog should open on. */
+function workloadRowFor(ctx: string, kind: string, namespace: string, name: string): WorkloadInfo | undefined {
+  return state.workloads.get(ctx)?.find((w) => w.kind === kind && w.namespace === namespace && w.name === name);
+}
+
+/** The on/off switch itself. Rendered in the topbar and in every detail panel header, so the app never changes a cluster from a view that didn't show you it was armed. */
+function writeModeToggle(compact = false): string {
+  const on = state.writeEnabled;
+  const title = on
+    ? "Write mode is ON — this app can change your clusters. Click for read-only."
+    : "Read-only. Click to allow changes: delete pods, restart or scale workloads, cordon or drain nodes.";
+  return `
+    <button
+      type="button"
+      onclick="window.__app.toggleWriteMode()"
+      title="${esc(title)}"
+      class="flex shrink-0 items-center gap-1.5 rounded-md border ${compact ? "px-1.5 py-1" : "px-2 py-1.5"} text-xs font-medium ${
+        on
+          ? "border-status-warning/60 bg-status-warning/10 text-status-warning"
+          : "border-gridline bg-surface-2 text-ink-muted hover:bg-surface-3 hover:text-ink-secondary"
+      }"
+    >
+      <span class="relative inline-flex h-3 w-6 shrink-0 items-center rounded-full ${on ? "bg-status-warning/70" : "bg-surface-3"}">
+        <span class="absolute h-2 w-2 rounded-full bg-surface-1 ${on ? "left-3.5" : "left-1"}"></span>
+      </span>
+      ${on ? "Write" : "Read-only"}
+    </button>`;
+}
+
+/** A button for one cluster-changing action, inert and visibly so while read-only. */
+function writeActionButton(label: string, title: string, handler: string, danger = false): string {
+  const on = state.writeEnabled;
+  return `
+    <button
+      type="button"
+      ${on ? `onclick="${handler}"` : "disabled"}
+      title="${esc(on ? title : `${label} — turn on write mode to use this`)}"
+      class="shrink-0 rounded-md border border-gridline px-2 py-1 text-xs font-medium ${
+        on
+          ? danger
+            ? "bg-surface-2 text-status-critical hover:bg-surface-3"
+            : "bg-surface-2 text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+          : "cursor-not-allowed bg-surface-2 text-ink-muted opacity-50"
+      }"
+    >${esc(label)}</button>`;
+}
+
+function renderConfirmDialog(): string {
+  const c = state.confirm;
+  if (!c) return "";
+  return `
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onclick="window.__app.cancelConfirm()">
+      <div class="w-full max-w-md rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="border-b border-gridline px-4 py-3 text-sm font-medium text-ink-primary">${esc(c.title)}</div>
+        <div class="whitespace-pre-line px-4 py-3 text-xs text-ink-secondary">${esc(c.body)}</div>
+        ${
+          c.numberInput
+            ? `<div class="flex items-center gap-2 px-4 pb-3">
+                 <label class="text-xs text-ink-secondary">${esc(c.numberInput.label)}</label>
+                 <input
+                   type="number"
+                   min="0"
+                   value="${c.numberInput.value}"
+                   data-filter-key="confirm-number"
+                   oninput="window.__app.setConfirmNumber(Number(this.value))"
+                   class="w-24 rounded-md border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none"
+                 />
+               </div>`
+            : ""
+        }
+        ${c.error ? `<div class="mx-4 mb-3 rounded-md border border-status-critical/40 bg-status-critical/10 p-2 text-xs text-status-critical">${esc(c.error)}</div>` : ""}
+        <div class="flex justify-end gap-2 border-t border-gridline px-4 py-3">
+          <button type="button" onclick="window.__app.cancelConfirm()" class="rounded-md border border-gridline bg-surface-2 px-3 py-1.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Cancel</button>
+          <button
+            type="button"
+            onclick="window.__app.runConfirm()"
+            ${c.busy ? "disabled" : ""}
+            class="rounded-md px-3 py-1.5 text-xs font-medium ${
+              c.danger ? "bg-status-critical/20 text-status-critical hover:bg-status-critical/30" : "bg-surface-3 text-ink-primary hover:bg-surface-2"
+            } ${c.busy ? "opacity-50" : ""}"
+          >${c.busy ? "Working…" : esc(c.confirmLabel)}</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
 // KEDA scaled object detail panel (YAML / Events / Graph)
 // ---------------------------------------------------------------------------
 
@@ -3365,6 +3633,15 @@ function setMetricsRange(minutes: number) {
   toggleNapManagedFields,
   setNapSearch,
   moveNapSearch,
+  toggleWriteMode,
+  cancelConfirm,
+  runConfirm,
+  setConfirmNumber,
+  confirmDeletePod,
+  confirmRestartWorkload,
+  confirmScaleWorkload,
+  confirmSetNodeSchedulable,
+  confirmDrainNode,
   openKedaDetail,
   closeKedaDetail,
   setKedaDetailView,
@@ -3569,6 +3846,7 @@ function render(carried?: PreRenderState) {
     ${renderClaudeExplainPanel()}
     ${renderClaudeDiagnosePanel()}
     ${renderClusterPalette()}
+    ${renderConfirmDialog()}
   `;
 
   // Before the scroll restore below, not after: innerHTML hands back a table
@@ -4157,6 +4435,7 @@ function renderTopbar(): string {
         >
           Refresh now
         </button>
+        ${writeModeToggle()}
         ${claudeAuthButton()}
         ${uiScaleButton()}
         ${themeToggleButton()}
@@ -6164,7 +6443,14 @@ function renderPodDetailPanel(): string {
                   >Diagnose</button>`
                 : ""
             }
-            <button type="button" onclick="window.__app.closePodDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+            ${writeActionButton(
+              "Delete",
+              "Delete this pod",
+              `window.__app.confirmDeletePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)})`,
+              true,
+            )}
+            ${writeModeToggle(true)}
+          <button type="button" onclick="window.__app.closePodDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
         </div>
         <div class="flex items-center justify-between gap-3 border-b border-gridline px-4 py-2">
@@ -6284,7 +6570,27 @@ function renderNodeDetailPanel(): string {
             <div class="truncate text-sm font-medium text-ink-primary">${esc(nd.name)}</div>
             <div class="truncate text-xs text-ink-muted">${esc(nd.ctx)}</div>
           </div>
-          <button type="button" onclick="window.__app.closeNodeDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          <div class="flex shrink-0 items-center gap-2">
+            ${(() => {
+              // Offer the direction the node isn't already in; unknown (the
+              // Nodes tab hasn't loaded this cluster) falls back to cordon,
+              // which the backend will simply re-apply harmlessly.
+              const schedulable = nodeRowFor(nd.ctx, nd.name)?.unschedulable === true;
+              return writeActionButton(
+                schedulable ? "Uncordon" : "Cordon",
+                schedulable ? "Allow new pods to schedule here again" : "Stop new pods scheduling here; running pods stay",
+                `window.__app.confirmSetNodeSchedulable(${jsArg(nd.ctx)},${jsArg(nd.name)},${schedulable})`,
+              );
+            })()}
+            ${writeActionButton(
+              "Drain",
+              "Cordon, then evict every pod a controller can replace",
+              `window.__app.confirmDrainNode(${jsArg(nd.ctx)},${jsArg(nd.name)})`,
+              true,
+            )}
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeNodeDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
         </div>
         <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
           ${tabs
@@ -6682,7 +6988,28 @@ function renderWorkloadDetailPanel(): string {
             <div class="truncate text-sm font-medium text-ink-primary">${esc(wd.name)}</div>
             <div class="truncate text-xs text-ink-muted">${esc(wd.ctx)} · ${esc(wd.kind)} · ${esc(wd.namespace)}</div>
           </div>
-          <button type="button" onclick="window.__app.closeWorkloadDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          <div class="flex shrink-0 items-center gap-2">
+            ${writeActionButton(
+              "Restart",
+              "Roll every pod through the controller's normal rollout",
+              `window.__app.confirmRestartWorkload(${jsArg(wd.ctx)},${jsArg(wd.kind)},${jsArg(wd.namespace)},${jsArg(wd.name)})`,
+            )}
+            ${
+              // A DaemonSet runs one pod per eligible node — there is no
+              // replica count to set, so don't offer one.
+              wd.kind === "DaemonSet"
+                ? ""
+                : writeActionButton(
+                    "Scale…",
+                    "Set the desired replica count",
+                    `window.__app.confirmScaleWorkload(${jsArg(wd.ctx)},${jsArg(wd.kind)},${jsArg(wd.namespace)},${jsArg(wd.name)},${
+                      workloadRowFor(wd.ctx, wd.kind, wd.namespace, wd.name)?.desired ?? 1
+                    })`,
+                  )
+            }
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeWorkloadDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
         </div>
         <div class="flex items-center justify-between gap-3 border-b border-gridline px-4 py-2">
           <div class="flex shrink-0 gap-1">
@@ -6794,7 +7121,10 @@ function renderNapDetailPanel(): string {
             <div class="truncate text-sm font-medium text-ink-primary">${esc(nd.name)}</div>
             <div class="truncate text-xs text-ink-muted">${esc(nd.ctx)}</div>
           </div>
-          <button type="button" onclick="window.__app.closeNapDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          <div class="flex shrink-0 items-center gap-2">
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeNapDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
         </div>
         <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
           ${tabs
@@ -6879,7 +7209,10 @@ function renderKedaDetailPanel(): string {
             <div class="truncate text-sm font-medium text-ink-primary">${esc(kd.name)}</div>
             <div class="truncate text-xs text-ink-muted">${esc(kd.kind)} · ${esc(kd.namespace)} · ${esc(kd.ctx)}</div>
           </div>
-          <button type="button" onclick="window.__app.closeKedaDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          <div class="flex shrink-0 items-center gap-2">
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeKedaDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
         </div>
         <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
           ${tabs
@@ -6918,7 +7251,10 @@ function renderGitOpsDetailPanel(): string {
             <div class="truncate text-sm font-medium text-ink-primary">${esc(gd.name)}</div>
             <div class="truncate text-xs text-ink-muted">${esc(gd.ctx)} · ${esc(gd.namespace)}</div>
           </div>
-          <button type="button" onclick="window.__app.closeGitOpsDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          <div class="flex shrink-0 items-center gap-2">
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeGitOpsDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
         </div>
         <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
           ${tabs
@@ -7612,7 +7948,10 @@ function renderHelmDetailPanel(): string {
             <div class="truncate text-sm font-medium text-ink-primary">${esc(hd.name)}</div>
             <div class="truncate text-xs text-ink-muted">${esc(hd.ctx)} · ${esc(hd.namespace)} · revision ${hd.revision}</div>
           </div>
-          <button type="button" onclick="window.__app.closeHelmDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          <div class="flex shrink-0 items-center gap-2">
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeHelmDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
         </div>
         <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
           ${tabs
@@ -7733,6 +8072,7 @@ function consumesPlainNavKeys(target: EventTarget | null): boolean {
  */
 function isNonPanelOverlayOpen(): boolean {
   return (
+    !!state.confirm ||
     !!state.clusterPalette ||
     !!state.claudeExplain ||
     !!state.claudeDiagnose ||
@@ -8218,7 +8558,11 @@ function closeOpenDetailPanel(): boolean {
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (state.clusterPalette) closeClusterPalette();
+    // First: it is the topmost overlay, and it is the one holding a pending
+    // cluster change. Escaping past it to close the panel underneath would
+    // leave the dialog stranded over a view it no longer belongs to.
+    if (state.confirm) cancelConfirm();
+    else if (state.clusterPalette) closeClusterPalette();
     else if (state.claudeExplain) closeClaudeExplain();
     else if (state.claudeDiagnose) closeClaudeDiagnose();
     else if (state.claudePanelOpen) toggleClaudePanel();
