@@ -161,6 +161,7 @@ pub fn run() {
             commands::scale_workload,
             commands::set_node_schedulable,
             commands::drain_node,
+            commands::apply_manifest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

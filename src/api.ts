@@ -46,6 +46,8 @@ export const api = {
   setNodeSchedulable: (contextName: string, name: string, schedulable: boolean) =>
     invoke<string>("set_node_schedulable", { contextName, name, schedulable }),
   drainNode: (contextName: string, name: string) => invoke<DrainReport>("drain_node", { contextName, name }),
+  applyManifest: (contextName: string, apiVersion: string, kind: string, namespace: string, name: string, yaml: string) =>
+    invoke<string>("apply_manifest", { contextName, apiVersion, kind, namespace, name, yaml }),
   getOverview: (contextName: string) => invoke<ClusterOverview>("get_cluster_overview", { contextName }),
   getNodes: (contextName: string) => invoke<NodeInfo[]>("get_nodes", { contextName }),
   getNodeManifest: (contextName: string, nodeName: string) =>
