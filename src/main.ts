@@ -138,18 +138,15 @@ function stepUiScale(delta: number) {
   setUiScale(UI_SCALE_STEPS[next]);
 }
 
-/** Cmd+0. */
-function resetUiScale() {
-  setUiScale(DEFAULT_UI_SCALE);
-}
-
 /**
- * The zoom button. Clicking resets to 100% rather than stepping to the next
- * rung: the button now shows the current percentage, so its job is to say
- * where you are and give you one click back to normal. Stepping stays on
- * Cmd+ / Cmd−, which is where a reader reaches for it anyway.
+ * Back to 100%. Reached from Cmd+0 and from the zoom button.
+ *
+ * The button resets rather than stepping to the next rung because it now
+ * shows the current percentage on its face: its job is to say where you are
+ * and give you one click back to normal. Stepping stays on Cmd+ / Cmd−, which
+ * is where a reader reaches for it anyway.
  */
-function resetUiScaleFromButton() {
+function resetUiScale() {
   setUiScale(DEFAULT_UI_SCALE);
 }
 
@@ -3414,7 +3411,7 @@ function setMetricsRange(minutes: number) {
   toggleEnumDropdown,
   clearFilters,
   toggleTheme,
-  resetUiScaleFromButton,
+  resetUiScale,
   toggleSidebar,
   startColumnResize,
   toggleRowSelected,
@@ -3903,7 +3900,7 @@ function uiScaleButton(): string {
   // sideways as the number changes — a min width holds its place.
   return `
     <button
-      onclick="window.__app.resetUiScaleFromButton()"
+      onclick="window.__app.resetUiScale()"
       ${atDefault ? "disabled" : ""}
       title="${atDefault ? "Zoom: 100% (⌘+ / ⌘− to change)" : `Zoom: ${state.uiScale}% — click to reset to ${DEFAULT_UI_SCALE}% (⌘+ / ⌘− to step)`}"
       class="flex min-w-[3.25rem] items-center justify-center rounded-md border border-gridline bg-surface-2 px-2 py-1.5 text-xs font-semibold leading-none tabular ${
@@ -3923,7 +3920,7 @@ function claudeExplainButton(subject: string, errorText: string): string {
   const signedIn = state.claudeAuth?.signed_in === true;
   const title = signedIn
     ? "Explain this error with Claude (sends only this message)"
-    : "Sign in to Claude first — see the ✦ button in the top bar";
+    : "Sign in to Claude first — see the AI button in the top bar";
   return `
     <button
       type="button"
@@ -3935,10 +3932,10 @@ function claudeExplainButton(subject: string, errorText: string): string {
     >Explain</button>`;
 }
 
-/** Top-bar Claude status/auth control. Click cycles: re-probe, or open the setup panel. */
 /** Two inputs feeding a node — a model, rather than the sparkle that reads as one vendor's mark. */
 const aiIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="17" cy="12" r="2.6"/><line x1="8" y1="7.1" x2="14.6" y2="10.9"/><line x1="8" y1="16.9" x2="14.6" y2="13.1"/><line x1="6" y1="8.2" x2="6" y2="15.8"/></svg>`;
 
+/** Top-bar Claude status/auth control. Click cycles: re-probe, or open the setup panel. */
 function claudeAuthButton(): string {
   const auth = state.claudeAuth;
   const signedIn = auth?.signed_in === true;
