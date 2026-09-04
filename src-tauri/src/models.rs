@@ -349,6 +349,20 @@ pub struct KedaScaledObjectInfo {
 
 pub type GitOpsAppManifest = ObjectManifest;
 
+/// What a drain asked the API server to do, and what it declined.
+///
+/// Split three ways rather than reported as a count, because the interesting
+/// cases are the ones that didn't move: a PodDisruptionBudget refusing an
+/// eviction is the answer you actually came for.
+#[derive(Serialize, Clone, Debug)]
+pub struct DrainReport {
+    pub node: String,
+    pub cordoned: bool,
+    pub evicting: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<String>,
+}
+
 /// One Helm release at its latest revision, decoded out of the
 /// `helm.sh/release.v1` Secret that Helm uses as its storage backend.
 /// Mirrors a row of `helm list --all-namespaces`.
