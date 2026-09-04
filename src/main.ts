@@ -2530,17 +2530,26 @@ function cancelConfirm() {
   render();
 }
 
+/** The Rust command takes an `i32`, and this is the whole range it can hold. */
+const I32_MAX = 2_147_483_647;
+
 /**
  * Holds the replica count as an integer the backend can actually take.
  *
- * The field is `type="number"`, which does not stop `2.5` or an empty value:
- * a fractional or NaN count would travel as far as Tauri and fail there on a
+ * The field is `type="number"`, which does not stop `2.5`, an empty value, or
+ * twenty digits: any of those would travel as far as Tauri and fail there on a
  * deserialization error naming i32, which explains nothing to the reader.
- * Clamped at zero for the same reason the backend rejects negatives.
+ * Clamped at both ends for that reason — the floor because the backend rejects
+ * negatives, the ceiling because that is where the type stops.
+ *
+ * A cluster will refuse a count this large long before it matters; the point
+ * is that it refuses it with something you can read.
  */
 function setConfirmNumber(value: number) {
   if (!state.confirm?.numberInput) return;
-  state.confirm.numberInput.value = Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+  state.confirm.numberInput.value = Number.isFinite(value)
+    ? Math.min(I32_MAX, Math.max(0, Math.trunc(value)))
+    : 0;
 }
 
 /**
@@ -2572,10 +2581,16 @@ async function runConfirm() {
   render();
   try {
     const message = await action(c.numberInput?.value ?? 0);
-    if (token !== confirmToken) return;
-    pendingConfirmAction = null;
-    state.confirm = null;
-    showCopyToast(message);
+    // Cancelling the dialog doesn't un-delete a pod. Only the dialog-facing
+    // half is suppressed when the token has moved on — closing a dialog the
+    // reader has since replaced, and announcing an action they have stopped
+    // watching for. The reload happens either way, or the table would sit on
+    // pre-change data until the next refresh tick.
+    if (token === confirmToken) {
+      pendingConfirmAction = null;
+      state.confirm = null;
+      showCopyToast(message);
+    }
     // The change is in flight, not done — reload so the table reflects
     // whatever the cluster now reports rather than what it reported before.
     loadTabData();
