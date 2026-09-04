@@ -657,6 +657,8 @@ interface AppState {
    * actually stops a write.
    */
   writeEnabled: boolean;
+  /** Whether the YAML pane wraps long lines. Off by default in both modes, so a 900-character last-applied-configuration annotation stays on one line you can skip past rather than a wall you have to scroll through. */
+  yamlWrap: boolean;
   confirm: ConfirmState | null;
   yamlEdit: YamlEditState | null;
   napDetail: NapDetailState | null;
@@ -723,6 +725,7 @@ const state: AppState = {
   workloadDetail: null,
   gitOpsDetail: null,
   writeEnabled: false,
+  yamlWrap: false,
   confirm: null,
   yamlEdit: null,
   napDetail: null,
@@ -2723,6 +2726,71 @@ function workloadRowFor(ctx: string, kind: string, namespace: string, name: stri
 // ---------------------------------------------------------------------------
 
 /**
+ * Every property that decides where a glyph lands, shared by the editor's two
+ * layers.
+ *
+ * The textarea is transparent and sits on top of a `<pre>` holding a
+ * highlighted copy of the same text — the only way to colour something you can
+ * still type into with a real caret, undo stack and IME. It works only while
+ * the two layers wrap identically: one differing padding or line-height and
+ * the colours slide off the characters. So the shared half lives here rather
+ * than being written out twice and drifting.
+ */
+const YAML_EDITOR_TEXT_CLASS = "p-3 font-mono text-xs leading-relaxed";
+
+/**
+ * How the YAML pane treats a line too long for it, for whichever mode is on
+ * screen.
+ *
+ * Not wrapping is the default because the manifests worth reading are full of
+ * single lines nobody reads — `last-applied-configuration` runs to hundreds of
+ * characters — and wrapping them buries the structure around them. Off, they
+ * are one line you skim past.
+ */
+function yamlWrapClass(): string {
+  return state.yamlWrap ? "whitespace-pre-wrap break-words" : "whitespace-pre";
+}
+
+function toggleYamlWrap() {
+  state.yamlWrap = !state.yamlWrap;
+  render();
+}
+
+function yamlWrapButton(): string {
+  return `
+    <button
+      type="button"
+      onclick="window.__app.toggleYamlWrap()"
+      aria-pressed="${state.yamlWrap}"
+      title="${state.yamlWrap ? "Wrapping long lines — click for one line each" : "Long lines run off to the right — click to wrap them"}"
+      class="shrink-0 rounded-md border px-2 py-1 text-xs font-medium ${
+        state.yamlWrap
+          ? "border-series-blue bg-surface-3 text-ink-primary"
+          : "border-gridline bg-surface-2 text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+      }"
+    >Wrap</button>`;
+}
+
+/**
+ * Keeps the highlighted layer under the caret lined up with the text above it.
+ *
+ * The width is the part that isn't obvious. The textarea scrolls, so its
+ * scrollbar takes width out of its content box; the layer underneath never
+ * scrolls on its own and would keep that width. Measured here at ten pixels —
+ * enough to wrap one long line differently and slide every colour after it out
+ * of place. Copied from the textarea rather than assumed, because how much a
+ * scrollbar takes is the platform's business, and on a machine with overlay
+ * scrollbars it takes none.
+ */
+function syncYamlHighlight(ta: HTMLTextAreaElement) {
+  const pre = ta.parentElement?.querySelector<HTMLElement>("[data-yaml-highlight]");
+  if (!pre) return;
+  pre.style.width = `${ta.clientWidth}px`;
+  pre.scrollTop = ta.scrollTop;
+  pre.scrollLeft = ta.scrollLeft;
+}
+
+/**
  * Enters edit mode on whatever the open panel is showing.
  *
  * Always the managed-fields-stripped text, whatever the toggle says:
@@ -2755,8 +2823,18 @@ function cancelYamlEdit() {
  * every character. The draft is read back out of state when the edit is
  * reviewed, so nothing needs redrawing until then.
  */
-function setYamlDraft(text: string) {
-  if (state.yamlEdit) state.yamlEdit.draft = text;
+function setYamlDraft(text: string, ta?: HTMLTextAreaElement) {
+  if (!state.yamlEdit) return;
+  state.yamlEdit.draft = text;
+  if (!ta) return;
+  const pre = ta.parentElement?.querySelector<HTMLElement>("[data-yaml-highlight]");
+  if (!pre) return;
+  // Repainted in place rather than through render(), for the same reason the
+  // draft is kept out of it: rebuilding the textarea would drop the caret on
+  // every keystroke. The trailing newline gives the layer the height a
+  // textarea's own final empty line has, which a <pre> otherwise collapses.
+  pre.innerHTML = `${highlightYaml(text)}\n`;
+  syncYamlHighlight(ta);
 }
 
 /** Whether the draft still says what the cluster already has. */
@@ -2799,6 +2877,7 @@ function writeModeToggle(compact = false): string {
     <button
       type="button"
       onclick="window.__app.toggleWriteMode()"
+      aria-pressed="${on}"
       title="${esc(title)}"
       class="flex shrink-0 items-center gap-1.5 rounded-md border ${compact ? "px-1.5 py-1" : "px-2 py-1.5"} text-xs font-medium ${
         on
@@ -3844,6 +3923,8 @@ function setMetricsRange(minutes: number) {
   startYamlEdit,
   cancelYamlEdit,
   setYamlDraft,
+  syncYamlHighlight,
+  toggleYamlWrap,
   reviewYamlEdit,
   confirmDeletePod,
   confirmRestartWorkload,
@@ -4089,6 +4170,11 @@ function render(carried?: PreRenderState) {
     }
   });
   restoreSelectionSnapshot(app, selectionSnapshot);
+
+  // After the scroll restore above, so the layer is aligned to the position
+  // the textarea actually ended up at rather than the one it was rebuilt with.
+  const yamlEditor = app.querySelector<HTMLTextAreaElement>('[data-filter-key="yaml-editor"]');
+  if (yamlEditor) syncYamlHighlight(yamlEditor);
 
   // While following, new lines keep arriving — pin to the bottom instead of
   // the scroll-restore above (which would otherwise hold it at whatever
@@ -6623,17 +6709,27 @@ function renderYamlPane(o: {
             <span class="text-ink-muted">— managed fields and status are left to the server</span>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${yamlWrapButton()}
             <button type="button" onclick="window.__app.cancelYamlEdit()" class="rounded-md border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Cancel</button>
             <button type="button" onclick="window.__app.reviewYamlEdit()" class="rounded-md bg-series-blue px-3 py-1 text-xs font-medium text-white">Review &amp; save…</button>
           </div>
         </div>
-        <textarea
-          spellcheck="false"
-          data-filter-key="yaml-editor"
-          data-scroll-id="yaml-editor:${esc(o.target.ctx)}:${esc(o.target.kind)}:${esc(o.target.namespace)}:${esc(o.target.name)}"
-          oninput="window.__app.setYamlDraft(this.value)"
-          class="min-h-0 flex-1 resize-none rounded-md border border-series-blue bg-surface-2 p-3 font-mono text-xs leading-relaxed text-ink-primary outline-none"
-        >${esc(edit.draft)}</textarea>
+        <div class="relative min-h-0 flex-1 overflow-hidden rounded-md border border-series-blue bg-surface-2">
+          <pre
+            data-yaml-highlight
+            aria-hidden="true"
+            class="${YAML_EDITOR_TEXT_CLASS} ${yamlWrapClass()} pointer-events-none absolute inset-0 overflow-hidden text-ink-primary"
+          >${highlightYaml(edit.draft)}\n</pre>
+          <textarea
+            spellcheck="false"
+            wrap="${state.yamlWrap ? "soft" : "off"}"
+            data-filter-key="yaml-editor"
+            data-scroll-id="yaml-editor:${esc(o.target.ctx)}:${esc(o.target.kind)}:${esc(o.target.namespace)}:${esc(o.target.name)}"
+            oninput="window.__app.setYamlDraft(this.value, this)"
+            onscroll="window.__app.syncYamlHighlight(this)"
+            class="${YAML_EDITOR_TEXT_CLASS} ${yamlWrapClass()} absolute inset-0 h-full w-full resize-none overflow-auto bg-transparent text-transparent caret-ink-primary outline-none"
+          >${esc(edit.draft)}</textarea>
+        </div>
       </div>`;
   }
 
@@ -6647,6 +6743,7 @@ function renderYamlPane(o: {
             Show managed fields
           </label>
           ${renderCopyButton(o.scrollId)}
+          ${yamlWrapButton()}
           ${writeActionButton(
             "Edit",
             `Edit this ${o.target.kind.toLowerCase()}'s YAML`,
@@ -6655,7 +6752,7 @@ function renderYamlPane(o: {
         </div>
         ${renderSearchBox(o.searchKind, "yaml", o.search, matchCount, o.searchIndex)}
       </div>
-      <pre data-scroll-id="${o.scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(o.yaml), o.search, o.searchIndex)}</pre>
+      <pre data-scroll-id="${o.scrollId}" class="${yamlWrapClass()} min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(o.yaml), o.search, o.searchIndex)}</pre>
     </div>`;
 }
 
