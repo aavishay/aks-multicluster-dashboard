@@ -74,7 +74,19 @@ impl Provider {
         }
     }
 
-    /// Only the providers you can point somewhere else have a base URL.
+    /// Whether the endpoint is yours to move. Claude and Gemini are hosted
+    /// services at fixed addresses; Ollama is a server you run, so where it
+    /// listens is genuinely a setting.
+    fn base_url_is_configurable(self) -> bool {
+        matches!(self, Provider::Ollama)
+    }
+
+    /// Whether the model name becomes part of the request URL. Gemini puts it
+    /// in the path; the other two send it in the body.
+    fn model_goes_in_url(self) -> bool {
+        matches!(self, Provider::Gemini)
+    }
+
     pub fn default_base_url(self) -> &'static str {
         match self {
             Provider::Claude => "https://api.anthropic.com",
@@ -128,14 +140,46 @@ pub fn settings() -> AiSettings {
     SETTINGS.lock().ok().and_then(|s| s.clone()).unwrap_or_default()
 }
 
+/// Characters that would let a model name escape its path segment.
+///
+/// Only checked for providers that interpolate the model into the request URL
+/// — which is Gemini alone. Claude and Ollama send it in the JSON body, where
+/// these are harmless, and for Ollama one of them is required: its tag syntax
+/// is `llama3.1:8b`, so rejecting `:` everywhere would lock out the ordinary
+/// way of naming an Ollama model.
+const URL_UNSAFE_IN_MODEL: &[char] = &['?', '#', '/', '\\', '&', ':', '@'];
+
+fn validate_model(provider: Provider, model: &str) -> Result<(), String> {
+    // Never legitimate anywhere, and a stray newline in a header or URL is
+    // its own kind of problem.
+    if let Some(bad) = model.chars().find(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("A model name cannot contain whitespace (found {bad:?})."));
+    }
+    if provider.model_goes_in_url() {
+        if let Some(bad) = model.chars().find(|c| URL_UNSAFE_IN_MODEL.contains(c)) {
+            return Err(format!("A {} model name cannot contain '{bad}'.", provider.label()));
+        }
+    }
+    Ok(())
+}
+
 pub fn set_settings(provider: &str, model: &str, base_url: &str) -> Result<AiSettings, String> {
     let provider = Provider::parse(provider)?;
     let model = model.trim();
     let base_url = base_url.trim().trim_end_matches('/');
+
+    validate_model(provider, model)?;
+
     let next = AiSettings {
         provider,
         model: if model.is_empty() { provider.default_model().to_string() } else { model.to_string() },
-        base_url: if base_url.is_empty() { provider.default_base_url().to_string() } else { base_url.to_string() },
+        // A hosted provider's address is not a setting, whatever the caller
+        // sends — the panel doesn't offer the field, and this is what makes
+        // that true rather than merely displayed.
+        base_url: match (provider.base_url_is_configurable(), base_url.is_empty()) {
+            (true, false) => base_url.to_string(),
+            _ => provider.default_base_url().to_string(),
+        },
     };
     if let Ok(mut guard) = SETTINGS.lock() {
         *guard = Some(next.clone());
@@ -642,6 +686,43 @@ mod tests {
 
         assert!(Provider::parse("gpt4").is_err());
         // Leave the shared slot as the app starts, so test order can't matter.
+        set_settings("claude", "", "").unwrap();
+    }
+
+    /// The model is a path segment in Gemini's URL, so a name carrying a URL
+    /// delimiter could append a query parameter instead of naming a model.
+    #[test]
+    fn a_gemini_model_name_cannot_escape_its_url_segment() {
+        for bad in ["gemini?key=leaked", "a/b", "a#f", "a:b", "a@b", "a&b", "a\\b"] {
+            assert!(set_settings("gemini", bad, "").is_err(), "{bad} must be rejected");
+        }
+        assert!(set_settings("gemini", "gemini-2.5-pro", "").is_ok());
+        set_settings("claude", "", "").unwrap();
+    }
+
+    /// `llama3.1:8b` is the ordinary way to name an Ollama model. The colon is
+    /// only dangerous where the model lands in a URL, which for Ollama it
+    /// never does — rejecting it everywhere would lock out normal use.
+    #[test]
+    fn an_ollama_tag_keeps_its_colon() {
+        let s = set_settings("ollama", "llama3.1:8b", "").unwrap();
+        assert_eq!(s.model, "llama3.1:8b");
+        assert_eq!(set_settings("claude", "claude-opus-5", "").unwrap().model, "claude-opus-5");
+        // Whitespace stays out everywhere: it is never part of a model name.
+        assert!(set_settings("ollama", "llama 3", "").is_err());
+        set_settings("claude", "", "").unwrap();
+    }
+
+    /// Claude and Gemini are hosted at fixed addresses. The panel doesn't offer
+    /// the field; this is what makes that true rather than merely displayed.
+    #[test]
+    fn only_ollama_can_be_pointed_somewhere_else() {
+        let s = set_settings("claude", "", "https://evil.example").unwrap();
+        assert_eq!(s.base_url, "https://api.anthropic.com");
+        let s = set_settings("gemini", "", "https://evil.example").unwrap();
+        assert_eq!(s.base_url, "https://generativelanguage.googleapis.com");
+        let s = set_settings("ollama", "", "http://192.168.1.5:11434").unwrap();
+        assert_eq!(s.base_url, "http://192.168.1.5:11434", "Ollama is a server you run");
         set_settings("claude", "", "").unwrap();
     }
 

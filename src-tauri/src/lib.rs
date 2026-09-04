@@ -6,6 +6,7 @@ mod k8s;
 mod kubeconfig;
 mod metrics_backend;
 mod models;
+mod mutate;
 mod redact;
 mod retry;
 
@@ -153,6 +154,13 @@ pub fn run() {
             commands::ai_diagnose,
             commands::ai_explain_error,
             commands::kubeconfig_path,
+            commands::get_write_enabled,
+            commands::set_write_enabled,
+            commands::delete_pod,
+            commands::restart_workload,
+            commands::scale_workload,
+            commands::set_node_schedulable,
+            commands::drain_node,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
