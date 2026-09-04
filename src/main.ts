@@ -461,6 +461,23 @@ interface KedaDetailState extends MetricsViewState {
  * it is a closure over what is being changed, and inline handlers can only
  * carry strings.
  */
+/**
+ * An in-progress edit of one resource's YAML.
+ *
+ * There is only ever one, because the detail panels are mutually exclusive —
+ * opening another closes this one, and with it the edit.
+ */
+interface YamlEditState {
+  ctx: string;
+  kind: string;
+  /** Empty for cluster-scoped kinds (Node, NodePool). */
+  namespace: string;
+  name: string;
+  /** What was on screen when editing began, so the diff has something to compare against. */
+  original: string;
+  draft: string;
+}
+
 interface ConfirmState {
   title: string;
   body: string;
@@ -468,6 +485,8 @@ interface ConfirmState {
   danger: boolean;
   /** Present when the action needs a number — scaling, so far. */
   numberInput: { label: string; value: number } | null;
+  /** Present when the action is a change to a document, and seeing what changed is the whole point. */
+  diff: { before: string; after: string } | null;
   busy: boolean;
   error: string | null;
 }
@@ -637,6 +656,7 @@ interface AppState {
    */
   writeEnabled: boolean;
   confirm: ConfirmState | null;
+  yamlEdit: YamlEditState | null;
   napDetail: NapDetailState | null;
   kedaDetail: KedaDetailState | null;
   helmDetail: HelmDetailState | null;
@@ -702,6 +722,7 @@ const state: AppState = {
   gitOpsDetail: null,
   writeEnabled: false,
   confirm: null,
+  yamlEdit: null,
   napDetail: null,
   kedaDetail: null,
   helmDetail: null,
@@ -2044,6 +2065,7 @@ function openNodeDetail(ctx: string, name: string) {
 function closeNodeDetail() {
   nodeDetailToken += 1;
   state.nodeDetail = null;
+  state.yamlEdit = null;
   render();
 }
 
@@ -2182,6 +2204,7 @@ function openHelmDetail(ctx: string, namespace: string, name: string, revision: 
 function closeHelmDetail() {
   helmDetailToken += 1;
   state.helmDetail = null;
+  state.yamlEdit = null;
   render();
 }
 
@@ -2278,6 +2301,7 @@ function openGitOpsDetail(ctx: string, namespace: string, name: string) {
 function closeGitOpsDetail() {
   gitOpsDetailToken += 1;
   state.gitOpsDetail = null;
+  state.yamlEdit = null;
   render();
 }
 
@@ -2385,6 +2409,7 @@ function openNapDetail(ctx: string, name: string) {
 function closeNapDetail() {
   napDetailToken += 1;
   state.napDetail = null;
+  state.yamlEdit = null;
   render();
 }
 
@@ -2506,7 +2531,14 @@ async function toggleWriteMode() {
 }
 
 function askConfirm(
-  opts: { title: string; body: string; confirmLabel: string; danger?: boolean; numberInput?: { label: string; value: number } },
+  opts: {
+    title: string;
+    body: string;
+    confirmLabel: string;
+    danger?: boolean;
+    numberInput?: { label: string; value: number };
+    diff?: { before: string; after: string };
+  },
   run: (value: number) => Promise<string>,
 ) {
   confirmToken += 1;
@@ -2517,6 +2549,7 @@ function askConfirm(
     confirmLabel: opts.confirmLabel,
     danger: opts.danger ?? false,
     numberInput: opts.numberInput ?? null,
+    diff: opts.diff ?? null,
     busy: false,
     error: null,
   };
@@ -2683,6 +2716,69 @@ function workloadRowFor(ctx: string, kind: string, namespace: string, name: stri
   return state.workloads.get(ctx)?.find((w) => w.kind === kind && w.namespace === namespace && w.name === name);
 }
 
+// ---------------------------------------------------------------------------
+// Editing a resource's YAML
+// ---------------------------------------------------------------------------
+
+/**
+ * Enters edit mode on whatever the open panel is showing.
+ *
+ * Always the managed-fields-stripped text, whatever the toggle says:
+ * `managedFields` is the API server's own bookkeeping, editing it means
+ * nothing, and sending it back is either ignored or rejected. The toggle is
+ * disabled while editing for the same reason.
+ */
+function startYamlEdit(ctx: string, kind: string, namespace: string, name: string, yaml: string) {
+  state.yamlEdit = { ctx, kind, namespace, name, original: yaml, draft: yaml };
+  render();
+}
+
+function cancelYamlEdit() {
+  state.yamlEdit = null;
+  render();
+}
+
+/**
+ * Records a keystroke without re-rendering.
+ *
+ * A render would rebuild the textarea and put the caret back at the start on
+ * every character. The draft is read back out of state when the edit is
+ * reviewed, so nothing needs redrawing until then.
+ */
+function setYamlDraft(text: string) {
+  if (state.yamlEdit) state.yamlEdit.draft = text;
+}
+
+/** Whether the draft still says what the cluster already has. */
+function yamlEditIsUnchanged(e: YamlEditState): boolean {
+  return e.draft.trim() === e.original.trim();
+}
+
+function reviewYamlEdit() {
+  const e = state.yamlEdit;
+  if (!e) return;
+  if (yamlEditIsUnchanged(e)) {
+    showCopyToast("No changes to save");
+    return;
+  }
+  const where = e.namespace ? `${e.namespace}/${e.name}` : e.name;
+  askConfirm(
+    {
+      title: `Save ${e.kind.toLowerCase()} ${e.name}?`,
+      body: `${where} on ${e.ctx}.\n\nSaves exactly what is in the editor. If something else changed this object since you opened it, the save is refused rather than overwriting it.`,
+      confirmLabel: "Save",
+      diff: { before: e.original, after: e.draft },
+    },
+    async () => {
+      const message = await api.applyManifest(e.ctx, e.kind, e.namespace, e.name, e.draft);
+      // Leave edit mode only once it actually landed — a rejected save should
+      // keep the draft, or the reader loses what they typed.
+      state.yamlEdit = null;
+      return message;
+    },
+  );
+}
+
 /** The on/off switch itself. Rendered in the topbar and in every detail panel header, so the app never changes a cluster from a view that didn't show you it was armed. */
 function writeModeToggle(compact = false): string {
   const on = state.writeEnabled;
@@ -2725,14 +2821,53 @@ function writeActionButton(label: string, title: string, handler: string, danger
     >${esc(label)}</button>`;
 }
 
+/**
+ * What the save will change, in the dialog that asks about it.
+ *
+ * A confirmation for a document is only worth reading if it shows the
+ * document's diff — "are you sure" about six hundred lines of YAML is not a
+ * question anyone can answer. Reuses the revision-diff machinery, collapsed to
+ * three lines of context so a one-line change reads as a one-line change.
+ */
+function renderConfirmDiff(before: string, after: string): string {
+  const ops = diffLines(before, after);
+  const added = ops.filter((o) => o.kind === "add").length;
+  const removed = ops.filter((o) => o.kind === "del").length;
+  const rows = collapseUnchanged(ops)
+    .map((op) => {
+      if (op.kind === "gap") {
+        return `<div class="select-none px-3 py-1 text-center text-ink-muted">${esc(op.text)}</div>`;
+      }
+      const marker = op.kind === "add" ? "+" : op.kind === "del" ? "-" : " ";
+      const tone =
+        op.kind === "add"
+          ? "bg-status-good/15 text-ink-primary"
+          : op.kind === "del"
+            ? "bg-status-critical/15 text-ink-primary"
+            : "text-ink-secondary";
+      return `<div class="flex ${tone}"><span class="w-5 shrink-0 select-none text-center text-ink-muted">${marker}</span><span class="whitespace-pre-wrap break-all">${esc(op.text)}</span></div>`;
+    })
+    .join("");
+
+  return `
+    <div class="mx-4 mb-3 flex flex-col gap-1">
+      <div class="flex items-center gap-3 text-xs">
+        <span class="text-status-good">+${added}</span>
+        <span class="text-status-critical">-${removed}</span>
+      </div>
+      <div class="max-h-64 overflow-auto rounded-md border border-gridline bg-surface-2 py-2 font-mono text-xs leading-relaxed">${rows}</div>
+    </div>`;
+}
+
 function renderConfirmDialog(): string {
   const c = state.confirm;
   if (!c) return "";
   return `
     <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onclick="window.__app.cancelConfirm()">
-      <div class="w-full max-w-md rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="w-full ${c.diff ? "max-w-2xl" : "max-w-md"} rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
         <div class="border-b border-gridline px-4 py-3 text-sm font-medium text-ink-primary">${esc(c.title)}</div>
         <div class="whitespace-pre-line px-4 py-3 text-xs text-ink-secondary">${esc(c.body)}</div>
+        ${c.diff ? renderConfirmDiff(c.diff.before, c.diff.after) : ""}
         ${
           c.numberInput
             ? `<div class="flex items-center gap-2 px-4 pb-3">
@@ -2844,6 +2979,7 @@ function openKedaDetail(ctx: string, namespace: string, kind: string, name: stri
 function closeKedaDetail() {
   kedaDetailToken += 1;
   state.kedaDetail = null;
+  state.yamlEdit = null;
   render();
 }
 
@@ -3014,6 +3150,7 @@ function closeWorkloadDetail() {
   stopWorkloadLogFollow();
   workloadDetailToken += 1;
   state.workloadDetail = null;
+  state.yamlEdit = null;
   render();
 }
 
@@ -3398,6 +3535,7 @@ function closePodDetail() {
   stopPodLogFollow();
   podDetailToken += 1;
   state.podDetail = null;
+  state.yamlEdit = null;
   render();
 }
 
@@ -3693,6 +3831,10 @@ function setMetricsRange(minutes: number) {
   runConfirm,
   setConfirmNumber,
   commitConfirmNumber,
+  startYamlEdit,
+  cancelYamlEdit,
+  setYamlDraft,
+  reviewYamlEdit,
   confirmDeletePod,
   confirmRestartWorkload,
   confirmScaleWorkload,
@@ -6420,30 +6562,98 @@ function renderSearchBox(
     </div>`;
 }
 
-function renderPodYamlView(pd: PodDetailState): string {
-  if (pd.manifestError) {
-    return `<div class="text-sm text-status-critical">${esc(pd.manifestError)}</div>`;
+/**
+ * The YAML tab, shared by every detail panel.
+ *
+ * The six panels differed only in where their text came from and what their
+ * toggle was called, so they were six copies of the same twenty lines. One
+ * copy means the editor below arrives in all of them at once, rather than in
+ * whichever five someone remembers.
+ */
+function renderYamlPane(o: {
+  error: string | null;
+  loaded: boolean;
+  /** The text as the toggle currently selects it — what a reader sees. */
+  yaml: string;
+  /** Always without managedFields: the only thing worth editing, and the only thing the server will take. */
+  editableYaml: string;
+  showManagedFields: boolean;
+  toggleHandler: string;
+  searchKind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda";
+  search: string;
+  searchIndex: number;
+  scrollId: string;
+  target: { ctx: string; kind: string; namespace: string; name: string };
+}): string {
+  if (o.error) return `<div class="text-sm text-status-critical">${esc(o.error)}</div>`;
+  if (!o.loaded) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+
+  const edit = state.yamlEdit;
+  const editing =
+    !!edit &&
+    edit.ctx === o.target.ctx &&
+    edit.kind === o.target.kind &&
+    edit.namespace === o.target.namespace &&
+    edit.name === o.target.name;
+
+  if (editing && edit) {
+    return `
+      <div class="flex h-full min-h-0 flex-col gap-2">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="text-xs text-ink-secondary">
+            Editing ${esc(o.target.kind)} <span class="text-ink-primary">${esc(o.target.name)}</span>
+            <span class="text-ink-muted">— managed fields and status are left to the server</span>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <button type="button" onclick="window.__app.cancelYamlEdit()" class="rounded-md border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Cancel</button>
+            <button type="button" onclick="window.__app.reviewYamlEdit()" class="rounded-md bg-series-blue px-3 py-1 text-xs font-medium text-white">Review &amp; save…</button>
+          </div>
+        </div>
+        <textarea
+          spellcheck="false"
+          data-filter-key="yaml-editor"
+          oninput="window.__app.setYamlDraft(this.value)"
+          class="min-h-0 flex-1 resize-none rounded-md border border-series-blue bg-surface-2 p-3 font-mono text-xs leading-relaxed text-ink-primary outline-none"
+        >${esc(edit.draft)}</textarea>
+      </div>`;
   }
-  if (!pd.manifest) {
-    return `<div class="text-sm text-ink-muted">Loading…</div>`;
-  }
-  const yaml = currentYamlText(pd);
-  const matchCount = countSearchMatches(yaml, pd.yamlSearch);
-  const scrollId = `pod-yaml:${esc(pd.ctx)}:${esc(pd.namespace)}:${esc(pd.name)}`;
+
+  const matchCount = countSearchMatches(o.yaml, o.search);
   return `
     <div class="flex h-full min-h-0 flex-col gap-2">
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="flex items-center gap-3">
           <label class="flex items-center gap-2 text-xs text-ink-secondary">
-            <input type="checkbox" ${pd.showManagedFields ? "checked" : ""} onchange="window.__app.toggleManagedFields()" />
+            <input type="checkbox" ${o.showManagedFields ? "checked" : ""} onchange="window.__app.${o.toggleHandler}()" />
             Show managed fields
           </label>
-          ${renderCopyButton(scrollId)}
+          ${renderCopyButton(o.scrollId)}
+          ${writeActionButton(
+            "Edit",
+            `Edit this ${o.target.kind.toLowerCase()}'s YAML`,
+            `window.__app.startYamlEdit(${jsArg(o.target.ctx)},${jsArg(o.target.kind)},${jsArg(o.target.namespace)},${jsArg(o.target.name)},${jsArg(o.editableYaml)})`,
+          )}
         </div>
-        ${renderSearchBox("Pod", "yaml", pd.yamlSearch, matchCount, pd.yamlSearchIndex)}
+        ${renderSearchBox(o.searchKind, "yaml", o.search, matchCount, o.searchIndex)}
       </div>
-      <pre data-scroll-id="${scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(yaml), pd.yamlSearch, pd.yamlSearchIndex)}</pre>
+      <pre data-scroll-id="${o.scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(o.yaml), o.search, o.searchIndex)}</pre>
     </div>`;
+}
+
+function renderPodYamlView(pd: PodDetailState): string {
+  return renderYamlPane({
+    error: pd.manifestError,
+    loaded: !!pd.manifest,
+    yaml: currentYamlText(pd),
+    editableYaml: pd.manifest?.yaml_without_managed_fields ?? "",
+    showManagedFields: pd.showManagedFields,
+    toggleHandler: "toggleManagedFields",
+    searchKind: "Pod",
+    search: pd.yamlSearch,
+    searchIndex: pd.yamlSearchIndex,
+    scrollId: `pod-yaml:${esc(pd.ctx)}:${esc(pd.namespace)}:${esc(pd.name)}`,
+    target: { ctx: pd.ctx, kind: "Pod", namespace: pd.namespace, name: pd.name },
+  });
 }
 
 function renderPodLogsView(pd: PodDetailState): string {
@@ -6686,29 +6896,19 @@ function renderPodDetailPanel(): string {
 // ---------------------------------------------------------------------------
 
 function renderNodeYamlView(nd: NodeDetailState): string {
-  if (nd.manifestError) {
-    return `<div class="text-sm text-status-critical">${esc(nd.manifestError)}</div>`;
-  }
-  if (!nd.manifest) {
-    return `<div class="text-sm text-ink-muted">Loading…</div>`;
-  }
-  const yaml = currentNodeYamlText(nd);
-  const matchCount = countSearchMatches(yaml, nd.yamlSearch);
-  const scrollId = `node-yaml:${esc(nd.ctx)}:${esc(nd.name)}`;
-  return `
-    <div class="flex h-full min-h-0 flex-col gap-2">
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <div class="flex items-center gap-3">
-          <label class="flex items-center gap-2 text-xs text-ink-secondary">
-            <input type="checkbox" ${nd.showManagedFields ? "checked" : ""} onchange="window.__app.toggleNodeManagedFields()" />
-            Show managed fields
-          </label>
-          ${renderCopyButton(scrollId)}
-        </div>
-        ${renderSearchBox("Node", "yaml", nd.yamlSearch, matchCount, nd.yamlSearchIndex)}
-      </div>
-      <pre data-scroll-id="${scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(yaml), nd.yamlSearch, nd.yamlSearchIndex)}</pre>
-    </div>`;
+  return renderYamlPane({
+    error: nd.manifestError,
+    loaded: !!nd.manifest,
+    yaml: currentNodeYamlText(nd),
+    editableYaml: nd.manifest?.yaml_without_managed_fields ?? "",
+    showManagedFields: nd.showManagedFields,
+    toggleHandler: "toggleNodeManagedFields",
+    searchKind: "Node",
+    search: nd.yamlSearch,
+    searchIndex: nd.yamlSearchIndex,
+    scrollId: `node-yaml:${esc(nd.ctx)}:${esc(nd.name)}`,
+    target: { ctx: nd.ctx, kind: "Node", namespace: "", name: nd.name },
+  });
 }
 
 /** Plain (non-sortable/filterable) events table shared by the Node and Workload detail panels — a small, already-scoped set doesn't need the full grid machinery the main Events tab has. */
@@ -6825,29 +7025,19 @@ function renderNodeDetailPanel(): string {
 // ---------------------------------------------------------------------------
 
 function renderWorkloadYamlView(wd: WorkloadDetailState): string {
-  if (wd.manifestError) {
-    return `<div class="text-sm text-status-critical">${esc(wd.manifestError)}</div>`;
-  }
-  if (!wd.manifest) {
-    return `<div class="text-sm text-ink-muted">Loading…</div>`;
-  }
-  const yaml = currentWorkloadYamlText(wd);
-  const matchCount = countSearchMatches(yaml, wd.yamlSearch);
-  const scrollId = `workload-yaml:${esc(wd.ctx)}:${esc(wd.kind)}:${esc(wd.namespace)}:${esc(wd.name)}`;
-  return `
-    <div class="flex h-full min-h-0 flex-col gap-2">
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <div class="flex items-center gap-3">
-          <label class="flex items-center gap-2 text-xs text-ink-secondary">
-            <input type="checkbox" ${wd.showManagedFields ? "checked" : ""} onchange="window.__app.toggleWorkloadManagedFields()" />
-            Show managed fields
-          </label>
-          ${renderCopyButton(scrollId)}
-        </div>
-        ${renderSearchBox("Workload", "yaml", wd.yamlSearch, matchCount, wd.yamlSearchIndex)}
-      </div>
-      <pre data-scroll-id="${scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(yaml), wd.yamlSearch, wd.yamlSearchIndex)}</pre>
-    </div>`;
+  return renderYamlPane({
+    error: wd.manifestError,
+    loaded: !!wd.manifest,
+    yaml: currentWorkloadYamlText(wd),
+    editableYaml: wd.manifest?.yaml_without_managed_fields ?? "",
+    showManagedFields: wd.showManagedFields,
+    toggleHandler: "toggleWorkloadManagedFields",
+    searchKind: "Workload",
+    search: wd.yamlSearch,
+    searchIndex: wd.yamlSearchIndex,
+    scrollId: `workload-yaml:${esc(wd.ctx)}:${esc(wd.kind)}:${esc(wd.namespace)}:${esc(wd.name)}`,
+    target: { ctx: wd.ctx, kind: wd.kind, namespace: wd.namespace, name: wd.name },
+  });
 }
 
 function renderWorkloadEventsView(wd: WorkloadDetailState): string {
@@ -7247,55 +7437,35 @@ function renderWorkloadDetailPanel(): string {
 // ---------------------------------------------------------------------------
 
 function renderGitOpsYamlView(gd: GitOpsDetailState): string {
-  if (gd.manifestError) {
-    return `<div class="text-sm text-status-critical">${esc(gd.manifestError)}</div>`;
-  }
-  if (!gd.manifest) {
-    return `<div class="text-sm text-ink-muted">Loading…</div>`;
-  }
-  const yaml = currentGitOpsYamlText(gd);
-  const matchCount = countSearchMatches(yaml, gd.yamlSearch);
-  const scrollId = `gitops-yaml:${esc(gd.ctx)}:${esc(gd.namespace)}:${esc(gd.name)}`;
-  return `
-    <div class="flex h-full min-h-0 flex-col gap-2">
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <div class="flex items-center gap-3">
-          <label class="flex items-center gap-2 text-xs text-ink-secondary">
-            <input type="checkbox" ${gd.showManagedFields ? "checked" : ""} onchange="window.__app.toggleGitOpsManagedFields()" />
-            Show managed fields
-          </label>
-          ${renderCopyButton(scrollId)}
-        </div>
-        ${renderSearchBox("GitOps", "yaml", gd.yamlSearch, matchCount, gd.yamlSearchIndex)}
-      </div>
-      <pre data-scroll-id="${scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(yaml), gd.yamlSearch, gd.yamlSearchIndex)}</pre>
-    </div>`;
+  return renderYamlPane({
+    error: gd.manifestError,
+    loaded: !!gd.manifest,
+    yaml: currentGitOpsYamlText(gd),
+    editableYaml: gd.manifest?.yaml_without_managed_fields ?? "",
+    showManagedFields: gd.showManagedFields,
+    toggleHandler: "toggleGitOpsManagedFields",
+    searchKind: "GitOps",
+    search: gd.yamlSearch,
+    searchIndex: gd.yamlSearchIndex,
+    scrollId: `gitops-yaml:${esc(gd.ctx)}:${esc(gd.namespace)}:${esc(gd.name)}`,
+    target: { ctx: gd.ctx, kind: "Application", namespace: gd.namespace, name: gd.name },
+  });
 }
 
 function renderNapYamlView(nd: NapDetailState): string {
-  if (nd.manifestError) {
-    return `<div class="text-sm text-status-critical">${esc(nd.manifestError)}</div>`;
-  }
-  if (!nd.manifest) {
-    return `<div class="text-sm text-ink-muted">Loading…</div>`;
-  }
-  const yaml = currentNapYamlText(nd);
-  const matchCount = countSearchMatches(yaml, nd.yamlSearch);
-  const scrollId = `nap-yaml:${esc(nd.ctx)}:${esc(nd.name)}`;
-  return `
-    <div class="flex h-full min-h-0 flex-col gap-2">
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <div class="flex items-center gap-3">
-          <label class="flex items-center gap-2 text-xs text-ink-secondary">
-            <input type="checkbox" ${nd.showManagedFields ? "checked" : ""} onchange="window.__app.toggleNapManagedFields()" />
-            Show managed fields
-          </label>
-          ${renderCopyButton(scrollId)}
-        </div>
-        ${renderSearchBox("Nap", "yaml", nd.yamlSearch, matchCount, nd.yamlSearchIndex)}
-      </div>
-      <pre data-scroll-id="${scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(yaml), nd.yamlSearch, nd.yamlSearchIndex)}</pre>
-    </div>`;
+  return renderYamlPane({
+    error: nd.manifestError,
+    loaded: !!nd.manifest,
+    yaml: currentNapYamlText(nd),
+    editableYaml: nd.manifest?.yaml_without_managed_fields ?? "",
+    showManagedFields: nd.showManagedFields,
+    toggleHandler: "toggleNapManagedFields",
+    searchKind: "Nap",
+    search: nd.yamlSearch,
+    searchIndex: nd.yamlSearchIndex,
+    scrollId: `nap-yaml:${esc(nd.ctx)}:${esc(nd.name)}`,
+    target: { ctx: nd.ctx, kind: "NodePool", namespace: "", name: nd.name },
+  });
 }
 
 function renderNapGraphView(nd: NapDetailState): string {
@@ -7355,29 +7525,19 @@ function renderNapDetailPanel(): string {
 }
 
 function renderKedaYamlView(kd: KedaDetailState): string {
-  if (kd.manifestError) {
-    return `<div class="text-sm text-status-critical">${esc(kd.manifestError)}</div>`;
-  }
-  if (!kd.manifest) {
-    return `<div class="text-sm text-ink-muted">Loading…</div>`;
-  }
-  const yaml = currentKedaYamlText(kd);
-  const matchCount = countSearchMatches(yaml, kd.yamlSearch);
-  const scrollId = `keda-yaml:${esc(kd.ctx)}:${esc(kd.namespace)}:${esc(kd.kind)}:${esc(kd.name)}`;
-  return `
-    <div class="flex h-full min-h-0 flex-col gap-2">
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <div class="flex items-center gap-3">
-          <label class="flex items-center gap-2 text-xs text-ink-secondary">
-            <input type="checkbox" ${kd.showManagedFields ? "checked" : ""} onchange="window.__app.toggleKedaManagedFields()" />
-            Show managed fields
-          </label>
-          ${renderCopyButton(scrollId)}
-        </div>
-        ${renderSearchBox("Keda", "yaml", kd.yamlSearch, matchCount, kd.yamlSearchIndex)}
-      </div>
-      <pre data-scroll-id="${scrollId}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-primary">${highlightSearchMatches(highlightYaml(yaml), kd.yamlSearch, kd.yamlSearchIndex)}</pre>
-    </div>`;
+  return renderYamlPane({
+    error: kd.manifestError,
+    loaded: !!kd.manifest,
+    yaml: currentKedaYamlText(kd),
+    editableYaml: kd.manifest?.yaml_without_managed_fields ?? "",
+    showManagedFields: kd.showManagedFields,
+    toggleHandler: "toggleKedaManagedFields",
+    searchKind: "Keda",
+    search: kd.yamlSearch,
+    searchIndex: kd.yamlSearchIndex,
+    scrollId: `keda-yaml:${esc(kd.ctx)}:${esc(kd.namespace)}:${esc(kd.kind)}:${esc(kd.name)}`,
+    target: { ctx: kd.ctx, kind: kd.kind, namespace: kd.namespace, name: kd.name },
+  });
 }
 
 function renderKedaGraphView(kd: KedaDetailState): string {
@@ -8772,6 +8932,9 @@ document.addEventListener("keydown", (e) => {
     // cluster change. Escaping past it to close the panel underneath would
     // leave the dialog stranded over a view it no longer belongs to.
     if (state.confirm) cancelConfirm();
+    // Before the panel closers below: an open editor holds unsaved text, and
+    // Escape reaching past it would close the panel and take the draft with it.
+    else if (state.yamlEdit) cancelYamlEdit();
     else if (state.clusterPalette) closeClusterPalette();
     else if (state.claudeExplain) closeClaudeExplain();
     else if (state.claudeDiagnose) closeClaudeDiagnose();
