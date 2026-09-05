@@ -7089,6 +7089,26 @@ function renderWorkloadGraphView(wd: WorkloadDetailState): string {
   return renderMetricsGraphView(wd, "setWorkloadMetricsRange", `workload:${wd.ctx}:${wd.kind}:${wd.namespace}:${wd.name}`, note);
 }
 
+/**
+ * The attributes every detail panel's scrolling body needs.
+ *
+ * The `data-scroll-id` is what stops the panel jumping to the top on every
+ * background refresh: render() replaces the whole subtree, and only elements
+ * carrying an id get their scroll offset put back. The YAML and Logs tabs
+ * escaped this because their `<pre>` has an id of its own — the Graph tab's
+ * scroller *is* this div, since a column of charts has no inner scroller.
+ *
+ * The view belongs in the key. Without it, switching tabs would hand the new
+ * tab the offset captured from the old one, scrolling a fresh document to
+ * wherever the previous one happened to sit. With it, a switch starts at the
+ * top. (It does not restore a tab's own position when you come back: the
+ * offsets are captured from the live DOM each render, so they survive one
+ * render, not a round trip through another tab.)
+ */
+function detailBodyAttrs(scrollId: string): string {
+  return `data-detail-body data-scroll-id="detail-body:${esc(scrollId)}"`;
+}
+
 function renderPodDetailPanel(): string {
   const pd = state.podDetail;
   if (!pd) return "";
@@ -7159,7 +7179,7 @@ function renderPodDetailPanel(): string {
           </div>
           ${pd.view !== "graph" ? containerSelector : ""}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+        <div ${detailBodyAttrs(`pod:${pd.ctx}:${pd.namespace}:${pd.name}:${pd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -7288,7 +7308,7 @@ function renderNodeDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+        <div ${detailBodyAttrs(`node:${nd.ctx}:${nd.name}:${nd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -7700,7 +7720,7 @@ function renderWorkloadDetailPanel(): string {
           </div>
           ${wd.view === "logs" ? `<div class="flex min-w-0 items-center gap-2">${podSelector}${containerSelector}</div>` : ""}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+        <div ${detailBodyAttrs(`workload:${wd.ctx}:${wd.kind}:${wd.namespace}:${wd.name}:${wd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -7792,7 +7812,7 @@ function renderNapDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+        <div ${detailBodyAttrs(`nap:${nd.ctx}:${nd.name}:${nd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -7870,7 +7890,7 @@ function renderKedaDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+        <div ${detailBodyAttrs(`keda:${kd.ctx}:${kd.namespace}:${kd.kind}:${kd.name}:${kd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -7912,7 +7932,7 @@ function renderGitOpsDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+        <div ${detailBodyAttrs(`gitops:${gd.ctx}:${gd.namespace}:${gd.name}:${gd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
     </div>`;
 }
@@ -8609,7 +8629,7 @@ function renderHelmDetailPanel(): string {
             )
             .join("")}
         </div>
-        <div data-detail-body class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${renderHelmDetailBody(hd)}</div>
+        <div ${detailBodyAttrs(`helm:${hd.ctx}:${hd.namespace}:${hd.name}:${hd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${renderHelmDetailBody(hd)}</div>
       </div>
     </div>`;
 }
