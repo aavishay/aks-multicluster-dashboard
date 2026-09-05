@@ -335,15 +335,21 @@ async fn resource_usage_over_time(
         )
     };
 
-    // Only the resource series can fail informatively. A GPU query against a
-    // cluster running no DCGM exporter returns nothing rather than erroring,
-    // and surfacing that as a warning on every CPU-only node — which is nearly
-    // all of them — would bury the errors that do matter.
+    // Every query counts, GPU included. A cluster with no DCGM exporter does
+    // not error here — a query matching no series is a *successful* empty
+    // response, which `query_range` turns into `Ok(vec![])` — so a GPU `Err`
+    // only ever means a real timeout or a backend failure. Dropping those
+    // would take the charts away silently, which is precisely what the warning
+    // banner exists to prevent. When there is no GPU scope at all the queries
+    // never run, so the fleet-wide tab can't be affected either.
     let error = cpu
         .as_ref()
         .err()
         .or(mem.as_ref().err())
         .or(ephemeral_storage.as_ref().err())
+        .or(gpu_util.as_ref().err())
+        .or(gpu_mem.as_ref().err())
+        .or(gpu_tensor.as_ref().err())
         .cloned();
 
     MetricsOverTimeResult {
