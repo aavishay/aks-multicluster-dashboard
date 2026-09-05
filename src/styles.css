@@ -163,14 +163,11 @@ table.data-table td {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-table.data-table tbody tr:hover td {
-  background: var(--surface-2);
-}
-
-/* The Up/Down keyboard row cursor. Deliberately reads differently from the
-   hover state above — a full-width row tinted one step darker is easy to
-   confuse with "the pointer happens to be resting here", so the cursor also
-   carries a left accent bar that hover never draws. */
+/* The row cursor, moved by Up/Down or by clicking a row.
+   Rows deliberately have no hover state: tinting whatever the pointer happens
+   to be resting over competes with this mark for the same meaning, and only
+   one of them survives you moving the mouse away. The left accent bar keeps
+   the cursor legible against the row striping. */
 table.data-table tbody tr[data-row-focused] td {
   background: var(--surface-3);
 }
