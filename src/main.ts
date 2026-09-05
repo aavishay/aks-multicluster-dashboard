@@ -659,7 +659,7 @@ interface AppState {
   writeEnabled: boolean;
   /** Whether the YAML pane wraps long lines. Off by default in both modes, so a 900-character last-applied-configuration annotation stays on one line you can skip past rather than a wall you have to scroll through. */
   yamlWrap: boolean;
-  /** The `?` reference. This app has grown about fifteen bindings, and none of them announce themselves. */
+  /** The `?` reference. There are more bindings here than anyone will discover by accident, and none of them announce themselves. */
   shortcutsOpen: boolean;
   confirm: ConfirmState | null;
   yamlEdit: YamlEditState | null;
@@ -8701,9 +8701,12 @@ function consumesPlainNavKeys(target: EventTarget | null): boolean {
 }
 
 /**
- * True while something is layered over the tab content that fully *takes*
- * a plain arrow key: the cluster palette, Claude's panel/explain/diagnose
- * views, the metrics-backend editor, or an open enum dropdown.
+ * True while something is layered over the tab content that fully *takes* a
+ * plain arrow key — everything in the return below, currently the shortcuts
+ * list, a confirmation dialog, the cluster palette, Claude's
+ * panel/explain/diagnose views, the metrics-backend editor and an open enum
+ * dropdown. Read the expression rather than trusting this sentence; a list in
+ * prose falls behind the code it describes, which this one has done twice.
  *
  * Detail panels are deliberately excluded, which is the whole reason this is
  * separate from `isAnyOverlayOpen`. A panel doesn't swallow Left/Right, it
@@ -9218,10 +9221,12 @@ document.addEventListener("keydown", (e) => {
   }
 
   if (e.key === "Escape") {
-    // First: it is the topmost overlay, and it is the one holding a pending
-    // cluster change. Escaping past it to close the panel underneath would
-    // leave the dialog stranded over a view it no longer belongs to.
+    // Ordered by what is drawn on top of what. The shortcuts list is above
+    // everything, including a confirmation dialog — it can be opened over one.
     if (state.shortcutsOpen) toggleShortcuts();
+    // Then the dialog, which holds a pending cluster change: escaping past it
+    // to close the panel underneath would strand it over a view it no longer
+    // belongs to.
     else if (state.confirm) cancelConfirm();
     // Before the panel closers below: an open editor holds unsaved text, and
     // Escape reaching past it would close the panel and take the draft with it.
