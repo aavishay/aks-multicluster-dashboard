@@ -659,6 +659,8 @@ interface AppState {
   writeEnabled: boolean;
   /** Whether the YAML pane wraps long lines. Off by default in both modes, so a 900-character last-applied-configuration annotation stays on one line you can skip past rather than a wall you have to scroll through. */
   yamlWrap: boolean;
+  /** The `?` reference. This app has grown about fifteen bindings, and none of them announce themselves. */
+  shortcutsOpen: boolean;
   confirm: ConfirmState | null;
   yamlEdit: YamlEditState | null;
   napDetail: NapDetailState | null;
@@ -726,6 +728,7 @@ const state: AppState = {
   gitOpsDetail: null,
   writeEnabled: false,
   yamlWrap: false,
+  shortcutsOpen: false,
   confirm: null,
   yamlEdit: null,
   napDetail: null,
@@ -3976,6 +3979,7 @@ function setMetricsRange(minutes: number) {
   setYamlDraft,
   syncYamlHighlight,
   toggleYamlWrap,
+  toggleShortcuts,
   reviewYamlEdit,
   confirmDeletePod,
   confirmRestartWorkload,
@@ -4197,6 +4201,7 @@ function render(carried?: PreRenderState) {
     ${renderClaudeDiagnosePanel()}
     ${renderClusterPalette()}
     ${renderConfirmDialog()}
+    ${renderShortcutsPanel()}
   `;
 
   // Before the scroll restore below, not after: innerHTML hands back a table
@@ -4459,6 +4464,96 @@ function renderSidebar(): string {
         ${esc(state.kubeconfigPath) || "no kubeconfig"}
       </div>
     </aside>`;
+}
+
+/**
+ * Every global binding, grouped the way they're reached.
+ *
+ * A list rather than scattered tooltips because the bindings only make sense
+ * together — that Enter opens a row is only useful once you know arrows put a
+ * cursor on one.
+ */
+const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[] = [
+  {
+    title: "Rows",
+    items: [
+      ["↑ ↓", "Move the row cursor"],
+      ["Enter", "Open the focused row's details"],
+      ["Space", "Select or deselect the focused row"],
+      ["⇧↑ ⇧↓", "Extend the selection"],
+      ["⌘A", "Select every matching row"],
+      ["PgUp PgDn", "Move a page at a time"],
+      ["Home End", "First or last row"],
+    ],
+  },
+  {
+    title: "Sorting",
+    items: [
+      ["⌥← ⌥→", "Sort by the previous or next column"],
+      ["⌥↑ ⌥↓", "Sort ascending or descending"],
+    ],
+  },
+  {
+    title: "Getting around",
+    items: [
+      ["← →", "Previous or next tab"],
+      ["⌘← ⌘→", "Back and forward through views"],
+      ["⌘K", "Switch cluster"],
+      ["⌘R", "Refresh now"],
+    ],
+  },
+  {
+    title: "Detail panels",
+    items: [
+      ["← →", "Switch between the panel's tabs"],
+      ["↑ ↓", "Scroll the panel"],
+      ["⌘F", "Jump to the panel's search box"],
+    ],
+  },
+  {
+    title: "Everywhere",
+    items: [
+      ["?", "This list"],
+      ["Esc", "Close what's open, or clear the tab's filters"],
+      ["⌘+ ⌘−", "Zoom in or out"],
+      ["⌘0", "Reset the zoom"],
+    ],
+  },
+];
+
+function toggleShortcuts() {
+  state.shortcutsOpen = !state.shortcutsOpen;
+  render();
+}
+
+function renderShortcutsPanel(): string {
+  if (!state.shortcutsOpen) return "";
+  const group = (g: (typeof SHORTCUT_GROUPS)[number]) => `
+    <div class="flex flex-col gap-1">
+      <div class="text-xs font-medium text-ink-primary">${esc(g.title)}</div>
+      ${g.items
+        .map(
+          ([keys, what]) => `
+        <div class="flex items-baseline justify-between gap-4 text-xs">
+          <span class="text-ink-secondary">${esc(what)}</span>
+          <kbd class="shrink-0 rounded border border-gridline bg-surface-2 px-1.5 py-0.5 font-mono text-ink-primary">${esc(keys)}</kbd>
+        </div>`,
+        )
+        .join("")}
+    </div>`;
+
+  return `
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6" onclick="window.__app.toggleShortcuts()">
+      <div class="flex max-h-full w-full max-w-2xl flex-col rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="text-sm font-medium text-ink-primary">Keyboard shortcuts</div>
+          <button type="button" onclick="window.__app.toggleShortcuts()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+        </div>
+        <div class="grid gap-x-8 gap-y-5 overflow-auto p-4 sm:grid-cols-2">
+          ${SHORTCUT_GROUPS.map(group).join("")}
+        </div>
+      </div>
+    </div>`;
 }
 
 function renderClusterPalette(): string {
@@ -8619,6 +8714,7 @@ function consumesPlainNavKeys(target: EventTarget | null): boolean {
  */
 function isNonPanelOverlayOpen(): boolean {
   return (
+    state.shortcutsOpen ||
     !!state.confirm ||
     !!state.clusterPalette ||
     !!state.claudeExplain ||
@@ -8899,12 +8995,23 @@ function consumesActivationKeys(target: EventTarget | null): boolean {
   );
 }
 
-/** The `<tr>` the row cursor currently sits on, clamped to the rows actually rendered. */
+/**
+ * The `<tr>` the row cursor sits on, clamped to the rows actually rendered.
+ *
+ * A table with no cursor yet gets one on its first row. Rows being
+ * keyboard-addressable at all was invisible until you happened to press an
+ * arrow key — and until then Enter looked like it did nothing, because there
+ * was nothing for it to open. Showing the cursor from the start is what makes
+ * the rest of the scheme discoverable.
+ */
 function focusedRowElement(): HTMLElement | null {
   const tbody = document.querySelector<HTMLElement>(`[data-scroll-id="table:${state.activeTab}"] tbody`);
-  const index = state.focusedRow[state.activeTab];
-  if (!tbody || index === undefined || tbody.children.length === 0) return null;
-  return tbody.children[Math.min(index, tbody.children.length - 1)] as HTMLElement;
+  if (!tbody || tbody.children.length === 0) return null;
+
+  const index = state.focusedRow[state.activeTab] ?? 0;
+  // Recorded so the next arrow press steps from here rather than starting over.
+  state.focusedRow[state.activeTab] = Math.min(index, tbody.children.length - 1);
+  return tbody.children[state.focusedRow[state.activeTab]!] as HTMLElement;
 }
 
 /** The selection key of the row at `index` among those currently rendered, read off the shared checkbox cell. */
@@ -9104,11 +9211,18 @@ function closeOpenDetailPanel(): boolean {
 }
 
 document.addEventListener("keydown", (e) => {
+  if (e.key === "?" && !isEditableTarget(e.target)) {
+    e.preventDefault();
+    toggleShortcuts();
+    return;
+  }
+
   if (e.key === "Escape") {
     // First: it is the topmost overlay, and it is the one holding a pending
     // cluster change. Escaping past it to close the panel underneath would
     // leave the dialog stranded over a view it no longer belongs to.
-    if (state.confirm) cancelConfirm();
+    if (state.shortcutsOpen) toggleShortcuts();
+    else if (state.confirm) cancelConfirm();
     // Before the panel closers below: an open editor holds unsaved text, and
     // Escape reaching past it would close the panel and take the draft with it.
     else if (state.yamlEdit) cancelYamlEdit();
