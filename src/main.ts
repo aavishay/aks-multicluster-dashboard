@@ -930,10 +930,14 @@ function setSortDirection(direction: "asc" | "desc"): boolean {
   const keys = tableSnapshots[tab]?.columnKeys ?? [];
   if (keys.length === 0) return false;
 
+  // Nothing sorted yet, or sorted by a column this tab no longer draws — the
+  // same case `stepSortColumn` handles, and just as reachable here: a column
+  // set can change with the cluster selection, leaving a sort key with no
+  // header to mark and no rows to order. Fall back to the first column so the
+  // press does something rather than silently nothing.
   const current = state.sortState[tab];
-  // Nothing sorted yet: start on the first column rather than doing nothing,
-  // so Option+Down is a complete gesture on its own.
-  state.sortState[tab] = { column: current?.column ?? keys[0], direction };
+  const column = current && keys.includes(current.column) ? current.column : keys[0];
+  state.sortState[tab] = { column, direction };
   pendingSortHeaderScroll = true;
   render();
   return true;
@@ -4284,9 +4288,11 @@ function render(carried?: PreRenderState) {
   // table under it, say — lands on the last row instead of disappearing.
   if (pendingSortHeaderScroll) {
     pendingSortHeaderScroll = false;
-    // `inline` only: the header is sticky, so it is already where it should be
-    // vertically, and asking to scroll it vertically would move the rows under
-    // it for no reason.
+    // `inline: "nearest"` does the work — bring the header in from whichever
+    // side it went off. `block: "nearest"` is the companion that keeps it from
+    // also moving vertically: the header is sticky, so it is already where it
+    // belongs, and "nearest" resolves to no vertical movement for an element
+    // already in view.
     app.querySelector<HTMLElement>("[data-sort-active]")?.scrollIntoView({ inline: "nearest", block: "nearest" });
   }
 
@@ -9132,13 +9138,16 @@ document.addEventListener("keydown", (e) => {
     // In a text field, Option+arrow is word-wise movement and belongs to the
     // field. Behind an overlay, the table isn't even visible.
     if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
-    const handled =
-      e.key === "ArrowLeft"
-        ? stepSortColumn(-1)
-        : e.key === "ArrowRight"
-          ? stepSortColumn(1)
-          : setSortDirection(e.key === "ArrowUp" ? "asc" : "desc");
-    if (handled) e.preventDefault();
+
+    // Claimed from here on whether or not there is anything to sort. On
+    // Windows and Linux — which this app bundles for, `targets: "all"` —
+    // Alt+Left/Right is the WebView's back and forward, so letting it fall
+    // through on Metrics or Cost, the two tabs with no table, would navigate
+    // the shell out from under the reader instead of doing nothing.
+    e.preventDefault();
+    if (e.key === "ArrowLeft") stepSortColumn(-1);
+    else if (e.key === "ArrowRight") stepSortColumn(1);
+    else setSortDirection(e.key === "ArrowUp" ? "asc" : "desc");
     return;
   }
 
