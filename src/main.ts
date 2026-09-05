@@ -7033,6 +7033,8 @@ function renderMetricsGraphView(m: MetricsViewState, rangeSetter: string, chartK
   const formatCpu = (cores: number) => formatMillicores(Math.round(cores * 1000));
   const formatMem = (bytes: number) => formatKi(Math.round(bytes / 1024));
 
+  const formatPercent = (v: number) => `${v < 10 ? v.toFixed(1) : Math.round(v)}%`;
+
   const series: { key: string; label: string; color: string; samples: MetricSample[]; format: (v: number) => string }[] = [
     { key: "cpu", label: "CPU usage", color: "var(--series-blue)", samples: m.metrics.cpu_cores, format: formatCpu },
     { key: "mem", label: "Memory usage", color: "var(--series-orange)", samples: m.metrics.memory_bytes, format: formatMem },
@@ -7043,6 +7045,36 @@ function renderMetricsGraphView(m: MetricsViewState, rangeSetter: string, chartK
       samples: m.metrics.ephemeral_storage_bytes,
       format: formatMem,
     },
+    // Drawn only where there is a GPU to draw. The backend returns nothing for
+    // a scope that never touches one, which is most of them — so an empty
+    // series is the "no GPU here" answer and needs no separate lookup.
+    ...(m.metrics.gpu_util_percent.length > 0
+      ? [
+          {
+            key: "gpu",
+            label: "GPU utilisation",
+            color: "var(--series-violet)",
+            samples: m.metrics.gpu_util_percent,
+            format: formatPercent,
+          },
+          {
+            key: "gpumem",
+            label: "GPU memory used",
+            color: "var(--series-pink)",
+            samples: m.metrics.gpu_memory_bytes,
+            format: formatMem,
+          },
+          {
+            // Utilisation reads 100% while any kernel runs, so it cannot tell
+            // a saturated card from a starved one. This can.
+            key: "gputensor",
+            label: "GPU tensor core activity",
+            color: "var(--series-cyan)",
+            samples: m.metrics.gpu_tensor_percent,
+            format: formatPercent,
+          },
+        ]
+      : []),
   ];
 
   return `

@@ -214,6 +214,13 @@ pub struct MetricsOverTimeResult {
     pub cpu_cores: Vec<MetricSample>,
     pub memory_bytes: Vec<MetricSample>,
     pub ephemeral_storage_bytes: Vec<MetricSample>,
+    /// GPU series, empty unless DCGM exporter is running *and* this node, pod
+    /// or workload actually touches a GPU. Empty is the answer for most of
+    /// them, and is what tells the UI not to draw the charts — no separate
+    /// "has a GPU" lookup needed.
+    pub gpu_util_percent: Vec<MetricSample>,
+    pub gpu_memory_bytes: Vec<MetricSample>,
+    pub gpu_tensor_percent: Vec<MetricSample>,
 }
 
 /// One ArgoCD `Application` (`applications.argoproj.io`), flattened out of its

@@ -22,6 +22,9 @@
   --color-series-blue: var(--series-blue);
   --color-series-orange: var(--series-orange);
   --color-series-aqua: var(--series-aqua);
+  --color-series-violet: var(--series-violet);
+  --color-series-pink: var(--series-pink);
+  --color-series-cyan: var(--series-cyan);
 
   --color-status-good: var(--status-good);
   --color-status-warning: var(--status-warning);
@@ -44,6 +47,11 @@
   --series-blue: #3987e5;
   --series-orange: #d95926;
   --series-aqua: #199e70;
+  /* The GPU trio. Kept clear of --status-warning's gold, which a chart line
+     sitting next to a health indicator would otherwise echo. */
+  --series-violet: #8b5cf6;
+  --series-pink: #e0559c;
+  --series-cyan: #22a5c4;
 
   --status-good: #0ca30c;
   --status-warning: #fab219;
@@ -69,6 +77,9 @@
   --series-blue: #1d5fc2;
   --series-orange: #b8481a;
   --series-aqua: #12805c;
+  --series-violet: #6d28d9;
+  --series-pink: #b02870;
+  --series-cyan: #15748c;
 
   --status-good: #0a8a0a;
   --status-warning: #a3690a;

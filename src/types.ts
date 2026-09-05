@@ -152,6 +152,10 @@ export interface MetricsOverTimeResult {
   cpu_cores: MetricSample[];
   memory_bytes: MetricSample[];
   ephemeral_storage_bytes: MetricSample[];
+  /** Empty unless DCGM exporter is running and this scope actually touches a GPU — which is what tells the UI whether to draw the GPU charts at all. */
+  gpu_util_percent: MetricSample[];
+  gpu_memory_bytes: MetricSample[];
+  gpu_tensor_percent: MetricSample[];
 }
 
 export interface GitOpsAppInfo {

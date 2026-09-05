@@ -264,12 +264,47 @@ const MEMORY_BYTES_QUERY: &str = r#"sum(container_memory_working_set_bytes{conta
 // ephemeral-storage accounting more closely.
 const EPHEMERAL_STORAGE_BYTES_QUERY: &str = r#"sum(container_ephemeral_storage_usage_bytes{container!="",container!="POD"})"#;
 
+/// The three GPU series worth a chart, for whatever `selectors` scope them.
+///
+/// Chosen against a live DCGM 4.5 exporter, which publishes thirty:
+///
+/// - **Utilisation** is the headline, the direct analogue of CPU.
+/// - **Framebuffer used** is what decides whether the next model fits.
+/// - **Tensor activity** is what says the card is doing useful work rather
+///   than merely being busy — `GPU_UTIL` reads 100% while *any* kernel runs,
+///   so a starved pipeline looks identical to a saturated one.
+///
+/// Several selectors are joined with `or`, which yields the right-hand side
+/// only when the left matches nothing — the same trick the node CPU queries
+/// use, and needed for the same reason: DCGM labels a node both `node` and
+/// `Hostname`, and which is populated depends on the scrape config.
+///
+/// `FB_USED` is reported in MiB — verified against a live Tesla T4, 4002 used
+/// plus 11926 free being its 16 GiB — so it is scaled to bytes to match the
+/// memory series beside it.
+fn gpu_queries(selectors: &[String]) -> (String, String, String) {
+    let joined = |metric: &str, agg: &str, scale: &str| {
+        selectors
+            .iter()
+            .map(|sel| format!("{agg}({metric}{{{sel}}}){scale}"))
+            .collect::<Vec<_>>()
+            .join(" or ")
+    };
+    (
+        joined("DCGM_FI_DEV_GPU_UTIL", "avg", ""),
+        joined("DCGM_FI_DEV_FB_USED", "sum", " * 1024 * 1024"),
+        // Reported 0-1; shown as a percentage beside utilisation.
+        joined("DCGM_FI_PROF_PIPE_TENSOR_ACTIVE", "avg", " * 100"),
+    )
+}
+
 async fn resource_usage_over_time(
     client: &Client,
     backend: MetricsBackendInfo,
     cpu_query: &str,
     mem_query: &str,
     ephemeral_storage_query: &str,
+    gpu_selectors: &[String],
     range_minutes: i64,
 ) -> MetricsOverTimeResult {
     let range_minutes = range_minutes.clamp(5, 24 * 60);
@@ -285,6 +320,25 @@ async fn resource_usage_over_time(
         query_range(client, &backend, ephemeral_storage_query, start, end, step_secs),
     );
 
+    // No selectors means no scope to attribute a GPU to — the fleet-wide
+    // Metrics tab, where an average across every card in the cluster would
+    // describe nothing in particular. Skipped rather than asked with an empty
+    // matcher, which is not valid PromQL.
+    let (gpu_util, gpu_mem, gpu_tensor) = if gpu_selectors.is_empty() {
+        (Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new()))
+    } else {
+        let (util_q, mem_q, tensor_q) = gpu_queries(gpu_selectors);
+        tokio::join!(
+            query_range(client, &backend, &util_q, start, end, step_secs),
+            query_range(client, &backend, &mem_q, start, end, step_secs),
+            query_range(client, &backend, &tensor_q, start, end, step_secs),
+        )
+    };
+
+    // Only the resource series can fail informatively. A GPU query against a
+    // cluster running no DCGM exporter returns nothing rather than erroring,
+    // and surfacing that as a warning on every CPU-only node — which is nearly
+    // all of them — would bury the errors that do matter.
     let error = cpu
         .as_ref()
         .err()
@@ -298,6 +352,9 @@ async fn resource_usage_over_time(
         cpu_cores: cpu.unwrap_or_default(),
         memory_bytes: mem.unwrap_or_default(),
         ephemeral_storage_bytes: ephemeral_storage.unwrap_or_default(),
+        gpu_util_percent: gpu_util.unwrap_or_default(),
+        gpu_memory_bytes: gpu_mem.unwrap_or_default(),
+        gpu_tensor_percent: gpu_tensor.unwrap_or_default(),
     }
 }
 
@@ -317,6 +374,7 @@ pub async fn get_metrics_over_time(
         CPU_CORES_QUERY,
         MEMORY_BYTES_QUERY,
         EPHEMERAL_STORAGE_BYTES_QUERY,
+        &[],
         range_minutes,
     )
     .await)
@@ -349,7 +407,18 @@ pub async fn get_pod_metrics_over_time(
     let ephemeral_storage_query = format!(
         r#"sum(container_ephemeral_storage_usage_bytes{{namespace="{namespace}",pod="{pod_name}",container!="",container!="POD"}})"#
     );
-    Ok(resource_usage_over_time(&client, backend, &cpu_query, &mem_query, &ephemeral_storage_query, range_minutes).await)
+    // DCGM attributes each GPU to the pod using it, so this is the same pod.
+    let gpu_selectors = [format!(r#"namespace="{namespace}",pod="{pod_name}""#)];
+    Ok(resource_usage_over_time(
+        &client,
+        backend,
+        &cpu_query,
+        &mem_query,
+        &ephemeral_storage_query,
+        &gpu_selectors,
+        range_minutes,
+    )
+    .await)
 }
 
 /// Escapes the only regex metacharacter a Kubernetes object name can legally
@@ -420,7 +489,19 @@ pub async fn get_node_metrics_over_time(
     let ephemeral_storage_query = format!(
         r#"sum(container_ephemeral_storage_usage_bytes{{instance="{node_name}",{common}}}) or sum(container_ephemeral_storage_usage_bytes{{node="{node_name}",{common}}})"#
     );
-    Ok(resource_usage_over_time(&client, backend, &cpu_query, &mem_query, &ephemeral_storage_query, range_minutes).await)
+    // DCGM labels a node both ways depending on the scrape config; ask for
+    // both and take whichever answers.
+    let gpu_selectors = [format!(r#"node="{node_name}""#), format!(r#"Hostname="{node_name}""#)];
+    Ok(resource_usage_over_time(
+        &client,
+        backend,
+        &cpu_query,
+        &mem_query,
+        &ephemeral_storage_query,
+        &gpu_selectors,
+        range_minutes,
+    )
+    .await)
 }
 
 /// Same shape as `get_pod_metrics_over_time`, summed across every pod the
@@ -443,7 +524,18 @@ pub async fn get_workload_metrics_over_time(
     let cpu_query = format!(r#"sum(rate(container_cpu_usage_seconds_total{{{scope}}}[5m]))"#);
     let mem_query = format!(r#"sum(container_memory_working_set_bytes{{{scope}}})"#);
     let ephemeral_storage_query = format!(r#"sum(container_ephemeral_storage_usage_bytes{{{scope}}})"#);
-    Ok(resource_usage_over_time(&client, backend, &cpu_query, &mem_query, &ephemeral_storage_query, range_minutes).await)
+    // Every pod of the workload, by the same regex the CPU series uses.
+    let gpu_selectors = [format!(r#"namespace="{namespace}",pod=~"{pod_regex}""#)];
+    Ok(resource_usage_over_time(
+        &client,
+        backend,
+        &cpu_query,
+        &mem_query,
+        &ephemeral_storage_query,
+        &gpu_selectors,
+        range_minutes,
+    )
+    .await)
 }
 
 /// Same shape as `get_node_metrics_over_time`, summed across every node the
@@ -485,7 +577,18 @@ pub async fn get_nap_node_pool_metrics_over_time(
     let ephemeral_storage_query = format!(
         r#"sum(container_ephemeral_storage_usage_bytes{{instance=~"{names_pattern}",{common}}}) or sum(container_ephemeral_storage_usage_bytes{{node=~"{names_pattern}",{common}}})"#
     );
-    Ok(resource_usage_over_time(&client, backend, &cpu_query, &mem_query, &ephemeral_storage_query, range_minutes).await)
+    // Every node the pool owns, by the same alternation the CPU series uses.
+    let gpu_selectors = [format!(r#"node=~"{names_pattern}""#), format!(r#"Hostname=~"{names_pattern}""#)];
+    Ok(resource_usage_over_time(
+        &client,
+        backend,
+        &cpu_query,
+        &mem_query,
+        &ephemeral_storage_query,
+        &gpu_selectors,
+        range_minutes,
+    )
+    .await)
 }
 
 /// Instant query against a candidate, used only by `test_metrics_backend`.
