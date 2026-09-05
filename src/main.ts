@@ -4498,6 +4498,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       ["← →", "Previous or next tab"],
       ["⌘← ⌘→", "Back and forward through views"],
+      ["⌘B", "Show or hide the cluster list"],
       ["⌘K", "Switch cluster"],
       ["⌘R", "Refresh now"],
     ],
@@ -9348,6 +9349,21 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (!e.metaKey) return;
+
+  // Cmd+B shows or hides the cluster list, the same as the ‹ button — the
+  // binding every editor and chat app uses for its sidebar, so it is the first
+  // thing anyone tries.
+  //
+  // Not gated on isEditableTarget, for the same reason as Cmd+K below: Cmd+B
+  // means bold in a rich text editor, and this app has none, so there is
+  // nothing in a plain input for it to collide with. Overlays don't gate it
+  // either — same reasoning as Cmd+R: collapsing the sidebar behind a panel is
+  // harmless and is what was asked for.
+  if (e.key === "b" || e.key === "B") {
+    e.preventDefault();
+    toggleSidebar();
+    return;
+  }
 
   // Not gated on isEditableTarget: unlike Cmd+Left's native cursor-movement
   // conflict, Cmd+K has no competing meaning inside a plain text input, so it
