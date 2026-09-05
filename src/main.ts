@@ -895,6 +895,50 @@ interface ColumnFilterState {
   enumValues?: Set<string>;
 }
 
+/** Set when sorting moved to a column that may be scrolled out of sight, so the next render can bring it back. */
+let pendingSortHeaderScroll = false;
+
+/**
+ * Moves sorting to the next or previous column.
+ *
+ * There is no separate "selected column" — the sorted one *is* the selection,
+ * which is why this needs no mode to enter or escape and no new indicator: the
+ * ▲▼ already in the header is the feedback. Sorting is cheap and reversible,
+ * so stepping is also previewing.
+ */
+function stepSortColumn(delta: number): boolean {
+  const tab = state.activeTab;
+  const keys = tableSnapshots[tab]?.columnKeys ?? [];
+  if (keys.length === 0) return false;
+
+  const current = state.sortState[tab];
+  const at = current ? keys.indexOf(current.column) : -1;
+  // Unsorted, or sorted by a column this tab no longer draws: come in from the
+  // end you are heading away from, so the first press lands somewhere sensible
+  // rather than always on column one.
+  const next = at < 0 ? (delta > 0 ? 0 : keys.length - 1) : (at + delta + keys.length) % keys.length;
+
+  state.sortState[tab] = { column: keys[next], direction: current?.direction ?? "asc" };
+  pendingSortHeaderScroll = true;
+  render();
+  return true;
+}
+
+/** Option+Up/Down set the direction outright rather than toggling, so the keys mean the same thing every time — and they match the ▲▼ they produce. */
+function setSortDirection(direction: "asc" | "desc"): boolean {
+  const tab = state.activeTab;
+  const keys = tableSnapshots[tab]?.columnKeys ?? [];
+  if (keys.length === 0) return false;
+
+  const current = state.sortState[tab];
+  // Nothing sorted yet: start on the first column rather than doing nothing,
+  // so Option+Down is a complete gesture on its own.
+  state.sortState[tab] = { column: current?.column ?? keys[0], direction };
+  pendingSortHeaderScroll = true;
+  render();
+  return true;
+}
+
 function setSort(tab: TabId, column: string) {
   const current = state.sortState[tab];
   state.sortState[tab] =
@@ -923,9 +967,10 @@ function sortableHeaderRow<T>(tab: TabId, columns: ColumnDef<T>[]): string {
   const spec = state.sortState[tab];
   return columns
     .map((c) => {
-      const indicator = spec && spec.column === c.key ? (spec.direction === "asc" ? " ▲" : " ▼") : "";
+      const sorted = spec?.column === c.key;
+      const indicator = sorted ? (spec.direction === "asc" ? " ▲" : " ▼") : "";
       return `
-        <th class="relative cursor-pointer select-none hover:text-ink-secondary" onclick="window.__app.setSort(${jsArg(tab)},${jsArg(c.key)})">
+        <th ${sorted ? "data-sort-active" : ""} class="relative cursor-pointer select-none hover:text-ink-secondary" onclick="window.__app.setSort(${jsArg(tab)},${jsArg(c.key)})">
           <span class="block truncate pr-2">${esc(c.label)}${indicator}</span>
           <span
             onmousedown="event.stopPropagation(); window.__app.startColumnResize(event,${jsArg(tab)},${jsArg(c.key)})"
@@ -1028,6 +1073,8 @@ document.addEventListener("mouseup", () => {
 
 interface TableSnapshot {
   headers: string[];
+  /** Sort keys in the order the columns are drawn, so Option+Left/Right can step along them. Kept beside the headers rather than read back out of the DOM, which would tie the keyboard to the markup. */
+  columnKeys: string[];
   rows: [key: string, cells: string[]][];
 }
 
@@ -1049,7 +1096,7 @@ function recordTableSnapshot<T>(
       ...columns.map((c) => (c.copyText ? c.copyText(row) : String(c.value(row)))),
     ],
   ]);
-  tableSnapshots[tab] = { headers, rows: rows_ };
+  tableSnapshots[tab] = { headers, columnKeys: columns.map((c) => c.key), rows: rows_ };
 }
 
 function rowSelection(tab: TabId): Set<string> {
@@ -4235,6 +4282,14 @@ function render(carried?: PreRenderState) {
   // re-render an auto-refresh triggers. Clamped against the rows actually
   // present, so a cursor left pointing past the end — a filter narrowed the
   // table under it, say — lands on the last row instead of disappearing.
+  if (pendingSortHeaderScroll) {
+    pendingSortHeaderScroll = false;
+    // `inline` only: the header is sticky, so it is already where it should be
+    // vertically, and asking to scroll it vertically would move the rows under
+    // it for no reason.
+    app.querySelector<HTMLElement>("[data-sort-active]")?.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }
+
   const focusedRow = focusedRowElement();
   if (focusedRow) {
     focusedRow.setAttribute("data-row-focused", "");
@@ -9060,6 +9115,33 @@ document.addEventListener("keydown", (e) => {
     else if (!closeOpenDetailPanel() && hasActiveFilters(state.activeTab)) clearFilters(state.activeTab);
     return;
   }
+  // Option+arrows sort: Left/Right choose the column, Up/Down the direction.
+  //
+  // Option is the one modifier the arrows here don't already claim — plain is
+  // tab and row movement, Cmd is view history, Shift extends row selection —
+  // and every one of those handlers excludes altKey precisely to leave it
+  // alone. Deliberately not a mode: nothing to enter, nothing to escape, and
+  // the ▲▼ in the header is the only indicator it needs.
+  if (
+    ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key) &&
+    e.altKey &&
+    !e.metaKey &&
+    !e.ctrlKey &&
+    !e.shiftKey
+  ) {
+    // In a text field, Option+arrow is word-wise movement and belongs to the
+    // field. Behind an overlay, the table isn't even visible.
+    if (consumesPlainNavKeys(e.target) || isAnyOverlayOpen()) return;
+    const handled =
+      e.key === "ArrowLeft"
+        ? stepSortColumn(-1)
+        : e.key === "ArrowRight"
+          ? stepSortColumn(1)
+          : setSortDirection(e.key === "ArrowUp" ? "asc" : "desc");
+    if (handled) e.preventDefault();
+    return;
+  }
+
   // Plain Left/Right step the tab bar. Checked before the Cmd gate below,
   // since this is the unmodified key — Cmd+Left/Right keep their existing
   // view-history meaning. Any other modifier is left alone too: Shift+Arrow
