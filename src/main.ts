@@ -9214,6 +9214,42 @@ function closeOpenDetailPanel(): boolean {
   return true;
 }
 
+/**
+ * Clicking a row puts the cursor on it.
+ *
+ * Rows no longer tint on hover — that mark said only "the pointer is resting
+ * here", which is not a thing worth remembering, and it competed with this one
+ * for the same visual language. A click is the deliberate version of the same
+ * gesture, and leaves something that stays put.
+ *
+ * Delegated from the document rather than an onclick per row: there are ten
+ * table renderers, and this way none of them has to know about it.
+ *
+ * The mark is moved in place rather than through render(). A checkbox fires
+ * its `change` as activation behaviour *after* the click has finished
+ * bubbling, so re-rendering here tore the input out of the document before its
+ * own handler ever ran — clicking a row's checkbox moved the cursor and then
+ * silently failed to select the row.
+ */
+document.addEventListener("click", (e) => {
+  const target = e.target;
+  if (!(target instanceof Element)) return;
+
+  const row = target.closest("tbody tr");
+  // Scoped to the active tab's own table: detail panels contain tables of
+  // their own (events, revisions), and a click in one of those is not a row
+  // cursor move.
+  const inActiveTable = row?.closest(`[data-scroll-id="table:${state.activeTab}"]`);
+  if (!row || !inActiveTable || !row.parentElement) return;
+
+  const index = [...row.parentElement.children].indexOf(row);
+  if (index < 0 || state.focusedRow[state.activeTab] === index) return;
+
+  state.focusedRow[state.activeTab] = index;
+  inActiveTable.querySelector("[data-row-focused]")?.removeAttribute("data-row-focused");
+  row.setAttribute("data-row-focused", "");
+});
+
 document.addEventListener("keydown", (e) => {
   if (e.key === "?" && !isEditableTarget(e.target)) {
     e.preventDefault();
