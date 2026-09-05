@@ -100,7 +100,9 @@ jobs:
             ## Install
 
             ```bash
-            brew install --cask aavishay/aks-fleet-dashboard/aks-fleet-dashboard
+            brew tap aavishay/aks-fleet-dashboard
+            brew trust aavishay/aks-fleet-dashboard
+            brew install --cask aks-fleet-dashboard
             ```
 
             ## Not notarized
