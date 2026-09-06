@@ -8992,20 +8992,9 @@ function scrollDetailPanel(mode: "line" | "page" | "edge", direction: 1 | -1): b
 }
 
 /**
- * Cmd+F: puts the cursor in the open detail panel's search box.
- *
- * Only some views have one — YAML and the log panes do, Events and Graph
- * don't — so this reports whether it found one, letting the caller leave the
- * key alone rather than swallowing it on a view with nothing to search.
- *
- * Selects the existing query so a second Cmd+F retypes rather than appends,
- * which is what the browser's own find bar does. The input already carries a
- * `data-filter-key`, so `render()`'s focus restoration keeps the caret there
- * across the re-render that typing triggers.
- */
-/**
- * The active table's own filter box — the text one, which in every table is
- * the Name column.
+ * The active table's first text filter — the object's own name in every
+ * table, though not always under that heading: Helm labels the same column
+ * "Release".
  *
  * `type="text"` is what distinguishes it: enum filters are buttons and the
  * numeric ones are `type="number"`, so this skips both. The Workloads filter
@@ -9025,6 +9014,20 @@ function focusTableFilter(): boolean {
   return true;
 }
 
+/**
+ * Cmd+F: puts the cursor in the open detail panel's search box.
+ *
+ * Only some views have one — the YAML pane, the two log panes and Helm's
+ * value views do; Events, Graph and Revisions don't — so this reports
+ * whether it found one, which is what lets the caller decide where the key
+ * goes next. Not whether to claim it: the handler claims Cmd+F either way,
+ * so on a pane with nothing to search it simply leaves the caret alone.
+ *
+ * Selects the existing query so a second Cmd+F retypes rather than appends,
+ * which is what the browser's own find bar does. The input already carries a
+ * `data-filter-key`, so `render()`'s focus restoration keeps the caret there
+ * across the re-render that typing triggers.
+ */
 function focusDetailSearch(): boolean {
   const input = document.querySelector<HTMLInputElement>("[data-detail-search]");
   if (!input) return false;
@@ -9495,16 +9498,23 @@ document.addEventListener("keydown", (e) => {
   // *behind* the overlay — every subsequent keystroke would vanish into a
   // hidden input while the overlay looked focused.
   //
-  // With no panel open it falls through to the table's own filter box, so the
-  // key keeps one meaning — find in whatever is on screen — rather than doing
-  // nothing on the tab where you most want it.
+  // With no panel open at all it falls through to the table's own filter box,
+  // so the key keeps one meaning — find in whatever is on screen — rather
+  // than doing nothing on the tab where you most want it.
   if (e.key === "f" || e.key === "F") {
     if (isNonPanelOverlayOpen()) return;
     // Claimed either way. Unhandled it reaches the WebView, whose own find
     // has no business searching a document the app is rewriting every 30
     // seconds, and which the reader cannot dismiss from here.
     e.preventDefault();
-    if (!focusDetailSearch()) focusTableFilter();
+    if (focusDetailSearch()) return;
+    // Several panel tabs carry no search box — Events, Graph and Revisions
+    // among them — so `focusDetailSearch` failing does not mean the table is
+    // reachable: an open panel on one of those still covers it completely.
+    // Falling through there would put the caret in a filter the reader cannot
+    // see and send every keystroke into it, which is the exact failure the
+    // overlay guard above exists to prevent.
+    if (!isAnyDetailPanelOpen()) focusTableFilter();
     return;
   }
 
