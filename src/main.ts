@@ -4508,12 +4508,12 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       ["← →", "Switch between the panel's tabs"],
       ["↑ ↓", "Scroll the panel"],
-      ["⌘F", "Jump to the panel's search box"],
     ],
   },
   {
     title: "Everywhere",
     items: [
+      ["⌘F", "Search — the panel's box, or this table's filter"],
       ["?", "This list"],
       ["Esc", "Close what's open, or clear the tab's filters"],
       ["⌘+ ⌘−", "Zoom in or out"],
@@ -9003,6 +9003,28 @@ function scrollDetailPanel(mode: "line" | "page" | "edge", direction: 1 | -1): b
  * `data-filter-key`, so `render()`'s focus restoration keeps the caret there
  * across the re-render that typing triggers.
  */
+/**
+ * The active table's own filter box — the text one, which in every table is
+ * the Name column.
+ *
+ * `type="text"` is what distinguishes it: enum filters are buttons and the
+ * numeric ones are `type="number"`, so this skips both. The Workloads filter
+ * row holds fifteen focusable controls, thirteen of them min/max pairs, which
+ * is why tabbing to the one you want was never a real answer.
+ *
+ * Selects the existing text, the same as the panel search box does, so a
+ * second press replaces the query rather than appending to it.
+ */
+function focusTableFilter(): boolean {
+  const input = document.querySelector<HTMLInputElement>(
+    `[data-scroll-id="table:${state.activeTab}"] tr.filter-row input[type="text"]`,
+  );
+  if (!input) return false;
+  input.focus();
+  input.select();
+  return true;
+}
+
 function focusDetailSearch(): boolean {
   const input = document.querySelector<HTMLInputElement>("[data-detail-search]");
   if (!input) return false;
@@ -9472,9 +9494,17 @@ document.addEventListener("keydown", (e) => {
   // once. Without this, Cmd+F would move focus into the panel's search box
   // *behind* the overlay — every subsequent keystroke would vanish into a
   // hidden input while the overlay looked focused.
+  //
+  // With no panel open it falls through to the table's own filter box, so the
+  // key keeps one meaning — find in whatever is on screen — rather than doing
+  // nothing on the tab where you most want it.
   if (e.key === "f" || e.key === "F") {
     if (isNonPanelOverlayOpen()) return;
-    if (focusDetailSearch()) e.preventDefault();
+    // Claimed either way. Unhandled it reaches the WebView, whose own find
+    // has no business searching a document the app is rewriting every 30
+    // seconds, and which the reader cannot dismiss from here.
+    e.preventDefault();
+    if (!focusDetailSearch()) focusTableFilter();
     return;
   }
 
