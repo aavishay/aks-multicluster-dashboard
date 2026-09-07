@@ -768,6 +768,8 @@ const state: AppState = {
 };
 
 let refreshTimer: number | undefined;
+/** How many refresh passes are still fetching. A timer tick that lands while one is in flight is dropped rather than stacked on top of it — see `scheduleAutoRefresh`. */
+let refreshPassesInFlight = 0;
 let requestGeneration = 0;
 /** Bumped whenever the cluster selection changes, so a background prefetch loop targeting the old selection stops advancing (see `prefetchOtherTabsInBackground`). */
 let backgroundPrefetchGeneration = 0;
@@ -1568,17 +1570,19 @@ async function refreshSidebarBadges() {
   // calls (and the connections behind them) per cluster per refresh tick.
   if (state.activeTab === "overview") return;
 
-  for (const ctx of selectedContextsList()) {
-    api
-      .getOverview(ctx)
-      .then((ov) => {
+  // Awaited as a whole rather than fired and forgotten, so `runRefreshPass`
+  // can tell when this pass has finished. Each cluster still commits and
+  // renders on its own as it arrives, so a slow cluster doesn't hold back the
+  // badges of a fast one, and a rejection is absorbed here exactly as the
+  // per-call `.catch()` used to absorb it: the badge stays "unknown".
+  await Promise.allSettled(
+    selectedContextsList().map((ctx) =>
+      api.getOverview(ctx).then((ov) => {
         state.overviews.set(ctx, ov);
         render();
-      })
-      .catch(() => {
-        /* badge stays "unknown" */
-      });
-  }
+      }),
+    ),
+  );
 }
 
 /** Fetches one tab's data for one cluster and stores it in the matching cache Map — the one place that knows which API call backs which tab, shared by the foreground loader and the background prefetcher below. */
@@ -1880,12 +1884,37 @@ async function prefetchOtherTabsInBackground() {
   }
 }
 
+/**
+ * Runs one refresh pass (active tab + sidebar badges) and resolves only once
+ * every request behind it has settled, so callers can tell when the pass is
+ * genuinely over rather than merely started.
+ */
+function runRefreshPass(): Promise<unknown> {
+  refreshPassesInFlight++;
+  return Promise.allSettled([loadTabData(), refreshSidebarBadges()]).finally(() => {
+    refreshPassesInFlight--;
+  });
+}
+
 function scheduleAutoRefresh() {
   if (refreshTimer) window.clearInterval(refreshTimer);
   if (state.autoRefreshSeconds <= 0) return;
   refreshTimer = window.setInterval(() => {
-    loadTabData();
-    refreshSidebarBadges();
+    // A tick that lands while the previous pass is still fetching is dropped,
+    // not queued. setInterval fires on a fixed wall-clock cadence no matter
+    // how long the work takes, and one pass can legitimately outlast the
+    // interval by a wide margin: a command's deadline is SLOW_CLUSTER_TIMEOUT
+    // (120s) and `with_retry` allows two further attempts, so one slow cluster
+    // can hold a pass open for minutes against the 30s default interval.
+    //
+    // Without this guard those passes overlap rather than replace each other.
+    // `requestGeneration` discards a superseded pass's *results*, but every
+    // superseded request still runs to completion and still pays for its bytes
+    // on the wire. Against a private-link cluster over a VPN that pile-up
+    // sustains itself: more overlap saturates the tunnel, which makes each
+    // fetch slower, which deepens the overlap.
+    if (refreshPassesInFlight > 0) return;
+    void runRefreshPass();
   }, state.autoRefreshSeconds * 1000);
 }
 
@@ -3645,8 +3674,10 @@ function stopWorkloadLogFollow() {
 }
 
 function manualRefresh() {
-  loadTabData();
-  refreshSidebarBadges();
+  // Always runs — an explicit click is the user asking for it now, even mid-pass
+  // — but goes through `runRefreshPass` so the auto-refresh timer counts it and
+  // defers its own tick instead of doubling up on it.
+  void runRefreshPass();
 }
 
 // ---------------------------------------------------------------------------
