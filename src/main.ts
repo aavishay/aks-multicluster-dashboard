@@ -768,7 +768,7 @@ const state: AppState = {
 };
 
 let refreshTimer: number | undefined;
-/** How many refresh passes are still fetching. A timer tick that lands while one is in flight is dropped rather than stacked on top of it — see `scheduleAutoRefresh`. */
+/** How many refresh fetches are still in flight, counted by the `loadTabData` and `refreshSidebarBadges` wrappers so every caller is included — not just `runRefreshPass`. A timer tick landing while any is outstanding is dropped rather than stacked on top of it; see `scheduleAutoRefresh`. */
 let refreshPassesInFlight = 0;
 let requestGeneration = 0;
 /** Bumped whenever the cluster selection changes, so a background prefetch loop targeting the old selection stops advancing (see `prefetchOtherTabsInBackground`). */
@@ -1563,7 +1563,21 @@ async function init() {
   applyAiSettings({});
 }
 
-async function refreshSidebarBadges() {
+/**
+ * Refreshes the sidebar badges, counted as in-flight refresh traffic so the
+ * auto-refresh timer can tell whether to defer its next tick. See
+ * `loadTabData` for why the accounting lives at the wrapper.
+ */
+async function refreshSidebarBadges(): Promise<void> {
+  refreshPassesInFlight++;
+  try {
+    await refreshSidebarBadgesInner();
+  } finally {
+    refreshPassesInFlight--;
+  }
+}
+
+async function refreshSidebarBadgesInner() {
   // The badges render straight out of `state.overviews`, which the overview
   // tab's own load already fills — and every caller here pairs this with
   // `loadTabData()`. Fetching again on that tab would just double the API
@@ -1788,7 +1802,29 @@ async function reconnectCluster(contextName: string) {
   render();
 }
 
-async function loadTabData() {
+/**
+ * Fetches the active tab's data for the whole selection, counted as in-flight
+ * refresh traffic so the auto-refresh timer can tell whether to defer its
+ * next tick.
+ *
+ * The accounting lives on this wrapper rather than in `runRefreshPass`
+ * because most callers never go through that: `init`'s very first load, every
+ * cluster-selection handler, and the various filter toggles all call this
+ * directly. Counting here is what makes `scheduleAutoRefresh`'s guard
+ * actually cover them — a first load that outlasts the interval would
+ * otherwise leave the counter at zero and let a tick stack a second pass on
+ * top of it, which is the overlap the guard exists to prevent.
+ */
+async function loadTabData(): Promise<void> {
+  refreshPassesInFlight++;
+  try {
+    await loadTabDataInner();
+  } finally {
+    refreshPassesInFlight--;
+  }
+}
+
+async function loadTabDataInner() {
   const ctxs = selectedContextsList();
   const gen = ++requestGeneration;
   if (ctxs.length === 0) {
@@ -1887,13 +1923,11 @@ async function prefetchOtherTabsInBackground() {
 /**
  * Runs one refresh pass (active tab + sidebar badges) and resolves only once
  * every request behind it has settled, so callers can tell when the pass is
- * genuinely over rather than merely started.
+ * genuinely over rather than merely started. Both halves do their own
+ * in-flight accounting, so this only has to join them.
  */
 function runRefreshPass(): Promise<unknown> {
-  refreshPassesInFlight++;
-  return Promise.allSettled([loadTabData(), refreshSidebarBadges()]).finally(() => {
-    refreshPassesInFlight--;
-  });
+  return Promise.allSettled([loadTabData(), refreshSidebarBadges()]);
 }
 
 function scheduleAutoRefresh() {
