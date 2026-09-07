@@ -49,12 +49,12 @@ xattr -dr com.apple.quarantine "/Applications/AKS Fleet Dashboard.app"
 
 ### Linux (amd64)
 
-> **Not available yet.** Nothing published carries a Linux build today: no
-> release has an AppImage asset, and the cask is macOS-only, so `brew install`
-> on Linux fails with "This cask requires macOS." Both arrive together at the
-> next release — the release gains an `x86_64.AppImage`, and the cask is
-> updated to serve both platforms. The rest of this section describes what
-> lands then.
+> **The Homebrew path is not live yet.** Releases carry an `x86_64.AppImage`
+> from 0.7.2 onward, so you can download and run one today — see
+> [Without Homebrew](#without-homebrew). What has not been published is the
+> updated cask: the tap still serves a macOS-only one, so `brew install` on
+> Linux fails with "This cask requires macOS." until that lands. The rest of
+> this section describes the Homebrew path once it does.
 
 Homebrew installs the AppImage into `~/Applications` and marks it executable.
 x86-64 only — there is no arm64 Linux build yet. Two things differ from macOS:
