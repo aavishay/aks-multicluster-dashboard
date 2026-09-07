@@ -115,3 +115,36 @@ jobs:
             ```
 
             Universal binary — runs natively on both Apple Silicon and Intel.
+
+  # Linux amd64, built by the same workflow pull requests run. It holds no
+  # write access and produces only an artifact; attaching that artifact to the
+  # release is the next job's business.
+  linux:
+    uses: ./.github/workflows/linux-appimage.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+
+  # Serialised behind the macOS job on purpose: both attach to one release, and
+  # two concurrent "create release" calls race. By this point the macOS job has
+  # created it, so this only uploads.
+  #
+  # Split out from the build so that write access lives here, in a job that runs
+  # nothing but a download and an upload, rather than in the reusable workflow
+  # that also builds pull request code.
+  linux-publish:
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist-release
+
+      - uses: softprops/action-gh-release@v2
+        # No body and no generate_release_notes: the macOS job owns those, and
+        # setting them again here would overwrite what it wrote.
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist-release/*
