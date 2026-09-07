@@ -60,10 +60,16 @@ x86-64 only — there is no arm64 Linux build yet. Two things differ from macOS:
 - **Ctrl replaces Cmd.** Every shortcut that is `⌘` on macOS is `Ctrl` on
   Linux. Press `?` in the app for the list, which labels itself per platform.
 
-The AppImage is built against the oldest glibc GitHub still offers (Ubuntu
-22.04, glibc 2.35), so it should run on anything that recent or newer. It
-needs WebKitGTK's runtime libraries, which the AppImage carries itself, and a
-normal X11 or Wayland session.
+The AppImage is built on `ubuntu-22.04`, the oldest runner image GitHub still
+offers, so it links against an older glibc than a 24.04 build would and
+should reach correspondingly more distros. It needs a normal X11 or Wayland
+session.
+
+It is packaged with `linuxdeploy`, which pulls the app's library dependencies
+into the image, so a host WebKitGTK install should not be required — but that
+has not been confirmed on real hardware, and neither has first launch. If it
+fails to start, installing your distribution's `webkit2gtk-4.1` runtime is
+the first thing to try, and please open an issue.
 
 Prefer not to use Homebrew? Grab the `.dmg` from
 [Releases](https://github.com/aavishay/aks-multicluster-dashboard/releases).
