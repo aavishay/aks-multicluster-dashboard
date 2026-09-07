@@ -35,6 +35,37 @@ import type {
 } from "./types";
 
 // ---------------------------------------------------------------------------
+// Keyboard conventions
+// ---------------------------------------------------------------------------
+
+// One build now renders in WKWebView on macOS and WebKitGTK on Linux, so it
+// has to speak both keyboard conventions: Cmd is the primary modifier on
+// macOS, Ctrl everywhere else. Read once at load — the platform underneath a
+// running window does not change. `navigator.platform` is deprecated but is
+// still what every engine reports most reliably here; the userAgent is the
+// fallback for whenever it finally goes away.
+const IS_MAC = /mac/i.test(navigator.platform || navigator.userAgent);
+
+/** True when the event carries the platform's primary shortcut modifier. */
+function hasPrimaryModifier(e: KeyboardEvent): boolean {
+  return IS_MAC ? e.metaKey : e.ctrlKey;
+}
+
+// Shortcut labels. The macOS glyph sits flush against the key (⌘A), but "Ctrl"
+// is a word and needs a separator: a "+" between alphanumerics, a space before
+// anything else, because "Ctrl +" reads better than "Ctrl++".
+function withMod(key: string): string {
+  if (IS_MAC) return `⌘${key}`;
+  return /^[A-Za-z0-9]$/.test(key) ? `Ctrl+${key}` : `Ctrl ${key}`;
+}
+
+/** Option on macOS, Alt elsewhere — the same physical key, a different name. */
+function withAlt(key: string): string {
+  if (IS_MAC) return `⌥${key}`;
+  return /^[A-Za-z0-9]$/.test(key) ? `Alt+${key}` : `Alt ${key}`;
+}
+
+// ---------------------------------------------------------------------------
 // Theme
 // ---------------------------------------------------------------------------
 
@@ -4481,7 +4512,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
       ["Enter", "Open the focused row's details"],
       ["Space", "Select or deselect the focused row"],
       ["⇧↑ ⇧↓", "Extend the selection"],
-      ["⌘A", "Select every matching row"],
+      [withMod("A"), "Select every matching row"],
       ["PgUp PgDn", "Move a page at a time"],
       ["Home End", "First or last row"],
     ],
@@ -4489,18 +4520,18 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
   {
     title: "Sorting",
     items: [
-      ["⌥← ⌥→", "Sort by the previous or next column"],
-      ["⌥↑ ⌥↓", "Sort ascending or descending"],
+      [`${withAlt("←")} ${withAlt("→")}`, "Sort by the previous or next column"],
+      [`${withAlt("↑")} ${withAlt("↓")}`, "Sort ascending or descending"],
     ],
   },
   {
     title: "Getting around",
     items: [
       ["← →", "Previous or next tab"],
-      ["⌘← ⌘→", "Back and forward through views"],
-      ["⌘B", "Show or hide the cluster list"],
-      ["⌘K", "Switch cluster"],
-      ["⌘R", "Refresh now"],
+      [`${withMod("←")} ${withMod("→")}`, "Back and forward through views"],
+      [withMod("B"), "Show or hide the cluster list"],
+      [withMod("K"), "Switch cluster"],
+      [withMod("R"), "Refresh now"],
     ],
   },
   {
@@ -4513,11 +4544,11 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
   {
     title: "Everywhere",
     items: [
-      ["⌘F", "Search — the panel's box, or this table's filter"],
+      [withMod("F"), "Search — the panel's box, or this table's filter"],
       ["?", "This list"],
       ["Esc", "Close what's open, or clear the tab's filters"],
-      ["⌘+ ⌘−", "Zoom in or out"],
-      ["⌘0", "Reset the zoom"],
+      [`${withMod("+")} ${withMod("−")}`, "Zoom in or out"],
+      [withMod("0"), "Reset the zoom"],
     ],
   },
 ];
@@ -4640,7 +4671,7 @@ function uiScaleButton(): string {
     <button
       onclick="window.__app.resetUiScale()"
       ${atDefault ? "disabled" : ""}
-      title="${atDefault ? "Zoom: 100% (⌘+ / ⌘− to change)" : `Zoom: ${state.uiScale}% — click to reset to ${DEFAULT_UI_SCALE}% (⌘+ / ⌘− to step)`}"
+      title="${atDefault ? `Zoom: 100% (${withMod("+")} / ${withMod("−")} to change)` : `Zoom: ${state.uiScale}% — click to reset to ${DEFAULT_UI_SCALE}% (${withMod("+")} / ${withMod("−")} to step)`}"
       class="flex min-w-[3.25rem] items-center justify-center rounded-md border border-gridline bg-surface-2 px-2 py-1.5 text-xs font-semibold leading-none tabular ${
         atDefault ? "text-ink-muted" : "text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
       }"
@@ -9461,7 +9492,7 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Enter" ? activateFocusedRow() : toggleFocusedRowSelection()) e.preventDefault();
     return;
   }
-  if (!e.metaKey) return;
+  if (!hasPrimaryModifier(e)) return;
 
   // Cmd+B shows or hides the cluster list, the same as the ‹ button — the
   // binding every editor and chat app uses for its sidebar, so it is the first
