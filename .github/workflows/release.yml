@@ -115,3 +115,14 @@ jobs:
             ```
 
             Universal binary — runs natively on both Apple Silicon and Intel.
+
+  # Linux amd64. Serialised behind macOS on purpose: both publish to one
+  # release, and two concurrent "create release" calls race — this one only
+  # uploads to the release the macOS job has already made.
+  linux:
+    needs: macos
+    permissions:
+      contents: write
+    uses: ./.github/workflows/linux-appimage.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
