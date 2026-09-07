@@ -1,0 +1,133 @@
+name: Linux AppImage
+
+# One definition, two callers: pull requests build it as a portability check,
+# and the release workflow calls it with a tag to publish the asset. Keeping it
+# in one place means the release cannot drift from what PRs actually test.
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to publish the AppImage to. Omitted for a build-only check."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04 # oldest available glibc, so the AppImage runs on more distros
+    permissions:
+      contents: write # only used by the publish step, which a PR build skips
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # WebKitGTK is the webview Tauri renders into on Linux, the way WKWebView
+      # is on macOS. The rest is what packaging an AppImage needs: patchelf to
+      # rewrite the bundled libraries' rpaths, librsvg for the icon.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            build-essential \
+            file
+
+      - run: npm ci
+
+      # Worth running here and not only on macOS: this is the only thing that
+      # proves the Rust compiles for Linux at all, keyring backend included.
+      - name: Test
+        run: |
+          npx tsc --noEmit
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build the AppImage
+        # Only the AppImage: it is what the Homebrew cask installs. The config's
+        # "targets": "all" would also produce .deb and .rpm, which nothing here
+        # consumes yet.
+        run: npm run tauri build -- --bundles appimage
+
+      - name: Name the artifact and checksum it
+        id: collect
+        run: |
+          set -euo pipefail
+          # On a build-only run there is no tag, so fall back to the version in
+          # the manifest purely to give the file a sensible name.
+          TAG="${{ inputs.tag }}"
+          if [ -n "$TAG" ]; then
+            VERSION="${TAG#v}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          mkdir -p dist-release
+
+          # Tauri names it from productName and version; normalise to the same
+          # scheme as the macOS assets so the cask URL is predictable.
+          BUILT=$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)
+          [ -n "$BUILT" ] || { echo "::error::no AppImage was produced"; exit 1; }
+          ASSET="AKS-Fleet-Dashboard-${VERSION}-x86_64.AppImage"
+          cp "$BUILT" "dist-release/$ASSET"
+
+          cd dist-release
+          # A separate file from the macOS SHA256SUMS.txt: uploading the same
+          # name from two jobs would have the second overwrite the first.
+          shasum -a 256 "$ASSET" | tee SHA256SUMS-linux.txt
+          {
+            echo "### Linux amd64 checksum for the Homebrew cask"
+            echo '```'
+            cat SHA256SUMS-linux.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the AppImage is a runnable x86-64 executable
+        run: |
+          set -euo pipefail
+          APP=$(find dist-release -name '*.AppImage' -print -quit)
+          chmod +x "$APP"
+          DESC=$(file -b "$APP")
+          echo "file: $DESC"
+          # Fail loudly rather than shipping something that is not an amd64 ELF.
+          case "$DESC" in
+            *ELF*64-bit*x86-64*) ;;
+            *) echo "::error::not an x86-64 ELF: $DESC"; exit 1 ;;
+          esac
+          # --appimage-offset only succeeds on a well-formed AppImage and needs
+          # no display, so it is safe on a headless runner. It is not proof the
+          # app runs; it is proof the bundle is not malformed.
+          "$APP" --appimage-offset >/dev/null
+
+      # Always kept, so a PR build is downloadable for manual checks.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist-release/*
+          if-no-files-found: error
+
+      - name: Publish to the release
+        if: inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        # No body and no generate_release_notes: the macOS job owns those, and
+        # setting them again here would overwrite what it wrote.
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist-release/*

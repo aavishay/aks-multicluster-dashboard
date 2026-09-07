@@ -32,6 +32,11 @@ To upgrade an existing install to the latest release:
 brew upgrade --cask aks-fleet-dashboard
 ```
 
+The same two commands work on macOS and on Linux amd64; the cask picks the
+right artifact for the platform it is running on.
+
+### macOS
+
 Universal build — native on both Apple Silicon and Intel Macs.
 
 The app is ad-hoc signed rather than signed with an Apple Developer ID, so
@@ -41,6 +46,24 @@ cannot be verified"). Clear the flag once after installing:
 ```bash
 xattr -dr com.apple.quarantine "/Applications/AKS Fleet Dashboard.app"
 ```
+
+### Linux (amd64)
+
+Homebrew installs an AppImage into `~/Applications` and marks it executable.
+x86-64 only — there is no arm64 Linux build yet. Two things differ from macOS:
+
+- **API keys need a Secret Service.** Keys for the AI providers go to the
+  system credential store, which on Linux means a running D-Bus secret
+  service — `gnome-keyring` or `kwallet` on a normal desktop session. Without
+  one, saving a key fails; everything else works, and the provider env vars
+  (`ANTHROPIC_API_KEY` and friends) are honoured either way.
+- **Ctrl replaces Cmd.** Every shortcut that is `⌘` on macOS is `Ctrl` on
+  Linux. Press `?` in the app for the list, which labels itself per platform.
+
+The AppImage is built against the oldest glibc GitHub still offers (Ubuntu
+22.04, glibc 2.35), so it should run on anything that recent or newer. It
+needs WebKitGTK's runtime libraries, which the AppImage carries itself, and a
+normal X11 or Wayland session.
 
 Prefer not to use Homebrew? Grab the `.dmg` from
 [Releases](https://github.com/aavishay/aks-multicluster-dashboard/releases).
