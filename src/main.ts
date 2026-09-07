@@ -1962,15 +1962,29 @@ function moveClusterPaletteHighlight(delta: number) {
   render();
 }
 
-/** Mouse hover takes over the highlight rather than drawing its own separate hover state, so there's only ever one highlighted row, whether it got there by keyboard or mouse. */
+/**
+ * Mouse hover takes over the highlight rather than drawing its own separate
+ * hover state, so there's only ever one highlighted row, whether it got there
+ * by keyboard or mouse.
+ *
+ * Driven by `mousemove` on each row and deliberately not `mouseenter`. Every
+ * arrow key runs `render()`, which replaces the whole app's innerHTML — so the
+ * row under a resting pointer is destroyed and rebuilt on each keypress, and
+ * the replacement node arriving beneath the cursor earns a fresh `mouseenter`
+ * even though the mouse never moved. That fired this function with the hovered
+ * row's index and snapped the highlight straight back, which made the arrow
+ * keys look broken for as long as the pointer happened to rest over the list.
+ * `mousemove` needs the pointer to actually move, so a rebuild underneath a
+ * still mouse produces nothing.
+ */
 function setClusterPaletteHighlight(index: number) {
   const palette = state.clusterPalette;
   if (!palette || palette.highlightedIndex === index) return;
   palette.highlightedIndex = index;
-  // render() rebuilds the whole app's innerHTML, not just the palette; a
-  // fast mouse sweep can fire mouseenter once per row in a handful of
-  // milliseconds, so batch those into at most one render per frame instead
-  // of one full-app rebuild per row crossed. highlightedIndex itself is
+  // render() rebuilds the whole app's innerHTML, not just the palette, and
+  // `mousemove` fires continuously while the pointer travels — many times per
+  // row crossed, not once. Batch those into at most one render per frame
+  // rather than one full-app rebuild per event. highlightedIndex itself is
   // still updated synchronously above, so click/Enter always act on the
   // current row even before the next paint.
   if (clusterPaletteHoverRenderScheduled) return;
@@ -4610,7 +4624,7 @@ function renderClusterPalette(): string {
         <div
           ${highlighted ? "data-cluster-palette-current" : ""}
           onclick="window.__app.toggleCluster(${jsArg(c.context_name)})"
-          onmouseenter="window.__app.setClusterPaletteHighlight(${i})"
+          onmousemove="window.__app.setClusterPaletteHighlight(${i})"
           class="flex cursor-pointer items-center gap-2.5 rounded-md px-3 py-2 text-left ${highlighted ? "bg-surface-3" : ""}"
         >
           <input type="checkbox" class="pointer-events-none shrink-0 accent-series-blue" ${checked ? "checked" : ""} />
