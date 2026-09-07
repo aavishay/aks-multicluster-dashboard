@@ -9,16 +9,21 @@ on:
   workflow_call:
     inputs:
       tag:
-        description: "Release tag to publish the AppImage to. Omitted for a build-only check."
+        description: "Release tag, used only to name the asset. Omitted for a build-only check."
         required: false
         type: string
         default: ""
 
+# Read-only, on every trigger. This workflow only ever produces an artifact —
+# uploading it to a release is release.yml's job, and that is the only place
+# holding write access. So a pull_request run here, which is the one that can
+# execute a contributor's code, cannot write to the repository at all.
+permissions:
+  contents: read
+
 jobs:
   appimage:
     runs-on: ubuntu-22.04 # oldest available glibc, so the AppImage runs on more distros
-    permissions:
-      contents: write # only used by the publish step, which a PR build skips
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,18 +121,10 @@ jobs:
           # app runs; it is proof the bundle is not malformed.
           "$APP" --appimage-offset >/dev/null
 
-      # Always kept, so a PR build is downloadable for manual checks.
+      # The only output. A PR build leaves it here for manual inspection; a
+      # release run has release.yml pick it up and attach it to the release.
       - uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
           path: dist-release/*
           if-no-files-found: error
-
-      - name: Publish to the release
-        if: inputs.tag != ''
-        uses: softprops/action-gh-release@v2
-        # No body and no generate_release_notes: the macOS job owns those, and
-        # setting them again here would overwrite what it wrote.
-        with:
-          tag_name: ${{ inputs.tag }}
-          files: dist-release/*

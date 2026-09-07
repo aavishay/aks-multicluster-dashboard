@@ -32,8 +32,8 @@ To upgrade an existing install to the latest release:
 brew upgrade --cask aks-fleet-dashboard
 ```
 
-The same two commands work on macOS and on Linux amd64; the cask picks the
-right artifact for the platform it is running on.
+On macOS these install a universal `.app`. Linux amd64 is built but not yet
+published — see [Linux (amd64)](#linux-amd64) below.
 
 ### macOS
 
@@ -49,7 +49,14 @@ xattr -dr com.apple.quarantine "/Applications/AKS Fleet Dashboard.app"
 
 ### Linux (amd64)
 
-Homebrew installs an AppImage into `~/Applications` and marks it executable.
+> **Not available yet.** Nothing published carries a Linux build today: no
+> release has an AppImage asset, and the cask is macOS-only, so `brew install`
+> on Linux fails with "This cask requires macOS." Both arrive together at the
+> next release — the release gains an `x86_64.AppImage`, and the cask is
+> updated to serve both platforms. The rest of this section describes what
+> lands then.
+
+Homebrew installs the AppImage into `~/Applications` and marks it executable.
 x86-64 only — there is no arm64 Linux build yet. Two things differ from macOS:
 
 - **API keys need a Secret Service.** Keys for the AI providers go to the
@@ -71,15 +78,21 @@ has not been confirmed on real hardware, and neither has first launch. If it
 fails to start, installing your distribution's `webkit2gtk-4.1` runtime is
 the first thing to try, and please open an issue.
 
-Prefer not to use Homebrew? Grab the `.dmg` from
+### Without Homebrew
+
+Releases carry the artifacts directly:
 [Releases](https://github.com/aavishay/aks-multicluster-dashboard/releases).
+Take the `.dmg`, or the `.app.zip` if you would rather not mount a disk image.
+From the next release onward there is also an `x86_64.AppImage` for Linux —
+`chmod +x` it and run it.
 
 ### Optional: Claude features
 
 Explaining cryptic Helm/ArgoCD errors uses the Anthropic API. Click the ✦
 button in the top bar and paste an API key (from
 [console.anthropic.com](https://console.anthropic.com) → API keys). It's stored
-in your macOS Keychain, never in the app or in a file it owns.
+in your operating system's credential store — Keychain on macOS, the D-Bus
+secret service on Linux — never in the app or in a file it owns.
 
 An exported `ANTHROPIC_API_KEY` takes precedence if you'd rather not store one.
 
