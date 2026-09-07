@@ -218,6 +218,76 @@ fn parse_memory_ki(q: &str) -> i64 {
     (q.parse::<f64>().unwrap_or(0.0) / 1024.0) as i64
 }
 
+/// Splits a total pod count and a not-Running count into the
+/// `(running, not_ready)` pair the overview reports.
+///
+/// Pulled out of `get_overview` so the clamp has somewhere to be tested. The
+/// two inputs are separate concurrent round trips to a live cluster, so they
+/// can legitimately disagree — pods come and go between them — and a
+/// not-Running count above the total would otherwise underflow `running` into
+/// a nonsense figure.
+fn split_pod_counts(total: usize, not_running: usize) -> (usize, usize) {
+    let not_ready = not_running.min(total);
+    (total - not_ready, not_ready)
+}
+
+/// Page size for the rare fallback path in `count_matching` — big enough that
+/// counting a large collection takes few round trips, since each one costs a
+/// full VPN round trip.
+const COUNT_PAGE_SIZE: u32 = 500;
+
+/// Number of objects matching `lp`, counted without downloading the objects.
+///
+/// The overview reduces whole collections to single integers, but was fetching
+/// them in full to do it. Measured against this app's own dev cluster that is
+/// 22 MB of Pods (1,181 objects) and 6 MB of Events (5,235 objects) — ~30 MB
+/// per cluster, on every auto-refresh tick, over a VPN, to produce four
+/// numbers. Against a private-link cluster that alone can saturate the tunnel
+/// and starve every other request sharing it, `kubectl` included.
+///
+/// Two things make the count cheap:
+///
+/// * `limit=1` makes the apiserver report `metadata.remainingItemCount`, so an
+///   *unfiltered* count is one small round trip. This is only filled in for an
+///   unfiltered list — with a field selector the server returns a continue
+///   token and no remainder, because selectors are applied after the etcd
+///   range read and it genuinely cannot know the count without scanning. So a
+///   field-selected count has to walk pages; callers should select for the
+///   *small* side of a split and subtract (see `get_overview`).
+/// * The request asks for `PartialObjectMetadata`, so even the pages that do
+///   get walked carry only object metadata rather than full specs and statuses
+///   — for a Pod, the difference between a name and a whole podspec.
+///
+/// A missing `remainingItemCount` is handled rather than assumed: with no
+/// continue token the response wasn't truncated and `items` is already
+/// everything. Only a truncated response without a reported remainder walks
+/// pages, and that never holds more than one page at a time.
+async fn count_matching<K>(api: &Api<K>, lp: &ListParams) -> Result<usize, kube::Error>
+where
+    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned + kube::Resource,
+    K::DynamicType: Default,
+{
+    let first = api.list_metadata(&lp.clone().limit(1)).await?;
+    if let Some(remaining) = first.metadata.remaining_item_count {
+        return Ok(first.items.len() + remaining.max(0) as usize);
+    }
+    let Some(mut token) = first.metadata.continue_.clone().filter(|t| !t.is_empty()) else {
+        return Ok(first.items.len());
+    };
+
+    let mut total = first.items.len();
+    loop {
+        let page = api
+            .list_metadata(&lp.clone().limit(COUNT_PAGE_SIZE).continue_token(&token))
+            .await?;
+        total += page.items.len();
+        match page.metadata.continue_.clone().filter(|t| !t.is_empty()) {
+            Some(next) => token = next,
+            None => return Ok(total),
+        }
+    }
+}
+
 pub async fn get_overview(context_name: &str) -> Result<ClusterOverview, String> {
     let client = match client_for_context(context_name).await {
         Ok(c) => c,
@@ -236,18 +306,33 @@ pub async fn get_overview(context_name: &str) -> Result<ClusterOverview, String>
     let ns_api: Api<Namespace> = Api::all(client.clone());
     let events_api: Api<Event> = Api::all(client.clone());
 
-    // These five reads are independent of each other, so they're issued
+    // Only the Node list is fetched in full: readiness comes from
+    // `status.conditions`, which no field selector can filter on. Everything
+    // else this overview needs is a count, so it's counted server-side by
+    // `count_matching` rather than downloaded — see that helper for the sizes
+    // involved, which are the difference between a few hundred bytes and tens
+    // of megabytes per cluster per refresh tick.
+    //
+    // These reads are independent of each other, so they're issued
     // concurrently rather than one after another — over a loaded VPN/private-
     // link path each round trip alone can take several seconds to tens of
-    // seconds, and five back-to-back easily exceed the per-command deadline
-    // even though the cluster is still responding, just slowly.
-    let lp = ListParams::default();
-    let (version, nodes_result, namespaces_result, pods_result, events_result) = tokio::join!(
+    // seconds, and issuing them back-to-back easily exceeds the per-command
+    // deadline even though the cluster is still responding, just slowly.
+    let all = ListParams::default();
+    // Selected as the complement — not-Running rather than Running — because a
+    // field-selected count has to walk pages (see `count_matching`), so it
+    // should walk the short side. On this app's own dev cluster that is 35
+    // pods against 1,146 Running, and a cluster where the ratio inverts has
+    // worse problems than a slow overview.
+    let not_running_pods = ListParams::default().fields("status.phase!=Running");
+    let warning_events = ListParams::default().fields("type=Warning");
+    let (version, nodes_result, namespaces_result, pods_result, not_running_result, events_result) = tokio::join!(
         client.apiserver_version(),
-        nodes_api.list(&lp),
-        ns_api.list(&lp),
-        pods_api.list(&lp),
-        events_api.list(&lp),
+        nodes_api.list(&all),
+        count_matching(&ns_api, &all),
+        count_matching(&pods_api, &all),
+        count_matching(&pods_api, &not_running_pods),
+        count_matching(&events_api, &warning_events),
     );
 
     let nodes = match nodes_result {
@@ -263,18 +348,15 @@ pub async fn get_overview(context_name: &str) -> Result<ClusterOverview, String>
     };
     let nodes_ready = nodes.iter().filter(|n| node_is_ready(n)).count();
 
-    let namespaces = namespaces_result.map(|l| l.items.len()).unwrap_or(0);
+    // Best-effort, exactly as the full-list version treated these: a count
+    // that fails shows as zero rather than failing the whole overview, which
+    // still has a usable node picture to show.
+    let namespaces = namespaces_result.unwrap_or(0);
 
-    let pods = pods_result.map(|l| l.items).unwrap_or_default();
-    let pods_running = pods
-        .iter()
-        .filter(|p| p.status.as_ref().and_then(|s| s.phase.clone()).as_deref() == Some("Running"))
-        .count();
-    let pods_not_ready = pods.len().saturating_sub(pods_running);
+    let pod_count = pods_result.unwrap_or(0);
+    let (pods_running, pods_not_ready) = split_pod_counts(pod_count, not_running_result.unwrap_or(0));
 
-    let warning_event_count = events_result
-        .map(|l| l.items.iter().filter(|e| e.type_.as_deref() == Some("Warning")).count())
-        .unwrap_or(0);
+    let warning_event_count = events_result.unwrap_or(0);
 
     Ok(ClusterOverview {
         context_name: context_name.to_string(),
@@ -284,7 +366,7 @@ pub async fn get_overview(context_name: &str) -> Result<ClusterOverview, String>
         node_count: nodes.len(),
         nodes_ready,
         namespace_count: namespaces,
-        pod_count: pods.len(),
+        pod_count,
         pods_running,
         pods_not_ready,
         warning_event_count,
@@ -1823,6 +1905,33 @@ pub async fn get_gitops_events(context_name: &str, namespace: &str, name: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pod_counts_split_into_running_and_not_ready() {
+        // The real figures from this app's own dev cluster, where the
+        // unfiltered total and the not-Running field selector agreed exactly:
+        // 35 + 1,146 == 1,181.
+        assert_eq!(split_pod_counts(1181, 35), (1146, 35));
+    }
+
+    #[test]
+    fn pod_counts_clamp_when_concurrent_reads_disagree() {
+        // The total and the not-Running count are separate round trips to a
+        // live cluster, so a burst of deletions between them can leave the
+        // complement larger than the total. That has to clamp rather than
+        // underflow `running` into a huge bogus number.
+        assert_eq!(split_pod_counts(10, 12), (0, 10));
+    }
+
+    #[test]
+    fn pod_counts_handle_a_cluster_with_no_pods() {
+        assert_eq!(split_pod_counts(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn pod_counts_treat_every_pod_running_as_none_not_ready() {
+        assert_eq!(split_pod_counts(7, 0), (7, 0));
+    }
 
     /// Builds a `DynamicObject` from the JSON shape the API server actually
     /// returns, so the parsers are exercised against real CRD layout rather
