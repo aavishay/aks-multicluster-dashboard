@@ -4686,6 +4686,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     title: "Getting around",
     items: [
       ["← →", "Previous or next tab"],
+      ["↑ ↓ PgUp PgDn Home End", "Scroll a tab with no table, like Metrics or Cost"],
       [`${withMod("←")} ${withMod("→")}`, "Back and forward through views"],
       [withMod("B"), "Show or hide the cluster list"],
       [withMod("K"), "Switch cluster"],
@@ -9152,6 +9153,37 @@ function detailPanelScroller(): HTMLElement | null {
   return pane ?? (isScrollable(body) ? body : null);
 }
 
+/**
+ * The tab content's own scroll container.
+ *
+ * Same problem `detailPanelScroller` solves, one level out: the region that
+ * overflows is a `<div data-scroll-id="main">`, not the document, so the
+ * browser's arrow scrolling never reaches it — it scrolls the focused
+ * element's nearest scrollable ancestor, and with focus on `<body>` that is
+ * the document, which does not scroll here.
+ *
+ * Which is why "just don't preventDefault and let the browser scroll" does
+ * not work on a tab with no table: there was nothing to fall through to.
+ *
+ * Returns null when the content fits, so the caller leaves the key alone.
+ */
+function mainContentScroller(): HTMLElement | null {
+  const main = document.querySelector<HTMLElement>('[data-scroll-id="main"]');
+  return main && isScrollable(main) ? main : null;
+}
+
+/** Scrolls the tab content by a line, a near-full page, or to either edge. */
+function scrollMainContent(mode: "line" | "page" | "edge", direction: 1 | -1): boolean {
+  const el = mainContentScroller();
+  if (!el) return false;
+  if (mode === "edge") {
+    el.scrollTop = direction > 0 ? el.scrollHeight : 0;
+  } else {
+    el.scrollTop += direction * (mode === "page" ? el.clientHeight * 0.9 : DETAIL_SCROLL_LINE_PX);
+  }
+  return true;
+}
+
 /** Scrolls the open detail panel by a line, a near-full page, or to either edge. */
 function scrollDetailPanel(mode: "line" | "page" | "edge", direction: 1 | -1): boolean {
   const el = detailPanelScroller();
@@ -9616,9 +9648,10 @@ document.addEventListener("keydown", (e) => {
       if (scrollDetailPanel("line", delta)) e.preventDefault();
       return;
     }
-    // Conditional, unlike the horizontal case: a tab with no table (Metrics,
-    // Cost) must keep Up/Down as ordinary scrolling.
-    if (moveTableRowFocus(delta)) e.preventDefault();
+    // A tab with no table — Metrics, Cost — scrolls instead. Done explicitly
+    // rather than by letting the key fall through: see `mainContentScroller`
+    // for why the browser will not scroll this region on its own.
+    if (moveTableRowFocus(delta) || scrollMainContent("line", delta)) e.preventDefault();
     return;
   }
   // Shift+Up/Down carry the selection along with the cursor.
@@ -9637,7 +9670,7 @@ document.addEventListener("keydown", (e) => {
       if (scrollDetailPanel("edge", toEnd ? 1 : -1)) e.preventDefault();
       return;
     }
-    if (jumpRowFocus(toEnd)) e.preventDefault();
+    if (jumpRowFocus(toEnd) || scrollMainContent("edge", toEnd ? 1 : -1)) e.preventDefault();
     return;
   }
   // PageUp/PageDown step the table's pagination where there is any, else
@@ -9649,7 +9682,7 @@ document.addEventListener("keydown", (e) => {
       if (scrollDetailPanel("page", delta)) e.preventDefault();
       return;
     }
-    if (pageTableRows(delta)) e.preventDefault();
+    if (pageTableRows(delta) || scrollMainContent("page", delta)) e.preventDefault();
     return;
   }
   // Enter opens the cursor's row; Space selects it. Guarded one step wider
