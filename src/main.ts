@@ -2701,8 +2701,8 @@ let pendingConfirmAction: ((value: number) => Promise<string>) | null = null;
 /** Bumped on every open and close, so a request still in flight can tell whether the dialog it belongs to is still the one on screen. Same guard the detail panels use for their fetches. */
 let confirmToken = 0;
 
-async function toggleWriteMode() {
-  const next = !state.writeEnabled;
+/** Moves write mode to an explicit state. Shared by the toggle and by Escape. */
+async function setWriteMode(next: boolean) {
   try {
     // Trust the backend's answer rather than `next`: this flag decides what
     // the UI offers, and it should never claim a permission the guard doesn't
@@ -2720,6 +2720,21 @@ async function toggleWriteMode() {
     showCopyToast(`Could not change mode: ${String(e)}`);
   }
   render();
+}
+
+async function toggleWriteMode() {
+  await setWriteMode(!state.writeEnabled);
+}
+
+/**
+ * Escape's disarm. Guarded on already being read-only, which is not just an
+ * optimisation: Escape is pressed constantly for ordinary navigation, and
+ * without this every one of those presses would spend an IPC round trip, a
+ * toast and a render saying nothing changed.
+ */
+function returnToReadOnly() {
+  if (!state.writeEnabled) return;
+  void setWriteMode(false);
 }
 
 function askConfirm(
@@ -4689,7 +4704,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       [withMod("F"), "Search — the panel's box, or this table's filter"],
       ["?", "This list"],
-      ["Esc", "Close what's open, or clear the tab's filters"],
+      ["Esc", "Close what's open, clear filters, and return to read-only"],
       [`${withMod("+")} ${withMod("−")}`, "Zoom in or out"],
       [withMod("0"), "Reset the zoom"],
     ],
@@ -9522,6 +9537,20 @@ document.addEventListener("keydown", (e) => {
     else if (state.metricsBackendEditor) closeMetricsBackendEditor();
     else if (state.openEnumFilter !== null) closeEnumDropdown();
     else if (!closeOpenDetailPanel() && hasActiveFilters(state.activeTab)) clearFilters(state.activeTab);
+
+    // And disarm write mode, whatever else Escape just did.
+    //
+    // Deliberately unconditional rather than only when nothing else closed:
+    // Escape then means one thing everywhere — back out to a state that cannot
+    // change the cluster — instead of depending on what happened to be open.
+    // The cost is that stringing several write operations together means
+    // re-arming between them, which is the right way round for a key whose job
+    // is to bail out.
+    //
+    // An open shell never reaches here: the handler returns early for it, so
+    // Escape goes to the container. That matters twice over, because dropping
+    // write mode closes the shell.
+    returnToReadOnly();
     return;
   }
   // Option+arrows sort: Left/Right choose the column, Up/Down the direction.
