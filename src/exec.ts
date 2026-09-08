@@ -82,6 +82,99 @@ export function execTarget(): ExecTarget | null {
 }
 
 /**
+ * The classes the YAML viewer renders its text with (`YAML_EDITOR_TEXT_CLASS`
+ * in main.ts, minus its padding). Kept as a list so the metrics below are read
+ * from the same declarations the viewer resolves, not a second copy of them.
+ */
+const YAML_TEXT_CLASSES = "font-mono text-xs leading-relaxed";
+
+/**
+ * Font metrics measured from a throwaway element wearing the YAML viewer's
+ * classes, rather than numbers written out here.
+ *
+ * Two reasons not to hardcode. Tailwind supplies the mono stack and `text-xs`
+ * from its own theme, so duplicating either would drift the moment the theme
+ * changed. And more importantly `text-xs` is rem-based, while the app's zoom is
+ * an inline `font-size` percentage on `:root` — so the viewer's text follows the
+ * zoom and a fixed pixel size would not. At 125% the viewer sat at 15px while
+ * this terminal stayed at 12.
+ */
+function yamlFontMetrics(): { fontFamily: string; fontSize: number; lineHeight: number; lineHeightPx: number } {
+  const probe = document.createElement("div");
+  probe.className = YAML_TEXT_CLASSES;
+  probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none";
+  probe.textContent = "0";
+  document.body.append(probe);
+  const style = getComputedStyle(probe);
+  const fontFamily = style.fontFamily;
+  const fontSize = Number.parseFloat(style.fontSize) || 12;
+  const lineHeightPx = Number.parseFloat(style.lineHeight);
+  probe.remove();
+  const usableLineHeight = Number.isFinite(lineHeightPx) && lineHeightPx > 0 ? lineHeightPx : 0;
+  return {
+    fontFamily,
+    fontSize,
+    // A starting multiplier only. xterm's `lineHeight` scales its own measured
+    // glyph height rather than the font size, and that glyph height is
+    // font-specific, so this ratio does not land on `lineHeightPx` — it is
+    // corrected by measurement in `matchRowPitch` once a row exists.
+    lineHeight: usableLineHeight && fontSize > 0 ? usableLineHeight / fontSize : 1.0,
+    lineHeightPx: usableLineHeight,
+  };
+}
+
+/**
+ * Nudges the row pitch onto the YAML viewer's line height.
+ *
+ * Needed because xterm's `lineHeight` is a multiple of the glyph height it
+ * measures for the chosen font, not of the font size — at 12px this font
+ * measures ~13.5px, so the viewer's 1.625 ratio produced 22px rows against the
+ * viewer's 19.5px. Rather than hardcode a per-font fudge factor, read what one
+ * row actually came out as and scale the multiplier by the error.
+ *
+ * Clamped because a bad measurement (a hidden or zero-height mount) would
+ * otherwise drive the multiplier to something unreadable, and exact equality is
+ * not always reachable anyway — xterm rounds cell height up to whole pixels.
+ */
+function matchRowPitch(term: Terminal, mount: HTMLElement, targetPx: number): void {
+  if (!targetPx) return;
+  const row = mount.querySelector<HTMLElement>(".xterm-rows > div");
+  const actual = row?.getBoundingClientRect().height ?? 0;
+  const current = typeof term.options.lineHeight === "number" ? term.options.lineHeight : 1;
+  if (!actual || !current) return;
+  const corrected = current * (targetPx / actual);
+  if (!Number.isFinite(corrected) || corrected < 0.5 || corrected > 3) return;
+  term.options.lineHeight = corrected;
+}
+
+/**
+ * Re-applies those metrics to an open shell, for when the zoom changes under it.
+ *
+ * Unreachable as things stand, and deliberately kept anyway: the overlay is
+ * modal, so ⌘+/⌘−/⌘0 are swallowed by the keyboard gate and the zoom button
+ * sits behind it — verified, not assumed. The metrics read in `openExec` are
+ * therefore what actually keeps the two panes aligned today. This exists so the
+ * invariant survives the overlay ceasing to be modal, which is the change that
+ * would otherwise leave the terminal as the one pane ignoring the zoom.
+ *
+ * Changing the font size changes the cell size, so the grid is remeasured and
+ * the remote PTY told its new dimensions, or full-screen programs would draw to
+ * the old one.
+ */
+export function syncExecFontMetrics(): void {
+  if (!session) return;
+  const { fontFamily, fontSize, lineHeight } = yamlFontMetrics();
+  session.term.options.fontFamily = fontFamily;
+  session.term.options.fontSize = fontSize;
+  session.term.options.lineHeight = lineHeight;
+  matchRowPitch(session.term, session.root, yamlFontMetrics().lineHeightPx);
+  session.fit.fit();
+  if (session.sessionId !== null && !session.ended) {
+    void api.resizePodExec(session.sessionId, session.term.cols, session.term.rows).catch(() => {});
+  }
+}
+
+/**
  * Colours pulled from the app's own CSS variables rather than hardcoded, so
  * the terminal follows the light/dark theme like everything else. Read at open
  * time: a theme switch while a shell is open is rare enough not to warrant
@@ -196,11 +289,13 @@ export async function openExec(target: ExecTarget, onStateChange: () => void): P
   document.body.append(root);
 
   const colors = themeColors();
+  const metrics = yamlFontMetrics();
   const term = new Terminal({
     convertEol: false,
     cursorBlink: true,
-    fontSize: 12,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", monospace',
+    fontFamily: metrics.fontFamily,
+    fontSize: metrics.fontSize,
+    lineHeight: metrics.lineHeight,
     theme: colors,
     // The remote PTY owns wrapping and scrollback trimming; this only bounds
     // how much the webview keeps in memory for scrolling back.
@@ -209,6 +304,9 @@ export async function openExec(target: ExecTarget, onStateChange: () => void): P
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(mount);
+  // Pitch is corrected before the first fit, so the grid is measured at the
+  // size it will actually render at rather than being refitted a frame later.
+  matchRowPitch(term, mount, metrics.lineHeightPx);
   fit.fit();
   term.focus();
 
