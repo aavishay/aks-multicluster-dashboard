@@ -182,7 +182,7 @@ counts. Pods is a live pod table with restarts and per-pod CPU/memory. Resource
 Usage rolls the fleet's CPU/memory usage-vs-allocatable into two bars.
 Events surfaces recent cluster events, defaulting to warnings only. The
 sidebar auto-refreshes cluster health badges, and there's a refresh interval
-selector (15s/30s/60s/5m/off) for the active tab.
+selector (15s/30s/60s/5m/off) for the active tab, defaulting to 15s.
 
 ## What's intentionally not built yet
 

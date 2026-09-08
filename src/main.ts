@@ -753,7 +753,11 @@ const state: AppState = {
   tabLoadProgress: null,
   tabLoadStartedAt: null,
   lastUpdated: null,
-  autoRefreshSeconds: 30,
+  // Not persisted, so this is what every launch starts on. Safe to keep this
+  // short only because `scheduleAutoRefresh` drops a tick that lands while the
+  // previous pass is still fetching: against a slow cluster the pass rate is
+  // bounded by how long a pass actually takes, not by this number.
+  autoRefreshSeconds: 15,
   podDetail: null,
   nodeDetail: null,
   workloadDetail: null,
@@ -1621,7 +1625,7 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       // load" is tracked by podsLoadedComplete, NOT by whether state.pods
       // already has an entry — a first load that gets interrupted after
       // page one still leaves state.pods non-empty, and on a slow/flaky
-      // cluster (one real fetch here took 82s against this app's own 30s
+      // cluster (one real fetch here took 82s against this app's own 15s
       // auto-refresh interval, so overlapping attempts are the norm, not
       // the exception) every later refresh attempt can keep failing
       // without ever re-completing. If "first load" were keyed off
@@ -1940,7 +1944,7 @@ function scheduleAutoRefresh() {
     // how long the work takes, and one pass can legitimately outlast the
     // interval by a wide margin: a command's deadline is SLOW_CLUSTER_TIMEOUT
     // (120s) and `with_retry` allows two further attempts, so one slow cluster
-    // can hold a pass open for minutes against the 30s default interval.
+    // can hold a pass open for minutes against the 15s default interval.
     //
     // Without this guard those passes overlap rather than replace each other.
     // `requestGeneration` discards a superseded pass's *results*, but every
@@ -9016,7 +9020,7 @@ function sizeTableScrollBox(app: HTMLElement): number | null {
   // Collapsing the box below its scrolled position forces scrollTop to 0 —
   // the browser clamps it, since there is briefly nothing to scroll — and
   // restoring the height does not bring it back. Left unsaved, every render
-  // (each 30s auto-refresh, and each keystroke that re-renders) snapped the
+  // (each 15s auto-refresh, and each keystroke that re-renders) snapped the
   // table back to the top, losing both the reading position and the row
   // cursor. Saved here rather than relying on render()'s scroll restore,
   // which runs earlier and so cannot undo this, and which the resize path
