@@ -1,7 +1,7 @@
 import "./styles.css";
 import { ANSI_BASE16, xterm256ToHex } from "./ansi";
 import { api } from "./api";
-import { closeExec, isExecOpen, openExec, syncExecFontMetrics } from "./exec";
+import { closeExec, isExecEnded, isExecOpen, openExec, syncExecFontMetrics } from "./exec";
 import { MONO_TEXT_CLASSES } from "./typography";
 import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
 import type {
@@ -9578,7 +9578,21 @@ document.addEventListener("keydown", (e) => {
   // Placed before every other branch rather than folded into
   // `isNonPanelOverlayOpen`: that predicate is consulted per-shortcut and some
   // shortcuts deliberately ignore it, whereas this has to be absolute.
-  if (isExecOpen()) return;
+  if (isExecOpen()) {
+    // One exception: a session whose remote process has exited has nothing left
+    // to receive keys, so Escape closes the panel as it does for every other
+    // overlay.
+    //
+    // This branch only fires when focus is outside the terminal. With focus
+    // inside it, xterm stops Escape from propagating — a real Escape keypress
+    // there never reaches this listener at all — so exec.ts carries the same
+    // rule in xterm's own key handler. Hence both places, deliberately.
+    if (e.key === "Escape" && isExecEnded()) {
+      e.preventDefault();
+      closeExec();
+    }
+    return;
+  }
 
   if (e.key === "?" && !isEditableTarget(e.target)) {
     e.preventDefault();
