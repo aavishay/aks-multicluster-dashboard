@@ -2,6 +2,7 @@ import "./styles.css";
 import { ANSI_BASE16, xterm256ToHex } from "./ansi";
 import { api } from "./api";
 import { closeExec, isExecOpen, openExec, syncExecFontMetrics } from "./exec";
+import { MONO_TEXT_CLASSES } from "./typography";
 import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
 import type {
   AiAuthState,
@@ -2980,7 +2981,7 @@ function workloadRowFor(ctx: string, kind: string, namespace: string, name: stri
  * the colours slide off the characters. So the shared half lives here rather
  * than being written out twice and drifting.
  */
-const YAML_EDITOR_TEXT_CLASS = "p-3 font-mono text-xs leading-relaxed";
+const YAML_EDITOR_TEXT_CLASS = `p-3 ${MONO_TEXT_CLASSES}`;
 
 /**
  * How the YAML pane treats a line too long for it, for whichever mode is on
@@ -3188,7 +3189,7 @@ function renderConfirmDiff(before: string, after: string): string {
         <span class="text-status-good">+${added}</span>
         <span class="text-status-critical">-${removed}</span>
       </div>
-      <div class="max-h-64 overflow-auto rounded-md border border-gridline bg-surface-2 py-2 font-mono text-xs leading-relaxed">${rows}</div>
+      <div class="max-h-64 overflow-auto rounded-md border border-gridline bg-surface-2 py-2 ${MONO_TEXT_CLASSES}">${rows}</div>
     </div>`;
 }
 
@@ -7676,7 +7677,7 @@ function renderRevisionDiff(wd: WorkloadDetailState, revisions: WorkloadRevision
           ${renderCopyButton(scrollId)}
         </div>
       </div>
-      <div data-scroll-id="${esc(scrollId)}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 py-2 font-mono text-xs leading-relaxed">${rows}</div>
+      <div data-scroll-id="${esc(scrollId)}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 py-2 ${MONO_TEXT_CLASSES}">${rows}</div>
     </div>`;
 }
 
