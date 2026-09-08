@@ -28,6 +28,14 @@ on:
         type: string
         default: ""
 
+# Nothing here reads the repository — there is no checkout, and the tap comes
+# from GitHub over https like any other user's would — so read is already more
+# than this needs. Declared anyway, and explicitly: the job bootstraps Homebrew
+# by piping a fetched script to bash, and that is precisely the step whose blast
+# radius is worth bounding.
+permissions:
+  contents: read
+
 jobs:
   install:
     runs-on: ubuntu-22.04
@@ -99,7 +107,11 @@ jobs:
           CASK=$(brew info --cask --json=v2 aks-fleet-dashboard | jq -r '.casks[0].version')
           echo "installed=$INSTALLED cask=$CASK"
           [ "$INSTALLED" = "$CASK" ] || { echo "::error::installed $INSTALLED but cask offers $CASK"; exit 1; }
-          WANT="${{ inputs.expect_version }}"
+          # `github.event.inputs` rather than `inputs`, matching release.yml.
+          # Both render here — the pull_request run resolved this to an empty
+          # string, as intended — but this form is the one the rest of the repo
+          # uses, and `inputs` is only guaranteed for dispatch and workflow_call.
+          WANT="${{ github.event.inputs.expect_version }}"
           if [ -n "$WANT" ] && [ "$INSTALLED" != "$WANT" ]; then
             echo "::error::expected $WANT, tap installed $INSTALLED — has the tap been pushed?"
             exit 1
