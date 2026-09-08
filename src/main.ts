@@ -1,4 +1,5 @@
 import "./styles.css";
+import { ANSI_BASE16, xterm256ToHex } from "./ansi";
 import { api } from "./api";
 import { closeExec, isExecOpen, openExec } from "./exec";
 import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
@@ -1953,6 +1954,19 @@ function scheduleAutoRefresh() {
     // sustains itself: more overlap saturates the tunnel, which makes each
     // fetch slower, which deepens the overlap.
     if (refreshPassesInFlight > 0) return;
+    // An open shell covers the tab completely, so this pass would fetch data
+    // nobody can see and then pay for it twice: once in the requests, and
+    // again in the full-app rebuild that render() does on the main thread —
+    // the same thread the terminal uses to process keystrokes and paint them.
+    // That stall is felt as input lag in the one view where latency is most
+    // noticeable.
+    //
+    // An individual tick is skipped rather than the timer being cancelled,
+    // matching the guard above. So the cadence itself is untouched — nothing
+    // is rescheduled — but recovery is not immediate: the first tick *after*
+    // the shell closes runs the next pass, which leaves the tab underneath up
+    // to one whole interval stale at the moment the overlay goes away.
+    if (isExecOpen()) return;
     void runRefreshPass();
   }, state.autoRefreshSeconds * 1000);
 }
@@ -2826,12 +2840,31 @@ async function runConfirm() {
  * the same reason `kubectl exec` has none — guessing a different program than
  * the one asked for is worse than a clear error.
  *
+ * TERM is exported first because the exec API carries no environment and a
+ * container's own env almost never sets one — verified against a real pod,
+ * where a TTY exec sees `TERM=`. With it empty, every colour-aware program
+ * disables colour, which is why the shell arrived monochrome no matter what
+ * palette the terminal itself was given. COLORTERM alongside it is what the
+ * newer generation of CLIs checks for truecolor.
+ *
+ * `exec` replaces the wrapper rather than leaving it as a parent, so signals
+ * and the exit status belong to the shell the reader is actually talking to.
+ *
  * The terminal lives outside `#app`, so it survives render(); see exec.ts.
  * `render()` is called after opening only so the pod panel can reflect that a
  * session is up.
  */
 function openPodExec(ctx: string, namespace: string, pod: string, container: string) {
-  void openExec({ ctx, namespace, pod, container, command: ["/bin/sh"] }, render);
+  void openExec(
+    {
+      ctx,
+      namespace,
+      pod,
+      container,
+      command: ["/bin/sh", "-c", "export TERM=xterm-256color COLORTERM=truecolor; exec /bin/sh"],
+    },
+    render,
+  );
 }
 
 function confirmDeletePod(ctx: string, namespace: string, name: string) {
@@ -6757,26 +6790,6 @@ function highlightYaml(yaml: string): string {
 // 16-color ANSI base palette (standard 0-7, bright 8-15), reused both for
 // plain SGR color codes (30-37/90-97) and as the low end of the 256-color
 // cube below — so `\x1b[32m` and `\x1b[38;5;2m` render as the same green.
-const ANSI_BASE16 = [
-  "#3f3f3f", "#e6675a", "#3fae56", "#d9a441", "#4a90e2", "#b06fd1", "#3fb0ae", "#b8b8b0",
-  "#7a7a72", "#f08a7e", "#6bd685", "#f0c46b", "#7bb0f0", "#d69ae8", "#6bd6d4", "#eeeee6",
-];
-
-function xterm256ToHex(n: number): string {
-  if (n < 16) return ANSI_BASE16[n];
-  if (n >= 232) {
-    const level = 8 + (n - 232) * 10;
-    const hex = level.toString(16).padStart(2, "0");
-    return `#${hex}${hex}${hex}`;
-  }
-  const cube = n - 16;
-  const levels = [0, 95, 135, 175, 215, 255];
-  const r = levels[Math.floor(cube / 36)];
-  const g = levels[Math.floor((cube % 36) / 6)];
-  const b = levels[cube % 6];
-  const toHex = (v: number) => v.toString(16).padStart(2, "0");
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
-}
 
 /**
  * Converts ANSI SGR (color/style) escape codes in log output — common from
