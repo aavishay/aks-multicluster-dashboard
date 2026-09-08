@@ -36,7 +36,8 @@ jobs:
       - name: Install Homebrew's own prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential procps curl file git
+          # jq for reading `brew info --json`; the rest is what Homebrew itself asks for.
+          sudo apt-get install --no-install-recommends -y build-essential procps curl file git jq
 
       - name: Install Homebrew
         run: |
@@ -91,7 +92,11 @@ jobs:
         run: |
           set -euo pipefail
           INSTALLED=$(brew list --cask --versions aks-fleet-dashboard | awk '{print $2}')
-          CASK=$(brew info --cask --json=v2 aks-fleet-dashboard | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+          # Parsed, not grepped. `--json=v2` pretty-prints with a space after
+          # the colon, so a `"version":"..."` pattern matched nothing — and
+          # under `pipefail` that made grep's exit 1 kill the step before the
+          # echo below could say so, which is a miserable way to debug.
+          CASK=$(brew info --cask --json=v2 aks-fleet-dashboard | jq -r '.casks[0].version')
           echo "installed=$INSTALLED cask=$CASK"
           [ "$INSTALLED" = "$CASK" ] || { echo "::error::installed $INSTALLED but cask offers $CASK"; exit 1; }
           WANT="${{ inputs.expect_version }}"
