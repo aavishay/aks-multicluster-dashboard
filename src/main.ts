@@ -1,7 +1,7 @@
 import "./styles.css";
 import { ANSI_BASE16, xterm256ToHex } from "./ansi";
 import { api } from "./api";
-import { closeExec, isExecOpen, openExec } from "./exec";
+import { closeExec, isExecOpen, openExec, syncExecFontMetrics } from "./exec";
 import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
 import type {
   AiAuthState,
@@ -153,6 +153,10 @@ function setUiScale(scale: number) {
   if (scale === state.uiScale) return;
   state.uiScale = scale;
   applyUiScale(scale);
+  // The shell lives outside `#app`, so render() cannot reach it — and its font
+  // size is taken from the same rem-based `text-xs` the zoom scales. Left out,
+  // the terminal would be the one pane that ignored the zoom.
+  syncExecFontMetrics();
   render();
 }
 
