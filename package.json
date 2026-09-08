@@ -1,7 +1,7 @@
 {
   "name": "k8s-view",
   "private": true,
-  "version": "0.7.6",
+  "version": "0.7.7",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
