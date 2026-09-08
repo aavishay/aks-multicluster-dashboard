@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { ANSI_BASE16 } from "./ansi";
 import { api } from "./api";
+import { MONO_TEXT_CLASSES } from "./typography";
 
 /**
  * An interactive shell in a pod container.
@@ -82,13 +83,6 @@ export function execTarget(): ExecTarget | null {
 }
 
 /**
- * The classes the YAML viewer renders its text with (`YAML_EDITOR_TEXT_CLASS`
- * in main.ts, minus its padding). Kept as a list so the metrics below are read
- * from the same declarations the viewer resolves, not a second copy of them.
- */
-const YAML_TEXT_CLASSES = "font-mono text-xs leading-relaxed";
-
-/**
  * Font metrics measured from a throwaway element wearing the YAML viewer's
  * classes, rather than numbers written out here.
  *
@@ -101,7 +95,7 @@ const YAML_TEXT_CLASSES = "font-mono text-xs leading-relaxed";
  */
 function yamlFontMetrics(): { fontFamily: string; fontSize: number; lineHeight: number; lineHeightPx: number } {
   const probe = document.createElement("div");
-  probe.className = YAML_TEXT_CLASSES;
+  probe.className = MONO_TEXT_CLASSES;
   probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none";
   probe.textContent = "0";
   document.body.append(probe);
@@ -163,11 +157,13 @@ function matchRowPitch(term: Terminal, mount: HTMLElement, targetPx: number): vo
  */
 export function syncExecFontMetrics(): void {
   if (!session) return;
-  const { fontFamily, fontSize, lineHeight } = yamlFontMetrics();
+  // Measured once and reused: probing twice was extra layout work for no gain,
+  // and the two reads could in principle disagree.
+  const { fontFamily, fontSize, lineHeight, lineHeightPx } = yamlFontMetrics();
   session.term.options.fontFamily = fontFamily;
   session.term.options.fontSize = fontSize;
   session.term.options.lineHeight = lineHeight;
-  matchRowPitch(session.term, session.root, yamlFontMetrics().lineHeightPx);
+  matchRowPitch(session.term, session.root, lineHeightPx);
   session.fit.fit();
   if (session.sessionId !== null && !session.ended) {
     void api.resizePodExec(session.sessionId, session.term.cols, session.term.rows).catch(() => {});
