@@ -1,5 +1,6 @@
 import "./styles.css";
 import { api } from "./api";
+import { closeExec, isExecOpen, openExec } from "./exec";
 import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
 import type {
   AiAuthState,
@@ -2689,6 +2690,12 @@ async function toggleWriteMode() {
     // the UI offers, and it should never claim a permission the guard doesn't
     // actually hold.
     state.writeEnabled = await api.setWriteEnabled(next);
+    // An open shell is a live arbitrary-code-execution session, so leaving one
+    // running after a switch back to read-only would make the toggle a lie.
+    // The backend would refuse its keystrokes anyway — `send_pod_exec_stdin`
+    // checks the same gate — so the alternative is a terminal that silently
+    // stops accepting input rather than one that closes and says why.
+    if (!state.writeEnabled && isExecOpen()) closeExec();
     showCopyToast(state.writeEnabled ? "Write mode on — changes are now allowed" : "Read-only mode");
   } catch (e) {
     state.writeEnabled = false;
@@ -2802,6 +2809,25 @@ async function runConfirm() {
     c.error = String(e);
     render();
   }
+}
+
+/**
+ * Opens a shell in a pod container.
+ *
+ * `/bin/sh` and not `/bin/bash`: sh exists in essentially every image that has
+ * a shell at all (busybox ash on Alpine, dash on Debian, bash-as-sh
+ * elsewhere), whereas bash is absent from most slim and distroless-adjacent
+ * images. Anyone who wants bash can type it at the prompt, which is a better
+ * failure mode than the session refusing to open. No fallback chain here for
+ * the same reason `kubectl exec` has none — guessing a different program than
+ * the one asked for is worse than a clear error.
+ *
+ * The terminal lives outside `#app`, so it survives render(); see exec.ts.
+ * `render()` is called after opening only so the pod panel can reflect that a
+ * session is up.
+ */
+function openPodExec(ctx: string, namespace: string, pod: string, container: string) {
+  void openExec({ ctx, namespace, pod, container, command: ["/bin/sh"] }, render);
 }
 
 function confirmDeletePod(ctx: string, namespace: string, name: string) {
@@ -4092,6 +4118,7 @@ function setMetricsRange(minutes: number) {
   toggleShortcuts,
   reviewYamlEdit,
   confirmDeletePod,
+  openPodExec,
   confirmRestartWorkload,
   confirmScaleWorkload,
   confirmSetNodeSchedulable,
@@ -7296,6 +7323,11 @@ function renderPodDetailPanel(): string {
                 : ""
             }
             ${writeActionButton(
+              "Shell",
+              "Open an interactive shell in this container",
+              `window.__app.openPodExec(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer)})`,
+            )}
+            ${writeActionButton(
               "Delete",
               "Delete this pod",
               `window.__app.confirmDeletePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)})`,
@@ -9438,6 +9470,17 @@ document.addEventListener("click", (e) => {
 });
 
 document.addEventListener("keydown", (e) => {
+  // Everything below belongs to the container while a shell is open — Escape
+  // included, or vim would be unusable, and Cmd+B/K/F/R/A too, since none of
+  // them is gated on `isEditableTarget` and all of them are ordinary keys to a
+  // remote program. The overlay is closed with its own button or by exiting
+  // the shell, which is what its hint line says.
+  //
+  // Placed before every other branch rather than folded into
+  // `isNonPanelOverlayOpen`: that predicate is consulted per-shortcut and some
+  // shortcuts deliberately ignore it, whereas this has to be absolute.
+  if (isExecOpen()) return;
+
   if (e.key === "?" && !isEditableTarget(e.target)) {
     e.preventDefault();
     toggleShortcuts();

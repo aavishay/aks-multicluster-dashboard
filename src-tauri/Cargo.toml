@@ -25,8 +25,13 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-kube = { version = "0.99", default-features = false, features = ["client", "config", "rustls-tls"] }
+# io-util: AsyncWriteExt/AsyncReadExt, for pumping an exec session's stdin and stdout.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "sync"] }
+# `ws` is what makes `Api::exec` available: exec runs over a SPDY/WebSocket
+# upgrade, not plain HTTP. It pulls tokio-tungstenite, which declares no TLS
+# features of its own — kube still terminates TLS through hyper-rustls, so the
+# ring provider chosen above stays the only one in the tree.
+kube = { version = "0.99", default-features = false, features = ["client", "config", "rustls-tls", "ws"] }
 k8s-openapi = { version = "0.24", features = ["latest"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 chrono = { version = "0.4", features = ["serde"] }
