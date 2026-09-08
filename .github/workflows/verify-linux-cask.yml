@@ -1,0 +1,140 @@
+name: Verify the Linux cask installs
+
+# The one claim about this project nothing could check: that
+# `brew install --cask` works the same on Linux amd64 as on macOS. Everything
+# else was verified on a Mac or with a simulated system — which is exactly how
+# a cask that raised NoMethodError on its Linux branch once passed `brew audit`
+# clean, because audit only ever evaluated the macOS half.
+#
+# So this installs from the *published* tap, the way a stranger would, and
+# fails if any step of that path is broken.
+#
+# Manual rather than on every push: it installs Homebrew from scratch, and it
+# tests whatever the tap currently publishes, which only changes when the tap
+# is pushed. Run it after updating the tap.
+on:
+  # Also on a pull request that touches this file, and only then: a
+  # workflow_dispatch is only dispatchable once it is on the default branch, so
+  # without this the thing could not be tried before being merged. The path
+  # filter keeps a five-minute Homebrew install off every other PR.
+  pull_request:
+    paths:
+      - ".github/workflows/verify-linux-cask.yml"
+  workflow_dispatch:
+    inputs:
+      expect_version:
+        description: "Version the tap should install (blank to accept whatever it serves)"
+        required: false
+        type: string
+        default: ""
+
+# Nothing here reads the repository — there is no checkout, and the tap comes
+# from GitHub over https like any other user's would — so read is already more
+# than this needs. Declared anyway, and explicitly: the job bootstraps Homebrew
+# by piping a fetched script to bash, and that is precisely the step whose blast
+# radius is worth bounding.
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-22.04
+    steps:
+      # Homebrew on Linux wants these to build/relocate anything it fetches.
+      - name: Install Homebrew's own prerequisites
+        run: |
+          sudo apt-get update
+          # jq for reading `brew info --json`; the rest is what Homebrew itself asks for.
+          sudo apt-get install --no-install-recommends -y build-essential procps curl file git jq
+
+      - name: Install Homebrew
+        run: |
+          set -euo pipefail
+          NONINTERACTIVE=1 /bin/bash -c \
+            "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+
+      - name: Report what we are testing against
+        run: |
+          brew --version
+          echo "HOMEBREW_PREFIX=$(brew --prefix)"
+
+      - name: Tap and trust
+        # `brew trust` is required for casks from a third-party tap, and it is
+        # part of the documented install, so it is part of what gets tested.
+        run: |
+          set -euo pipefail
+          brew tap aavishay/aks-fleet-dashboard
+          brew trust aavishay/aks-fleet-dashboard
+
+      # The check that would have caught the appimagedir bug: loading the cask
+      # on Linux at all. Kept separate from the install so a definition error
+      # is distinguishable from a download or artifact failure.
+      - name: The cask loads on Linux
+        run: |
+          set -euo pipefail
+          brew info --cask aks-fleet-dashboard
+          brew audit --cask aavishay/aks-fleet-dashboard/aks-fleet-dashboard
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          brew install --cask aks-fleet-dashboard
+
+      - name: The AppImage is where the caveats promise, and runnable
+        run: |
+          set -euo pipefail
+          APP="$HOME/Applications/AKS-Fleet-Dashboard.AppImage"
+          [ -f "$APP" ] || { echo "::error::not installed at $APP"; ls -la "$HOME/Applications" || true; exit 1; }
+          [ -x "$APP" ] || { echo "::error::$APP is not executable"; exit 1; }
+          DESC=$(file -b "$APP")
+          echo "file: $DESC"
+          case "$DESC" in
+            *ELF*64-bit*x86-64*) ;;
+            *) echo "::error::not an x86-64 ELF: $DESC"; exit 1 ;;
+          esac
+          # Needs no display, so it is safe here; proves the bundle is intact.
+          "$APP" --appimage-offset >/dev/null
+
+      - name: Installed version matches the tap, and the expected one if given
+        run: |
+          set -euo pipefail
+          INSTALLED=$(brew list --cask --versions aks-fleet-dashboard | awk '{print $2}')
+          # Parsed, not grepped. `--json=v2` pretty-prints with a space after
+          # the colon, so a `"version":"..."` pattern matched nothing — and
+          # under `pipefail` that made grep's exit 1 kill the step before the
+          # echo below could say so, which is a miserable way to debug.
+          CASK=$(brew info --cask --json=v2 aks-fleet-dashboard | jq -r '.casks[0].version')
+          echo "installed=$INSTALLED cask=$CASK"
+          [ "$INSTALLED" = "$CASK" ] || { echo "::error::installed $INSTALLED but cask offers $CASK"; exit 1; }
+          # `github.event.inputs` rather than `inputs`, matching release.yml.
+          # Both render here — the pull_request run resolved this to an empty
+          # string, as intended — but this form is the one the rest of the repo
+          # uses, and `inputs` is only guaranteed for dispatch and workflow_call.
+          WANT="${{ github.event.inputs.expect_version }}"
+          if [ -n "$WANT" ] && [ "$INSTALLED" != "$WANT" ]; then
+            echo "::error::expected $WANT, tap installed $INSTALLED — has the tap been pushed?"
+            exit 1
+          fi
+
+      - name: brew upgrade behaves as it does on macOS
+        # The specific parity claim: the same command, and on an up-to-date
+        # install it declines rather than erroring. A Linux-only failure here
+        # is exactly what this workflow exists to catch.
+        run: |
+          set -euo pipefail
+          OUT=$(brew upgrade --cask aks-fleet-dashboard 2>&1) || {
+            echo "$OUT"; echo "::error::brew upgrade exited non-zero on Linux"; exit 1;
+          }
+          echo "$OUT"
+          case "$OUT" in
+            *"already installed"*|*"Upgrading"*) ;;
+            *) echo "::error::unexpected upgrade output"; exit 1 ;;
+          esac
+
+      - name: Uninstall cleanly
+        run: |
+          set -euo pipefail
+          brew uninstall --cask aks-fleet-dashboard
+          [ ! -f "$HOME/Applications/AKS-Fleet-Dashboard.AppImage" ] \
+            || { echo "::error::AppImage survived uninstall"; exit 1; }
