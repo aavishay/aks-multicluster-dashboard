@@ -32,8 +32,9 @@ To upgrade an existing install to the latest release:
 brew upgrade --cask aks-fleet-dashboard
 ```
 
-On macOS these install a universal `.app`. Linux amd64 is built but not yet
-published — see [Linux (amd64)](#linux-amd64) below.
+The same commands work on macOS and on Linux amd64 — the cask picks the right
+artifact for the platform it is running on. See [macOS](#macos) and
+[Linux (amd64)](#linux-amd64) for what differs.
 
 ### macOS
 
@@ -48,13 +49,6 @@ xattr -dr com.apple.quarantine "/Applications/AKS Fleet Dashboard.app"
 ```
 
 ### Linux (amd64)
-
-> **The Homebrew path is not live yet.** Releases carry an `x86_64.AppImage`
-> from 0.7.2 onward, so you can download and run one today — see
-> [Without Homebrew](#without-homebrew). What has not been published is the
-> updated cask: the tap still serves a macOS-only one, so `brew install` on
-> Linux fails with "This cask requires macOS." until that lands. The rest of
-> this section describes the Homebrew path once it does.
 
 Homebrew installs the AppImage into `~/Applications` and marks it executable.
 x86-64 only — there is no arm64 Linux build yet. Two things differ from macOS:
@@ -83,7 +77,7 @@ the first thing to try, and please open an issue.
 Releases carry the artifacts directly:
 [Releases](https://github.com/aavishay/aks-multicluster-dashboard/releases).
 Take the `.dmg`, or the `.app.zip` if you would rather not mount a disk image.
-From the next release onward there is also an `x86_64.AppImage` for Linux —
+Every release from 0.7.2 onward also carries an `x86_64.AppImage` for Linux —
 `chmod +x` it and run it.
 
 ### Optional: Claude features
