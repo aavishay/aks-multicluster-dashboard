@@ -16,8 +16,11 @@ import { api } from "./api";
  *
  * So the overlay is built imperatively, mounted on `document.body` rather than
  * inside `#app`, and owned entirely by this module. `render()` never sees it.
- * The app's `state` holds only a flag saying a session is open, which is what
- * the keyboard handler needs in order to keep its own shortcuts off the wire.
+ *
+ * Nothing about a session lives in the app's `state`: it is all held in the
+ * module-level `session` below, and the keyboard handler asks `isExecOpen()`
+ * rather than reading a flag. That keeps the terminal's lifetime out of the
+ * object `render()` derives the DOM from, which is the whole point.
  */
 
 /** Bytes in, bytes out — a terminal is not a text stream, and its encoding must survive the trip. */
@@ -41,7 +44,11 @@ interface OpenSession {
   term: Terminal;
   fit: FitAddon;
   observer: ResizeObserver;
-  /** null until the backend hands one back, and again once the session ends. */
+  /**
+   * null only until the backend hands one back. It is deliberately NOT
+   * cleared when the session ends — `closeExec` still needs it to release the
+   * backend's registry entry. `ended` is what gates input.
+   */
   sessionId: number | null;
   /** Set when the remote process exits, so input stops being forwarded. */
   ended: boolean;
@@ -114,6 +121,10 @@ function buildChrome(target: ExecTarget): { root: HTMLDivElement; mount: HTMLDiv
   const right = document.createElement("div");
   right.className = "flex shrink-0 items-center gap-2 text-xs";
   const status = document.createElement("span");
+  // Addressed by attribute, not by class: the ctx/namespace label carries the
+  // same muted class and is earlier in the DOM, so a class selector finds that
+  // one instead and writes the status over the pod's location.
+  status.setAttribute("data-exec-status", "");
   status.className = "text-ink-muted";
   status.textContent = "connecting…";
   const close = document.createElement("button");
@@ -174,7 +185,7 @@ export async function openExec(target: ExecTarget, onStateChange: () => void): P
   term.focus();
 
   const observer = new ResizeObserver(() => {
-    if (!session) return;
+    if (!session || session.ended) return;
     fit.fit();
     if (session.sessionId !== null) {
       void api.resizePodExec(session.sessionId, term.cols, term.rows).catch(() => {});
@@ -228,9 +239,13 @@ function markEnded(message: string) {
   if (!session || session.ended) return;
   session.ended = true;
   session.term.write(`\r\n\x1b[90m${message}\x1b[0m\r\n`);
-  const status = session.root.querySelector("span.text-ink-muted");
+  const status = session.root.querySelector("[data-exec-status]");
   if (status) status.textContent = "ended";
-  session.sessionId = null;
+  // `sessionId` is deliberately kept. Clearing it here made `closeExec` skip
+  // `stopPodExec`, so a shell that exited on its own left its entry in the
+  // backend registry — and its stdin task parked on a receive — until the app
+  // restarted. `ended` is what stops input being forwarded; the id is what
+  // still has to be handed back to be cleaned up.
 }
 
 /** Tears the session down. Safe to call when nothing is open. */
@@ -240,6 +255,9 @@ export function closeExec(): void {
   session = null;
 
   s.observer.disconnect();
+  // Called even for a session that already ended: the backend's `stop` is a
+  // documented no-op for an unknown id, so this is the cheap way to guarantee
+  // the registry entry goes rather than hoping the exit path removed it.
   if (s.sessionId !== null) void api.stopPodExec(s.sessionId).catch(() => {});
   s.term.dispose();
   s.root.remove();

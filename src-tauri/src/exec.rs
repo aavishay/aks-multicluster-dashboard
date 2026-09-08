@@ -165,9 +165,28 @@ pub async fn start_pod_exec(
         }
     });
 
+    // Registered before the exit watcher is spawned, and not after: the watcher
+    // removes this entry when the process ends, and a process that exits
+    // immediately would otherwise race the insert and leave a dead entry behind
+    // forever.
+    sessions().lock().unwrap().insert(
+        id,
+        Session {
+            stdin: stdin_tx,
+            resize,
+            aborts: vec![stdout_pump.abort_handle(), stdin_pump.abort_handle()],
+        },
+    );
+
     // Watches for the process ending so the panel can say so, rather than
     // going quiet and leaving the reader unsure whether the shell died or is
     // merely idle.
+    //
+    // It also drops the registry entry, so a shell exited on its own does not
+    // depend on the frontend closing its panel to be cleaned up. Dropping the
+    // `Session` drops the stdin sender, which closes that channel, which ends
+    // the stdin pump's `recv()` loop and releases the remote writer — no abort
+    // needed for it.
     let exit_channel = on_event;
     let exit_watch = tokio::spawn(async move {
         let message = match process.join().await {
@@ -175,18 +194,15 @@ pub async fn start_pod_exec(
             Err(e) => format!("Session ended: {e}"),
         };
         let _ = exit_channel.send(ExecEvent::Exit { message });
+        sessions().lock().unwrap().remove(&id);
     });
 
-    let session = Session {
-        stdin: stdin_tx,
-        resize,
-        aborts: vec![
-            stdout_pump.abort_handle(),
-            stdin_pump.abort_handle(),
-            exit_watch.abort_handle(),
-        ],
-    };
-    sessions().lock().unwrap().insert(id, session);
+    // Attached after the fact for the same race: by now the watcher may already
+    // have removed the entry, which is exactly the case where there is nothing
+    // left to abort.
+    if let Some(open) = sessions().lock().unwrap().get_mut(&id) {
+        open.aborts.push(exit_watch.abort_handle());
+    }
 
     // The shell computes its first prompt from the size it is told at startup,
     // so send the real one before the user can type.
