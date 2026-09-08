@@ -70,7 +70,36 @@ jobs:
         # Only the AppImage: it is what the Homebrew cask installs. The config's
         # "targets": "all" would also produce .deb and .rpm, which nothing here
         # consumes yet.
-        run: npm run tauri build -- --bundles appimage
+        #
+        # Retried because bundling reaches the network at the very end: Tauri
+        # fetches linuxdeploy and its appimage plugin from GitHub releases, and
+        # that download returned HTTP 500 twice in one afternoon. Failing the job
+        # over someone else's 500 is worse on a release tag than on a PR, since
+        # the macOS assets are already published by then and the release ends up
+        # missing its Linux half.
+        #
+        # Cheap to retry despite the job's length: cargo and the frontend build
+        # are already done and cached by the first attempt, so a second pass
+        # re-runs the bundling rather than the compile. A genuine compile error
+        # cannot land here either — `cargo test` above would have failed first —
+        # so retrying does not paper over a real break.
+        #
+        # Each attempt is announced as a warning rather than swallowed: a flake
+        # absorbed silently is a flake nobody knows is getting worse.
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if npm run tauri build -- --bundles appimage; then
+              [ "$attempt" -gt 1 ] && echo "::warning::AppImage bundling succeeded on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::AppImage bundling failed on attempt $attempt, retrying"
+              sleep $((attempt * 20))
+            fi
+          done
+          echo "::error::AppImage bundling failed three times"
+          exit 1
 
       - name: Name the artifact and checksum it
         id: collect
@@ -123,8 +152,34 @@ jobs:
 
       # The only output. A PR build leaves it here for manual inspection; a
       # release run has release.yml pick it up and attach it to the release.
+      #
+      # Two attempts, because this is the step that actually cost something: it
+      # failed with "Failed to FinalizeArtifact: (403) Forbidden" on the 0.7.5
+      # tag, which left `linux-publish` with nothing to download and published a
+      # release carrying the macOS assets and no AppImage.
+      #
+      # Done with `continue-on-error` and a conditional second step rather than a
+      # retry action, to avoid adding a third-party action to a release path for
+      # something two steps express plainly. `overwrite` is on the retry because
+      # a partially-created artifact would otherwise make the second attempt fail
+      # as a name collision.
       - uses: actions/upload-artifact@v4
+        id: upload
+        continue-on-error: true
         with:
           name: linux-appimage
           path: dist-release/*
           if-no-files-found: error
+
+      - name: Retry the upload
+        if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist-release/*
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Say so if the upload needed a retry
+        if: steps.upload.outcome == 'failure'
+        run: echo "::warning::the artifact upload failed once and succeeded on retry"

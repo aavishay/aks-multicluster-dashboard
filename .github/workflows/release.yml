@@ -142,9 +142,41 @@ jobs:
           name: linux-appimage
           path: dist-release
 
+      # Two attempts, for the same reason the artifact upload has them: this is
+      # the last mile of a release, the macOS assets are already published by the
+      # time it runs, and a single 403 here leaves the release advertising a
+      # platform whose asset is missing. Attaching the same files twice is
+      # harmless — the action replaces an asset of the same name.
       - uses: softprops/action-gh-release@v2
+        id: publish
+        continue-on-error: true
         # No body and no generate_release_notes: the macOS job owns those, and
         # setting them again here would overwrite what it wrote.
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist-release/*
+
+      - name: Retry attaching the Linux asset
+        if: steps.publish.outcome == 'failure'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist-release/*
+
+      # Without this the job would go green on a failed first attempt whose
+      # retry also failed, since `continue-on-error` masks the outcome.
+      - name: Confirm the Linux asset is actually on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.publish.outcome }}" = "failure" ]; then
+            echo "::warning::attaching the Linux asset failed once and was retried"
+          fi
+          NAMES=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          echo "$NAMES"
+          case "$NAMES" in
+            *AppImage*) ;;
+            *) echo "::error::the release has no AppImage asset"; exit 1 ;;
+          esac
