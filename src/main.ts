@@ -1959,8 +1959,13 @@ function scheduleAutoRefresh() {
     // again in the full-app rebuild that render() does on the main thread —
     // the same thread the terminal uses to process keystrokes and paint them.
     // That stall is felt as input lag in the one view where latency is most
-    // noticeable. Skipped rather than cancelled, matching the guard above, so
-    // the cadence resumes untouched the moment the shell closes.
+    // noticeable.
+    //
+    // An individual tick is skipped rather than the timer being cancelled,
+    // matching the guard above. So the cadence itself is untouched — nothing
+    // is rescheduled — but recovery is not immediate: the first tick *after*
+    // the shell closes runs the next pass, which leaves the tab underneath up
+    // to one whole interval stale at the moment the overlay goes away.
     if (isExecOpen()) return;
     void runRefreshPass();
   }, state.autoRefreshSeconds * 1000);
