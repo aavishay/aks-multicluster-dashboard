@@ -36,7 +36,7 @@ pub fn write_enabled() -> bool {
 /// the accidental click, but this is what makes "read-only" mean the process
 /// will not change a cluster regardless of what calls in — a stale frontend, a
 /// queued request from before the switch flipped, a future caller that forgets.
-fn require_write() -> Result<(), String> {
+pub(crate) fn require_write() -> Result<(), String> {
     if write_enabled() {
         Ok(())
     } else {
