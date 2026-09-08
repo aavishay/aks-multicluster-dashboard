@@ -1,6 +1,7 @@
 mod ai;
 mod claude;
 mod commands;
+mod exec;
 mod helm;
 mod k8s;
 mod kubeconfig;
@@ -162,6 +163,10 @@ pub fn run() {
             commands::set_node_schedulable,
             commands::drain_node,
             commands::apply_manifest,
+            commands::start_pod_exec,
+            commands::send_pod_exec_stdin,
+            commands::resize_pod_exec,
+            commands::stop_pod_exec,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

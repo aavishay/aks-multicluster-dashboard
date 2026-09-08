@@ -541,6 +541,57 @@ pub fn kubeconfig_path() -> Option<String> {
     kubeconfig::kubeconfig_path().map(|p| p.display().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Interactive exec
+// ---------------------------------------------------------------------------
+
+/// Opens a PTY-backed shell. `with_deadline` bounds only the connection
+/// handshake — the returned id refers to a session that then lives until the
+/// remote process exits or `stop_pod_exec` is called, which is deliberately
+/// not on a timer.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn start_pod_exec(
+    context_name: String,
+    namespace: String,
+    pod_name: String,
+    container: String,
+    command: Vec<String>,
+    cols: u16,
+    rows: u16,
+    on_event: tauri::ipc::Channel<crate::exec::ExecEvent>,
+) -> Result<u64, String> {
+    with_deadline(
+        &context_name,
+        crate::exec::start_pod_exec(
+            &context_name,
+            &namespace,
+            &pod_name,
+            &container,
+            command,
+            cols,
+            rows,
+            on_event,
+        ),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn send_pod_exec_stdin(session_id: u64, data: String) -> Result<(), String> {
+    crate::exec::send_pod_exec_stdin(session_id, data).await
+}
+
+#[tauri::command]
+pub async fn resize_pod_exec(session_id: u64, cols: u16, rows: u16) {
+    crate::exec::resize_pod_exec(session_id, cols, rows).await;
+}
+
+#[tauri::command]
+pub fn stop_pod_exec(session_id: u64) {
+    crate::exec::stop_pod_exec(session_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
