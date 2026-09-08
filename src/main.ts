@@ -4710,7 +4710,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       [withMod("F"), "Search — the panel's box, or this table's filter"],
       ["?", "This list"],
-      ["Esc", "Close what's open, clear filters, and return to read-only"],
+      ["Esc", "Back out a layer: the field, then what's open, then filters, then write mode"],
       [`${withMod("+")} ${withMod("−")}`, "Zoom in or out"],
       [withMod("0"), "Reset the zoom"],
     ],
@@ -9494,6 +9494,36 @@ function stepTab(delta: number) {
   selectTab(ids[Math.min(ids.length - 1, Math.max(0, current + delta))]);
 }
 
+/**
+ * Escape's innermost step: leave a filter field, keeping what is typed in it.
+ *
+ * Escape used to reach straight past the field to `clearFilters`, so stepping
+ * out of a filter you had just narrowed threw the filter away — the opposite of
+ * what the key is for at that moment.
+ *
+ * An allowlist of two places rather than "any field with a filter key", and
+ * deliberately so: the cluster palette's query, the YAML editor and the
+ * confirmation dialog's number all carry `data-filter-key` as well, and Escape
+ * there belongs to the thing the field sits in, not to the field. A denylist
+ * would quietly capture the next one of those to be added.
+ *
+ * Restricted to `input` for a second reason: the enum dropdown's trigger is a
+ * button in the same filter row, and Escape must keep closing the open dropdown
+ * rather than blurring the button.
+ */
+function blurFocusedFilterField(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLInputElement)) return false;
+  const key = target.dataset.filterKey;
+  if (!key) return false;
+  // A column filter in the active table, or the sidebar's cluster filter —
+  // which has exactly the same complaint: Escape in it used to clear the tab's
+  // filters, which are not even the filter being typed in.
+  const isTableFilter = target.closest('[data-scroll-id^="table:"]') !== null;
+  if (!isTableFilter && key !== "cluster-filter") return false;
+  target.blur();
+  return true;
+}
+
 /** Closes whichever detail panel is open, reporting whether there was one. */
 function closeOpenDetailPanel(): boolean {
   const panel = DETAIL_PANEL_CLOSERS.find((p) => p.isOpen());
@@ -9557,6 +9587,13 @@ document.addEventListener("keydown", (e) => {
   }
 
   if (e.key === "Escape") {
+    // Innermost first: a focused filter field is stepped out of and nothing
+    // else happens — not the chain below, and not the write-mode disarm at the
+    // end. One press leaves the field with the filter intact; a second then
+    // reaches the chain and clears it. Escape peels one layer at a time, which
+    // is what the rest of this chain already does for overlays.
+    if (blurFocusedFilterField(e.target)) return;
+
     // Ordered by what is drawn on top of what. The shortcuts list is above
     // everything, including a confirmation dialog — it can be opened over one.
     if (state.shortcutsOpen) toggleShortcuts();
