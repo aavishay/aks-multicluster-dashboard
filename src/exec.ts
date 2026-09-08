@@ -83,7 +83,12 @@ export function isExecOpen(): boolean {
  * The app's keyboard handler needs this because it swallows every key while a
  * shell is open: an ended session has nothing to swallow keys on behalf of, so
  * Escape should reach the close path when focus happens to be outside the
- * terminal. When focus is inside it, xterm's own handler above gets there first.
+ * terminal.
+ *
+ * When focus is inside the terminal instead, the `attachCustomKeyEventHandler`
+ * registered in `openExec` gets there first — xterm stops Escape propagating,
+ * so it never reaches the app's listener at all. Named rather than pointed at,
+ * because a relative direction is wrong the moment either moves.
  */
 export function isExecEnded(): boolean {
   return session?.ended === true;
