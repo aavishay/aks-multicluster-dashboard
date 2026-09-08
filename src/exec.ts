@@ -1,6 +1,7 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { ANSI_BASE16 } from "./ansi";
 import { api } from "./api";
 
 /**
@@ -66,6 +67,10 @@ export interface ExecTarget {
 
 let session: OpenSession | null = null;
 
+/** Keystrokes waiting for the next frame's flush; see `term.onData` below. */
+let pendingInput = "";
+let inputFlushHandle: number | null = null;
+
 /** True while a shell is on screen — the keyboard handler uses this to stay out of the way. */
 export function isExecOpen(): boolean {
   return session !== null;
@@ -81,16 +86,39 @@ export function execTarget(): ExecTarget | null {
  * the terminal follows the light/dark theme like everything else. Read at open
  * time: a theme switch while a shell is open is rare enough not to warrant
  * observing, and re-reading on open keeps it correct for the next one.
+ *
+ * The 16 ANSI slots come from the same `ANSI_BASE16` the log viewer uses. Left
+ * unset, xterm substitutes its own defaults, so identical output rendered in
+ * the Logs tab and in a shell came out in two different palettes — and the
+ * shell's clashed with the surrounding chrome.
  */
-function themeColors(): { background: string; foreground: string; cursor: string } {
+function themeColors(): Record<string, string> {
   const css = getComputedStyle(document.documentElement);
   const pick = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
+  const [black, red, green, yellow, blue, magenta, cyan, white, brightBlack, brightRed, brightGreen, brightYellow, brightBlue, brightMagenta, brightCyan, brightWhite] =
+    ANSI_BASE16;
   return {
     // Terminals conventionally sit darker than the surrounding chrome, and
     // xterm needs concrete colours rather than var() references.
     background: pick("--surface-1", "#111318"),
     foreground: pick("--ink-primary", "#e6e6e6"),
     cursor: pick("--ink-primary", "#e6e6e6"),
+    black,
+    red,
+    green,
+    yellow,
+    blue,
+    magenta,
+    cyan,
+    white,
+    brightBlack,
+    brightRed,
+    brightGreen,
+    brightYellow,
+    brightBlue,
+    brightMagenta,
+    brightCyan,
+    brightWhite,
   };
 }
 
@@ -199,10 +227,26 @@ export async function openExec(target: ExecTarget, onStateChange: () => void): P
   // Keystrokes out. Queued input before the session id arrives is dropped
   // rather than buffered: the shell has not printed a prompt yet, so there is
   // nothing sensible for early keystrokes to apply to.
+  //
+  // Coalesced into one send per frame rather than one per keystroke. Each send
+  // is an IPC hop into Rust, and `onData` fires per character — so a 2000-byte
+  // paste was 2000 round trips, and fast typing was one per key. Batching
+  // costs at most a frame of added latency and collapses both to a single
+  // call. Order is preserved because the bytes are concatenated in arrival
+  // order, which is exactly what a fast typist produces on a real terminal
+  // anyway.
   term.onData((data) => {
     if (!session || session.sessionId === null || session.ended) return;
-    void api.sendPodExecStdin(session.sessionId, toBase64(encoder.encode(data))).catch((e) => {
-      markEnded(String(e));
+    pendingInput += data;
+    if (inputFlushHandle !== null) return;
+    inputFlushHandle = requestAnimationFrame(() => {
+      inputFlushHandle = null;
+      const batch = pendingInput;
+      pendingInput = "";
+      if (!batch || !session || session.sessionId === null || session.ended) return;
+      void api.sendPodExecStdin(session.sessionId, toBase64(encoder.encode(batch))).catch((e) => {
+        markEnded(String(e));
+      });
     });
   });
 
@@ -255,6 +299,11 @@ export function closeExec(): void {
   session = null;
 
   s.observer.disconnect();
+  // Anything typed in the last frame belongs to the session being torn down,
+  // not to whichever one opens next.
+  if (inputFlushHandle !== null) cancelAnimationFrame(inputFlushHandle);
+  inputFlushHandle = null;
+  pendingInput = "";
   // Called even for a session that already ended: the backend's `stop` is a
   // documented no-op for an unknown id, so this is the cheap way to guarantee
   // the registry entry goes rather than hoping the exit path removed it.
