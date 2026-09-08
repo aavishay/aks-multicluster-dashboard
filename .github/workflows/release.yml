@@ -163,8 +163,21 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist-release/*
 
-      # Without this the job would go green on a failed first attempt whose
-      # retry also failed, since `continue-on-error` masks the outcome.
+      # Not a guard against a silently-green job: the retry step above has no
+      # `continue-on-error`, so if both attempts fail the job fails there. That
+      # was wrong when first written.
+      #
+      # What this actually covers is the quieter case. `continue-on-error` masks
+      # the first attempt, and when that attempt reports success nothing else
+      # confirms the asset reached the release — a success from the action is not
+      # the same fact as an asset being present under the expected name. So ask
+      # GitHub what is attached and fail if the AppImage is not among it.
+      #
+      # Worth being precise about the 0.7.5 incident this whole change came from,
+      # since this step would not have caught it: there the artifact upload failed
+      # in the build job, so `linux-publish` was skipped entirely and never ran.
+      # The retry on that upload is what addresses that; this is the backstop for
+      # a publish that runs and claims to have worked.
       - name: Confirm the Linux asset is actually on the release
         env:
           GH_TOKEN: ${{ github.token }}
