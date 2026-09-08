@@ -77,6 +77,18 @@ export function isExecOpen(): boolean {
   return session !== null;
 }
 
+/**
+ * True when a shell is on screen whose remote process has already exited.
+ *
+ * The app's keyboard handler needs this because it swallows every key while a
+ * shell is open: an ended session has nothing to swallow keys on behalf of, so
+ * Escape should reach the close path when focus happens to be outside the
+ * terminal. When focus is inside it, xterm's own handler above gets there first.
+ */
+export function isExecEnded(): boolean {
+  return session?.ended === true;
+}
+
 /** The pod a session is attached to, for the header and for reopening. */
 export function execTarget(): ExecTarget | null {
   return session?.target ?? null;
@@ -257,9 +269,12 @@ function buildChrome(target: ExecTarget): { root: HTMLDivElement; mount: HTMLDiv
   mount.className = "min-h-0 flex-1 p-2";
 
   const hint = document.createElement("div");
+  hint.setAttribute("data-exec-hint", "");
   hint.className = "shrink-0 border-t border-gridline px-3 py-1.5 text-xs text-ink-muted";
-  // Esc is deliberately not the close key: it belongs to the shell, or vim
-  // would be unusable. Say so, since every other overlay here closes on Esc.
+  // Esc is deliberately not the close key while the shell is live: it belongs
+  // to the container, or vim would be unusable. Say so, since every other
+  // overlay here closes on Esc. `markEnded` rewrites this once the process is
+  // gone, because from then on Esc does close the panel.
   hint.textContent = "Keys go to the container — Esc included. Exit the shell, or use Close.";
 
   frame.append(header, mount, hint);
@@ -305,6 +320,23 @@ export async function openExec(target: ExecTarget, onStateChange: () => void): P
   matchRowPitch(term, mount, metrics.lineHeightPx);
   fit.fit();
   term.focus();
+
+  // Escape has to be caught here and not in the app's document handler: xterm
+  // stops its propagation, so a real Escape keypress inside the terminal never
+  // reaches `document` at all — verified, after first writing the handler in
+  // the wrong place. `b` and other keys do bubble; Escape specifically does not.
+  //
+  // While the shell is live this returns true and Escape goes to the container.
+  // Once the process has gone there is nothing to send keys to, so Escape does
+  // what every other overlay's Escape does and closes the panel.
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== "keydown" || e.key !== "Escape") return true;
+    if (!session?.ended) return true;
+    // Deferred rather than closed inline: `closeExec` disposes the terminal,
+    // and disposing it from inside its own key dispatch is asking for trouble.
+    setTimeout(() => closeExec(), 0);
+    return false;
+  });
 
   const observer = new ResizeObserver(() => {
     if (!session || session.ended) return;
@@ -379,6 +411,10 @@ function markEnded(message: string) {
   session.term.write(`\r\n\x1b[90m${message}\x1b[0m\r\n`);
   const status = session.root.querySelector("[data-exec-status]");
   if (status) status.textContent = "ended";
+  // The live-session hint is now false — there is nothing left to send keys to
+  // — and Escape has become the close key, so say that instead.
+  const hint = session.root.querySelector("[data-exec-hint]");
+  if (hint) hint.textContent = "Session ended. Press Esc, or use Close.";
   // `sessionId` is deliberately kept. Clearing it here made `closeExec` skip
   // `stopPodExec`, so a shell that exited on its own left its entry in the
   // backend registry — and its stdin task parked on a receive — until the app
