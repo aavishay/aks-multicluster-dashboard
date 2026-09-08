@@ -1,4 +1,19 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+
+/**
+ * Mirrors `exec::ExecEvent`. `data` is base64 rather than text because the
+ * remote stdout is a byte stream: escape sequences and multi-byte characters
+ * both split across reads, and decoding per chunk would corrupt them.
+ */
+export type ExecEvent = { kind: "output"; data: string } | { kind: "exit"; message: string };
+
+export interface ExecStartTarget {
+  ctx: string;
+  namespace: string;
+  pod: string;
+  container: string;
+  command: string[];
+}
 import type {
   AiAuthState,
   AiProvider,
@@ -188,4 +203,27 @@ export const api = {
     invoke<GitOpsAppManifest>("get_gitops_manifest", { contextName, namespace, name }),
   getGitOpsEvents: (contextName: string, namespace: string, name: string) =>
     invoke<EventInfo[]>("get_gitops_events", { contextName, namespace, name }),
+  /**
+   * Opens a PTY-backed shell and returns its session id. Write mode is
+   * required, and enforced in the backend rather than only here — the UI gate
+   * is a courtesy, not the boundary.
+   */
+  startPodExec: (target: ExecStartTarget, cols: number, rows: number, onEvent: (event: ExecEvent) => void) => {
+    const channel = new Channel<ExecEvent>();
+    channel.onmessage = onEvent;
+    return invoke<number>("start_pod_exec", {
+      contextName: target.ctx,
+      namespace: target.namespace,
+      podName: target.pod,
+      container: target.container,
+      command: target.command,
+      cols,
+      rows,
+      onEvent: channel,
+    });
+  },
+  sendPodExecStdin: (sessionId: number, data: string) => invoke<void>("send_pod_exec_stdin", { sessionId, data }),
+  resizePodExec: (sessionId: number, cols: number, rows: number) =>
+    invoke<void>("resize_pod_exec", { sessionId, cols, rows }),
+  stopPodExec: (sessionId: number) => invoke<void>("stop_pod_exec", { sessionId }),
 };
