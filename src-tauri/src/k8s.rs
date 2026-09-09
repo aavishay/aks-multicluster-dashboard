@@ -11,6 +11,7 @@ use k8s_openapi::api::apps::v1::{ControllerRevision, DaemonSet, Deployment, Repl
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams, ObjectList, ResourceExt};
+use kube::discovery::Scope;
 use kube::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1902,6 +1903,513 @@ pub async fn get_gitops_events(context_name: &str, namespace: &str, name: &str) 
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// Drift diff for an Application's not-Synced resources
+// ---------------------------------------------------------------------------
+//
+// Worth stating plainly what this computes, because it is *not* what
+// `argocd app diff` computes. ArgoCD renders the manifests from Git and
+// compares them against the live cluster, in its repo-server, caching the
+// result in Redis. None of that reaches the `Application` resource:
+// `status.resources[]` names each drifted resource and stops there. An app
+// holding only a kubeconfig therefore cannot reproduce ArgoCD's answer.
+//
+// What a kubeconfig *can* read is each resource's `last-applied-configuration`
+// annotation — the manifest most recently applied to it. Comparing that with
+// the live object shows drift: what changed in the cluster since the last
+// apply. That answers a real and different question ("who edited my cluster"),
+// and it is the one implemented here. The UI labels it as such rather than
+// letting it be mistaken for the Git diff.
+
+/// The annotation holding the manifest most recently applied to a resource.
+const LAST_APPLIED_ANNOTATION: &str = "kubectl.kubernetes.io/last-applied-configuration";
+
+/// Metadata the server or a controller owns, which a manifest does not declare.
+///
+/// Removed from the live side *only when the desired manifest is silent about
+/// it* — the same value-matched discipline the default suppressor below uses,
+/// and for the same reason. `finalizers` and `ownerReferences` are the entries
+/// that make the condition earn its keep: both are usually controller-written,
+/// but both are legitimately declarable, and stripping them from one side
+/// unconditionally would leave a permanent phantom deletion on every diff of a
+/// manifest that does declare them.
+const DIFF_STRIP_METADATA: &[&str] = &[
+    "managedFields",
+    "resourceVersion",
+    "uid",
+    "generation",
+    "creationTimestamp",
+    "deletionTimestamp",
+    "selfLink",
+    "ownerReferences",
+    "finalizers",
+];
+
+/// Annotations that are pure controller bookkeeping. `last-applied` is handled
+/// separately and unconditionally — it *is* the other side of the diff.
+const DIFF_STRIP_ANNOTATIONS: &[&str] = &["deployment.kubernetes.io/revision"];
+
+/// Pod-spec fields the API server defaults, as (field, default as JSON).
+const POD_SPEC_DEFAULTS: &[(&str, &str)] = &[
+    ("dnsPolicy", "\"ClusterFirst\""),
+    ("schedulerName", "\"default-scheduler\""),
+    ("terminationGracePeriodSeconds", "30"),
+    ("securityContext", "{}"),
+];
+
+/// Per-container fields the API server defaults.
+const CONTAINER_DEFAULTS: &[(&str, &str)] = &[
+    ("terminationMessagePath", "\"/dev/termination-log\""),
+    ("terminationMessagePolicy", "\"File\""),
+];
+
+/// Drops keys whose value is an explicit null, recursively.
+///
+/// Run on *both* sides. Helm charts routinely render an unset block as
+/// `livenessProbe: null`, which the API server then drops entirely — so the
+/// annotation keeps the null and the live object does not. In an apply, an
+/// explicit null means "unset", so the two are the same statement and pruning
+/// both is what makes them compare equal. Pruning one side would manufacture a
+/// deletion on every single diff.
+fn prune_explicit_nulls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                prune_explicit_nulls(v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items.iter_mut() {
+                prune_explicit_nulls(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `serde_json` can read through a JSON pointer but not delete through one.
+fn remove_at_pointer(root: &mut serde_json::Value, pointer: &str) {
+    let Some((parent, key)) = pointer.rsplit_once('/') else { return };
+    if let Some(serde_json::Value::Object(map)) = root.pointer_mut(parent) {
+        map.remove(key);
+    }
+}
+
+/// Drops `metadata.annotations`/`metadata.labels` once empty, on both sides, so
+/// a map emptied by stripping does not diff as `annotations: {}` against a side
+/// that never had one.
+fn drop_empty_metadata_maps(value: &mut serde_json::Value) {
+    let Some(meta) = value.pointer_mut("/metadata").and_then(|m| m.as_object_mut()) else { return };
+    for key in ["annotations", "labels"] {
+        if meta.get(key).and_then(|m| m.as_object()).is_some_and(|m| m.is_empty()) {
+            meta.remove(key);
+        }
+    }
+}
+
+/// Removes server-owned bookkeeping from the live side, skipping anything the
+/// desired manifest declares for itself.
+fn strip_server_bookkeeping(live: &mut serde_json::Value, desired: &serde_json::Value) {
+    if desired.get("status").is_none() {
+        if let Some(map) = live.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
+    let desired_meta = desired.get("metadata");
+    let desired_annotations = desired_meta.and_then(|m| m.get("annotations"));
+    let Some(meta) = live.pointer_mut("/metadata").and_then(|m| m.as_object_mut()) else { return };
+
+    for key in DIFF_STRIP_METADATA {
+        if desired_meta.and_then(|m| m.get(*key)).is_none() {
+            meta.remove(*key);
+        }
+    }
+
+    if let Some(annotations) = meta.get_mut("annotations").and_then(|a| a.as_object_mut()) {
+        for key in DIFF_STRIP_ANNOTATIONS {
+            if desired_annotations.and_then(|a| a.get(*key)).is_none() {
+                annotations.remove(*key);
+            }
+        }
+    }
+}
+
+/// Removes a field from the live side only when the desired manifest is silent
+/// about it **and** the live value equals `default_json`.
+///
+/// The value match is the whole safety property, and it was measured rather
+/// than assumed. Suppressing by key alone — "the manifest never mentions
+/// `restartPolicy`, so hide it" — was tested against 15 injected drifts and hid
+/// 7 of them, including `paused: true`, `runAsUser: 0`, and every case where a
+/// defaulted field had been set to a *non*-default value. Matching the value
+/// means the only fact this can ever hide is "the field still has its default",
+/// which is the one fact nobody is looking for.
+fn suppress_default(live: &mut serde_json::Value, desired: &serde_json::Value, pointer: &str, default_json: &str) {
+    if desired.pointer(pointer).is_some() {
+        return;
+    }
+    let Ok(expected) = serde_json::from_str::<serde_json::Value>(default_json) else { return };
+    if live.pointer(pointer) != Some(&expected) {
+        return;
+    }
+    remove_at_pointer(live, pointer);
+}
+
+/// Kind-level defaults. Empty for anything not listed, including every CRD.
+fn kind_default_fields(kind: &str) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        "Deployment" => &[("/spec/revisionHistoryLimit", "10"), ("/spec/progressDeadlineSeconds", "600")],
+        "StatefulSet" | "DaemonSet" => &[("/spec/revisionHistoryLimit", "10")],
+        "Service" => &[
+            ("/spec/sessionAffinity", "\"None\""),
+            ("/spec/internalTrafficPolicy", "\"Cluster\""),
+            ("/spec/ipFamilyPolicy", "\"SingleStack\""),
+        ],
+        "CronJob" => &[
+            ("/spec/concurrencyPolicy", "\"Allow\""),
+            ("/spec/failedJobsHistoryLimit", "1"),
+            ("/spec/successfulJobsHistoryLimit", "3"),
+            ("/spec/suspend", "false"),
+        ],
+        _ => &[],
+    }
+}
+
+/// Where a kind keeps its pod spec, if it has one.
+///
+/// Keyed per kind because the path genuinely moves: a CronJob's is nested one
+/// Job template deeper. A table written for a Deployment and applied blindly to
+/// a CronJob is worse than no table at all — nothing would match, so the
+/// CronJob's own defaults would go unsuppressed while the code reported success.
+fn pod_spec_pointer(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Job" => Some("/spec/template/spec"),
+        "CronJob" => Some("/spec/jobTemplate/spec/template/spec"),
+        "Pod" => Some("/spec"),
+        _ => None,
+    }
+}
+
+/// True when a value looks like an address the cluster assigned rather than one
+/// an author wrote.
+///
+/// This exists for one specific value: `clusterIP: None`. `clusterIP` and
+/// `clusterIPs` are normally filled in by the API server, so a manifest silent
+/// about them should not show them as drift — but `None` is the exception,
+/// because `None` is not an assignment, it is an author declaring a headless
+/// Service. Suppressing those keys unconditionally would render a
+/// headless-conversion — which breaks DNS and every consumer's routing — as a
+/// completely empty diff.
+fn looks_cluster_assigned(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.parse::<std::net::IpAddr>().is_ok(),
+        serde_json::Value::Array(items) => !items.is_empty() && items.iter().all(looks_cluster_assigned),
+        _ => false,
+    }
+}
+
+/// `ipFamilies` is server-assigned too, but its values are never addresses, so
+/// it needs its own value check rather than sharing the address one.
+fn is_ip_family_list(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| !items.is_empty() && items.iter().all(|v| matches!(v.as_str(), Some("IPv4") | Some("IPv6"))))
+}
+
+/// Suppresses the ports' defaulted `protocol`, wherever the ports live.
+///
+/// Shared because `protocol: TCP` is defaulted in two unrelated places — a
+/// Service's own `spec.ports[]` and a container's `ports[]` — and the first
+/// was missed at first precisely because a Service has no pod spec, so the
+/// container path never reached it.
+fn suppress_port_protocols(live: &mut serde_json::Value, desired: &serde_json::Value, ports_pointer: &str) {
+    let count = live.pointer(ports_pointer).and_then(|p| p.as_array()).map_or(0, |p| p.len());
+    for index in 0..count {
+        suppress_default(live, desired, &format!("{ports_pointer}/{index}/protocol"), "\"TCP\"");
+    }
+}
+
+fn suppress_service_addresses(live: &mut serde_json::Value, desired: &serde_json::Value) {
+    suppress_port_protocols(live, desired, "/spec/ports");
+    for pointer in ["/spec/clusterIP", "/spec/clusterIPs"] {
+        if desired.pointer(pointer).is_none() && live.pointer(pointer).is_some_and(looks_cluster_assigned) {
+            remove_at_pointer(live, pointer);
+        }
+    }
+    if desired.pointer("/spec/ipFamilies").is_none() && live.pointer("/spec/ipFamilies").is_some_and(is_ip_family_list) {
+        remove_at_pointer(live, "/spec/ipFamilies");
+    }
+}
+
+/// Suppresses fields the API server defaulted, for kinds whose defaults are
+/// known. A kind that is not in the tables comes back untouched — honest and
+/// slightly noisy, rather than quietly incomplete.
+fn suppress_server_defaults(live: &mut serde_json::Value, desired: &serde_json::Value, kind: &str) {
+    for (pointer, default_json) in kind_default_fields(kind) {
+        suppress_default(live, desired, pointer, default_json);
+    }
+    if kind == "Service" {
+        suppress_service_addresses(live, desired);
+    }
+
+    let Some(prefix) = pod_spec_pointer(kind) else { return };
+
+    for (field, default_json) in POD_SPEC_DEFAULTS {
+        suppress_default(live, desired, &format!("{prefix}/{field}"), default_json);
+    }
+
+    // `restartPolicy: Always` is only a default where a controller restarts
+    // pods for you. A Job or CronJob has to say `OnFailure` or `Never`, so
+    // there the field is authored and must never be hidden.
+    if matches!(kind, "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Pod") {
+        suppress_default(live, desired, &format!("{prefix}/restartPolicy"), "\"Always\"");
+    }
+
+    // `serviceAccount` is a deprecated mirror of `serviceAccountName` that the
+    // server keeps in step, so it is only noise while the two agree.
+    if let Some(account) = live.pointer(&format!("{prefix}/serviceAccountName")).cloned() {
+        let mirror = format!("{prefix}/serviceAccount");
+        if desired.pointer(&mirror).is_none() && live.pointer(&mirror) == Some(&account) {
+            remove_at_pointer(live, &mirror);
+        }
+    }
+
+    // Containers are addressed by index, which assumes both sides list them in
+    // the same order — true for anything ArgoCD applied. If a webhook injects a
+    // sidecar and shifts the indexes, the value match simply stops matching and
+    // the defaults are shown rather than wrongly hidden.
+    for list in ["containers", "initContainers"] {
+        let containers = live
+            .pointer(&format!("{prefix}/{list}"))
+            .and_then(|c| c.as_array())
+            .map_or(0, |c| c.len());
+        for index in 0..containers {
+            let base = format!("{prefix}/{list}/{index}");
+            for (field, default_json) in CONTAINER_DEFAULTS {
+                suppress_default(live, desired, &format!("{base}/{field}"), default_json);
+            }
+            suppress_port_protocols(live, desired, &format!("{base}/ports"));
+        }
+    }
+}
+
+/// Renders a normalised value as YAML for line-diffing.
+///
+/// Both sides reach this as a `serde_json::Value`, and that is load-bearing
+/// rather than incidental: `serde_json`'s map is a `BTreeMap` here — the
+/// crate's `preserve_order` feature is enabled nowhere in the tree — so keys
+/// iterate sorted and both sides come out in the same order for free, with no
+/// explicit sort. Serializing a `DynamicObject` directly, the way
+/// `object_manifest` does (correctly, for display), would emit `metadata`
+/// through `ObjectMeta`'s derived `Serialize` in struct-field order; the two
+/// sides would then disagree on key order and the diff would be pure noise.
+fn diff_yaml(value: &serde_json::Value) -> Result<String, String> {
+    let text = serde_yaml::to_string(value).map_err(|e| format!("Failed to render YAML: {e}"))?;
+    // `serde_yaml` always terminates with a newline. Trimming it on both sides
+    // keeps a trailing blank line out of every diff.
+    Ok(text.trim_end_matches('\n').to_string())
+}
+
+/// The identity fields of one `status.resources[]` entry.
+fn resource_identity(entry: &serde_json::Value) -> (String, String, String, String, String, String) {
+    (
+        // Absent *entirely* for core resources rather than null, so "" means
+        // the core group and must not be read as "missing".
+        json_str(Some(entry), "group").to_string(),
+        json_str(Some(entry), "version").to_string(),
+        json_str(Some(entry), "kind").to_string(),
+        json_str(Some(entry), "namespace").to_string(),
+        json_str(Some(entry), "name").to_string(),
+        json_str(Some(entry), "status").to_string(),
+    )
+}
+
+/// One resource that could not be read at all.
+fn unavailable_resource_diff(entry: &serde_json::Value, error: String) -> GitOpsResourceDiff {
+    let (group, version, kind, namespace, name, sync_status) = resource_identity(entry);
+    GitOpsResourceDiff {
+        group,
+        version,
+        kind,
+        namespace,
+        name,
+        sync_status,
+        desired_yaml: String::new(),
+        live_yaml: String::new(),
+        live_yaml_full: String::new(),
+        suppressed_lines: 0,
+        desired_available: false,
+        error: Some(error),
+    }
+}
+
+/// Builds one resource's diff payload. Pure, so every normalisation rule above
+/// is testable against real fixtures without a cluster.
+fn build_resource_diff(entry: &serde_json::Value, live_object: &serde_json::Value) -> Result<GitOpsResourceDiff, String> {
+    let (group, version, kind, namespace, name, sync_status) = resource_identity(entry);
+
+    let desired_raw = live_object
+        .pointer("/metadata/annotations")
+        .and_then(|a| a.get(LAST_APPLIED_ANNOTATION))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let mut live = live_object.clone();
+    // Unconditional, unlike everything in `DIFF_STRIP_ANNOTATIONS`: this
+    // annotation *is* the other side of the diff, so leaving it in would diff
+    // the desired manifest against itself as one enormous line.
+    if let Some(annotations) = live.pointer_mut("/metadata/annotations").and_then(|a| a.as_object_mut()) {
+        annotations.remove(LAST_APPLIED_ANNOTATION);
+    }
+
+    let Some(desired_raw) = desired_raw else {
+        // No annotation: nothing to compare against. Reported as its own state
+        // rather than as an empty diff, which would read as "no drift".
+        prune_explicit_nulls(&mut live);
+        drop_empty_metadata_maps(&mut live);
+        let live_yaml_full = diff_yaml(&live)?;
+        return Ok(GitOpsResourceDiff {
+            group,
+            version,
+            kind,
+            namespace,
+            name,
+            sync_status,
+            desired_yaml: String::new(),
+            live_yaml: live_yaml_full.clone(),
+            live_yaml_full,
+            suppressed_lines: 0,
+            desired_available: false,
+            error: None,
+        });
+    };
+
+    let mut desired: serde_json::Value = serde_json::from_str(&desired_raw)
+        .map_err(|e| format!("The last-applied-configuration annotation on {kind}/{name} is not valid JSON: {e}"))?;
+
+    prune_explicit_nulls(&mut desired);
+    prune_explicit_nulls(&mut live);
+    strip_server_bookkeeping(&mut live, &desired);
+    drop_empty_metadata_maps(&mut desired);
+    drop_empty_metadata_maps(&mut live);
+
+    let mut suppressed = live.clone();
+    suppress_server_defaults(&mut suppressed, &desired, &kind);
+
+    let desired_yaml = diff_yaml(&desired)?;
+    let live_yaml_full = diff_yaml(&live)?;
+    let live_yaml = diff_yaml(&suppressed)?;
+
+    // The line-count delta, not a count of rules that fired: one rule can
+    // remove a list-valued field worth several lines (`clusterIPs`,
+    // `ipFamilies`), so counting rules would understate what is hidden.
+    let suppressed_lines = live_yaml_full.lines().count().saturating_sub(live_yaml.lines().count());
+
+    Ok(GitOpsResourceDiff {
+        group,
+        version,
+        kind,
+        namespace,
+        name,
+        sync_status,
+        desired_yaml,
+        live_yaml,
+        live_yaml_full,
+        suppressed_lines,
+        desired_available: true,
+        error: None,
+    })
+}
+
+/// Every not-Synced resource an Application manages, with both sides of its
+/// drift diff normalised and ready to line-diff.
+pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) -> Result<Vec<GitOpsResourceDiff>, String> {
+    let client = client_for_context(context_name).await?;
+    let ar = argocd_application_resource();
+    let app_api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+    let app = app_api
+        .get(name)
+        .await
+        .map_err(|e| format!("Failed to get Application '{name}': {e}"))?;
+
+    let entries = app
+        .data
+        .pointer("/status/resources")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // One discovery round trip per distinct GVK rather than per resource: an
+    // app with twenty drifted Deployments should ask the cluster what a
+    // Deployment is once. `None` caches a kind the cluster does not recognise,
+    // so that is not re-asked either.
+    let mut resolved: HashMap<GroupVersionKind, Option<(ApiResource, Scope)>> = HashMap::new();
+    let mut diffs = Vec::new();
+
+    for entry in &entries {
+        let (group, version, kind, child_namespace, child_name, sync_status) = resource_identity(entry);
+
+        // Anything ArgoCD is content with has no drift worth showing, and an
+        // entry with no status at all is one it has not compared yet.
+        if sync_status.is_empty() || sync_status == "Synced" {
+            continue;
+        }
+        if kind.is_empty() || child_name.is_empty() {
+            continue;
+        }
+
+        let gvk = GroupVersionKind::gvk(&group, &version, &kind);
+        if !resolved.contains_key(&gvk) {
+            // Asked rather than guessed, the same reasoning as `apply_manifest`:
+            // the plural is not derivable from the kind (Ingress → ingresses,
+            // PodDisruptionBudget → poddisruptionbudgets), and this has to work
+            // for CRDs the app has never seen.
+            let found = kube::discovery::pinned_kind(&client, &gvk)
+                .await
+                .ok()
+                .map(|(resource, capabilities)| (resource, capabilities.scope));
+            resolved.insert(gvk.clone(), found);
+        }
+
+        let Some(Some((resource, scope))) = resolved.get(&gvk) else {
+            diffs.push(unavailable_resource_diff(
+                entry,
+                format!("The cluster doesn't recognise {kind} ({group}/{version})"),
+            ));
+            continue;
+        };
+
+        let api: Api<DynamicObject> = match scope {
+            Scope::Namespaced => Api::namespaced_with(client.clone(), &child_namespace, resource),
+            Scope::Cluster => Api::all_with(client.clone(), resource),
+        };
+
+        // One unreadable resource must not blank the whole panel: an app can
+        // manage many, and a read-only token commonly lacks `get` on a few of
+        // their kinds.
+        match api.get(&child_name).await {
+            Ok(live) => {
+                let live_value = match serde_json::to_value(&live) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        diffs.push(unavailable_resource_diff(entry, format!("Failed to read {kind}/{child_name}: {e}")));
+                        continue;
+                    }
+                };
+                match build_resource_diff(entry, &live_value) {
+                    Ok(diff) => diffs.push(diff),
+                    Err(e) => diffs.push(unavailable_resource_diff(entry, e)),
+                }
+            }
+            Err(e) => diffs.push(unavailable_resource_diff(entry, format!("Failed to get {kind}/{child_name}: {e}"))),
+        }
+    }
+
+    Ok(diffs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1938,6 +2446,376 @@ mod tests {
     /// than hand-built structs that could drift from it.
     fn dynamic(json: serde_json::Value) -> DynamicObject {
         serde_json::from_value(json).expect("valid DynamicObject")
+    }
+
+    // -----------------------------------------------------------------
+    // Drift diff normalisation
+    //
+    // Shaped after the real thing throughout: the fixtures below are trimmed
+    // from a live `cbp-service` Deployment whose OutOfSync cause is the
+    // Reloader operator injecting an env var, plus its own Service. A
+    // hand-simplified fixture would not exercise the cases that actually bite.
+    // -----------------------------------------------------------------
+
+    /// A `status.resources[]` entry for a drifted Deployment.
+    fn drifted_entry() -> serde_json::Value {
+        serde_json::json!({
+            "group": "apps", "version": "v1", "kind": "Deployment",
+            "namespace": "sbx-weu", "name": "cbp-service", "status": "OutOfSync"
+        })
+    }
+
+    /// Wraps a manifest as the live object that carries it as its own
+    /// last-applied annotation — i.e. a resource with no drift at all.
+    fn live_matching(manifest: &serde_json::Value, extra_live: serde_json::Value) -> serde_json::Value {
+        let mut live = manifest.clone();
+        merge(&mut live, &extra_live);
+        live["metadata"]["annotations"][LAST_APPLIED_ANNOTATION] =
+            serde_json::Value::String(serde_json::to_string(manifest).unwrap());
+        live
+    }
+
+    /// Deep-merges a patch into a fixture. Arrays merge element-wise rather
+    /// than replacing, so a patch adding server defaults to `containers[0]`
+    /// keeps the container the manifest declared.
+    fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+        match (target, patch) {
+            (serde_json::Value::Object(t), serde_json::Value::Object(p)) => {
+                for (k, v) in p {
+                    merge(t.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+                }
+            }
+            (serde_json::Value::Array(t), serde_json::Value::Array(p)) => {
+                for (i, v) in p.iter().enumerate() {
+                    match t.get_mut(i) {
+                        Some(slot) => merge(slot, v),
+                        None => t.push(v.clone()),
+                    }
+                }
+            }
+            (t, p) => *t = p.clone(),
+        }
+    }
+
+    fn deployment_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "cbp-service",
+                "namespace": "sbx-weu",
+                "annotations": { "reloader.stakater.com/auto": "true" }
+            },
+            "spec": {
+                "replicas": 2,
+                "template": {
+                    "metadata": { "creationTimestamp": null },
+                    "spec": {
+                        "serviceAccountName": "cbp-service",
+                        "containers": [{
+                            "name": "cbp-service",
+                            "image": "example.azurecr.io/cbp-service:latest",
+                            // This chart renders unset probe blocks as explicit
+                            // nulls; the API server drops them.
+                            "livenessProbe": null,
+                            "startupProbe": null,
+                            "env": [{ "name": "DB_USERNAME" }],
+                            "ports": [{ "containerPort": 8080 }]
+                        }]
+                    }
+                }
+            }
+        })
+    }
+
+    /// THE oracle. A resource whose live object is its own manifest plus
+    /// nothing but API-server defaults must diff to exactly zero. Every
+    /// normalisation rule either earns its place here or is noise, and this is
+    /// the test that fails first if one of them regresses.
+    #[test]
+    fn gitops_diff_of_an_undrifted_resource_is_empty() {
+        let manifest = deployment_manifest();
+        let live = live_matching(
+            &manifest,
+            serde_json::json!({
+                // Everything a real live object accretes.
+                "metadata": {
+                    "uid": "3f1c9c1e-0000-4000-8000-000000000000",
+                    "resourceVersion": "884213319",
+                    "generation": 7,
+                    "creationTimestamp": "2026-03-11T09:14:02Z",
+                    "managedFields": [{ "manager": "argocd-controller", "operation": "Update" }],
+                    "annotations": { "deployment.kubernetes.io/revision": "12" }
+                },
+                "spec": {
+                    "revisionHistoryLimit": 10,
+                    "progressDeadlineSeconds": 600,
+                    "template": { "spec": {
+                        "dnsPolicy": "ClusterFirst",
+                        "restartPolicy": "Always",
+                        "schedulerName": "default-scheduler",
+                        "terminationGracePeriodSeconds": 30,
+                        "securityContext": {},
+                        "serviceAccount": "cbp-service",
+                        "containers": [{
+                            "terminationMessagePath": "/dev/termination-log",
+                            "terminationMessagePolicy": "File",
+                            "ports": [{ "protocol": "TCP" }]
+                        }]
+                    }}
+                },
+                "status": { "readyReplicas": 2, "observedGeneration": 7 }
+            }),
+        );
+
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert!(diff.desired_available);
+        assert_eq!(
+            diff.desired_yaml, diff.live_yaml,
+            "an undrifted resource must diff to nothing.\n--- desired ---\n{}\n--- live ---\n{}",
+            diff.desired_yaml, diff.live_yaml
+        );
+        // And the toggle's other side is the honest one: turning suppression
+        // off is expected to show those defaults again.
+        assert!(diff.suppressed_lines > 0, "the defaults above should have been suppressed, not absent");
+    }
+
+    /// The real OutOfSync cause on this fleet: Reloader inserts an env var at
+    /// `env[0]`, shifting every later entry. It has to survive normalisation as
+    /// one visible addition.
+    #[test]
+    fn gitops_diff_shows_an_injected_env_var() {
+        let manifest = deployment_manifest();
+        let mut live = live_matching(&manifest, serde_json::json!({}));
+        live["spec"]["template"]["spec"]["containers"][0]["env"] = serde_json::json!([
+            { "name": "STAKATER_CBP_SERVICE_CONFIGMAP", "value": "d41d8cd9" },
+            { "name": "DB_USERNAME" }
+        ]);
+
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert!(diff.live_yaml.contains("STAKATER_CBP_SERVICE_CONFIGMAP"));
+        assert!(!diff.desired_yaml.contains("STAKATER_CBP_SERVICE_CONFIGMAP"));
+        // The pre-existing entry must still be present on both sides, so the
+        // line diff can align them and render the insertion as one block
+        // rather than as a rewrite of the whole list.
+        assert!(diff.desired_yaml.contains("DB_USERNAME") && diff.live_yaml.contains("DB_USERNAME"));
+    }
+
+    /// Explicit nulls are pruned on BOTH sides. Pruning one would leave these
+    /// two lines as a permanent phantom deletion on every diff of this chart.
+    #[test]
+    fn gitops_diff_prunes_explicit_nulls_symmetrically() {
+        let diff = build_resource_diff(&drifted_entry(), &live_matching(&deployment_manifest(), serde_json::json!({})))
+            .expect("diff");
+        assert!(!diff.desired_yaml.contains("livenessProbe"));
+        assert!(!diff.desired_yaml.contains("startupProbe"));
+        assert_eq!(diff.desired_yaml, diff.live_yaml);
+    }
+
+    /// Metadata the server owns is stripped only where the manifest is silent.
+    /// A manifest that declares `finalizers` must not have them stripped from
+    /// the live side alone — that would be a phantom deletion forever.
+    #[test]
+    fn gitops_diff_keeps_metadata_the_manifest_declares() {
+        let mut manifest = deployment_manifest();
+        manifest["metadata"]["finalizers"] = serde_json::json!(["example.com/cleanup"]);
+        let diff = build_resource_diff(&drifted_entry(), &live_matching(&manifest, serde_json::json!({}))).expect("diff");
+        assert!(diff.desired_yaml.contains("example.com/cleanup"));
+        assert_eq!(diff.desired_yaml, diff.live_yaml, "declared finalizers must not diff against themselves");
+    }
+
+    /// ...while a finalizer only the cluster added stays out of the way.
+    #[test]
+    fn gitops_diff_strips_metadata_the_manifest_never_mentions() {
+        let live = live_matching(
+            &deployment_manifest(),
+            serde_json::json!({ "metadata": { "finalizers": ["kubernetes.io/pvc-protection"] } }),
+        );
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert!(!diff.live_yaml.contains("pvc-protection"));
+    }
+
+    fn service_entry() -> serde_json::Value {
+        serde_json::json!({
+            "version": "v1", "kind": "Service",
+            "namespace": "sbx-weu", "name": "cbp-service", "status": "OutOfSync"
+        })
+    }
+
+    fn service_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": { "name": "cbp-service", "namespace": "sbx-weu" },
+            "spec": { "ports": [{ "port": 80, "targetPort": 8080 }], "selector": { "app": "cbp-service" } }
+        })
+    }
+
+    /// An address the cluster assigned is noise, and is suppressed.
+    #[test]
+    fn gitops_diff_hides_an_assigned_cluster_ip() {
+        let live = live_matching(
+            &service_manifest(),
+            serde_json::json!({ "spec": {
+                "clusterIP": "10.0.114.23",
+                "clusterIPs": ["10.0.114.23"],
+                "ipFamilies": ["IPv4"],
+                "ipFamilyPolicy": "SingleStack",
+                "sessionAffinity": "None",
+                "internalTrafficPolicy": "Cluster",
+                "ports": [{ "protocol": "TCP" }]
+            }}),
+        );
+        let diff = build_resource_diff(&service_entry(), &live).expect("diff");
+        assert_eq!(diff.desired_yaml, diff.live_yaml, "a Service with only assigned addresses has no drift");
+    }
+
+    /// `clusterIP: None` is the exception that makes suppressing these keys by
+    /// name alone unsafe: `None` is not an assignment, it is an author
+    /// declaring a headless Service. Hiding it would render a change that
+    /// breaks DNS and every consumer's routing as a completely empty diff.
+    #[test]
+    fn gitops_diff_shows_a_headless_service_conversion() {
+        let live = live_matching(
+            &service_manifest(),
+            serde_json::json!({ "spec": { "clusterIP": "None", "clusterIPs": ["None"] } }),
+        );
+        let diff = build_resource_diff(&service_entry(), &live).expect("diff");
+        assert!(diff.live_yaml.contains("None"), "a headless conversion must be visible:\n{}", diff.live_yaml);
+        assert_ne!(diff.desired_yaml, diff.live_yaml);
+    }
+
+    /// Suppression is by VALUE, never by key. A defaulted field set to a
+    /// non-default value is real drift and must survive.
+    #[test]
+    fn gitops_diff_never_hides_a_non_default_value() {
+        for (pointer, value) in [
+            ("/spec/template/spec/terminationGracePeriodSeconds", serde_json::json!(5)),
+            ("/spec/template/spec/restartPolicy", serde_json::json!("OnFailure")),
+            ("/spec/revisionHistoryLimit", serde_json::json!(1)),
+            ("/spec/paused", serde_json::json!(true)),
+        ] {
+            let mut live = live_matching(&deployment_manifest(), serde_json::json!({}));
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            live.pointer_mut(parent).unwrap().as_object_mut().unwrap().insert(key.to_string(), value.clone());
+
+            let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+            assert_ne!(
+                diff.desired_yaml, diff.live_yaml,
+                "{pointer} = {value} is drift and must not be suppressed"
+            );
+        }
+    }
+
+    /// An unlisted kind — every CRD — gets no default suppression at all,
+    /// rather than a Deployment's table applied where its paths mean nothing.
+    #[test]
+    fn gitops_diff_suppresses_nothing_for_an_unknown_kind() {
+        let entry = serde_json::json!({
+            "group": "external-secrets.io", "version": "v1", "kind": "ExternalSecret",
+            "namespace": "sbx-weu", "name": "cbp-service-secret", "status": "OutOfSync"
+        });
+        let manifest = serde_json::json!({
+            "apiVersion": "external-secrets.io/v1", "kind": "ExternalSecret",
+            "metadata": { "name": "cbp-service-secret", "namespace": "sbx-weu" },
+            "spec": { "target": { "name": "cbp-service-secret" } }
+        });
+        let live = live_matching(&manifest, serde_json::json!({ "spec": { "target": { "creationPolicy": "Owner" } } }));
+        let diff = build_resource_diff(&entry, &live).expect("diff");
+        assert_eq!(diff.suppressed_lines, 0, "an unlisted kind must not be silently trimmed");
+        assert!(diff.live_yaml.contains("creationPolicy"));
+    }
+
+    /// A server-side-applied resource has no annotation to compare against.
+    /// That is its own state, not an empty diff — an empty diff would read as
+    /// "no drift" and be wrong.
+    #[test]
+    fn gitops_diff_reports_a_missing_last_applied_annotation() {
+        let mut live = deployment_manifest();
+        live["metadata"]["managedFields"] = serde_json::json!([{ "manager": "argocd-controller" }]);
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert!(!diff.desired_available);
+        assert!(diff.desired_yaml.is_empty());
+        assert!(diff.error.is_none(), "this is an explanation, not a failure");
+        assert!(!diff.live_yaml.is_empty(), "the live object is still worth showing");
+    }
+
+    /// Both sides must come out with keys in the same order or the diff is
+    /// pure noise. Sorted order is what `serde_json`'s BTreeMap gives, and it
+    /// is load-bearing rather than incidental.
+    #[test]
+    fn gitops_diff_emits_both_sides_with_sorted_keys() {
+        let yaml = diff_yaml(&serde_json::json!({ "zebra": 1, "apple": 2, "Mango": 3 })).expect("yaml");
+        let keys: Vec<&str> = yaml.lines().filter_map(|l| l.split(':').next()).collect();
+        assert_eq!(keys, vec!["Mango", "apple", "zebra"]);
+        // And no trailing blank line on either side.
+        assert!(!yaml.ends_with('\n'));
+    }
+
+    /// The identity of a core resource: `status.resources[]` omits `group`
+    /// entirely rather than setting it null, so "" has to mean core/v1.
+    #[test]
+    fn gitops_diff_reads_a_core_resource_identity() {
+        let (group, version, kind, namespace, name, status) = resource_identity(&serde_json::json!({
+            "version": "v1", "kind": "ConfigMap", "namespace": "sbx-weu",
+            "name": "cbp-service-config", "status": "OutOfSync"
+        }));
+        assert_eq!(group, "");
+        assert_eq!((version.as_str(), kind.as_str()), ("v1", "ConfigMap"));
+        assert_eq!((namespace.as_str(), name.as_str(), status.as_str()), ("sbx-weu", "cbp-service-config", "OutOfSync"));
+    }
+
+    /// End to end against a real Application, because everything the unit tests
+    /// above cannot reach lives in the parts that talk to a cluster: GVK
+    /// discovery for an arbitrary child kind, namespaced-versus-cluster scope,
+    /// and whether `last-applied-configuration` is actually there in practice.
+    ///
+    ///   GITOPS_DIFF_TEST_CONTEXT=aks-sbx-weu-ng GITOPS_DIFF_TEST_NS=argocd \
+    ///   GITOPS_DIFF_TEST_APP=cbp-service \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml gitops_diff_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set GITOPS_DIFF_TEST_* to run"]
+    async fn gitops_diff_against_a_live_cluster() {
+        let (Ok(context), Ok(namespace), Ok(app)) = (
+            std::env::var("GITOPS_DIFF_TEST_CONTEXT"),
+            std::env::var("GITOPS_DIFF_TEST_NS"),
+            std::env::var("GITOPS_DIFF_TEST_APP"),
+        ) else {
+            eprintln!("GITOPS_DIFF_TEST_* not set — skipping");
+            return;
+        };
+
+        let diffs = get_gitops_diff(&context, &namespace, &app).await.expect("diff should be readable");
+        eprintln!("{} not-Synced resource(s) in {app}", diffs.len());
+
+        for d in &diffs {
+            eprintln!(
+                "\n=== {}/{} ({}{}) ns={} status={} desired_available={} suppressed={} error={:?}",
+                d.kind,
+                d.name,
+                if d.group.is_empty() { "core" } else { &d.group },
+                format!("/{}", d.version),
+                d.namespace,
+                d.sync_status,
+                d.desired_available,
+                d.suppressed_lines,
+                d.error,
+            );
+            if d.error.is_none() && d.desired_available {
+                // Both sides must be sorted-key YAML of the same shape, or the
+                // line diff on the frontend is noise.
+                assert!(d.desired_yaml.starts_with("apiVersion:"), "desired should start at apiVersion");
+                assert!(d.live_yaml.starts_with("apiVersion:"), "live should start at apiVersion");
+                assert!(!d.desired_yaml.ends_with('\n') && !d.live_yaml.ends_with('\n'));
+                assert!(
+                    !d.live_yaml.contains(LAST_APPLIED_ANNOTATION),
+                    "the annotation must never appear on the live side — it IS the other side"
+                );
+                assert!(!d.live_yaml.contains("managedFields"), "managedFields must be stripped");
+                assert!(d.live_yaml.lines().count() <= d.live_yaml_full.lines().count());
+                eprintln!("--- last applied ---\n{}", d.desired_yaml);
+                eprintln!("--- live ---\n{}", d.live_yaml);
+            }
+        }
     }
 
     #[test]

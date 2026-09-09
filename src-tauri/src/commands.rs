@@ -464,6 +464,14 @@ pub async fn get_gitops_events(context_name: String, namespace: String, name: St
     with_retry(&context_name, || k8s::get_gitops_events(&context_name, &namespace, &name)).await
 }
 
+/// Every not-Synced resource this Application manages, with both sides of its
+/// drift diff. Read-only, so `with_retry` applies like the rest of this group;
+/// the borrowed arguments matter because that closure can run more than once.
+#[tauri::command]
+pub async fn get_gitops_diff(context_name: String, namespace: String, name: String) -> Result<Vec<GitOpsResourceDiff>, String> {
+    with_retry(&context_name, || k8s::get_gitops_diff(&context_name, &namespace, &name)).await
+}
+
 #[tauri::command]
 pub async fn list_metrics_backends(context_name: String) -> Result<Vec<MetricsBackendInfo>, String> {
     with_retry(&context_name, || metrics_backend::list_metrics_backends(&context_name)).await

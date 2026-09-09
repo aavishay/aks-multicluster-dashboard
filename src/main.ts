@@ -13,6 +13,7 @@ import type {
   EventInfo,
   GitOpsAppInfo,
   GitOpsAppManifest,
+  GitOpsResourceDiff,
   GitOpsResult,
   KedaResult,
   KedaScaledObjectInfo,
@@ -442,7 +443,7 @@ interface GitOpsDetailState {
   ctx: string;
   namespace: string;
   name: string;
-  view: "yaml" | "events";
+  view: "yaml" | "events" | "diff";
   manifest: GitOpsAppManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
@@ -451,6 +452,20 @@ interface GitOpsDetailState {
   events: EventInfo[] | null;
   eventsError: string | null;
   eventsLoading: boolean;
+  /** Every not-Synced resource this app manages. Fetched lazily on first visit to the Diff tab. */
+  diff: GitOpsResourceDiff[] | null;
+  diffError: string | null;
+  diffLoading: boolean;
+  /** Which of `diff` is on screen. An app can have several drifted resources. */
+  diffResource: number;
+  /**
+   * Whether to show fields the API server defaulted. Off by default, and
+   * purely client-side over two strings already in the payload — the same
+   * arrangement as `showManagedFields`, and for the same second reason:
+   * refetching on toggle could show a *different* live object than the one
+   * the reader is already looking at.
+   */
+  showServerDefaults: boolean;
 }
 
 interface NapDetailState extends MetricsViewState {
@@ -2472,6 +2487,11 @@ function openGitOpsDetail(ctx: string, namespace: string, name: string) {
     events: null,
     eventsError: null,
     eventsLoading: false,
+    diff: null,
+    diffError: null,
+    diffLoading: false,
+    diffResource: 0,
+    showServerDefaults: false,
   };
   render();
 
@@ -2503,12 +2523,48 @@ function setGitOpsDetailView(view: GitOpsDetailState["view"]) {
   if (view === "events" && !state.gitOpsDetail.events && !state.gitOpsDetail.eventsLoading) {
     fetchGitOpsEvents();
   }
+  if (view === "diff" && !state.gitOpsDetail.diff && !state.gitOpsDetail.diffLoading) {
+    fetchGitOpsDiff();
+  }
 }
 
 function toggleGitOpsManagedFields() {
   if (!state.gitOpsDetail) return;
   state.gitOpsDetail.showManagedFields = !state.gitOpsDetail.showManagedFields;
   render();
+}
+
+function toggleGitOpsServerDefaults() {
+  if (!state.gitOpsDetail) return;
+  state.gitOpsDetail.showServerDefaults = !state.gitOpsDetail.showServerDefaults;
+  render();
+}
+
+function setGitOpsDiffResource(index: number) {
+  if (!state.gitOpsDetail) return;
+  state.gitOpsDetail.diffResource = index;
+  render();
+}
+
+async function fetchGitOpsDiff() {
+  const gd = state.gitOpsDetail;
+  if (!gd) return;
+  const token = gitOpsDetailToken;
+  gd.diffLoading = true;
+  gd.diffError = null;
+  render();
+  try {
+    const diff = await api.getGitOpsDiff(gd.ctx, gd.namespace, gd.name);
+    if (token !== gitOpsDetailToken || !state.gitOpsDetail) return;
+    state.gitOpsDetail.diff = diff;
+    state.gitOpsDetail.diffResource = 0;
+  } catch (e) {
+    if (token !== gitOpsDetailToken || !state.gitOpsDetail) return;
+    state.gitOpsDetail.diffError = String(e);
+  } finally {
+    if (token === gitOpsDetailToken && state.gitOpsDetail) state.gitOpsDetail.diffLoading = false;
+    render();
+  }
 }
 
 async function fetchGitOpsEvents() {
@@ -3163,11 +3219,17 @@ function writeActionButton(label: string, title: string, handler: string, danger
  * question anyone can answer. Reuses the revision-diff machinery, collapsed to
  * three lines of context so a one-line change reads as a one-line change.
  */
-function renderConfirmDiff(before: string, after: string): string {
-  const ops = diffLines(before, after);
-  const added = ops.filter((o) => o.kind === "add").length;
-  const removed = ops.filter((o) => o.kind === "del").length;
-  const rows = collapseUnchanged(ops)
+/**
+ * The +/- rows of a line diff.
+ *
+ * One copy, three consumers: the save-confirmation diff, the workload revision
+ * diff, and the GitOps drift diff. It was duplicated verbatim in the first two
+ * before the third arrived — the same trap `MONO_TEXT_CLASSES` in
+ * typography.ts exists to prevent, and the same fix. What each diff compares,
+ * and what it says about it, is all that legitimately differs.
+ */
+function renderDiffRows(ops: DiffOp[]): string {
+  return collapseUnchanged(ops)
     .map((op) => {
       if (op.kind === "gap") {
         return `<div class="select-none px-3 py-1 text-center text-ink-muted">${esc(op.text)}</div>`;
@@ -3182,6 +3244,13 @@ function renderConfirmDiff(before: string, after: string): string {
       return `<div class="flex ${tone}"><span class="w-5 shrink-0 select-none text-center text-ink-muted">${marker}</span><span class="whitespace-pre-wrap break-all">${esc(op.text)}</span></div>`;
     })
     .join("");
+}
+
+function renderConfirmDiff(before: string, after: string): string {
+  const ops = diffLines(before, after);
+  const added = ops.filter((o) => o.kind === "add").length;
+  const removed = ops.filter((o) => o.kind === "del").length;
+  const rows = renderDiffRows(ops);
 
   return `
     <div class="mx-4 mb-3 flex flex-col gap-1">
@@ -4153,6 +4222,8 @@ function setMetricsRange(minutes: number) {
   closeGitOpsDetail,
   setGitOpsDetailView,
   toggleGitOpsManagedFields,
+  toggleGitOpsServerDefaults,
+  setGitOpsDiffResource,
   setGitOpsSearch,
   moveGitOpsSearch,
   openNapDetail,
@@ -7648,21 +7719,7 @@ function renderRevisionDiff(wd: WorkloadDetailState, revisions: WorkloadRevision
       </div>`;
   }
 
-  const rows = collapseUnchanged(ops)
-    .map((op) => {
-      if (op.kind === "gap") {
-        return `<div class="select-none px-3 py-1 text-center text-ink-muted">${esc(op.text)}</div>`;
-      }
-      const marker = op.kind === "add" ? "+" : op.kind === "del" ? "-" : " ";
-      const tone =
-        op.kind === "add"
-          ? "bg-status-good/15 text-ink-primary"
-          : op.kind === "del"
-            ? "bg-status-critical/15 text-ink-primary"
-            : "text-ink-secondary";
-      return `<div class="flex ${tone}"><span class="w-5 shrink-0 select-none text-center text-ink-muted">${marker}</span><span class="whitespace-pre-wrap break-all">${esc(op.text)}</span></div>`;
-    })
-    .join("");
+  const rows = renderDiffRows(ops);
 
   return `
     <div class="flex min-h-0 flex-1 flex-col gap-1.5">
@@ -8107,16 +8164,161 @@ function renderKedaDetailPanel(): string {
     </div>`;
 }
 
+/**
+ * The drift diff for every resource an Application manages that ArgoCD does
+ * not consider Synced.
+ *
+ * Worth being explicit about what is on screen, because it is easy to mistake
+ * for ArgoCD's own diff and it is not one. ArgoCD renders the manifests from
+ * Git and compares those against the cluster, inside its repo-server, and
+ * stores none of that on the Application — `status.resources[]` names each
+ * drifted resource and stops there. What this compares instead is the manifest
+ * last *applied* to each resource against its live state: drift. The two
+ * questions overlap enough for this to be useful, and diverge enough that the
+ * panel labels itself every time rather than only when the diff comes back
+ * empty.
+ */
+function renderGitOpsDiffView(gd: GitOpsDetailState): string {
+  if (gd.diffError) {
+    return `<div class="text-sm text-status-critical">${esc(gd.diffError)}</div>`;
+  }
+  if (!gd.diff) {
+    return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  }
+  if (gd.diff.length === 0) {
+    return `
+      <div class="rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-secondary">
+        Every resource this application manages is Synced, so there is nothing to compare.
+      </div>`;
+  }
+
+  // Clamped rather than trusted: a refetch can return fewer resources than the
+  // selection was made against.
+  const index = Math.min(gd.diffResource, gd.diff.length - 1);
+  const resource = gd.diff[index];
+
+  const picker =
+    gd.diff.length > 1
+      ? `<div class="flex shrink-0 flex-wrap items-center gap-1.5">
+          ${gd.diff
+            .map(
+              (r, i) => `<button
+                type="button"
+                onclick="window.__app.setGitOpsDiffResource(${i})"
+                title="${esc(r.namespace ? `${r.namespace}/${r.name}` : r.name)}"
+                class="rounded-md px-2 py-1 text-xs font-medium ${
+                  i === index ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"
+                }"
+              >${esc(r.kind)}/${esc(r.name)}</button>`,
+            )
+            .join("")}
+        </div>`
+      : "";
+
+  const heading = `
+    <div class="shrink-0 text-xs">
+      <span class="font-medium text-ink-primary">${esc(resource.kind)}/${esc(resource.name)}</span>
+      ${resource.namespace ? `<span class="text-ink-muted"> &middot; ${esc(resource.namespace)}</span>` : ""}
+      <span class="text-ink-muted"> &middot; ${esc(resource.sync_status)}</span>
+    </div>`;
+
+  // Shown whether or not there is anything to see, so a populated diff is
+  // never taken for ArgoCD's.
+  const caveat = `
+    <div class="shrink-0 text-xs text-ink-muted">
+      Drift only: what was last applied to this resource, versus its live state. Not ArgoCD&rsquo;s diff against Git.
+    </div>`;
+
+  const frame = (inner: string) => `<div class="flex min-h-0 flex-1 flex-col gap-2">${picker}${heading}${caveat}${inner}</div>`;
+
+  if (resource.error) {
+    return frame(`
+      <div class="rounded-md border border-gridline bg-surface-2 p-3 text-xs text-status-critical">${esc(resource.error)}</div>`);
+  }
+
+  if (!resource.desired_available) {
+    return frame(`
+      <div class="rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-secondary">
+        <div class="font-medium text-ink-primary">Nothing to compare against</div>
+        <div class="mt-1">
+          This resource carries no <code>last-applied-configuration</code> annotation, which is normal for anything
+          applied server-side. What it was applied with is recorded in <code>managedFields</code> as per-field
+          ownership, which cannot be turned back into a manifest to diff against. Said plainly rather than shown as an
+          empty diff, which would read as &ldquo;no drift&rdquo;.
+        </div>
+      </div>`);
+  }
+
+  const live = gd.showServerDefaults ? resource.live_yaml_full : resource.live_yaml;
+  const ops = diffLines(resource.desired_yaml, live);
+  const added = ops.filter((o) => o.kind === "add").length;
+  const removed = ops.filter((o) => o.kind === "del").length;
+  const scrollId = `gitops-diff:${gd.ctx}:${gd.namespace}:${gd.name}:${resource.kind}:${resource.name}`;
+
+  // Only offered when there is something behind it, and it always says how
+  // much — a quieter diff that does not admit what it is hiding is worse than
+  // a noisy one.
+  const defaultsToggle =
+    resource.suppressed_lines > 0 || gd.showServerDefaults
+      ? `<button
+          type="button"
+          onclick="window.__app.toggleGitOpsServerDefaults()"
+          class="rounded-md px-2 py-1 text-xs ${gd.showServerDefaults ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
+          title="Fields the API server filled in and that still hold their default value. Anything set to a non-default value is always shown."
+        >${
+          gd.showServerDefaults
+            ? "Showing server defaults"
+            : `${resource.suppressed_lines} default line${resource.suppressed_lines === 1 ? "" : "s"} hidden`
+        }</button>`
+      : "";
+
+  if (added === 0 && removed === 0) {
+    return frame(`
+      <div class="rounded-md border border-gridline bg-surface-2 p-3 text-xs text-ink-secondary">
+        <div class="font-medium text-ink-primary">No drift detected</div>
+        <div class="mt-1">
+          ArgoCD reports this resource as ${esc(resource.sync_status)}, but its live state matches the manifest last
+          applied to it exactly, so nothing has changed it since. That leaves the other cause: Git has moved ahead of
+          the cluster and has not been synced yet. ArgoCD computes that diff against your Git revision in its
+          repo-server and does not store it on the Application, so this app cannot reproduce it &mdash; the ArgoCD UI
+          can.
+        </div>
+      </div>
+      ${defaultsToggle ? `<div class="shrink-0">${defaultsToggle}</div>` : ""}`);
+  }
+
+  return frame(`
+    <div class="flex shrink-0 items-center justify-between text-xs">
+      <div class="text-ink-secondary">
+        <span class="font-medium text-ink-primary">last applied</span>
+        &rarr; <span class="font-medium text-ink-primary">live</span>
+      </div>
+      <div class="flex items-center gap-3">
+        ${defaultsToggle}
+        <span class="text-status-good">+${added}</span>
+        <span class="text-status-critical">-${removed}</span>
+        ${renderCopyButton(scrollId)}
+      </div>
+    </div>
+    <div data-scroll-id="${esc(scrollId)}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 py-2 ${MONO_TEXT_CLASSES}">${renderDiffRows(ops)}</div>`);
+}
+
 function renderGitOpsDetailPanel(): string {
   const gd = state.gitOpsDetail;
   if (!gd) return "";
 
   const tabs: { id: GitOpsDetailState["view"]; label: string }[] = [
     { id: "yaml", label: "YAML" },
+    { id: "diff", label: "Diff" },
     { id: "events", label: "Events" },
   ];
 
-  const body = gd.view === "yaml" ? renderGitOpsYamlView(gd) : renderEventsList(`gitops-events:${gd.ctx}:${gd.namespace}:${gd.name}`, gd.events, gd.eventsError);
+  const body =
+    gd.view === "yaml"
+      ? renderGitOpsYamlView(gd)
+      : gd.view === "diff"
+        ? renderGitOpsDiffView(gd)
+        : renderEventsList(`gitops-events:${gd.ctx}:${gd.namespace}:${gd.name}`, gd.events, gd.eventsError);
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeGitOpsDetail()">
