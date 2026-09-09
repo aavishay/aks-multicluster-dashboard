@@ -259,6 +259,67 @@ pub struct GitOpsResult {
     pub apps: Vec<GitOpsAppInfo>,
 }
 
+/// One resource an ArgoCD `Application` manages that is **not** Synced, with
+/// both sides of its diff already normalised for line-diffing.
+///
+/// A word on what this diff is, because it is not what ArgoCD's own diff is.
+/// ArgoCD compares the manifests rendered from Git against the live cluster,
+/// and computes that in its repo-server — the result is cached in Redis and is
+/// *not* stored on the `Application` resource. `status.resources[]` names each
+/// drifted resource and nothing more. So an app holding only a kubeconfig
+/// cannot reproduce it.
+///
+/// What a kubeconfig *can* see is the `last-applied-configuration` annotation
+/// each resource carries: what was most recently applied to it. Diffing that
+/// against the live object shows **drift** — a change made to the cluster
+/// after the last apply. That is a genuinely useful and different question,
+/// and it is the one this struct answers. It is deliberately not dressed up as
+/// ArgoCD's answer; the UI says which it is.
+#[derive(Serialize, Clone, Debug)]
+pub struct GitOpsResourceDiff {
+    /// Empty for core resources — `status.resources[]` omits the `group` key
+    /// entirely rather than setting it null, so "" here means core/v1.
+    pub group: String,
+    pub version: String,
+    pub kind: String,
+    /// Empty for cluster-scoped resources.
+    pub namespace: String,
+    pub name: String,
+    /// Carried through from `status.resources[].status` so the UI can label a
+    /// row with what ArgoCD actually said, rather than assuming "OutOfSync".
+    pub sync_status: String,
+    /// The `last-applied-configuration` annotation, normalised. Empty when
+    /// `desired_available` is false.
+    pub desired_yaml: String,
+    /// The live object, normalised, with server-assigned defaults suppressed.
+    pub live_yaml: String,
+    /// The same live object with nothing suppressed. Both variants ship in one
+    /// payload for the same reason `ObjectManifest` carries two: the toggle
+    /// then costs no round trip, and — more importantly — cannot end up
+    /// showing a *different* live object than the one already on screen.
+    pub live_yaml_full: String,
+    /// How many lines `live_yaml` hides relative to `live_yaml_full`, so the
+    /// UI can say so instead of quietly showing less.
+    ///
+    /// Counted as the line-count delta between the two rendered strings, not
+    /// as a count of suppression rules that fired: one rule can remove a
+    /// list-valued field worth several lines (`clusterIPs`, `ipFamilies`).
+    pub suppressed_lines: usize,
+    /// False when the resource carries no `last-applied-configuration` — which
+    /// is the normal state for anything applied server-side (`kubectl apply
+    /// --server-side`, or ArgoCD configured for SSA), where the equivalent
+    /// information lives in `managedFields` in a form that cannot be
+    /// reconstituted into a manifest. Not an error: there is simply nothing to
+    /// compare against, and saying so beats rendering an empty diff that reads
+    /// as "no drift".
+    pub desired_available: bool,
+    /// Set when this one resource could not be read at all — RBAC on its kind,
+    /// or it has since been deleted. Per-resource rather than failing the
+    /// whole panel, because an app can manage many resources and a token
+    /// commonly lacks `get` on a few of their kinds.
+    pub error: Option<String>,
+}
+
 /// Azure Node Auto Provisioning (NAP) is AKS's managed Karpenter, so the
 /// resources are Karpenter's own CRDs rather than anything Azure-specific.
 /// `installed: false` distinguishes "this cluster has no NAP" from "NAP is on
