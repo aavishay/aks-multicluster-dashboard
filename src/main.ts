@@ -8178,6 +8178,15 @@ function renderKedaDetailPanel(): string {
  * panel labels itself every time rather than only when the diff comes back
  * empty.
  */
+/**
+ * A drifted resource's full identity. Group and version are included because
+ * kind alone is not unique — two CRDs can share one — which is the same reason
+ * the YAML editor records the group it read a manifest from.
+ */
+function resourceIdentity(r: GitOpsResourceDiff): string {
+  return `${r.group || "core"}/${r.version}:${r.kind}:${r.namespace}:${r.name}`;
+}
+
 function renderGitOpsDiffView(gd: GitOpsDetailState): string {
   if (gd.diffError) {
     return `<div class="text-sm text-status-critical">${esc(gd.diffError)}</div>`;
@@ -8197,6 +8206,14 @@ function renderGitOpsDiffView(gd: GitOpsDetailState): string {
   const index = Math.min(gd.diffResource, gd.diff.length - 1);
   const resource = gd.diff[index];
 
+  // An Application can manage the same kind and name in more than one
+  // namespace, and `Kind/name` alone would render those two buttons
+  // identically. Qualify with the namespace only when the set actually spans
+  // more than one, the same way the Events table earns its Cluster column.
+  const spansNamespaces = new Set(gd.diff.map((r) => r.namespace)).size > 1;
+  const resourceLabel = (r: GitOpsResourceDiff) =>
+    spansNamespaces && r.namespace ? `${r.namespace}/${r.kind}/${r.name}` : `${r.kind}/${r.name}`;
+
   const picker =
     gd.diff.length > 1
       ? `<div class="flex shrink-0 flex-wrap items-center gap-1.5">
@@ -8205,11 +8222,11 @@ function renderGitOpsDiffView(gd: GitOpsDetailState): string {
               (r, i) => `<button
                 type="button"
                 onclick="window.__app.setGitOpsDiffResource(${i})"
-                title="${esc(r.namespace ? `${r.namespace}/${r.name}` : r.name)}"
+                title="${esc(resourceIdentity(r))}"
                 class="rounded-md px-2 py-1 text-xs font-medium ${
                   i === index ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"
                 }"
-              >${esc(r.kind)}/${esc(r.name)}</button>`,
+              >${esc(resourceLabel(r))}</button>`,
             )
             .join("")}
         </div>`
@@ -8253,7 +8270,11 @@ function renderGitOpsDiffView(gd: GitOpsDetailState): string {
   const ops = diffLines(resource.desired_yaml, live);
   const added = ops.filter((o) => o.kind === "add").length;
   const removed = ops.filter((o) => o.kind === "del").length;
-  const scrollId = `gitops-diff:${gd.ctx}:${gd.namespace}:${gd.name}:${resource.kind}:${resource.name}`;
+  // Full identity, not just kind+name: the scroll offset is restored by this
+  // key across re-renders, so two drifted resources sharing a kind and name in
+  // different namespaces would otherwise inherit each other's position — and
+  // `renderCopyButton` targets the pane by the same key.
+  const scrollId = `gitops-diff:${gd.ctx}:${gd.namespace}:${gd.name}:${resourceIdentity(resource)}`;
 
   // Only offered when there is something behind it, and it always says how
   // much — a quieter diff that does not admit what it is hiding is worse than
