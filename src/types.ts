@@ -193,6 +193,38 @@ export interface ObjectManifest {
 
 export type GitOpsAppManifest = ObjectManifest;
 
+/**
+ * One resource an ArgoCD Application manages that is **not** Synced, with both
+ * sides of its diff already normalised for line-diffing. Mirrors
+ * `GitOpsResourceDiff` in models.rs.
+ *
+ * This is a *drift* diff — the manifest last applied to the resource versus
+ * its live state — and deliberately not ArgoCD's own diff, which compares
+ * against Git and is computed in ArgoCD's repo-server rather than stored on
+ * the Application. See the Rust struct for the full reasoning.
+ */
+export interface GitOpsResourceDiff {
+  /** Empty for core resources: `status.resources[]` omits the key entirely. */
+  group: string;
+  version: string;
+  kind: string;
+  /** Empty for cluster-scoped resources. */
+  namespace: string;
+  name: string;
+  sync_status: string;
+  /** Empty when `desired_available` is false. */
+  desired_yaml: string;
+  /** Live, with known server-assigned defaults suppressed. */
+  live_yaml: string;
+  /** Live, with nothing suppressed — the other side of the defaults toggle. */
+  live_yaml_full: string;
+  suppressed_lines: number;
+  /** False for a server-side-applied resource, which has no annotation to compare against. */
+  desired_available: boolean;
+  /** Set when this one resource could not be read (RBAC, or since deleted). */
+  error: string | null;
+}
+
 /** What a drain asked the API server to do, and what it declined. */
 export interface DrainReport {
   node: string;

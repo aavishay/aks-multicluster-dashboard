@@ -145,6 +145,7 @@ pub fn run() {
             commands::get_gitops_apps,
             commands::get_gitops_manifest,
             commands::get_gitops_events,
+            commands::get_gitops_diff,
             commands::list_metrics_backends,
             commands::test_metrics_backend,
             commands::ai_auth_status,
