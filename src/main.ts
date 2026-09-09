@@ -2557,7 +2557,13 @@ async function fetchGitOpsDiff() {
     const diff = await api.getGitOpsDiff(gd.ctx, gd.namespace, gd.name);
     if (token !== gitOpsDetailToken || !state.gitOpsDetail) return;
     state.gitOpsDetail.diff = diff;
-    state.gitOpsDetail.diffResource = 0;
+    // Open on the first resource that actually differs, rather than on
+    // whichever one ArgoCD happened to list first. An app can report several
+    // resources OutOfSync where only one of them has drift this view can show,
+    // and defaulting to index 0 landed the reader on "No drift detected" and
+    // read as the feature being broken.
+    const firstWithDrift = diff.findIndex((r) => resourceHasDrift(r, false));
+    state.gitOpsDetail.diffResource = firstWithDrift === -1 ? 0 : firstWithDrift;
   } catch (e) {
     if (token !== gitOpsDetailToken || !state.gitOpsDetail) return;
     state.gitOpsDetail.diffError = String(e);
@@ -8183,6 +8189,19 @@ function renderKedaDetailPanel(): string {
  * kind alone is not unique — two CRDs can share one — which is the same reason
  * the YAML editor records the group it read a manifest from.
  */
+/**
+ * Whether a resource differs at all, against the same side the view is
+ * currently showing.
+ *
+ * A string comparison rather than a diff: this is asked for every resource on
+ * every render, and `diffLines` builds an LCS table, so asking it that way
+ * would be quadratic work to answer a yes/no question.
+ */
+function resourceHasDrift(r: GitOpsResourceDiff, showServerDefaults: boolean): boolean {
+  if (r.error || !r.desired_available) return false;
+  return r.desired_yaml !== (showServerDefaults ? r.live_yaml_full : r.live_yaml);
+}
+
 function resourceIdentity(r: GitOpsResourceDiff): string {
   return `${r.group || "core"}/${r.version}:${r.kind}:${r.namespace}:${r.name}`;
 }
@@ -8214,6 +8233,16 @@ function renderGitOpsDiffView(gd: GitOpsDetailState): string {
   const resourceLabel = (r: GitOpsResourceDiff) =>
     spansNamespaces && r.namespace ? `${r.namespace}/${r.kind}/${r.name}` : `${r.kind}/${r.name}`;
 
+  // Annotated with whether there is anything to see. ArgoCD marks a resource
+  // OutOfSync for reasons this view cannot show — Git having moved ahead — so
+  // a picker of bare names gives no clue which entries are empty, and the
+  // reader ends up opening each one to find the one that is not.
+  const resourceNote = (r: GitOpsResourceDiff) => {
+    if (r.error) return "unreadable";
+    if (!r.desired_available) return "not comparable";
+    return resourceHasDrift(r, gd.showServerDefaults) ? "" : "no drift";
+  };
+
   const picker =
     gd.diff.length > 1
       ? `<div class="flex shrink-0 flex-wrap items-center gap-1.5">
@@ -8226,7 +8255,9 @@ function renderGitOpsDiffView(gd: GitOpsDetailState): string {
                 class="rounded-md px-2 py-1 text-xs font-medium ${
                   i === index ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"
                 }"
-              >${esc(resourceLabel(r))}</button>`,
+              >${esc(resourceLabel(r))}${
+                  resourceNote(r) ? `<span class="ml-1.5 font-normal text-ink-muted">${esc(resourceNote(r))}</span>` : ""
+                }</button>`,
             )
             .join("")}
         </div>`
