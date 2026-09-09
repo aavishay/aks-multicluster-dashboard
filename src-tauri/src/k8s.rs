@@ -2005,6 +2005,55 @@ fn prune_explicit_nulls(value: &mut serde_json::Value) {
     }
 }
 
+/// Renders quantity values as strings, recursively, on both sides.
+///
+/// Kubernetes' `Quantity` accepts `1` and `"1"` as the same value and the API
+/// server always hands it back as a string, so a chart that writes a bare
+/// number — `nvidia.com/gpu: 1` — diffs against a live `'1'` forever. Seen on
+/// a real app the moment the view was pointed at a second one: four of its ten
+/// changed lines were this and nothing else.
+///
+/// Scoped to `limits` and `requests` maps rather than stringifying every
+/// number in the object, because outside those maps a number and a string are
+/// genuinely different things — `replicas: 3` is not `replicas: "3"`, and
+/// flattening that distinction would hide a real (if unlikely) change.
+///
+/// This equalises representation, not magnitude: `1024Mi` and `1Gi` are the
+/// same quantity and would still diff. That needs Quantity's own parsing
+/// rather than a string, and has not been seen in practice, so it is left
+/// alone deliberately — but it is the next thing to suspect if a false
+/// positive is reported here.
+fn stringify_quantities(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if matches!(key.as_str(), "limits" | "requests") {
+                    if let Some(quantities) = child.as_object_mut() {
+                        for quantity in quantities.values_mut() {
+                            // `is_number`, not `as_f64`: this is a type test, and
+                            // routing it through a float would imply the value's
+                            // magnitude mattered here. It does not — the rendering
+                            // is `to_string`, which reproduces the number as
+                            // written and cannot lose precision on a large one.
+                            if quantity.is_number() {
+                                let rendered = quantity.to_string();
+                                *quantity = serde_json::Value::String(rendered);
+                            }
+                        }
+                    }
+                }
+                stringify_quantities(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                stringify_quantities(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `serde_json` can read through a JSON pointer but not delete through one.
 fn remove_at_pointer(root: &mut serde_json::Value, pointer: &str) {
     let Some((parent, key)) = pointer.rsplit_once('/') else { return };
@@ -2198,6 +2247,19 @@ fn suppress_server_defaults(live: &mut serde_json::Value, desired: &serde_json::
         }
     }
 
+    // A volume that projects a ConfigMap or Secret gets `defaultMode: 420`
+    // (0644) filled in. Same value match as everything else, so a chart that
+    // sets its own mode still shows.
+    let volumes = live
+        .pointer(&format!("{prefix}/volumes"))
+        .and_then(|v| v.as_array())
+        .map_or(0, |v| v.len());
+    for index in 0..volumes {
+        for source in ["configMap", "secret", "projected", "downwardAPI"] {
+            suppress_default(live, desired, &format!("{prefix}/volumes/{index}/{source}/defaultMode"), "420");
+        }
+    }
+
     // Containers are addressed by index, which assumes both sides list them in
     // the same order — true for anything ArgoCD applied. If a webhook injects a
     // sidecar and shifts the indexes, the value match simply stops matching and
@@ -2313,6 +2375,8 @@ fn build_resource_diff(entry: &serde_json::Value, live_object: &serde_json::Valu
 
     prune_explicit_nulls(&mut desired);
     prune_explicit_nulls(&mut live);
+    stringify_quantities(&mut desired);
+    stringify_quantities(&mut live);
     strip_server_bookkeeping(&mut live, &desired);
     drop_empty_metadata_maps(&mut desired);
     drop_empty_metadata_maps(&mut live);
@@ -2621,6 +2685,80 @@ mod tests {
         // line diff can align them and render the insertion as one block
         // rather than as a rewrite of the whole list.
         assert!(diff.desired_yaml.contains("DB_USERNAME") && diff.live_yaml.contains("DB_USERNAME"));
+    }
+
+    /// A projected volume's mode is server-filled and is noise at its default.
+    #[test]
+    fn gitops_diff_hides_a_defaulted_volume_mode_but_not_a_chosen_one() {
+        let mut manifest = deployment_manifest();
+        manifest["spec"]["template"]["spec"]["volumes"] =
+            serde_json::json!([{ "name": "config", "configMap": { "name": "cbp-service" } }]);
+        let live = live_matching(
+            &manifest,
+            serde_json::json!({ "spec": { "template": { "spec": {
+                "volumes": [{ "configMap": { "defaultMode": 420 } }]
+            }}}}),
+        );
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert_eq!(diff.desired_yaml, diff.live_yaml, "0644 is the default and is noise");
+
+        // A chart that picks its own mode is not noise.
+        let mut chosen = manifest.clone();
+        chosen["spec"]["template"]["spec"]["volumes"][0]["configMap"]["defaultMode"] = serde_json::json!(493);
+        let mut live = live_matching(&chosen, serde_json::json!({}));
+        live["spec"]["template"]["spec"]["volumes"][0]["configMap"]["defaultMode"] = serde_json::json!(420);
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert_ne!(diff.desired_yaml, diff.live_yaml, "0755 -> 0644 is real drift");
+    }
+
+    /// A quantity written as a bare number must not diff against the string
+    /// the API server hands back for the same value.
+    #[test]
+    fn gitops_diff_treats_a_numeric_quantity_as_its_string_form() {
+        let mut manifest = deployment_manifest();
+        manifest["spec"]["template"]["spec"]["containers"][0]["resources"] = serde_json::json!({
+            "limits": { "cpu": "3", "memory": "4Gi", "nvidia.com/gpu": 1 },
+            "requests": { "cpu": "500m", "memory": "2Gi", "nvidia.com/gpu": 1 }
+        });
+        let mut live = live_matching(&manifest, serde_json::json!({}));
+        // What the API server actually stores: Quantity, always as a string.
+        for section in ["limits", "requests"] {
+            live["spec"]["template"]["spec"]["containers"][0]["resources"][section]["nvidia.com/gpu"] =
+                serde_json::json!("1");
+        }
+
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert_eq!(
+            diff.desired_yaml, diff.live_yaml,
+            "a numeric quantity and its string form are the same value\n--- desired ---\n{}\n--- live ---\n{}",
+            diff.desired_yaml, diff.live_yaml
+        );
+    }
+
+    /// ...but a real change to a quantity still shows.
+    #[test]
+    fn gitops_diff_still_shows_a_changed_quantity() {
+        let mut manifest = deployment_manifest();
+        manifest["spec"]["template"]["spec"]["containers"][0]["resources"] =
+            serde_json::json!({ "limits": { "nvidia.com/gpu": 1 } });
+        let mut live = live_matching(&manifest, serde_json::json!({}));
+        live["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] =
+            serde_json::json!("2");
+
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert_ne!(diff.desired_yaml, diff.live_yaml, "1 -> 2 is real drift");
+    }
+
+    /// And the coercion stays inside quantity maps: a number elsewhere is not
+    /// the same thing as its string form.
+    #[test]
+    fn gitops_diff_does_not_stringify_numbers_outside_quantity_maps() {
+        let manifest = deployment_manifest();
+        let mut live = live_matching(&manifest, serde_json::json!({}));
+        live["spec"]["replicas"] = serde_json::json!("2");
+
+        let diff = build_resource_diff(&drifted_entry(), &live).expect("diff");
+        assert_ne!(diff.desired_yaml, diff.live_yaml, "replicas 2 vs \"2\" must not be flattened");
     }
 
     /// Explicit nulls are pruned on BOTH sides. Pruning one would leave these
