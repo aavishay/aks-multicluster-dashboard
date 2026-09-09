@@ -8247,8 +8247,11 @@ function renderGitOpsDiffView(gd: GitOpsDetailState): string {
     gd.diff.length > 1
       ? `<div class="flex shrink-0 flex-wrap items-center gap-1.5">
           ${gd.diff
-            .map(
-              (r, i) => `<button
+            .map((r, i) => {
+              // Once per resource, not twice: the note compares two manifests
+              // as strings, and this runs for every resource on every render.
+              const note = resourceNote(r);
+              return `<button
                 type="button"
                 onclick="window.__app.setGitOpsDiffResource(${i})"
                 title="${esc(resourceIdentity(r))}"
@@ -8256,9 +8259,9 @@ function renderGitOpsDiffView(gd: GitOpsDetailState): string {
                   i === index ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"
                 }"
               >${esc(resourceLabel(r))}${
-                  resourceNote(r) ? `<span class="ml-1.5 font-normal text-ink-muted">${esc(resourceNote(r))}</span>` : ""
-                }</button>`,
-            )
+                note ? `<span class="ml-1.5 font-normal text-ink-muted">${esc(note)}</span>` : ""
+              }</button>`;
+            })
             .join("")}
         </div>`
       : "";
