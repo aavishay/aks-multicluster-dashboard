@@ -2030,8 +2030,14 @@ fn stringify_quantities(value: &mut serde_json::Value) {
                 if matches!(key.as_str(), "limits" | "requests") {
                     if let Some(quantities) = child.as_object_mut() {
                         for quantity in quantities.values_mut() {
-                            if let Some(number) = quantity.as_f64().map(|_| quantity.to_string()) {
-                                *quantity = serde_json::Value::String(number);
+                            // `is_number`, not `as_f64`: this is a type test, and
+                            // routing it through a float would imply the value's
+                            // magnitude mattered here. It does not — the rendering
+                            // is `to_string`, which reproduces the number as
+                            // written and cannot lose precision on a large one.
+                            if quantity.is_number() {
+                                let rendered = quantity.to_string();
+                                *quantity = serde_json::Value::String(rendered);
                             }
                         }
                     }
