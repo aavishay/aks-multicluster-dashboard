@@ -1510,7 +1510,24 @@ fn dynamic_object_to_gitops_app(obj: DynamicObject) -> GitOpsAppInfo {
     };
 
     let sync = status.and_then(|s| s.get("sync"));
-    let revision = json_str(sync, "revision");
+    // A multi-source app records one revision per source in
+    // `status.sync.revisions` (plural) and leaves the singular
+    // `status.sync.revision` null — so reading only the singular field left
+    // the Revision column empty for every such app, which on a fleet where
+    // multi-source is the norm meant nearly all of them.
+    //
+    // Index 0 to match the source whose repo and path this same row already
+    // shows: `source` above resolves to `spec.sources[0]`, and `revisions` is
+    // index-aligned with `sources`, so the SHA shown belongs to the repo shown.
+    let revision = match json_str(sync, "revision") {
+        "" => sync
+            .and_then(|s| s.get("revisions"))
+            .and_then(|r| r.as_array())
+            .and_then(|r| r.first())
+            .and_then(|r| r.as_str())
+            .unwrap_or_default(),
+        single => single,
+    };
     let sync_status = match json_str(sync, "status") {
         "" => "Unknown".to_string(),
         s => s.to_string(),
@@ -2854,6 +2871,52 @@ mod tests {
 
         let app = dynamic_object_to_gitops_app(obj);
         assert_eq!(app.last_synced_at, Some("2026-08-30T09:00:00Z".to_string()));
+    }
+
+    /// A multi-source app leaves `status.sync.revision` null and records the
+    /// per-source SHAs in `status.sync.revisions`. Reading only the singular
+    /// field showed a blank Revision column for nearly every app on a
+    /// multi-source fleet.
+    #[test]
+    fn gitops_app_reads_revision_from_the_plural_field_for_a_multi_source_app() {
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "namespace": "argocd", "name": "cbp-service" },
+            "spec": { "sources": [
+                { "repoURL": "git@ssh.dev.azure.com:v3/org/proj/argocd", "path": "helm", "targetRevision": "HEAD" },
+                { "repoURL": "git@ssh.dev.azure.com:v3/org/proj/values", "ref": "devteam", "targetRevision": "HEAD" }
+            ]},
+            "status": {
+                "sync": {
+                    "status": "OutOfSync",
+                    "revisions": [
+                        "e8f6111f96db5353ad2364b09cd3e6264ab2210a",
+                        "5c71a7d48c1790ab5b6a6c094ce0825b0fa379d1"
+                    ]
+                },
+                "health": { "status": "Healthy" }
+            }
+        }));
+
+        let app = dynamic_object_to_gitops_app(obj);
+        // The first source's SHA, because the first source is the one whose
+        // repo and path this row shows.
+        assert_eq!(app.revision, "e8f6111");
+        assert_eq!(app.path, "helm");
+    }
+
+    /// A single-source app still reads the singular field.
+    #[test]
+    fn gitops_app_still_reads_the_singular_revision_for_a_single_source_app() {
+        let obj = dynamic(serde_json::json!({
+            "metadata": { "namespace": "argocd", "name": "aks-nodepool-exporter" },
+            "spec": { "source": { "repoURL": "https://example/repo.git", "path": "chart" } },
+            "status": {
+                "sync": { "status": "Synced", "revision": "c704fac36d5f698df2b7b36461f963bbc7d419db" },
+                "health": { "status": "Healthy" }
+            }
+        }));
+
+        assert_eq!(dynamic_object_to_gitops_app(obj).revision, "c704fac");
     }
 
     #[test]
