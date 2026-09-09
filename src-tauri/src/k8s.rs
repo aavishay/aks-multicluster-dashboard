@@ -2067,8 +2067,13 @@ fn suppress_default(live: &mut serde_json::Value, desired: &serde_json::Value, p
     if desired.pointer(pointer).is_some() {
         return;
     }
+    // The live lookup comes before parsing the default because most pointers
+    // in the tables below are absent from any given resource — a Deployment
+    // never has `/spec/clusterIP`, and every container pointer is walked per
+    // index — so the cheap check should decide it.
+    let Some(actual) = live.pointer(pointer) else { return };
     let Ok(expected) = serde_json::from_str::<serde_json::Value>(default_json) else { return };
-    if live.pointer(pointer) != Some(&expected) {
+    if *actual != expected {
         return;
     }
     remove_at_pointer(live, pointer);
