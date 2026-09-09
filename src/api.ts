@@ -22,6 +22,7 @@ import type {
   ClusterOverview,
   EventInfo,
   GitOpsAppManifest,
+  GitOpsResourceDiff,
   GitOpsResult,
   HelmReleaseDetail,
   HelmReleaseInfo,
@@ -203,6 +204,8 @@ export const api = {
     invoke<GitOpsAppManifest>("get_gitops_manifest", { contextName, namespace, name }),
   getGitOpsEvents: (contextName: string, namespace: string, name: string) =>
     invoke<EventInfo[]>("get_gitops_events", { contextName, namespace, name }),
+  getGitOpsDiff: (contextName: string, namespace: string, name: string) =>
+    invoke<GitOpsResourceDiff[]>("get_gitops_diff", { contextName, namespace, name }),
   /**
    * Opens a PTY-backed shell and returns its session id. Write mode is
    * required, and enforced in the backend rather than only here — the UI gate
