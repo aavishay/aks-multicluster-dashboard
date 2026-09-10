@@ -3078,6 +3078,18 @@ function workloadRowFor(ctx: string, kind: string, namespace: string, name: stri
 const YAML_EDITOR_TEXT_CLASS = `p-3 ${MONO_TEXT_CLASSES}`;
 
 /**
+ * The shell every slide-over panel shares — the detail panels, and the two
+ * Claude panels that open over them.
+ *
+ * One string because the width is not a per-panel choice: these open on top of
+ * each other, and two different widths leave a ledge down one edge where the
+ * panel underneath shows through. That is exactly what happened — the AI
+ * panels had drifted to `max-w-2xl` while all eight detail panels were
+ * `max-w-3xl`, which is visible the moment Diagnose opens over a pod's YAML.
+ */
+const SLIDE_OVER_SHELL = "flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl";
+
+/**
  * How the YAML pane treats a line too long for it, for whichever mode is on
  * screen.
  *
@@ -5244,6 +5256,123 @@ function renderClaudePanel(): string {
     </div>`;
 }
 
+/**
+ * Inline Markdown — bold, emphasis and code spans.
+ *
+ * SAFETY: the text is escaped *first*, and the only tags in the result are the
+ * ones added here. This renders model output, which can contain anything at
+ * all including HTML, so letting any of it through unescaped would inject into
+ * the app's own chrome. Escaping afterwards is not an option either — it would
+ * destroy the tags this just added. `esc` leaves backticks and asterisks
+ * alone, so the patterns below still match once it has run.
+ */
+function renderInlineMarkdown(text: string): string {
+  let out = esc(text);
+  // Code spans first, so `**` inside backticks stays literal rather than
+  // being eaten by the bold pass.
+  out = out.replace(/`([^`\n]+)`/g, '<code class="rounded bg-surface-3 px-1 py-0.5 text-[0.92em]">$1</code>');
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong class="font-semibold text-ink-primary">$1</strong>');
+  // Single asterisks, but not the leftovers of an unmatched bold marker.
+  out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  return out;
+}
+
+/**
+ * A deliberately small Markdown renderer for the Claude panels.
+ *
+ * Small on purpose rather than a dependency: what a model actually emits here
+ * is headings, bold, numbered and bulleted lists, code spans and fenced
+ * blocks. That is a short list, it is stable, and the alternative is shipping
+ * a parser several times larger than the need — the same reasoning `diffLines`
+ * carries for not taking a diff dependency.
+ *
+ * It has to tolerate *partial* input: the answer streams in, so this runs
+ * against a prefix of the text on every chunk. Blocks flush as they close and
+ * an unterminated fence renders what has arrived, so a half-written answer
+ * looks half-written rather than vanishing.
+ */
+function renderMarkdown(source: string): string {
+  const lines = source.replace(/\r\n/g, "\n").split("\n");
+  const out: string[] = [];
+  let paragraph: string[] = [];
+  let items: string[] = [];
+  let ordered = false;
+  let code: string[] | null = null;
+
+  const codeBlock = (body: string[]) =>
+    `<pre class="mb-2 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-2 ${MONO_TEXT_CLASSES} last:mb-0">${esc(body.join("\n"))}</pre>`;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    out.push(`<p class="mb-2 last:mb-0">${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (!items.length) return;
+    const tag = ordered ? "ol" : "ul";
+    out.push(
+      `<${tag} class="mb-2 ml-5 flex flex-col gap-1 ${ordered ? "list-decimal" : "list-disc"} last:mb-0">${items.join("")}</${tag}>`,
+    );
+    items = [];
+  };
+  const flush = () => {
+    flushParagraph();
+    flushList();
+  };
+
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      if (code === null) {
+        flush();
+        code = [];
+      } else {
+        out.push(codeBlock(code));
+        code = null;
+      }
+      continue;
+    }
+    if (code) {
+      code.push(line);
+      continue;
+    }
+    if (!line.trim()) {
+      flush();
+      continue;
+    }
+
+    const heading = /^(#{1,4})\s+(.*)$/.exec(line);
+    if (heading) {
+      flush();
+      out.push(
+        `<div class="mb-1 mt-3 font-semibold ${heading[1].length <= 2 ? "text-sm" : "text-xs"} text-ink-primary first:mt-0">${renderInlineMarkdown(heading[2])}</div>`,
+      );
+      continue;
+    }
+
+    const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    const bullet = /^\s*[-*+]\s+(.*)$/.exec(line);
+    if (numbered || bullet) {
+      flushParagraph();
+      const isOrdered = numbered !== null;
+      // Switching marker style closes the previous list rather than mixing
+      // bullets and numbers under one marker.
+      if (items.length && isOrdered !== ordered) flushList();
+      ordered = isOrdered;
+      items.push(`<li>${renderInlineMarkdown((numbered ?? bullet)![1])}</li>`);
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line.trim());
+  }
+
+  // A fence still open means the stream stopped inside it. Show the partial
+  // block; dropping it would make text vanish as it arrived.
+  if (code) out.push(codeBlock(code));
+  flush();
+  return out.join("");
+}
+
 function renderClaudeExplainPanel(): string {
   const ex = state.claudeExplain;
   if (!ex) return "";
@@ -5252,12 +5381,12 @@ function renderClaudeExplainPanel(): string {
   const body = ex.error
     ? `<div class="text-sm text-status-critical">${esc(ex.error)}</div>`
     : ex.answer
-      ? `<div class="whitespace-pre-wrap text-sm leading-relaxed text-ink-primary">${esc(ex.answer)}</div>`
+      ? `<div class="text-sm leading-relaxed text-ink-secondary">${renderMarkdown(ex.answer)}</div>`
       : `<div class="text-sm text-ink-muted">Thinking…</div>`;
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeClaudeExplain()">
-      <div class="flex h-full w-full max-w-2xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">Explain error</div>
@@ -5329,7 +5458,7 @@ function renderClaudeDiagnosePanel(): string {
           </div>
           ${
             d.answer
-              ? `<div class="whitespace-pre-wrap text-sm leading-relaxed text-ink-primary">${esc(d.answer)}</div>`
+              ? `<div class="text-sm leading-relaxed text-ink-secondary">${renderMarkdown(d.answer)}</div>`
               : `<div class="text-sm text-ink-muted">Thinking…</div>`
           }
         </div>`
@@ -5337,7 +5466,7 @@ function renderClaudeDiagnosePanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeClaudeDiagnose()">
-      <div class="flex h-full w-full max-w-2xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">Diagnose ${esc(d.podName)}</div>
@@ -7578,7 +7707,7 @@ function renderPodDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closePodDetail()">
-      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(pd.name)}</div>
@@ -7711,7 +7840,7 @@ function renderNodeDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeNodeDetail()">
-      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(nd.name)}</div>
@@ -8108,7 +8237,7 @@ function renderWorkloadDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeWorkloadDetail()">
-      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(wd.name)}</div>
@@ -8221,7 +8350,7 @@ function renderNapDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeNapDetail()">
-      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(nd.name)}</div>
@@ -8314,7 +8443,7 @@ function renderHpaDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeHpaDetail()">
-      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(hd.name)}</div>
@@ -8363,7 +8492,7 @@ function renderKedaDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeKedaDetail()">
-      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(kd.name)}</div>
@@ -8599,7 +8728,7 @@ function renderGitOpsDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeGitOpsDetail()">
-      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(gd.name)}</div>
@@ -9414,7 +9543,7 @@ function renderHelmDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeHelmDetail()">
-      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(hd.name)}</div>
