@@ -8,6 +8,11 @@ use crate::retry::retry_transient;
 use chrono::Utc;
 use futures::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{ControllerRevision, DaemonSet, Deployment, ReplicaSet, StatefulSet};
+use k8s_openapi::api::autoscaling::v2::{
+    CrossVersionObjectReference, HorizontalPodAutoscaler, HorizontalPodAutoscalerCondition, MetricSpec, MetricStatus,
+    MetricTarget, MetricValueStatus,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams, ObjectList, ResourceExt};
@@ -1763,6 +1768,286 @@ pub async fn get_nap_node_pool_events(context_name: &str, name: &str) -> Result<
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// HorizontalPodAutoscalers
+// ---------------------------------------------------------------------------
+
+/// The HPA's own GVK, for the manifest view.
+///
+/// The list above reads the generated `HorizontalPodAutoscaler` type, but
+/// `object_manifest` takes a `DynamicObject`, so the detail panel fetches it
+/// again that way. The plural is stated rather than discovered because this
+/// one is not a CRD — it cannot vary between clusters the way an ArgoCD or
+/// KEDA kind can.
+fn hpa_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("autoscaling", "v2", "HorizontalPodAutoscaler"),
+        "horizontalpodautoscalers",
+    )
+}
+
+/// A metric target as text: `70%` for a utilization target, the raw quantity
+/// otherwise.
+fn render_metric_target(target: &MetricTarget) -> String {
+    if let Some(utilization) = target.average_utilization {
+        return format!("{utilization}%");
+    }
+    if let Some(value) = target.average_value.as_ref().or(target.value.as_ref()) {
+        return value.0.clone();
+    }
+    // A target with none of the three set is not something the API server
+    // accepts, but rendering "?" beats rendering an empty half of a pair.
+    "?".to_string()
+}
+
+/// The same, for the observed side.
+fn render_metric_current(current: &MetricValueStatus) -> String {
+    if let Some(utilization) = current.average_utilization {
+        return format!("{utilization}%");
+    }
+    if let Some(value) = current.average_value.as_ref().or(current.value.as_ref()) {
+        return value.0.clone();
+    }
+    // Genuinely reachable: the HPA has not gathered this metric yet, or cannot.
+    "<unknown>".to_string()
+}
+
+/// One metric reduced to what pairing and display each need.
+struct HpaMetric {
+    /// Full identity: the metric's type, its name, its selector, and — for an
+    /// Object metric — the object it describes. Never shown; it exists only to
+    /// pair a declared metric with its reading.
+    key: String,
+    /// What the column shows: `cpu`, `sidecar/memory`, `queue_length`.
+    label: String,
+    /// The rendered target, or the rendered current reading.
+    value: String,
+}
+
+/// Field separator for identity keys. A unit separator rather than a printable
+/// character, because metric names and label values may contain almost
+/// anything, and a separator that can appear inside a field is a separator
+/// that can forge a collision.
+const KEY_SEP: char = '\u{1f}';
+
+/// A selector as a stable string.
+///
+/// `match_labels` is a `BTreeMap` and `match_expressions` keeps the author's
+/// order, so serializing is deterministic for a given selector rather than
+/// dependent on hash iteration order.
+fn selector_key(selector: Option<&LabelSelector>) -> String {
+    selector.and_then(|s| serde_json::to_string(s).ok()).unwrap_or_default()
+}
+
+fn described_object_key(object: &CrossVersionObjectReference) -> String {
+    format!("{}/{}/{}", object.api_version.as_deref().unwrap_or_default(), object.kind, object.name)
+}
+
+/// One declared metric: its identity, its label, and its target.
+fn spec_metric(metric: &MetricSpec) -> Option<HpaMetric> {
+    let type_ = metric.type_.as_str();
+    match type_ {
+        "Resource" => metric.resource.as_ref().map(|r| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}", r.name),
+            label: r.name.clone(),
+            value: render_metric_target(&r.target),
+        }),
+        "ContainerResource" => metric.container_resource.as_ref().map(|r| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", r.container, r.name),
+            label: format!("{}/{}", r.container, r.name),
+            value: render_metric_target(&r.target),
+        }),
+        "Pods" => metric.pods.as_ref().map(|p| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", p.metric.name, selector_key(p.metric.selector.as_ref())),
+            label: p.metric.name.clone(),
+            value: render_metric_target(&p.target),
+        }),
+        "Object" => metric.object.as_ref().map(|o| HpaMetric {
+            key: format!(
+                "{type_}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}",
+                o.metric.name,
+                selector_key(o.metric.selector.as_ref()),
+                described_object_key(&o.described_object)
+            ),
+            label: o.metric.name.clone(),
+            value: render_metric_target(&o.target),
+        }),
+        "External" => metric.external.as_ref().map(|e| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", e.metric.name, selector_key(e.metric.selector.as_ref())),
+            label: e.metric.name.clone(),
+            value: render_metric_target(&e.target),
+        }),
+        _ => None,
+    }
+}
+
+/// The same, for one observed metric. Keys are built identically so the two
+/// sides can be matched.
+fn status_metric(metric: &MetricStatus) -> Option<HpaMetric> {
+    let type_ = metric.type_.as_str();
+    match type_ {
+        "Resource" => metric.resource.as_ref().map(|r| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}", r.name),
+            label: r.name.clone(),
+            value: render_metric_current(&r.current),
+        }),
+        "ContainerResource" => metric.container_resource.as_ref().map(|r| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", r.container, r.name),
+            label: format!("{}/{}", r.container, r.name),
+            value: render_metric_current(&r.current),
+        }),
+        "Pods" => metric.pods.as_ref().map(|p| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", p.metric.name, selector_key(p.metric.selector.as_ref())),
+            label: p.metric.name.clone(),
+            value: render_metric_current(&p.current),
+        }),
+        "Object" => metric.object.as_ref().map(|o| HpaMetric {
+            key: format!(
+                "{type_}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}",
+                o.metric.name,
+                selector_key(o.metric.selector.as_ref()),
+                described_object_key(&o.described_object)
+            ),
+            label: o.metric.name.clone(),
+            value: render_metric_current(&o.current),
+        }),
+        "External" => metric.external.as_ref().map(|e| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", e.metric.name, selector_key(e.metric.selector.as_ref())),
+            label: e.metric.name.clone(),
+            value: render_metric_current(&e.current),
+        }),
+        _ => None,
+    }
+}
+
+/// `cpu: 1%/70%, memory: 42%/80%`.
+///
+/// Driven by the spec rather than the status, so a metric the HPA has not
+/// managed to read yet still appears — with `<unknown>` on the current side,
+/// which is exactly the state worth seeing.
+///
+/// Paired on full metric identity rather than on the displayed label, and each
+/// reading is consumed once. Both matter: `autoscaling/v2` allows two metrics
+/// to share a name across types, and within a type to differ only by selector
+/// (or, for an Object metric, by the object described). Matching on the label
+/// would attribute one metric's reading to another's target, and without
+/// consumption two identically-keyed entries would both read the same value —
+/// in the one column this tab exists for. The two lists normally arrive in the
+/// same order, but nothing in the API promises it.
+fn format_hpa_targets(spec: &[MetricSpec], status: &[MetricStatus]) -> String {
+    let mut observed: Vec<(HpaMetric, bool)> = status.iter().filter_map(status_metric).map(|m| (m, false)).collect();
+
+    let mut parts = Vec::new();
+    for declared in spec.iter().filter_map(spec_metric) {
+        let mut current = "<unknown>".to_string();
+        for (reading, taken) in observed.iter_mut() {
+            if !*taken && reading.key == declared.key {
+                current = reading.value.clone();
+                *taken = true;
+                break;
+            }
+        }
+        parts.push(format!("{}: {}/{}", declared.label, current, declared.value));
+    }
+    parts.join(", ")
+}
+
+/// A condition by type: whether it is True, plus its reason and message.
+fn hpa_condition(conditions: &[HorizontalPodAutoscalerCondition], want: &str) -> (bool, String) {
+    match conditions.iter().find(|c| c.type_ == want) {
+        Some(condition) => {
+            let detail = match (condition.reason.as_deref(), condition.message.as_deref()) {
+                (Some(reason), Some(message)) => format!("{reason}: {message}"),
+                (Some(reason), None) => reason.to_string(),
+                (None, Some(message)) => message.to_string(),
+                (None, None) => String::new(),
+            };
+            (condition.status == "True", detail)
+        }
+        // Absent rather than False: a freshly-created HPA has no conditions
+        // for a moment. Treated as "not yet known to be broken" so it does not
+        // flash red on creation.
+        None => (true, String::new()),
+    }
+}
+
+fn hpa_to_info(hpa: HorizontalPodAutoscaler) -> HpaInfo {
+    let spec = hpa.spec.unwrap_or_default();
+    let status = hpa.status.unwrap_or_default();
+    let conditions = status.conditions.unwrap_or_default();
+
+    let (able_to_scale, able_detail) = hpa_condition(&conditions, "AbleToScale");
+    let (scaling_active, active_detail) = hpa_condition(&conditions, "ScalingActive");
+    let (scaling_limited, _) = hpa_condition(&conditions, "ScalingLimited");
+
+    // Whichever thing is actually wrong. `ScalingActive` first: an HPA that
+    // cannot read its metrics is the common failure, and its message names the
+    // metric, where `AbleToScale`'s tends to restate the same problem.
+    let condition_reason = if !scaling_active {
+        active_detail
+    } else if !able_to_scale {
+        able_detail
+    } else {
+        String::new()
+    };
+
+    HpaInfo {
+        namespace: hpa.metadata.namespace.clone().unwrap_or_default(),
+        name: hpa.metadata.name.clone().unwrap_or_default(),
+        target_kind: spec.scale_target_ref.kind,
+        target_name: spec.scale_target_ref.name,
+        // The API server defaults an unset `minReplicas` to 1.
+        min_replicas: spec.min_replicas.unwrap_or(1) as i64,
+        max_replicas: spec.max_replicas as i64,
+        current_replicas: status.current_replicas.unwrap_or(0) as i64,
+        desired_replicas: status.desired_replicas as i64,
+        targets: format_hpa_targets(&spec.metrics.unwrap_or_default(), &status.current_metrics.unwrap_or_default()),
+        able_to_scale,
+        scaling_active,
+        scaling_limited,
+        condition_reason,
+        last_scale_at: status.last_scale_time.map(|t| t.0.to_rfc3339()),
+        age_days: age_days(hpa.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(hpa.metadata.creation_timestamp.clone()),
+    }
+}
+
+pub async fn get_hpas(context_name: &str) -> Result<Vec<HpaInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    let api: Api<HorizontalPodAutoscaler> = Api::all(client);
+    let list = api
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| format!("Failed to list horizontal pod autoscalers: {e}"))?;
+    Ok(list.items.into_iter().map(hpa_to_info).collect())
+}
+
+pub async fn get_hpa_manifest(context_name: &str, namespace: &str, name: &str) -> Result<ObjectManifest, String> {
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &hpa_resource());
+    let obj = api
+        .get(name)
+        .await
+        .map_err(|e| format!("Failed to get HorizontalPodAutoscaler '{name}': {e}"))?;
+    object_manifest(obj)
+}
+
+/// Same reasoning as `get_keda_events` (filter before the cap).
+pub async fn get_hpa_events(context_name: &str, namespace: &str, name: &str) -> Result<Vec<EventInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    let items = list_events_sorted(&client).await?;
+
+    Ok(items
+        .into_iter()
+        .filter(|e| {
+            e.involved_object.kind.as_deref() == Some("HorizontalPodAutoscaler")
+                && e.involved_object.name.as_deref() == Some(name)
+                && e.metadata.namespace.as_deref() == Some(namespace)
+        })
+        .map(event_to_info)
+        .collect())
+}
+
 fn keda_resource(kind: &str, plural: &str) -> ApiResource {
     ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk("keda.sh", "v1alpha1", kind), plural)
 }
@@ -3158,6 +3443,221 @@ mod tests {
         assert_eq!(pool.node_class, "");
         assert_eq!(pool.capacity_types, "");
         assert_eq!(pool.weight, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // HorizontalPodAutoscalers
+    // -----------------------------------------------------------------
+
+    fn resource_metric(name: &str, utilization: i32) -> MetricSpec {
+        MetricSpec {
+            type_: "Resource".to_string(),
+            resource: Some(k8s_openapi::api::autoscaling::v2::ResourceMetricSource {
+                name: name.to_string(),
+                target: MetricTarget {
+                    type_: "Utilization".to_string(),
+                    average_utilization: Some(utilization),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn resource_metric_status(name: &str, utilization: i32) -> MetricStatus {
+        MetricStatus {
+            type_: "Resource".to_string(),
+            resource: Some(k8s_openapi::api::autoscaling::v2::ResourceMetricStatus {
+                name: name.to_string(),
+                current: MetricValueStatus { average_utilization: Some(utilization), ..Default::default() },
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The shape `kubectl get hpa` prints, which is what makes this column
+    /// worth having. Taken from a real HPA on this fleet: two resource metrics
+    /// on one autoscaler.
+    #[test]
+    fn hpa_targets_render_current_against_target_per_metric() {
+        let spec = vec![resource_metric("cpu", 70), resource_metric("memory", 80)];
+        let status = vec![resource_metric_status("cpu", 1), resource_metric_status("memory", 42)];
+        assert_eq!(format_hpa_targets(&spec, &status), "cpu: 1%/70%, memory: 42%/80%");
+    }
+
+    /// Order comes from the spec, and pairing from the metric's identity — so
+    /// a status list in a different order still lines up. Nothing in the API
+    /// promises the two agree, and mispairing would quietly attribute one
+    /// metric's reading to another's target.
+    #[test]
+    fn hpa_targets_pair_by_identity_not_by_position() {
+        let spec = vec![resource_metric("cpu", 70), resource_metric("memory", 80)];
+        let status = vec![resource_metric_status("memory", 42), resource_metric_status("cpu", 1)];
+        assert_eq!(format_hpa_targets(&spec, &status), "cpu: 1%/70%, memory: 42%/80%");
+    }
+
+    fn external_metric(name: &str, selector: Option<&str>, target: &str) -> MetricSpec {
+        MetricSpec {
+            type_: "External".to_string(),
+            external: Some(k8s_openapi::api::autoscaling::v2::ExternalMetricSource {
+                metric: k8s_openapi::api::autoscaling::v2::MetricIdentifier {
+                    name: name.to_string(),
+                    selector: selector.map(|q| LabelSelector {
+                        match_labels: Some([("queue".to_string(), q.to_string())].into_iter().collect()),
+                        ..Default::default()
+                    }),
+                },
+                target: MetricTarget {
+                    type_: "AverageValue".to_string(),
+                    average_value: Some(k8s_openapi::apimachinery::pkg::api::resource::Quantity(target.to_string())),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn external_metric_status(name: &str, selector: Option<&str>, current: &str) -> MetricStatus {
+        MetricStatus {
+            type_: "External".to_string(),
+            external: Some(k8s_openapi::api::autoscaling::v2::ExternalMetricStatus {
+                metric: k8s_openapi::api::autoscaling::v2::MetricIdentifier {
+                    name: name.to_string(),
+                    selector: selector.map(|q| LabelSelector {
+                        match_labels: Some([("queue".to_string(), q.to_string())].into_iter().collect()),
+                        ..Default::default()
+                    }),
+                },
+                current: MetricValueStatus {
+                    average_value: Some(k8s_openapi::apimachinery::pkg::api::resource::Quantity(current.to_string())),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Two metrics may share a name across types. Pairing on the displayed
+    /// label alone would hand the Resource target the External reading.
+    #[test]
+    fn hpa_targets_do_not_cross_pair_metrics_of_different_types() {
+        let spec = vec![resource_metric("cpu", 70), external_metric("cpu", None, "100")];
+        // Deliberately reversed, so a positional or label-only match is wrong.
+        let status = vec![external_metric_status("cpu", None, "12"), resource_metric_status("cpu", 3)];
+        assert_eq!(format_hpa_targets(&spec, &status), "cpu: 3%/70%, cpu: 12/100");
+    }
+
+    /// Within a type, `autoscaling/v2` allows two metrics that differ only by
+    /// selector — the shape KEDA emits for a multi-trigger ScaledObject.
+    #[test]
+    fn hpa_targets_distinguish_metrics_by_selector() {
+        let spec = vec![
+            external_metric("queue_length", Some("orders"), "100"),
+            external_metric("queue_length", Some("invoices"), "500"),
+        ];
+        let status = vec![
+            external_metric_status("queue_length", Some("invoices"), "480"),
+            external_metric_status("queue_length", Some("orders"), "7"),
+        ];
+        assert_eq!(
+            format_hpa_targets(&spec, &status),
+            "queue_length: 7/100, queue_length: 480/500",
+            "each selector's reading must land on its own target"
+        );
+    }
+
+    /// A reading is consumed once. Two indistinguishable spec entries must not
+    /// both claim the same observation and read as agreeing.
+    #[test]
+    fn hpa_targets_consume_each_reading_once() {
+        let spec = vec![external_metric("dupe", None, "100"), external_metric("dupe", None, "200")];
+        let status = vec![external_metric_status("dupe", None, "9")];
+        assert_eq!(format_hpa_targets(&spec, &status), "dupe: 9/100, dupe: <unknown>/200");
+    }
+
+    /// A metric the HPA has not read yet still has to appear: that gap is the
+    /// symptom of the most common HPA failure, and dropping the row would hide
+    /// it behind a plausible-looking replica count.
+    #[test]
+    fn hpa_targets_show_a_metric_with_no_reading() {
+        let spec = vec![resource_metric("cpu", 70)];
+        assert_eq!(format_hpa_targets(&spec, &[]), "cpu: <unknown>/70%");
+    }
+
+    /// An unset `minReplicas` means 1, and a missing condition must not read
+    /// as a failure — a freshly-created HPA has none for a moment.
+    #[test]
+    fn hpa_defaults_min_replicas_and_treats_absent_conditions_as_healthy() {
+        let hpa: HorizontalPodAutoscaler = serde_json::from_value(serde_json::json!({
+            "metadata": { "namespace": "prod-ejp", "name": "amlv-service" },
+            "spec": { "maxReplicas": 20, "scaleTargetRef": { "kind": "Deployment", "name": "amlv-service" } },
+            "status": { "desiredReplicas": 3 }
+        }))
+        .expect("HPA fixture");
+
+        let info = hpa_to_info(hpa);
+        assert_eq!(info.min_replicas, 1);
+        assert_eq!(info.max_replicas, 20);
+        assert_eq!((info.target_kind.as_str(), info.target_name.as_str()), ("Deployment", "amlv-service"));
+        assert!(info.able_to_scale && info.scaling_active);
+        assert_eq!(info.condition_reason, "");
+    }
+
+    /// The condition that actually explains a broken HPA is `ScalingActive`,
+    /// and its message names the metric. Preferred over `AbleToScale`, which
+    /// tends to restate the same problem less usefully.
+    #[test]
+    fn hpa_reports_why_it_cannot_scale() {
+        let hpa: HorizontalPodAutoscaler = serde_json::from_value(serde_json::json!({
+            "metadata": { "namespace": "prod-ejp", "name": "df-service" },
+            "spec": { "maxReplicas": 4, "minReplicas": 3, "scaleTargetRef": { "kind": "Deployment", "name": "df-service" } },
+            "status": {
+                "desiredReplicas": 3, "currentReplicas": 3,
+                "conditions": [
+                    { "type": "AbleToScale", "status": "True", "reason": "SucceededGetScale" },
+                    { "type": "ScalingActive", "status": "False", "reason": "FailedGetResourceMetric",
+                      "message": "did not receive metrics for any ready pods" },
+                    { "type": "ScalingLimited", "status": "True", "reason": "TooFewReplicas" }
+                ]
+            }
+        }))
+        .expect("HPA fixture");
+
+        let info = hpa_to_info(hpa);
+        assert!(info.able_to_scale, "the scale subresource itself was reachable");
+        assert!(!info.scaling_active);
+        assert!(info.scaling_limited);
+        assert_eq!(info.condition_reason, "FailedGetResourceMetric: did not receive metrics for any ready pods");
+    }
+
+    /// End to end against a real cluster, for the parts a fixture cannot
+    /// reach: that `autoscaling/v2` is what gets served, and that real
+    /// autoscalers produce the summary this tab is built around.
+    ///
+    ///   HPA_TEST_CONTEXT=aks-prod-ejp-ng \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml hpas_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set HPA_TEST_CONTEXT to run"]
+    async fn hpas_against_a_live_cluster() {
+        let Ok(context) = std::env::var("HPA_TEST_CONTEXT") else {
+            eprintln!("HPA_TEST_CONTEXT not set — skipping");
+            return;
+        };
+
+        let hpas = get_hpas(&context).await.expect("HPAs should be listable");
+        eprintln!("{} HorizontalPodAutoscaler(s) in {context}", hpas.len());
+        assert!(!hpas.is_empty(), "this fleet has HPAs; an empty list means the read is wrong");
+
+        for h in &hpas {
+            eprintln!(
+                "  {}/{} -> {}/{}  {}..{} (now {}, want {})  [{}]  able={} active={} limited={} {}",
+                h.namespace, h.name, h.target_kind, h.target_name,
+                h.min_replicas, h.max_replicas, h.current_replicas, h.desired_replicas,
+                h.targets, h.able_to_scale, h.scaling_active, h.scaling_limited, h.condition_reason,
+            );
+            assert!(!h.name.is_empty() && !h.target_name.is_empty());
+            assert!(h.max_replicas >= h.min_replicas, "max must not be below min");
+        }
     }
 
     #[test]
