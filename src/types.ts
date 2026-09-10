@@ -191,6 +191,36 @@ export interface ObjectManifest {
   yaml_without_managed_fields: string;
 }
 
+/**
+ * One HorizontalPodAutoscaler. Mirrors `HpaInfo` in models.rs.
+ *
+ * No `installed` wrapper, unlike KedaResult/NapResult beside it:
+ * `autoscaling/v2` is part of Kubernetes rather than an addon, so an empty
+ * list always means "nothing is autoscaled here".
+ */
+export interface HpaInfo {
+  namespace: string;
+  name: string;
+  target_kind: string;
+  target_name: string;
+  min_replicas: number;
+  max_replicas: number;
+  current_replicas: number;
+  desired_replicas: number;
+  /** `cpu: 1%/70%, memory: 42%/80%` — current against target, per metric. */
+  targets: string;
+  able_to_scale: boolean;
+  /** False when the metrics are unavailable — the classic HPA failure. */
+  scaling_active: boolean;
+  /** Held at min or max. Normal at min, so not on its own a fault. */
+  scaling_limited: boolean;
+  /** Reason and message off whichever condition is unhealthy; empty when fine. */
+  condition_reason: string;
+  last_scale_at: string | null;
+  age_days: number;
+  age_seconds: number;
+}
+
 export type GitOpsAppManifest = ObjectManifest;
 
 /**
@@ -280,7 +310,7 @@ export interface ClaudeDiagnosisPayload {
   approx_tokens: number;
 }
 
-export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "nap" | "keda" | "gitops" | "helm" | "cost";
+export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "nap" | "hpa" | "keda" | "gitops" | "helm" | "cost";
 
 /** Azure Node Auto Provisioning (managed Karpenter). `installed: false` means the CRDs aren't registered, i.e. NAP is off for this cluster. */
 export interface NapResult {
