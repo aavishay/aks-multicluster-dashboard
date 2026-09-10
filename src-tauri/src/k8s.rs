@@ -9,8 +9,10 @@ use chrono::Utc;
 use futures::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{ControllerRevision, DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::autoscaling::v2::{
-    HorizontalPodAutoscaler, HorizontalPodAutoscalerCondition, MetricSpec, MetricStatus, MetricTarget, MetricValueStatus,
+    CrossVersionObjectReference, HorizontalPodAutoscaler, HorizontalPodAutoscalerCondition, MetricSpec, MetricStatus,
+    MetricTarget, MetricValueStatus,
 };
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams, ObjectList, ResourceExt};
@@ -1810,32 +1812,110 @@ fn render_metric_current(current: &MetricValueStatus) -> String {
     "<unknown>".to_string()
 }
 
-/// `(name, target)` for one declared metric, across all five metric kinds.
-fn spec_metric_pair(metric: &MetricSpec) -> Option<(String, String)> {
-    match metric.type_.as_str() {
-        "Resource" => metric.resource.as_ref().map(|r| (r.name.clone(), render_metric_target(&r.target))),
-        "ContainerResource" => metric
-            .container_resource
-            .as_ref()
-            .map(|r| (format!("{}/{}", r.container, r.name), render_metric_target(&r.target))),
-        "Pods" => metric.pods.as_ref().map(|p| (p.metric.name.clone(), render_metric_target(&p.target))),
-        "Object" => metric.object.as_ref().map(|o| (o.metric.name.clone(), render_metric_target(&o.target))),
-        "External" => metric.external.as_ref().map(|e| (e.metric.name.clone(), render_metric_target(&e.target))),
+/// One metric reduced to what pairing and display each need.
+struct HpaMetric {
+    /// Full identity: the metric's type, its name, its selector, and — for an
+    /// Object metric — the object it describes. Never shown; it exists only to
+    /// pair a declared metric with its reading.
+    key: String,
+    /// What the column shows: `cpu`, `sidecar/memory`, `queue_length`.
+    label: String,
+    /// The rendered target, or the rendered current reading.
+    value: String,
+}
+
+/// Field separator for identity keys. A unit separator rather than a printable
+/// character, because metric names and label values may contain almost
+/// anything, and a separator that can appear inside a field is a separator
+/// that can forge a collision.
+const KEY_SEP: char = '\u{1f}';
+
+/// A selector as a stable string.
+///
+/// `match_labels` is a `BTreeMap` and `match_expressions` keeps the author's
+/// order, so serializing is deterministic for a given selector rather than
+/// dependent on hash iteration order.
+fn selector_key(selector: Option<&LabelSelector>) -> String {
+    selector.and_then(|s| serde_json::to_string(s).ok()).unwrap_or_default()
+}
+
+fn described_object_key(object: &CrossVersionObjectReference) -> String {
+    format!("{}/{}/{}", object.api_version.as_deref().unwrap_or_default(), object.kind, object.name)
+}
+
+/// One declared metric: its identity, its label, and its target.
+fn spec_metric(metric: &MetricSpec) -> Option<HpaMetric> {
+    let type_ = metric.type_.as_str();
+    match type_ {
+        "Resource" => metric.resource.as_ref().map(|r| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}", r.name),
+            label: r.name.clone(),
+            value: render_metric_target(&r.target),
+        }),
+        "ContainerResource" => metric.container_resource.as_ref().map(|r| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", r.container, r.name),
+            label: format!("{}/{}", r.container, r.name),
+            value: render_metric_target(&r.target),
+        }),
+        "Pods" => metric.pods.as_ref().map(|p| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", p.metric.name, selector_key(p.metric.selector.as_ref())),
+            label: p.metric.name.clone(),
+            value: render_metric_target(&p.target),
+        }),
+        "Object" => metric.object.as_ref().map(|o| HpaMetric {
+            key: format!(
+                "{type_}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}",
+                o.metric.name,
+                selector_key(o.metric.selector.as_ref()),
+                described_object_key(&o.described_object)
+            ),
+            label: o.metric.name.clone(),
+            value: render_metric_target(&o.target),
+        }),
+        "External" => metric.external.as_ref().map(|e| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", e.metric.name, selector_key(e.metric.selector.as_ref())),
+            label: e.metric.name.clone(),
+            value: render_metric_target(&e.target),
+        }),
         _ => None,
     }
 }
 
-/// `(name, current)` for one observed metric.
-fn status_metric_pair(metric: &MetricStatus) -> Option<(String, String)> {
-    match metric.type_.as_str() {
-        "Resource" => metric.resource.as_ref().map(|r| (r.name.clone(), render_metric_current(&r.current))),
-        "ContainerResource" => metric
-            .container_resource
-            .as_ref()
-            .map(|r| (format!("{}/{}", r.container, r.name), render_metric_current(&r.current))),
-        "Pods" => metric.pods.as_ref().map(|p| (p.metric.name.clone(), render_metric_current(&p.current))),
-        "Object" => metric.object.as_ref().map(|o| (o.metric.name.clone(), render_metric_current(&o.current))),
-        "External" => metric.external.as_ref().map(|e| (e.metric.name.clone(), render_metric_current(&e.current))),
+/// The same, for one observed metric. Keys are built identically so the two
+/// sides can be matched.
+fn status_metric(metric: &MetricStatus) -> Option<HpaMetric> {
+    let type_ = metric.type_.as_str();
+    match type_ {
+        "Resource" => metric.resource.as_ref().map(|r| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}", r.name),
+            label: r.name.clone(),
+            value: render_metric_current(&r.current),
+        }),
+        "ContainerResource" => metric.container_resource.as_ref().map(|r| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", r.container, r.name),
+            label: format!("{}/{}", r.container, r.name),
+            value: render_metric_current(&r.current),
+        }),
+        "Pods" => metric.pods.as_ref().map(|p| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", p.metric.name, selector_key(p.metric.selector.as_ref())),
+            label: p.metric.name.clone(),
+            value: render_metric_current(&p.current),
+        }),
+        "Object" => metric.object.as_ref().map(|o| HpaMetric {
+            key: format!(
+                "{type_}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}",
+                o.metric.name,
+                selector_key(o.metric.selector.as_ref()),
+                described_object_key(&o.described_object)
+            ),
+            label: o.metric.name.clone(),
+            value: render_metric_current(&o.current),
+        }),
+        "External" => metric.external.as_ref().map(|e| HpaMetric {
+            key: format!("{type_}{KEY_SEP}{}{KEY_SEP}{}", e.metric.name, selector_key(e.metric.selector.as_ref())),
+            label: e.metric.name.clone(),
+            value: render_metric_current(&e.current),
+        }),
         _ => None,
     }
 }
@@ -1844,24 +1924,32 @@ fn status_metric_pair(metric: &MetricStatus) -> Option<(String, String)> {
 ///
 /// Driven by the spec rather than the status, so a metric the HPA has not
 /// managed to read yet still appears — with `<unknown>` on the current side,
-/// which is exactly the state worth seeing. Paired by metric identity rather
-/// than by position: the two lists normally agree, but nothing in the API
-/// promises it, and mispairing would silently attribute one metric's reading
-/// to another's target.
+/// which is exactly the state worth seeing.
+///
+/// Paired on full metric identity rather than on the displayed label, and each
+/// reading is consumed once. Both matter: `autoscaling/v2` allows two metrics
+/// to share a name across types, and within a type to differ only by selector
+/// (or, for an Object metric, by the object described). Matching on the label
+/// would attribute one metric's reading to another's target, and without
+/// consumption two identically-keyed entries would both read the same value —
+/// in the one column this tab exists for. The two lists normally arrive in the
+/// same order, but nothing in the API promises it.
 fn format_hpa_targets(spec: &[MetricSpec], status: &[MetricStatus]) -> String {
-    let observed: Vec<(String, String)> = status.iter().filter_map(status_metric_pair).collect();
-    spec.iter()
-        .filter_map(spec_metric_pair)
-        .map(|(name, target)| {
-            let current = observed
-                .iter()
-                .find(|(observed_name, _)| *observed_name == name)
-                .map(|(_, value)| value.clone())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            format!("{name}: {current}/{target}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut observed: Vec<(HpaMetric, bool)> = status.iter().filter_map(status_metric).map(|m| (m, false)).collect();
+
+    let mut parts = Vec::new();
+    for declared in spec.iter().filter_map(spec_metric) {
+        let mut current = "<unknown>".to_string();
+        for (reading, taken) in observed.iter_mut() {
+            if !*taken && reading.key == declared.key {
+                current = reading.value.clone();
+                *taken = true;
+                break;
+            }
+        }
+        parts.push(format!("{}: {}/{}", declared.label, current, declared.value));
+    }
+    parts.join(", ")
 }
 
 /// A condition by type: whether it is True, plus its reason and message.
@@ -3402,10 +3490,89 @@ mod tests {
     /// promises the two agree, and mispairing would quietly attribute one
     /// metric's reading to another's target.
     #[test]
-    fn hpa_targets_pair_by_name_not_by_position() {
+    fn hpa_targets_pair_by_identity_not_by_position() {
         let spec = vec![resource_metric("cpu", 70), resource_metric("memory", 80)];
         let status = vec![resource_metric_status("memory", 42), resource_metric_status("cpu", 1)];
         assert_eq!(format_hpa_targets(&spec, &status), "cpu: 1%/70%, memory: 42%/80%");
+    }
+
+    fn external_metric(name: &str, selector: Option<&str>, target: &str) -> MetricSpec {
+        MetricSpec {
+            type_: "External".to_string(),
+            external: Some(k8s_openapi::api::autoscaling::v2::ExternalMetricSource {
+                metric: k8s_openapi::api::autoscaling::v2::MetricIdentifier {
+                    name: name.to_string(),
+                    selector: selector.map(|q| LabelSelector {
+                        match_labels: Some([("queue".to_string(), q.to_string())].into_iter().collect()),
+                        ..Default::default()
+                    }),
+                },
+                target: MetricTarget {
+                    type_: "AverageValue".to_string(),
+                    average_value: Some(k8s_openapi::apimachinery::pkg::api::resource::Quantity(target.to_string())),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn external_metric_status(name: &str, selector: Option<&str>, current: &str) -> MetricStatus {
+        MetricStatus {
+            type_: "External".to_string(),
+            external: Some(k8s_openapi::api::autoscaling::v2::ExternalMetricStatus {
+                metric: k8s_openapi::api::autoscaling::v2::MetricIdentifier {
+                    name: name.to_string(),
+                    selector: selector.map(|q| LabelSelector {
+                        match_labels: Some([("queue".to_string(), q.to_string())].into_iter().collect()),
+                        ..Default::default()
+                    }),
+                },
+                current: MetricValueStatus {
+                    average_value: Some(k8s_openapi::apimachinery::pkg::api::resource::Quantity(current.to_string())),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Two metrics may share a name across types. Pairing on the displayed
+    /// label alone would hand the Resource target the External reading.
+    #[test]
+    fn hpa_targets_do_not_cross_pair_metrics_of_different_types() {
+        let spec = vec![resource_metric("cpu", 70), external_metric("cpu", None, "100")];
+        // Deliberately reversed, so a positional or label-only match is wrong.
+        let status = vec![external_metric_status("cpu", None, "12"), resource_metric_status("cpu", 3)];
+        assert_eq!(format_hpa_targets(&spec, &status), "cpu: 3%/70%, cpu: 12/100");
+    }
+
+    /// Within a type, `autoscaling/v2` allows two metrics that differ only by
+    /// selector — the shape KEDA emits for a multi-trigger ScaledObject.
+    #[test]
+    fn hpa_targets_distinguish_metrics_by_selector() {
+        let spec = vec![
+            external_metric("queue_length", Some("orders"), "100"),
+            external_metric("queue_length", Some("invoices"), "500"),
+        ];
+        let status = vec![
+            external_metric_status("queue_length", Some("invoices"), "480"),
+            external_metric_status("queue_length", Some("orders"), "7"),
+        ];
+        assert_eq!(
+            format_hpa_targets(&spec, &status),
+            "queue_length: 7/100, queue_length: 480/500",
+            "each selector's reading must land on its own target"
+        );
+    }
+
+    /// A reading is consumed once. Two indistinguishable spec entries must not
+    /// both claim the same observation and read as agreeing.
+    #[test]
+    fn hpa_targets_consume_each_reading_once() {
+        let spec = vec![external_metric("dupe", None, "100"), external_metric("dupe", None, "200")];
+        let status = vec![external_metric_status("dupe", None, "9")];
+        assert_eq!(format_hpa_targets(&spec, &status), "dupe: 9/100, dupe: <unknown>/200");
     }
 
     /// A metric the HPA has not read yet still has to appear: that gap is the
