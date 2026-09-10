@@ -5311,7 +5311,7 @@ function renderMarkdown(source: string): string {
     if (!items.length) return;
     const tag = ordered ? "ol" : "ul";
     out.push(
-      `<${tag} class="mb-2 ml-5 flex flex-col gap-1 ${ordered ? "list-decimal" : "list-disc"} last:mb-0">${items.join("")}</${tag}>`,
+      `<${tag} class="mb-2 ml-5 space-y-1 ${ordered ? "list-decimal" : "list-disc"} last:mb-0">${items.join("")}</${tag}>`,
     );
     items = [];
   };
@@ -5343,8 +5343,11 @@ function renderMarkdown(source: string): string {
     const heading = /^(#{1,4})\s+(.*)$/.exec(line);
     if (heading) {
       flush();
+      // One level below the panel's own title, which is the heading this
+      // content sits under, and clamped to the deepest level ARIA defines.
+      const level = Math.min(heading[1].length + 1, 6);
       out.push(
-        `<div class="mb-1 mt-3 font-semibold ${heading[1].length <= 2 ? "text-sm" : "text-xs"} text-ink-primary first:mt-0">${renderInlineMarkdown(heading[2])}</div>`,
+        `<div role="heading" aria-level="${level}" class="mb-1 mt-3 font-semibold ${heading[1].length <= 2 ? "text-sm" : "text-xs"} text-ink-primary first:mt-0">${renderInlineMarkdown(heading[2])}</div>`,
       );
       continue;
     }
