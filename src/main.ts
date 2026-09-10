@@ -15,6 +15,7 @@ import type {
   GitOpsAppManifest,
   GitOpsResourceDiff,
   GitOpsResult,
+  HpaInfo,
   KedaResult,
   KedaScaledObjectInfo,
   HelmReleaseDetail,
@@ -489,6 +490,21 @@ interface NapDetailState extends MetricsViewState {
  * the manifest: they decide whether the Graph tab is offered at all, which
  * has to be known before the manifest arrives.
  */
+interface HpaDetailState {
+  ctx: string;
+  namespace: string;
+  name: string;
+  view: "yaml" | "events";
+  manifest: ObjectManifest | null;
+  manifestError: string | null;
+  showManagedFields: boolean;
+  yamlSearch: string;
+  yamlSearchIndex: number;
+  events: EventInfo[] | null;
+  eventsError: string | null;
+  eventsLoading: boolean;
+}
+
 interface KedaDetailState extends MetricsViewState {
   ctx: string;
   namespace: string;
@@ -628,6 +644,8 @@ interface AppState {
   events: Map<string, EventInfo[]>;
   eventsWarningsOnly: boolean;
   nap: Map<string, NapResult>;
+  /** Plain list, not a `*Result`: `autoscaling/v2` is never absent. */
+  hpa: Map<string, HpaInfo[]>;
   keda: Map<string, KedaResult>;
   gitops: Map<string, GitOpsResult>;
   helm: Map<string, HelmReleaseInfo[]>;
@@ -717,6 +735,7 @@ interface AppState {
   confirm: ConfirmState | null;
   yamlEdit: YamlEditState | null;
   napDetail: NapDetailState | null;
+  hpaDetail: HpaDetailState | null;
   kedaDetail: KedaDetailState | null;
   helmDetail: HelmDetailState | null;
 }
@@ -742,6 +761,7 @@ const state: AppState = {
   events: new Map(),
   eventsWarningsOnly: true,
   nap: new Map(),
+  hpa: new Map(),
   keda: new Map(),
   gitops: new Map(),
   helm: new Map(),
@@ -789,6 +809,7 @@ const state: AppState = {
   confirm: null,
   yamlEdit: null,
   napDetail: null,
+  hpaDetail: null,
   kedaDetail: null,
   helmDetail: null,
 };
@@ -809,6 +830,7 @@ let workloadDetailToken = 0;
 let gitOpsDetailToken = 0;
 let napDetailToken = 0;
 /** Same idea as `podDetailToken`, for the KEDA scaled object detail panel. */
+let hpaDetailToken = 0;
 let kedaDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
 let helmDetailToken = 0;
@@ -1543,6 +1565,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "metrics", label: "Metrics" },
   { id: "events", label: "Events" },
   { id: "nap", label: "NAP" },
+  { id: "hpa", label: "HPA" },
   { id: "keda", label: "KEDA" },
   { id: "gitops", label: "GitOps" },
   { id: "helm", label: "Helm" },
@@ -1730,6 +1753,9 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
     case "nap":
       state.nap.set(ctx, await api.getNapNodePools(ctx));
       break;
+    case "hpa":
+      state.hpa.set(ctx, await api.getHpas(ctx));
+      break;
     case "keda":
       state.keda.set(ctx, await api.getKedaScaledObjects(ctx));
       break;
@@ -1762,6 +1788,8 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
       return state.events.has(ctx);
     case "nap":
       return state.nap.has(ctx);
+    case "hpa":
+      return state.hpa.has(ctx);
     case "keda":
       return state.keda.has(ctx);
     case "gitops":
@@ -2237,6 +2265,7 @@ function openNodeDetail(ctx: string, name: string) {
   closeHelmDetail();
   closeNapDetail();
   closeKedaDetail();
+    closeHpaDetail();
   const token = ++nodeDetailToken;
   state.nodeDetail = {
     ctx,
@@ -2375,6 +2404,7 @@ function openHelmDetail(ctx: string, namespace: string, name: string, revision: 
   closeGitOpsDetail();
   closeNapDetail();
   closeKedaDetail();
+    closeHpaDetail();
   const token = ++helmDetailToken;
   state.helmDetail = {
     ctx,
@@ -2473,6 +2503,7 @@ function openGitOpsDetail(ctx: string, namespace: string, name: string) {
   closeHelmDetail();
   closeNapDetail();
   closeKedaDetail();
+    closeHpaDetail();
   const token = ++gitOpsDetailToken;
   state.gitOpsDetail = {
     ctx,
@@ -2628,6 +2659,7 @@ function openNapDetail(ctx: string, name: string) {
   closeGitOpsDetail();
   closeHelmDetail();
   closeKedaDetail();
+    closeHpaDetail();
   const token = ++napDetailToken;
   state.napDetail = {
     ctx,
@@ -3337,6 +3369,120 @@ function kedaTargetIsGraphable(targetKind: string, targetName: string): boolean 
   return targetName !== "" && GRAPHABLE_KEDA_TARGET_KINDS.includes(targetKind);
 }
 
+// ---------------------------------------------------------------------------
+// HPA detail panel (YAML / Events)
+// ---------------------------------------------------------------------------
+//
+// No Graph view, unlike the KEDA panel next door. KEDA's graph plots the
+// *target workload's* CPU and memory, which is worth having there because a
+// ScaledObject's triggers are usually external to the cluster and invisible
+// otherwise. An HPA's own metrics are already summarised in its Targets
+// column, and the workload's series is one click away on the Workloads tab, so
+// a third view here would duplicate one of the two.
+
+function openHpaDetail(ctx: string, namespace: string, name: string) {
+  closePodDetail();
+  closeNodeDetail();
+  closeWorkloadDetail();
+  closeGitOpsDetail();
+  closeHelmDetail();
+  closeNapDetail();
+  closeKedaDetail();
+  const token = ++hpaDetailToken;
+  state.hpaDetail = {
+    ctx,
+    namespace,
+    name,
+    view: "yaml",
+    manifest: null,
+    manifestError: null,
+    showManagedFields: false,
+    yamlSearch: "",
+    yamlSearchIndex: 0,
+    events: null,
+    eventsError: null,
+    eventsLoading: false,
+  };
+  render();
+
+  api
+    .getHpaManifest(ctx, namespace, name)
+    .then((manifest) => {
+      if (token !== hpaDetailToken || !state.hpaDetail) return;
+      state.hpaDetail.manifest = manifest;
+      render();
+    })
+    .catch((e) => {
+      if (token !== hpaDetailToken || !state.hpaDetail) return;
+      state.hpaDetail.manifestError = String(e);
+      render();
+    });
+}
+
+function closeHpaDetail() {
+  hpaDetailToken += 1;
+  state.hpaDetail = null;
+  render();
+}
+
+function setHpaDetailView(view: HpaDetailState["view"]) {
+  if (!state.hpaDetail) return;
+  state.hpaDetail.view = view;
+  render();
+  if (view === "events" && !state.hpaDetail.events && !state.hpaDetail.eventsLoading) {
+    fetchHpaEvents();
+  }
+}
+
+function toggleHpaManagedFields() {
+  if (!state.hpaDetail) return;
+  state.hpaDetail.showManagedFields = !state.hpaDetail.showManagedFields;
+  render();
+}
+
+async function fetchHpaEvents() {
+  const hd = state.hpaDetail;
+  if (!hd) return;
+  const token = hpaDetailToken;
+  hd.eventsLoading = true;
+  hd.eventsError = null;
+  render();
+  try {
+    const events = await api.getHpaEvents(hd.ctx, hd.namespace, hd.name);
+    if (token !== hpaDetailToken || !state.hpaDetail) return;
+    state.hpaDetail.events = events;
+  } catch (e) {
+    if (token !== hpaDetailToken || !state.hpaDetail) return;
+    state.hpaDetail.eventsError = String(e);
+  } finally {
+    if (token === hpaDetailToken && state.hpaDetail) state.hpaDetail.eventsLoading = false;
+    render();
+  }
+}
+
+function currentHpaYamlText(hd: HpaDetailState): string {
+  if (!hd.manifest) return "";
+  return hd.showManagedFields ? hd.manifest.yaml_full : hd.manifest.yaml_without_managed_fields;
+}
+
+function setHpaSearch(_view: string, query: string) {
+  if (!state.hpaDetail) return;
+  state.hpaDetail.yamlSearch = query;
+  state.hpaDetail.yamlSearchIndex = 0;
+  pendingSearchScroll = true;
+  render();
+}
+
+function moveHpaSearch(_view: string, delta: number) {
+  const hd = state.hpaDetail;
+  if (!hd || !hd.yamlSearch) return;
+  const count = countSearchMatches(currentHpaYamlText(hd), hd.yamlSearch);
+  if (count === 0) return;
+  hd.yamlSearchIndex = (((hd.yamlSearchIndex + delta) % count) + count) % count;
+  pendingSearchScroll = true;
+  render();
+}
+
 function openKedaDetail(ctx: string, namespace: string, kind: string, name: string) {
   closePodDetail();
   closeNodeDetail();
@@ -3344,6 +3490,7 @@ function openKedaDetail(ctx: string, namespace: string, kind: string, name: stri
   closeGitOpsDetail();
   closeHelmDetail();
   closeNapDetail();
+    closeHpaDetail();
   const token = ++kedaDetailToken;
   // The row already carries the resolved target — KEDA defaults an omitted
   // `scaleTargetRef.kind` to Deployment and the backend applies that on the
@@ -3501,6 +3648,7 @@ function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: 
   closeNapDetail();
   closeKedaDetail();
   stopWorkloadLogFollow();
+    closeHpaDetail();
   const token = ++workloadDetailToken;
   state.workloadDetail = {
     ctx,
@@ -3898,6 +4046,7 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
   closeNapDetail();
   closeKedaDetail();
   stopPodLogFollow();
+    closeHpaDetail();
   const token = ++podDetailToken;
   state.podDetail = {
     ctx,
@@ -4257,6 +4406,12 @@ function setMetricsRange(minutes: number) {
   confirmScaleWorkload,
   confirmSetNodeSchedulable,
   confirmDrainNode,
+  openHpaDetail,
+  closeHpaDetail,
+  setHpaDetailView,
+  toggleHpaManagedFields,
+  setHpaSearch,
+  moveHpaSearch,
   openKedaDetail,
   closeKedaDetail,
   setKedaDetailView,
@@ -4463,6 +4618,7 @@ function render(carried?: PreRenderState) {
     ${renderNodeDetailPanel()}
     ${renderWorkloadDetailPanel()}
     ${renderNapDetailPanel()}
+    ${renderHpaDetailPanel()}
     ${renderKedaDetailPanel()}
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
@@ -5346,6 +5502,8 @@ function renderTabContentBody(): string {
       return renderEvents();
     case "nap":
       return renderNap();
+    case "hpa":
+      return renderHpa();
     case "keda":
       return renderKeda();
     case "gitops":
@@ -7038,7 +7196,7 @@ function highlightSearchMatches(html: string, query: string, currentIndex: numbe
  * to be unique within that panel for the `data-filter-key` focus-restore tag.
  */
 function renderSearchBox(
-  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda",
+  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa",
   view: string,
   query: string,
   matchCount: number,
@@ -7092,7 +7250,7 @@ function renderYamlPane(o: {
   editableYaml: string;
   showManagedFields: boolean;
   toggleHandler: string;
-  searchKind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda";
+  searchKind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa";
   search: string;
   searchIndex: number;
   scrollId: string;
@@ -8121,6 +8279,70 @@ function renderKedaGraphView(kd: KedaDetailState): string {
   );
 }
 
+function renderHpaYamlView(hd: HpaDetailState): string {
+  return renderYamlPane({
+    error: hd.manifestError,
+    loaded: !!hd.manifest,
+    yaml: currentHpaYamlText(hd),
+    editableYaml: hd.manifest?.yaml_without_managed_fields ?? "",
+    showManagedFields: hd.showManagedFields,
+    toggleHandler: "toggleHpaManagedFields",
+    searchKind: "Hpa",
+    search: hd.yamlSearch,
+    searchIndex: hd.yamlSearchIndex,
+    scrollId: `hpa-yaml:${esc(hd.ctx)}:${esc(hd.namespace)}:${esc(hd.name)}`,
+    // Editable like the other panels: min/max are the two fields anyone
+    // actually wants to change on an HPA, and `apply_manifest` resolves the
+    // kind through discovery, so nothing here is special-cased.
+    target: { ctx: hd.ctx, kind: "HorizontalPodAutoscaler", namespace: hd.namespace, name: hd.name },
+  });
+}
+
+function renderHpaDetailPanel(): string {
+  const hd = state.hpaDetail;
+  if (!hd) return "";
+
+  const tabs: { id: HpaDetailState["view"]; label: string }[] = [
+    { id: "yaml", label: "YAML" },
+    { id: "events", label: "Events" },
+  ];
+
+  const body =
+    hd.view === "yaml"
+      ? renderHpaYamlView(hd)
+      : renderEventsList(`hpa-events:${hd.ctx}:${hd.namespace}:${hd.name}`, hd.events, hd.eventsError);
+
+  return `
+    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeHpaDetail()">
+      <div class="flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">${esc(hd.name)}</div>
+            <div class="truncate text-xs text-ink-muted">HorizontalPodAutoscaler · ${esc(hd.namespace)} · ${esc(hd.ctx)}</div>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeHpaDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
+        </div>
+        <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
+          ${tabs
+            .map(
+              (t) => `
+            <button
+              type="button"
+              onclick="window.__app.setHpaDetailView(${jsArg(t.id)})"
+              data-detail-tab ${hd.view === t.id ? "data-detail-tab-active" : ""}
+              class="rounded-md px-3 py-1.5 text-xs font-medium ${hd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
+            >${t.label}</button>`,
+            )
+            .join("")}
+        </div>
+        <div ${detailBodyAttrs(`hpa:${hd.ctx}:${hd.namespace}:${hd.name}:${hd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+      </div>
+    </div>`;
+}
+
 function renderKedaDetailPanel(): string {
   const kd = state.kedaDetail;
   if (!kd) return "";
@@ -8652,6 +8874,124 @@ function renderNap(): string {
     </div>`;
 }
 
+/**
+ * HorizontalPodAutoscalers across the selected clusters.
+ *
+ * Simpler than the KEDA and NAP tabs either side of it, because there is no
+ * addon to be absent: `autoscaling/v2` is part of Kubernetes, so an empty list
+ * means nothing is autoscaled rather than nothing is installed, and none of
+ * the "not enabled" panels apply.
+ *
+ * The health signal is `AbleToScale` and `ScalingActive`, deliberately *not*
+ * `ScalingLimited`. Measured against this fleet: 47 of 49 autoscalers report
+ * ScalingLimited=True, because sitting at `minReplicas` with load below target
+ * is exactly that condition — treating it as a warning would paint almost
+ * every row red and mean nothing. What does matter is ScalingActive going
+ * false, which is how "cannot read my metrics" presents, and which the replica
+ * counts alone make look identical to idle.
+ */
+function renderHpa(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+
+  type HpaRow = { ctx: string; h: HpaInfo };
+  const allRows: HpaRow[] = ctxs.flatMap((ctx) => (state.hpa.get(ctx) ?? []).map((h) => ({ ctx, h })));
+  const healthy = (h: HpaInfo) => h.able_to_scale && h.scaling_active;
+
+  if (allRows.length === 0 && !state.tabLoading) {
+    return `<div class="text-sm text-ink-muted">No horizontal pod autoscalers found.</div>`;
+  }
+
+  const rows = state.unhealthyOnly.hpa ? allRows.filter((r) => !healthy(r.h)) : allRows;
+  const keyOf = (r: HpaRow) => `${r.ctx}:${r.h.namespace}:${r.h.name}`;
+
+  const columns: ColumnDef<HpaRow>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: HpaRow) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.h.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.h.name, filter: "string" },
+    { key: "target", label: "Target", value: (r) => `${r.h.target_kind}/${r.h.target_name}`, filter: "string" },
+    { key: "targets", label: "Targets", value: (r) => r.h.targets, filter: "string" },
+    { key: "min", label: "Min", value: (r) => r.h.min_replicas, filter: "number" },
+    { key: "max", label: "Max", value: (r) => r.h.max_replicas, filter: "number" },
+    { key: "replicas", label: "Replicas", value: (r) => r.h.current_replicas, filter: "number" },
+    {
+      key: "age",
+      label: "Age",
+      value: (r) => r.h.age_days,
+      filter: "number",
+      copyText: (r) => formatAgeDetailed(r.h.age_days, r.h.age_seconds),
+      sortValue: (r) => r.h.age_seconds,
+    },
+  ];
+  const filtered = applyFilters("hpa", rows, columns);
+  const sorted = sortRows("hpa", filtered, columns);
+  recordTableSnapshot("hpa", columns, sorted, keyOf, {
+    header: "Status",
+    text: (r) => (healthy(r.h) ? "Scaling" : r.h.condition_reason || "Not scaling"),
+  });
+
+  return `
+    <div class="mb-2 flex items-center justify-between">
+      <div class="text-xs text-ink-muted">${state.unhealthyOnly.hpa ? `${rows.length} of ${allRows.length} not scaling` : ""}</div>
+      ${unhealthyOnlyToggle("hpa")}
+    </div>
+    ${filterSummary("hpa", rows.length, filtered.length)}
+    ${selectionToolbar("hpa")}
+    <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:hpa">
+      <table class="data-table">
+        ${renderColGroup("hpa", columns, [32, 36])}
+        <thead>
+          <tr>${selectAllCheckboxHeader("hpa", sorted, keyOf)}<th></th>${sortableHeaderRow("hpa", columns)}</tr>
+          <tr class="filter-row"><th></th><th></th>${filterRowCells("hpa", columns, rows)}</tr>
+        </thead>
+        <tbody>
+          ${sorted
+            .map((row) => {
+              const { ctx, h } = row;
+              const ok = healthy(h);
+              // Its own tone rather than the red dot: an autoscaler pinned at
+              // its ceiling is working correctly and still the thing to know
+              // before asking why load is not being absorbed.
+              const atCeiling = h.current_replicas >= h.max_replicas;
+              const status = ok ? "Scaling" : h.condition_reason || "Not scaling";
+              return `
+            <tr>
+              ${rowCheckboxCell("hpa", keyOf(row))}
+              <td title="${esc(status)}">${statusDot(ok)}</td>
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter by this cluster" onclick="window.__app.setEnumFilter('hpa','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
+              <td><button type="button" title="Filter by this namespace" onclick="window.__app.setEnumFilter('hpa','namespace',[${jsArg(h.namespace)}])" class="hover:text-series-blue hover:underline">${esc(h.namespace)}</button></td>
+              <td>
+                <span class="inline-flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    title="View autoscaler details (YAML, Events)"
+                    data-row-open onclick="window.__app.openHpaDetail(${jsArg(ctx)},${jsArg(h.namespace)},${jsArg(h.name)})"
+                    class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
+                  >
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="8" r="0.5" fill="currentColor" stroke="none"/></svg>
+                  </button>
+                  <span class="truncate text-ink-primary">${esc(h.name)}</span>
+                </span>
+              </td>
+              <td>${esc(`${h.target_kind}/${h.target_name}`)}</td>
+              <td class="max-w-md truncate" title="${esc(h.targets)}">${esc(h.targets) || "—"}</td>
+              <td class="tabular">${h.min_replicas}</td>
+              <td class="tabular ${atCeiling ? "text-status-warning" : ""}" ${atCeiling ? 'title="At its ceiling — it cannot scale up further"' : ""}>${h.max_replicas}</td>
+              <td class="tabular" ${h.current_replicas !== h.desired_replicas ? `title="Scaling toward ${h.desired_replicas}"` : ""}>${h.current_replicas}${h.current_replicas !== h.desired_replicas ? ` <span class="text-ink-muted">&rarr; ${h.desired_replicas}</span>` : ""}</td>
+              <td class="tabular">${formatAgeDetailed(h.age_days, h.age_seconds)}</td>
+            </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+      ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching autoscalers.</div>' : ""}
+    </div>`;
+}
+
 function renderKeda(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
@@ -9148,6 +9488,7 @@ function isEditableTarget(target: EventTarget | null): boolean {
  * into Escape/Cmd+Left or the Cmd+Right guard.
  */
 const DETAIL_PANEL_CLOSERS: { isOpen: () => boolean; close: () => void }[] = [
+  { isOpen: () => !!state.hpaDetail, close: closeHpaDetail },
   { isOpen: () => !!state.podDetail, close: closePodDetail },
   { isOpen: () => !!state.nodeDetail, close: closeNodeDetail },
   { isOpen: () => !!state.workloadDetail, close: closeWorkloadDetail },
