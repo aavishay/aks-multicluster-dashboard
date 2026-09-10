@@ -24,6 +24,7 @@ import type {
   GitOpsAppManifest,
   GitOpsResourceDiff,
   GitOpsResult,
+  HpaInfo,
   HelmReleaseDetail,
   HelmReleaseInfo,
   KedaResult,
@@ -199,6 +200,11 @@ export const api = {
     invoke<ObjectManifest>("get_keda_manifest", { contextName, namespace, kind, name }),
   getKedaEvents: (contextName: string, namespace: string, kind: string, name: string) =>
     invoke<EventInfo[]>("get_keda_events", { contextName, namespace, kind, name }),
+  getHpas: (contextName: string) => invoke<HpaInfo[]>("get_hpas", { contextName }),
+  getHpaManifest: (contextName: string, namespace: string, name: string) =>
+    invoke<ObjectManifest>("get_hpa_manifest", { contextName, namespace, name }),
+  getHpaEvents: (contextName: string, namespace: string, name: string) =>
+    invoke<EventInfo[]>("get_hpa_events", { contextName, namespace, name }),
   getGitOpsApps: (contextName: string) => invoke<GitOpsResult>("get_gitops_apps", { contextName }),
   getGitOpsManifest: (contextName: string, namespace: string, name: string) =>
     invoke<GitOpsAppManifest>("get_gitops_manifest", { contextName, namespace, name }),

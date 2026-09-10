@@ -381,6 +381,53 @@ pub struct NapNodePoolInfo {
     pub age_seconds: i64,
 }
 
+/// One `HorizontalPodAutoscaler`.
+///
+/// Unlike the KEDA and Karpenter tabs beside it, this needs no `installed`
+/// flag: `autoscaling/v2` is part of Kubernetes itself rather than an addon,
+/// so an empty list means "nothing is autoscaled here", never "the API is
+/// missing". That is also why it is read through `k8s-openapi`'s generated
+/// type instead of a `DynamicObject` — the metric shapes below are nested
+/// enough that hand-walking the JSON would be the error-prone way to do it.
+#[derive(Serialize, Clone, Debug)]
+pub struct HpaInfo {
+    pub namespace: String,
+    pub name: String,
+    /// `spec.scaleTargetRef` — nearly always a Deployment.
+    pub target_kind: String,
+    pub target_name: String,
+    pub min_replicas: i64,
+    pub max_replicas: i64,
+    pub current_replicas: i64,
+    /// What the HPA has decided it wants. Differs from `current_replicas`
+    /// while a scale is in flight, and is the more interesting of the two when
+    /// they disagree.
+    pub desired_replicas: i64,
+    /// Current against target, per metric, in the manifest's declaration
+    /// order: `cpu: 1%/70%, memory: 42%/80%`. The same summary
+    /// `kubectl get hpa` prints, and the reason this tab is worth having next
+    /// to the Workloads one.
+    pub targets: String,
+    /// `AbleToScale` — false when the HPA cannot act at all (a missing target,
+    /// or a failed scale subresource call).
+    pub able_to_scale: bool,
+    /// `ScalingActive` — false when the metrics themselves are unavailable,
+    /// which is the classic HPA failure and looks identical to "idle" in the
+    /// replica counts alone.
+    pub scaling_active: bool,
+    /// `ScalingLimited` — the HPA wants to move further but is held at `min`
+    /// or `max`. Not a fault, but it is the thing to know before wondering why
+    /// load is not being absorbed.
+    pub scaling_limited: bool,
+    /// The reason and message off whichever condition is unhealthy, since that
+    /// is where the actual diagnosis lives (`FailedGetResourceMetric` and
+    /// friends). Empty when everything is fine.
+    pub condition_reason: String,
+    pub last_scale_at: Option<String>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+}
+
 /// KEDA autoscalers. Same `installed` reasoning as `NapResult`.
 #[derive(Serialize, Clone, Debug)]
 pub struct KedaResult {

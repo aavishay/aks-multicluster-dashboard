@@ -401,6 +401,23 @@ pub async fn get_nap_node_pools(context_name: String) -> Result<NapResult, Strin
     with_retry(&context_name, || k8s::get_nap_node_pools(&context_name)).await
 }
 
+/// Every HorizontalPodAutoscaler in the cluster. No `installed` flag to carry,
+/// unlike the KEDA and NAP reads below: `autoscaling/v2` ships with Kubernetes.
+#[tauri::command]
+pub async fn get_hpas(context_name: String) -> Result<Vec<HpaInfo>, String> {
+    with_retry(&context_name, || k8s::get_hpas(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_hpa_manifest(context_name: String, namespace: String, name: String) -> Result<ObjectManifest, String> {
+    with_retry(&context_name, || k8s::get_hpa_manifest(&context_name, &namespace, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_hpa_events(context_name: String, namespace: String, name: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || k8s::get_hpa_events(&context_name, &namespace, &name)).await
+}
+
 #[tauri::command]
 pub async fn get_keda_scaled_objects(context_name: String) -> Result<KedaResult, String> {
     with_retry(&context_name, || k8s::get_keda_scaled_objects(&context_name)).await
