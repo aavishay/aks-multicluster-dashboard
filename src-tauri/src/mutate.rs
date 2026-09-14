@@ -403,11 +403,33 @@ mod tests {
         assert!(!is_scalable("DaemonSet"));
     }
 
+    /// Serialises every test that flips write mode.
+    ///
+    /// `WRITE_ENABLED` is one process-global `AtomicBool` and cargo runs these
+    /// tests on parallel threads, so without this a test that sets it `false`
+    /// can have it set `true` underneath it by a neighbour before its own
+    /// assertion runs. Not hypothetical: that is what took
+    /// `editing_is_refused_while_read_only` straight past the write gate and
+    /// into a kubeconfig read, which then failed on a CI runner with no
+    /// `~/.kube/config` — a race that presented as a missing file. Measured at
+    /// 29 failures in 40 runs of this module before the lock, 0 after.
+    ///
+    /// Poison-tolerant deliberately: one failing test should report its own
+    /// assertion, not turn every other test here into a panic about a poisoned
+    /// mutex and hide the one that actually broke. Same idea as `ENV_LOCK` in
+    /// kubeconfig.rs, which serialises `KUBECONFIG` for the same reason.
+    static WRITE_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_mode_guard() -> std::sync::MutexGuard<'static, ()> {
+        WRITE_MODE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The identity check is what keeps an edit an edit. Without it, changing
     /// `name` in the text turns "save this Deployment" into "write a different
     /// one", from a dialog that said otherwise.
     #[tokio::test]
     async fn an_edit_cannot_retarget_another_object() {
+        let _write_mode = write_mode_guard();
         set_write_enabled(true);
         let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: other\n  namespace: dev\n";
         let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
@@ -428,6 +450,7 @@ mod tests {
     /// apiVersion send the write at whichever one shares the name.
     #[tokio::test]
     async fn an_edit_cannot_hop_api_groups_under_the_same_kind() {
+        let _write_mode = write_mode_guard();
         set_write_enabled(true);
         let yaml = "apiVersion: example.com/v1\nkind: Application\nmetadata:\n  name: mine\n  namespace: dev\n";
         let err = apply_manifest("ctx", "argoproj.io/v1alpha1", "Application", "dev", "mine", yaml).await.unwrap_err();
@@ -446,6 +469,7 @@ mod tests {
     /// invisible in the source. Asserted rather than eyeballed.
     #[tokio::test]
     async fn error_messages_carry_no_accidental_whitespace() {
+        let _write_mode = write_mode_guard();
         set_write_enabled(true);
         let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: other\n  namespace: dev\n";
         let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
@@ -457,6 +481,7 @@ mod tests {
     /// around read-only mode.
     #[tokio::test]
     async fn editing_is_refused_while_read_only() {
+        let _write_mode = write_mode_guard();
         set_write_enabled(false);
         let yaml = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mine\n  namespace: dev\n";
         let err = apply_manifest("ctx", "apps/v1", "Deployment", "dev", "mine", yaml).await.unwrap_err();
@@ -483,6 +508,7 @@ mod tests {
     /// safeguard in the app is decoration.
     #[test]
     fn writes_are_refused_until_the_switch_is_on() {
+        let _write_mode = write_mode_guard();
         set_write_enabled(false);
         assert!(!write_enabled());
         assert!(require_write().is_err());
