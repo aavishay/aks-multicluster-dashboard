@@ -100,8 +100,8 @@ jobs:
             ## Install
 
             ```bash
+            brew trust --tap aavishay/aks-fleet-dashboard
             brew tap aavishay/aks-fleet-dashboard
-            brew trust aavishay/aks-fleet-dashboard
             brew install --cask aks-fleet-dashboard
             ```
 
