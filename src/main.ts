@@ -1036,13 +1036,36 @@ function setSort(tab: TabId, column: string) {
   render();
 }
 
-function sortRows<T>(tab: TabId, rows: T[], columns: ColumnDef<T>[]): T[] {
+/**
+ * Sorts a table's rows, optionally floating unhealthy ones to the top.
+ *
+ * `unhealthy` outranks the chosen column rather than acting as a default,
+ * which is the point: the status dot has no header, so there is otherwise no
+ * way to sort by it at all, and a broken row lands wherever its name or age
+ * happens to put it. On any table long enough to page, a not-ready row that
+ * lands past page one is a row nobody sees.
+ *
+ * Reported that way twice, from tables that were *already* sorted by Age — so
+ * ordering by health only when no column sort is active would not have helped
+ * in either case.
+ *
+ * The chosen sort still applies in full, within each group. `Array.sort` is
+ * stable, so returning 0 for the column comparison — which is what happens
+ * when no column sort is active — leaves the rows in the order they arrived.
+ */
+function sortRows<T>(tab: TabId, rows: T[], columns: ColumnDef<T>[], unhealthy?: (row: T) => boolean): T[] {
   const spec = state.sortState[tab];
-  if (!spec) return rows;
-  const column = columns.find((c) => c.key === spec.column);
-  if (!column) return rows;
+  const column = spec ? columns.find((c) => c.key === spec.column) : undefined;
+  if (!unhealthy && !column) return rows;
+
   const sorted = [...rows];
   sorted.sort((a, b) => {
+    if (unhealthy) {
+      // Unhealthy first: `true` outranks `false`, so b-minus-a.
+      const rank = Number(unhealthy(b)) - Number(unhealthy(a));
+      if (rank !== 0) return rank;
+    }
+    if (!spec || !column) return 0;
     const va = (column.sortValue ?? column.value)(a);
     const vb = (column.sortValue ?? column.value)(b);
     const cmp = typeof va === "number" && typeof vb === "number" ? va - vb : String(va).localeCompare(String(vb));
@@ -5918,7 +5941,7 @@ function renderWorkloads(): string {
     },
   ];
   const filtered = applyFilters("workloads", rows, columns);
-  const sorted = sortRows("workloads", filtered, columns);
+  const sorted = sortRows("workloads", filtered, columns, (r) => !r.w.healthy);
   recordTableSnapshot("workloads", columns, sorted, keyOf, {
     header: "Status",
     text: (r) => (r.w.healthy ? "Healthy" : "Unhealthy"),
@@ -6061,7 +6084,7 @@ function renderPods(): string {
     },
   ];
   const filtered = applyFilters("pods", rows, columns);
-  const sorted = sortRows("pods", filtered, columns);
+  const sorted = sortRows("pods", filtered, columns, (r) => !podHealthy(r));
   recordTableSnapshot("pods", columns, sorted, keyOf, {
     header: "Phase",
     text: (r) => r.p.phase,
