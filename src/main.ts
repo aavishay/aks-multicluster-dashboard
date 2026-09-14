@@ -1042,10 +1042,12 @@ function setSort(tab: TabId, column: string) {
  * `unhealthy` outranks the chosen column rather than acting as a default,
  * which is the point: the status dot has no header, so there is otherwise no
  * way to sort by it at all, and a broken row lands wherever its name or age
- * happens to put it. On a fleet that pages — 1,207 pods across five pages — a
- * single not-ready pod sorted to page two is a pod nobody sees. Reported
- * exactly that way, from a table explicitly sorted by Age with the one red row
- * at the bottom of page 2.
+ * happens to put it. On any table long enough to page, a not-ready row that
+ * lands past page one is a row nobody sees.
+ *
+ * Reported that way twice, from tables that were *already* sorted by Age — so
+ * ordering by health only when no column sort is active would not have helped
+ * in either case.
  *
  * The chosen sort still applies in full, within each group. `Array.sort` is
  * stable, so returning 0 for the column comparison — which is what happens
@@ -5939,7 +5941,7 @@ function renderWorkloads(): string {
     },
   ];
   const filtered = applyFilters("workloads", rows, columns);
-  const sorted = sortRows("workloads", filtered, columns);
+  const sorted = sortRows("workloads", filtered, columns, (r) => !r.w.healthy);
   recordTableSnapshot("workloads", columns, sorted, keyOf, {
     header: "Status",
     text: (r) => (r.w.healthy ? "Healthy" : "Unhealthy"),
