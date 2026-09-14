@@ -5727,7 +5727,7 @@ function renderOverview(): string {
     { key: "warning_events", label: "Warning events", value: (r) => r.ov?.warning_event_count ?? -1, filter: "number" },
   ];
   const filtered = applyFilters("overview", rows, columns);
-  const sorted = sortRows("overview", filtered, columns);
+  const sorted = sortRows("overview", filtered, columns, (r) => !!r.ov && (!r.ov.reachable || r.ov.nodes_ready !== r.ov.node_count));
   recordTableSnapshot("overview", columns, sorted, keyOf, {
     header: "Status",
     text: (r) => (!r.ov ? "checking" : !r.ov.reachable ? "unreachable" : r.ov.nodes_ready === r.ov.node_count ? "healthy" : "degraded"),
@@ -5811,7 +5811,7 @@ function renderNodes(): string {
     },
   ];
   const filtered = applyFilters("nodes", rows, columns);
-  const sorted = sortRows("nodes", filtered, columns);
+  const sorted = sortRows("nodes", filtered, columns, (r) => !r.n.ready);
   recordTableSnapshot("nodes", columns, sorted, keyOf, {
     header: "Status",
     text: (r) => (r.n.ready ? "Ready" : "Not ready"),
@@ -8961,7 +8961,7 @@ function renderNap(): string {
     },
   ];
   const filtered = applyFilters("nap", rows, columns);
-  const sorted = sortRows("nap", filtered, columns);
+  const sorted = sortRows("nap", filtered, columns, (r) => !r.p.ready);
   recordTableSnapshot("nap", columns, sorted, keyOf, {
     header: "Status",
     text: (r) => (r.p.ready ? "Ready" : r.p.status_reason || "Not ready"),
@@ -9079,7 +9079,7 @@ function renderHpa(): string {
     },
   ];
   const filtered = applyFilters("hpa", rows, columns);
-  const sorted = sortRows("hpa", filtered, columns);
+  const sorted = sortRows("hpa", filtered, columns, (r) => !healthy(r.h));
   recordTableSnapshot("hpa", columns, sorted, keyOf, {
     header: "Status",
     text: (r) => (healthy(r.h) ? "Scaling" : r.h.condition_reason || "Not scaling"),
@@ -9193,7 +9193,7 @@ function renderKeda(): string {
     },
   ];
   const filtered = applyFilters("keda", rows, columns);
-  const sorted = sortRows("keda", filtered, columns);
+  const sorted = sortRows("keda", filtered, columns, (r) => !r.s.ready);
   recordTableSnapshot("keda", columns, sorted, keyOf, {
     header: "Status",
     text: (r) => (r.s.paused ? "Paused" : r.s.ready ? "Ready" : "Not ready"),
@@ -9317,7 +9317,7 @@ function renderGitOps(): string {
     },
   ];
   const filtered = applyFilters("gitops", rows, columns);
-  const sorted = sortRows("gitops", filtered, columns);
+  const sorted = sortRows("gitops", filtered, columns, (r) => !gitOpsAppHealthy(r.a));
   recordTableSnapshot("gitops", columns, sorted, keyOf, {
     header: "Status",
     text: (r) => (gitOpsAppHealthy(r.a) ? "Healthy" : `${r.a.sync_status}/${r.a.health_status}`),
@@ -9437,7 +9437,7 @@ function renderHelm(): string {
     { key: "description", label: "Description", value: (row) => row.r.description, filter: "string" },
   ];
   const filtered = applyFilters("helm", rows, columns);
-  const sorted = sortRows("helm", filtered, columns);
+  const sorted = sortRows("helm", filtered, columns, (r) => !helmReleaseHealthy(r.r));
   recordTableSnapshot("helm", columns, sorted, keyOf, {
     header: "Health",
     text: (row) => (helmReleaseHealthy(row.r) ? "Healthy" : row.r.status),
