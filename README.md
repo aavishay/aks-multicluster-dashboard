@@ -17,13 +17,17 @@ need to embed any Azure credentials or auth flows of its own.
 ## Install
 
 ```bash
+brew trust --tap aavishay/aks-fleet-dashboard
 brew tap aavishay/aks-fleet-dashboard
-brew trust aavishay/aks-fleet-dashboard
 brew install --cask aks-fleet-dashboard
 ```
 
-Both first steps are one-offs: `brew tap` adds the tap, and Homebrew requires
-`brew trust` for casks from third-party taps. Once tapped, the cask goes by its
+Both first steps are one-offs. The order matters and is not the intuitive one:
+as of Homebrew 7.0, `brew tap` verifies the tap by loading everything in it,
+and loading a cask from an untrusted third-party tap is refused — so tapping
+first fails with `invalid syntax in tap!` and deletes the clone it just made.
+Trusting first works because `brew trust --tap` only records the name, and
+accepts a tap that is not installed yet. Once tapped, the cask goes by its
 short name.
 
 To upgrade an existing install to the latest release:
