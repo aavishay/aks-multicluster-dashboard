@@ -60,12 +60,27 @@ jobs:
           echo "HOMEBREW_PREFIX=$(brew --prefix)"
 
       - name: Tap and trust
-        # `brew trust` is required for casks from a third-party tap, and it is
-        # part of the documented install, so it is part of what gets tested.
+        # Trust BEFORE tap, which is the opposite of what reads naturally and
+        # is required as of Homebrew 7.0.
+        #
+        # `brew tap` verifies the tap it just cloned by loading everything in
+        # it (tap.rb's `Readall.valid_tap?`), and loading a cask from an
+        # untrusted third-party tap is refused. So tap-then-trust cannot work:
+        # the tap fails verification, reports "invalid syntax in tap!", and its
+        # rescue deletes the clone — leaving nothing for `brew trust` to name.
+        #
+        # `brew trust --tap` takes a tap that is not installed yet, since it
+        # only writes the name into ~/.homebrew/trust.json. Doing it first
+        # means the verification pass inside `brew tap` is already allowed to
+        # load the cask.
+        #
+        # Caught here on the 0.7.10 release: the runner went from Homebrew
+        # 6.0.22 to 7.0.1 between releases and this step began failing, which
+        # is the whole reason this workflow exists.
         run: |
           set -euo pipefail
+          brew trust --tap aavishay/aks-fleet-dashboard
           brew tap aavishay/aks-fleet-dashboard
-          brew trust aavishay/aks-fleet-dashboard
 
       # The check that would have caught the appimagedir bug: loading the cask
       # on Linux at all. Kept separate from the install so a definition error
