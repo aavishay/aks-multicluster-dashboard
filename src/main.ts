@@ -248,6 +248,33 @@ function toggleSidebar() {
 }
 
 // ---------------------------------------------------------------------------
+// Detail panel width
+//
+// Read here rather than beside the drag itself because `state`'s initializer
+// calls `getInitialDetailWidth`, and a `const` declared further down the file
+// is still in its temporal dead zone at that point.
+// ---------------------------------------------------------------------------
+
+const DETAIL_WIDTH_STORAGE_KEY = "aks-dashboard-detail-width";
+
+/** 48rem — what `max-w-3xl` gave these panels before the width became a preference. */
+const DEFAULT_DETAIL_WIDTH = 768;
+
+/**
+ * Narrow enough to park a panel beside a table and still read both, wide
+ * enough that the header row (title, Restart, Scale…, the write toggle and ✕)
+ * does not collapse into itself.
+ */
+const MIN_DETAIL_WIDTH = 360;
+
+function getInitialDetailWidth(): number {
+  const stored = Number(localStorage.getItem(DETAIL_WIDTH_STORAGE_KEY));
+  // `Number(null)` and `Number("")` are both 0, so `> 0` covers a missing key
+  // as well as a hand-edited junk one.
+  return Number.isFinite(stored) && stored > 0 ? stored : DEFAULT_DETAIL_WIDTH;
+}
+
+// ---------------------------------------------------------------------------
 // Table pagination
 //
 // Display-only, deliberately: `recordTableSnapshot` keeps recording the whole
@@ -669,6 +696,8 @@ interface AppState {
   filterState: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
   /** filterKey (`${tab}:${col.key}`) of the currently open enum-filter dropdown, or null. */
   openEnumFilter: string | null;
+  /** User-dragged width (px) of the slide-over detail panels. Clamped to the viewport on read, not on write. */
+  detailPanelWidth: number;
   /** User-resized column widths (px), per tab per column key. Unset columns fall back to `defaultColumnWidth`. */
   columnWidths: Partial<Record<TabId, Record<string, number>>>;
   /** Row keys checked for clipboard copy, per tab. */
@@ -778,6 +807,7 @@ const state: AppState = {
   claudePanelOpen: false,
   claudeExplain: null,
   claudeDiagnose: null,
+  detailPanelWidth: getInitialDetailWidth(),
   sortState: {},
   filterState: {},
   openEnumFilter: null,
@@ -3104,13 +3134,118 @@ const YAML_EDITOR_TEXT_CLASS = `p-3 ${MONO_TEXT_CLASSES}`;
  * The shell every slide-over panel shares — the detail panels, and the two
  * Claude panels that open over them.
  *
- * One string because the width is not a per-panel choice: these open on top of
- * each other, and two different widths leave a ledge down one edge where the
- * panel underneath shows through. That is exactly what happened — the AI
+ * One string here and one helper below, because the width is not a per-panel
+ * choice: these open on top of each other, and two different widths leave a
+ * ledge down one edge where the panel underneath shows through. That is exactly what happened — the AI
  * panels had drifted to `max-w-2xl` while all eight detail panels were
  * `max-w-3xl`, which is visible the moment Diagnose opens over a pod's YAML.
+ * Now that the width is draggable that rule has to hold for every pixel of the
+ * drag too, which is why the move handler below resizes *every* open panel.
+ *
+ * `relative` is for the grip. It re-parents no existing absolute descendant:
+ * all five in the app sit inside a nearer `relative` of their own.
  */
-const SLIDE_OVER_SHELL = "flex h-full w-full max-w-3xl flex-col border-l border-gridline bg-surface-1 shadow-2xl";
+const SLIDE_OVER_SHELL = "relative flex h-full max-w-full flex-col border-l border-gridline bg-surface-1 shadow-2xl";
+
+// ---------------------------------------------------------------------------
+// Detail panel resizing
+//
+// The panels are anchored to the right edge, so the draggable border is their
+// left one and dragging left widens them. As with the column-resize drag, the
+// move handler writes to the live elements' `style.width` instead of going
+// through state+render() per mousemove — a full #app rebuild per pixel of drag
+// would be visibly janky.
+// ---------------------------------------------------------------------------
+
+interface DetailResizeDrag {
+  startX: number;
+  startWidth: number;
+  width: number;
+}
+
+let detailResizeDrag: DetailResizeDrag | null = null;
+
+/**
+ * Clamped on every read rather than once on write, so a width stored on a wide
+ * display still opens sensibly on a narrow one instead of running off screen.
+ *
+ * The upper bound is the whole viewport. A panel dragged that far covers the
+ * backdrop and so can no longer be dismissed by clicking outside it — but ✕ and
+ * Escape both still close it, and refusing the user the last inch of a drag
+ * they explicitly asked for would be the stranger behaviour. Double-clicking
+ * the grip resets the width, which is the way back if it was a mistake.
+ */
+function clampDetailWidth(px: number): number {
+  return Math.round(Math.min(Math.max(px, MIN_DETAIL_WIDTH), Math.max(MIN_DETAIL_WIDTH, window.innerWidth)));
+}
+
+/**
+ * An in-flight drag outranks the stored width, so a background refresh landing
+ * mid-drag repaints the panel at the width under the cursor rather than
+ * snapping it back to where the drag started.
+ */
+function detailPanelWidth(): number {
+  return clampDetailWidth(detailResizeDrag?.width ?? state.detailPanelWidth);
+}
+
+/**
+ * The opening tag *and* the grip, because those two must not drift apart
+ * across the ten call sites — the same reason the shell itself is one string.
+ * Callers supply the matching `</div>`.
+ */
+function slideOverShell(): string {
+  return `
+    <div data-detail-panel class="${SLIDE_OVER_SHELL}" style="width:${detailPanelWidth()}px" onclick="event.stopPropagation()">
+      <span
+        onmousedown="window.__app.startDetailResize(event)"
+        ondblclick="window.__app.resetDetailWidth()"
+        title="Drag to resize · double-click to reset"
+        class="absolute left-0 top-0 z-20 h-full w-1.5 cursor-col-resize select-none hover:bg-series-blue/50"
+      ></span>`;
+}
+
+function startDetailResize(e: MouseEvent) {
+  e.preventDefault();
+  const panel = (e.target as HTMLElement).closest<HTMLElement>("[data-detail-panel]");
+  if (!panel) return;
+  const startWidth = panel.getBoundingClientRect().width;
+  detailResizeDrag = { startX: e.clientX, startWidth, width: startWidth };
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+}
+
+function commitDetailWidth(width: number) {
+  state.detailPanelWidth = width;
+  localStorage.setItem(DETAIL_WIDTH_STORAGE_KEY, String(width));
+}
+
+function resetDetailWidth() {
+  commitDetailWidth(DEFAULT_DETAIL_WIDTH);
+  render();
+}
+
+document.addEventListener("mousemove", (e) => {
+  if (!detailResizeDrag) return;
+  const drag = detailResizeDrag;
+  // Anchored right: a clientX smaller than the one we started at means the
+  // pointer has moved left, which makes the panel wider.
+  drag.width = clampDetailWidth(drag.startWidth - (e.clientX - drag.startX));
+  // Every open panel, not only the one grabbed — a Claude panel sits on top of
+  // a detail panel, and moving one of that pair alone is the ledge described
+  // above, for the whole length of the drag.
+  document.querySelectorAll<HTMLElement>("[data-detail-panel]").forEach((panel) => {
+    panel.style.width = `${drag.width}px`;
+  });
+});
+
+document.addEventListener("mouseup", () => {
+  if (!detailResizeDrag) return;
+  commitDetailWidth(detailResizeDrag.width);
+  detailResizeDrag = null;
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+  render();
+});
 
 /**
  * How the YAML pane treats a line too long for it, for whichever mode is on
@@ -4497,6 +4632,8 @@ function setMetricsRange(minutes: number) {
   resetUiScale,
   toggleSidebar,
   startColumnResize,
+  startDetailResize,
+  resetDetailWidth,
   toggleRowSelected,
   toggleAllRowsSelected,
   clearRowSelection,
@@ -5412,7 +5549,7 @@ function renderClaudeExplainPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeClaudeExplain()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">Explain error</div>
@@ -5492,7 +5629,7 @@ function renderClaudeDiagnosePanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeClaudeDiagnose()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">Diagnose ${esc(d.podName)}</div>
@@ -7733,7 +7870,7 @@ function renderPodDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closePodDetail()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(pd.name)}</div>
@@ -7866,7 +8003,7 @@ function renderNodeDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeNodeDetail()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(nd.name)}</div>
@@ -8263,7 +8400,7 @@ function renderWorkloadDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeWorkloadDetail()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(wd.name)}</div>
@@ -8376,7 +8513,7 @@ function renderNapDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeNapDetail()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(nd.name)}</div>
@@ -8469,7 +8606,7 @@ function renderHpaDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeHpaDetail()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(hd.name)}</div>
@@ -8518,7 +8655,7 @@ function renderKedaDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeKedaDetail()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(kd.name)}</div>
@@ -8754,7 +8891,7 @@ function renderGitOpsDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeGitOpsDetail()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(gd.name)}</div>
@@ -9569,7 +9706,7 @@ function renderHelmDetailPanel(): string {
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeHelmDetail()">
-      <div class="${SLIDE_OVER_SHELL}" onclick="event.stopPropagation()">
+      ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
             <div class="truncate text-sm font-medium text-ink-primary">${esc(hd.name)}</div>
