@@ -6982,20 +6982,6 @@ function closeClaudeDiagnose() {
 }
 
 /**
- * Copies the diagnosis for pasting elsewhere — Teams, a ticket, a postmortem.
- *
- * Plain text is the markdown as the model wrote it, which stays readable
- * anywhere and renders properly in anything that understands markdown. The
- * HTML flavour is the same content through the same renderer, so the two can
- * never disagree about what the answer said.
- *
- * Both carry a header naming the subject and cluster. A diagnosis pasted into
- * a channel without it is a wall of findings about an unnamed workload, and
- * the reader has no way to tell which cluster it came from.
- *
- * Copies whatever has arrived, streaming or not, matching what is on screen.
- */
-/**
  * Copies a Claude answer for pasting elsewhere — Teams, a ticket, a postmortem.
  *
  * Shared by both panels because they want the same thing: the answer, framed
@@ -7009,6 +6995,8 @@ function closeClaudeDiagnose() {
  * answer that stopped mid-stream reads as a finished one once pasted, and the
  * reader has no way to tell. The provider's error goes with it, because
  * "incomplete" alone invites the question of why.
+ *
+ * Copies whatever has arrived, streaming or not, matching what is on screen.
  */
 async function copyClaudeAnswer(opts: {
   heading: string;
@@ -7043,6 +7031,13 @@ async function copyClaudeAnswer(opts: {
   showCopyToast(ok ? opts.toast : "Copy failed");
 }
 
+/**
+ * The subject and cluster travel with the diagnosis.
+ *
+ * Pasted into a channel without them it is a wall of findings about an
+ * unnamed workload, with no indication of which cluster produced it — and a
+ * fleet this size has the same workload names in several.
+ */
 async function copyDiagnosis() {
   const d = state.claudeDiagnose;
   if (!d || !d.answer) return;
