@@ -393,7 +393,7 @@ interface PodDetailState extends MetricsViewState {
   ctx: string;
   namespace: string;
   name: string;
-  view: "yaml" | "logs" | "graph";
+  view: "yaml" | "logs" | "events" | "graph";
   containers: string[];
   activeContainer: string;
   manifest: PodManifest | null;
@@ -402,6 +402,9 @@ interface PodDetailState extends MetricsViewState {
   yamlSearch: string;
   /** Which match (0-based, in document order) is the "current" one — scrolled to and highlighted distinctly. */
   yamlSearchIndex: number;
+  events: EventInfo[] | null;
+  eventsError: string | null;
+  eventsLoading: boolean;
   logMode: "head" | "tail";
   logLines: number;
   logText: string;
@@ -4230,6 +4233,9 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
     showManagedFields: false,
     yamlSearch: "",
     yamlSearchIndex: 0,
+    events: null,
+    eventsError: null,
+    eventsLoading: false,
     logMode: "tail",
     logLines: 100,
     logText: "",
@@ -4273,8 +4279,36 @@ function setPodDetailView(view: PodDetailState["view"]) {
   if (!state.podDetail) return;
   state.podDetail.view = view;
   render();
+  if (view === "events" && !state.podDetail.events && !state.podDetail.eventsLoading) {
+    fetchPodEvents();
+  }
   if (view === "graph" && !state.podDetail.metrics && !state.podDetail.metricsLoading) {
     fetchPodMetrics();
+  }
+}
+
+/**
+ * Fetched on first visit to the tab rather than alongside the manifest,
+ * because the backend reads the namespace's whole event list to find one
+ * pod's, and most pods are opened to read YAML or tail logs.
+ */
+async function fetchPodEvents() {
+  const pd = state.podDetail;
+  if (!pd) return;
+  const token = podDetailToken;
+  pd.eventsLoading = true;
+  pd.eventsError = null;
+  render();
+  try {
+    const events = await api.getPodEvents(pd.ctx, pd.namespace, pd.name);
+    if (token !== podDetailToken || !state.podDetail) return;
+    state.podDetail.events = events;
+  } catch (e) {
+    if (token !== podDetailToken || !state.podDetail) return;
+    state.podDetail.eventsError = String(e);
+  } finally {
+    if (token === podDetailToken && state.podDetail) state.podDetail.eventsLoading = false;
+    render();
   }
 }
 
@@ -7850,6 +7884,7 @@ function renderPodDetailPanel(): string {
   const tabs: { id: PodDetailState["view"]; label: string }[] = [
     { id: "yaml", label: "YAML" },
     { id: "logs", label: "Logs" },
+    { id: "events", label: "Events" },
     { id: "graph", label: "Graph" },
   ];
 
@@ -7866,7 +7901,14 @@ function renderPodDetailPanel(): string {
       </select>`
       : "";
 
-  const body = pd.view === "yaml" ? renderPodYamlView(pd) : pd.view === "logs" ? renderPodLogsView(pd) : renderPodGraphView(pd);
+  const body =
+    pd.view === "yaml"
+      ? renderPodYamlView(pd)
+      : pd.view === "logs"
+        ? renderPodLogsView(pd)
+        : pd.view === "events"
+          ? renderPodEventsView(pd)
+          : renderPodGraphView(pd);
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closePodDetail()">
@@ -7916,7 +7958,7 @@ function renderPodDetailPanel(): string {
               )
               .join("")}
           </div>
-          ${pd.view !== "graph" ? containerSelector : ""}
+          ${pd.view === "graph" || pd.view === "events" ? "" : containerSelector}
         </div>
         <div ${detailBodyAttrs(`pod:${pd.ctx}:${pd.namespace}:${pd.name}:${pd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
       </div>
@@ -7982,6 +8024,10 @@ function renderEventsList(scrollId: string, events: EventInfo[] | null, error: s
         </tbody>
       </table>
     </div>`;
+}
+
+function renderPodEventsView(pd: PodDetailState): string {
+  return renderEventsList(`pod-events:${pd.ctx}:${pd.namespace}:${pd.name}`, pd.events, pd.eventsError);
 }
 
 function renderNodeEventsView(nd: NodeDetailState): string {
