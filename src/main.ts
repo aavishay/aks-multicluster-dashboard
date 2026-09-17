@@ -4660,6 +4660,7 @@ function setMetricsRange(minutes: number) {
   closeClaudeDiagnose,
   toggleDiagnosePayload,
   copyDiagnosis,
+  copyExplanation,
   openMetricsBackendEditor,
   closeMetricsBackendEditor,
   setMetricsBackendField,
@@ -5683,10 +5684,14 @@ function renderClaudeExplainPanel(): string {
   if (!ex) return "";
   const scrollId = "claude-explain";
 
-  const body = ex.error
+  // The error does not replace the answer when tokens arrived before it, for
+  // the same reason as the diagnosis panel: a stream that failed halfway has
+  // still produced half an explanation, and discarding it takes the Copy
+  // button with it.
+  const body = ex.error && !ex.answer
     ? `<div class="text-sm text-status-critical">${esc(ex.error)}</div>`
     : ex.answer
-      ? `<div class="text-sm leading-relaxed text-ink-secondary">${renderMarkdown(ex.answer)}</div>`
+      ? `${ex.error ? `<div class="mb-2 text-sm text-status-critical">${esc(ex.error)}</div>` : ""}<div class="text-sm leading-relaxed text-ink-secondary">${renderMarkdown(ex.answer)}</div>`
       : `<div class="text-sm text-ink-muted">Thinking…</div>`;
 
   return `
@@ -5706,9 +5711,23 @@ function renderClaudeExplainPanel(): string {
             <pre class="max-h-32 overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-secondary">${esc(ex.errorText)}</pre>
           </div>
           <div class="border-t border-gridline pt-3">
-            <div class="mb-1 flex items-center gap-2 text-xs font-medium text-ink-secondary">
-              Explanation
-              ${ex.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}
+            <div class="mb-1 flex items-center justify-between gap-2 text-xs font-medium text-ink-secondary">
+              <div class="flex items-center gap-2">
+                Explanation
+                ${ex.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}${
+                  ex.error && ex.answer ? '<span class="text-status-warning">incomplete</span>' : ""
+                }
+              </div>
+              ${
+                ex.answer
+                  ? `<button
+                      type="button"
+                      title="Copy the explanation — pastes with formatting into Teams, Outlook or a ticket"
+                      onclick="window.__app.copyExplanation()"
+                      class="rounded px-2 py-1 text-xs font-normal text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+                    >Copy</button>`
+                  : ""
+              }
             </div>
             ${body}
           </div>
@@ -6963,46 +6982,93 @@ function closeClaudeDiagnose() {
 }
 
 /**
- * Copies the diagnosis for pasting elsewhere — Teams, a ticket, a postmortem.
+ * Copies a Claude answer for pasting elsewhere — Teams, a ticket, a postmortem.
+ *
+ * Shared by both panels because they want the same thing: the answer, framed
+ * so it still makes sense to someone who cannot see the panel it came from.
  *
  * Plain text is the markdown as the model wrote it, which stays readable
- * anywhere and renders properly in anything that understands markdown. The
- * HTML flavour is the same content through the same renderer, so the two can
- * never disagree about what the answer said.
+ * anywhere. The HTML flavour is the same content through the same renderer, so
+ * the two can never disagree about what the answer said.
  *
- * Both carry a header naming the subject and cluster. A diagnosis pasted into
- * a channel without it is a wall of findings about an unnamed workload, and
- * the reader has no way to tell which cluster it came from.
+ * `incomplete` travels with the text rather than sitting only in the panel: an
+ * answer that stopped mid-stream reads as a finished one once pasted, and the
+ * reader has no way to tell. The provider's error goes with it, because
+ * "incomplete" alone invites the question of why.
  *
  * Copies whatever has arrived, streaming or not, matching what is on screen.
+ */
+async function copyClaudeAnswer(opts: {
+  heading: string;
+  /** One line under the heading — where the subject lives. */
+  subtitle?: string;
+  /** Verbatim context the answer is about, rendered as a code block. */
+  context?: string;
+  answer: string;
+  error: string | null;
+  incompleteLabel: string;
+  toast: string;
+}): Promise<void> {
+  const incomplete = opts.error ? `${opts.incompleteLabel}: ${opts.error}` : "";
+
+  const lines = [opts.heading];
+  if (opts.subtitle) lines.push(opts.subtitle);
+  if (incomplete) lines.push(incomplete);
+  lines.push("");
+  if (opts.context) lines.push("```", opts.context, "```", "");
+  lines.push(opts.answer);
+
+  const html =
+    `<h2 style="${CLIPBOARD_HEADING_STYLE}font-size:1.3em;">${esc(opts.heading)}</h2>` +
+    (opts.subtitle ? `<p style="margin:0 0 12px;"><em>${esc(opts.subtitle)}</em></p>` : "") +
+    (incomplete ? `<p style="margin:0 0 12px;color:#b45309;"><strong>${esc(incomplete)}</strong></p>` : "") +
+    (opts.context
+      ? `<pre style="${CLIPBOARD_CODE_STYLE}padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-word;margin:0 0 12px;">${esc(opts.context)}</pre>`
+      : "") +
+    renderMarkdown(opts.answer, "clipboard");
+
+  const ok = await copyRichTextToClipboard(lines.join("\n"), html);
+  showCopyToast(ok ? opts.toast : "Copy failed");
+}
+
+/**
+ * The subject and cluster travel with the diagnosis.
+ *
+ * Pasted into a channel without them it is a wall of findings about an
+ * unnamed workload, with no indication of which cluster produced it — and a
+ * fleet this size has the same workload names in several.
  */
 async function copyDiagnosis() {
   const d = state.claudeDiagnose;
   if (!d || !d.answer) return;
+  await copyClaudeAnswer({
+    heading: `Diagnosis — ${d.kind} ${d.namespace}/${d.name}`,
+    subtitle: d.kind === "Pod" && d.container ? `${d.ctx} · container ${d.container}` : d.ctx,
+    answer: d.answer,
+    error: d.error,
+    incompleteLabel: "Incomplete — the diagnosis stopped early",
+    toast: "Diagnosis copied to clipboard",
+  });
+}
 
-  const subject = `${d.kind} ${d.namespace}/${d.name}`;
-  const where = d.kind === "Pod" && d.container ? `${d.ctx} · container ${d.container}` : d.ctx;
-  const heading = `Diagnosis — ${subject}`;
-
-  // The incomplete marker has to travel with the text, not just sit in the
-  // panel. A diagnosis that stopped mid-stream reads as a finished one once it
-  // is pasted into a channel — the reader has no way to tell — which is the
-  // whole reason the marker exists. Carrying the provider's error with it
-  // answers the obvious next question rather than leaving "incomplete"
-  // unexplained.
-  const incomplete = d.error ? `Incomplete — the diagnosis stopped early: ${d.error}` : "";
-
-  const text = [heading, where, incomplete, "", d.answer].filter((l, i) => l !== "" || i === 3).join("\n");
-  const html =
-    `<h2 style="${CLIPBOARD_HEADING_STYLE}font-size:1.3em;">${esc(heading)}</h2>` +
-    `<p style="margin:0 0 12px;"><em>${esc(where)}</em></p>` +
-    (incomplete
-      ? `<p style="margin:0 0 12px;color:#b45309;"><strong>${esc(incomplete)}</strong></p>`
-      : "") +
-    renderMarkdown(d.answer, "clipboard");
-
-  const ok = await copyRichTextToClipboard(text, html);
-  showCopyToast(ok ? "Diagnosis copied to clipboard" : "Copy failed");
+/**
+ * The explained error goes in the copy as well as the explanation.
+ *
+ * An explanation on its own is close to useless to a reader in a channel:
+ * they cannot tell what was explained, and the error is usually the thing
+ * someone needs to recognise before the explanation means anything.
+ */
+async function copyExplanation() {
+  const ex = state.claudeExplain;
+  if (!ex || !ex.answer) return;
+  await copyClaudeAnswer({
+    heading: `Explanation — ${ex.subject}`,
+    context: ex.errorText,
+    answer: ex.answer,
+    error: ex.error,
+    incompleteLabel: "Incomplete — the explanation stopped early",
+    toast: "Explanation copied to clipboard",
+  });
 }
 
 function toggleDiagnosePayload() {
