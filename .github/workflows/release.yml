@@ -91,7 +91,21 @@ jobs:
             case "$ARCHS" in *"$want"*) ;; *) echo "::error::missing $want slice"; exit 1 ;; esac
           done
 
+      # Retried for the same reason `linux-publish` retries below, which this
+      # job had been missing. The action uploads every file in `files:`
+      # concurrently, and on 0.7.14 GitHub answered exactly one of the three
+      # with a 500 ("Unicorn!") on three consecutive runs — a different asset
+      # each time, so it was the concurrency and not any one file. Two of three
+      # would land, the job would fail, and the release would sit as a draft
+      # advertising assets that were never attached.
+      #
+      # `continue-on-error` on the first attempt and a plain retry after it: the
+      # retry has no `continue-on-error`, so if both fail the job fails there.
+      # Re-attaching files that already uploaded is harmless, since the action
+      # replaces an asset of the same name.
       - uses: softprops/action-gh-release@v2
+        id: publish_macos
+        continue-on-error: true
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist-release/*
@@ -115,6 +129,49 @@ jobs:
             ```
 
             Universal binary — runs natively on both Apple Silicon and Intel.
+
+      - name: Retry attaching the macOS assets
+        if: steps.publish_macos.outcome == 'failure'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist-release/*
+          # Deliberately no body and no generate_release_notes on the retry: the
+          # first attempt sets them even when an asset upload fails afterwards,
+          # and repeating `generate_release_notes` would append a second copy of
+          # the notes to what is already there.
+
+      # The same backstop `linux-publish` has, and for the same reason: a
+      # success from the action is not the same fact as the assets being present
+      # under the expected names. Checked by name rather than by count, so a
+      # rename in the collect step cannot pass this by keeping the total right.
+      #
+      # This is also the check that would have caught 0.7.14 without a human
+      # noticing: all three runs left a draft holding two of three assets, and
+      # nothing downstream looked at what was attached.
+      - name: Confirm every macOS asset is actually on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.publish_macos.outcome }}" = "failure" ]; then
+            echo "::warning::attaching the macOS assets failed once and was retried"
+          fi
+          VERSION="${TAG#v}"
+          NAMES=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          echo "$NAMES"
+          MISSING=0
+          for want in \
+            "AKS-Fleet-Dashboard-${VERSION}-universal.dmg" \
+            "AKS-Fleet-Dashboard-${VERSION}-universal.app.zip" \
+            "SHA256SUMS.txt"; do
+            case "$NAMES" in
+              *"$want"*) ;;
+              *) echo "::error::the release is missing $want"; MISSING=1 ;;
+            esac
+          done
+          [ "$MISSING" -eq 0 ]
 
   # Linux amd64, built by the same workflow pull requests run. It holds no
   # write access and produces only an artifact; attaching that artifact to the
