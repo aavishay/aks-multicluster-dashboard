@@ -162,14 +162,18 @@ jobs:
           NAMES=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
           echo "$NAMES"
           MISSING=0
+          # `grep -Fx`, not a `case` glob: matching a whole line, literally.
+          # A substring test passes on a near-miss — `…universal.dmg` is a
+          # substring of `…universal.dmg.backup` — which would let exactly the
+          # rename this step exists to catch slip through.
           for want in \
             "AKS-Fleet-Dashboard-${VERSION}-universal.dmg" \
             "AKS-Fleet-Dashboard-${VERSION}-universal.app.zip" \
             "SHA256SUMS.txt"; do
-            case "$NAMES" in
-              *"$want"*) ;;
-              *) echo "::error::the release is missing $want"; MISSING=1 ;;
-            esac
+            if ! printf '%s\n' "$NAMES" | grep -Fxq -- "$want"; then
+              echo "::error::the release is missing $want"
+              MISSING=1
+            fi
           done
           [ "$MISSING" -eq 0 ]
 
