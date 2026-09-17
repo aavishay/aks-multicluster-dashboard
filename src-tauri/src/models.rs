@@ -70,6 +70,14 @@ pub struct PodInfo {
     pub cpu_usage_millicores: Option<i64>,
     pub memory_usage_ki: Option<i64>,
     pub status_reason: Option<String>,
+    /// The failing container's reason and message, for the Explain affordance.
+    ///
+    /// Separate from `status_reason`, which is `pod.status.reason` and is only
+    /// set for pod-level failures like `Evicted` — unset on every pod of a
+    /// real fleet. What an operator actually needs is in the container's
+    /// waiting or terminated state: "ImagePullBackOff: Back-off pulling image
+    /// …: ErrImagePull: …".
+    pub failure_message: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -117,6 +125,13 @@ pub struct WorkloadInfo {
     pub images: Vec<String>,
     /// `helm.sh/chart` label, e.g. "apisix-2.14.0", when Helm installed it.
     pub chart: Option<String>,
+    /// The most informative failing condition, for the Explain affordance.
+    ///
+    /// Controllers mostly report `MinimumReplicasUnavailable: Deployment does
+    /// not have minimum availability`, which restates the ready count and
+    /// explains nothing — so `ProgressDeadlineExceeded` and `ReplicaFailure`
+    /// are preferred when present, being the two that name a cause.
+    pub failure_message: Option<String>,
 }
 
 /// One entry of a workload's rollout history — a ReplicaSet for a Deployment,
