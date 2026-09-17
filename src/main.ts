@@ -1328,12 +1328,18 @@ async function copyPlainTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
-async function copyTableToClipboard(headers: string[], rows: string[][]): Promise<boolean> {
-  const text = buildClipboardPlainText(headers, rows);
-
+/**
+ * Writes both flavours, so each paste target takes the one it understands: a
+ * rich editor (Teams, Outlook, Word) reads `text/html` and keeps the
+ * formatting, while an editor or terminal reads `text/plain`.
+ *
+ * Falls back to plain text alone when the multi-type write is unavailable —
+ * some WKWebView versions expose `clipboard.writeText` but not
+ * `clipboard.write`, and a webview can deny it outright.
+ */
+async function copyRichTextToClipboard(text: string, html: string): Promise<boolean> {
   if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
     try {
-      const html = buildClipboardHtmlTable(headers, rows);
       await navigator.clipboard.write([
         new ClipboardItem({
           "text/plain": new Blob([text], { type: "text/plain" }),
@@ -1342,13 +1348,14 @@ async function copyTableToClipboard(headers: string[], rows: string[][]): Promis
       ]);
       return true;
     } catch {
-      // Fall through to the plain-text path below — e.g. Safari/WKWebView
-      // versions that support `clipboard.writeText` but not multi-type
-      // `clipboard.write`, or a webview that denies it outright.
+      // Fall through to the plain-text path below.
     }
   }
-
   return copyPlainTextToClipboard(text);
+}
+
+async function copyTableToClipboard(headers: string[], rows: string[][]): Promise<boolean> {
+  return copyRichTextToClipboard(buildClipboardPlainText(headers, rows), buildClipboardHtmlTable(headers, rows));
 }
 
 /** Copies the current text of a YAML/Log `<pre>`, identified by its (already-unique) `data-scroll-id`, to the clipboard. Reads live DOM text rather than re-deriving it, so it always matches exactly what's on screen — highlighting spans and all, stripped back down to plain text. */
@@ -4652,6 +4659,7 @@ function setMetricsRange(minutes: number) {
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
+  copyDiagnosis,
   openMetricsBackendEditor,
   closeMetricsBackendEditor,
   setMetricsBackendField,
@@ -5464,12 +5472,49 @@ function renderClaudePanel(): string {
  * destroy the tags this just added. `esc` leaves backticks and asterisks
  * alone, so the patterns below still match once it has run.
  */
-function renderInlineMarkdown(text: string): string {
+/**
+ * Which flavour of HTML the markdown renderers emit.
+ *
+ * `panel` styles with the app's Tailwind classes. `clipboard` emits
+ * self-contained HTML for `text/html` on the clipboard, where those classes
+ * mean nothing: it leans on semantic tags, which is what a paste target
+ * actually honours — Teams keeps headings, lists, `strong` and `pre`, and
+ * discards most CSS — plus modest inline styles for the targets that do keep
+ * them, such as Outlook and Word.
+ *
+ * One parser with two emitters rather than a second renderer, so the copied
+ * text cannot drift from what is on screen.
+ */
+type MarkdownTarget = "panel" | "clipboard";
+
+const CLIPBOARD_CODE_STYLE =
+  "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f4f4f4;";
+
+/**
+ * Every clipboard block carries its own layout inline, rather than leaning on
+ * the paste target's defaults.
+ *
+ * Not belt-and-braces: a rich editor usually applies its own reset to pasted
+ * markup, and `list-style:none` on `ol`/`ul` is the most common one — which
+ * silently strips the numbers off a numbered list of remediation steps and
+ * leaves an unordered wall of sentences. Tailwind's own preflight does exactly
+ * this, which is how it was caught: rendering the copied HTML inside the app
+ * produced a diagnosis with no step numbers at all.
+ */
+const CLIPBOARD_LIST_STYLE = "margin:0 0 8px;padding-left:24px;";
+const CLIPBOARD_HEADING_STYLE = "font-weight:600;margin:12px 0 4px;";
+
+function renderInlineMarkdown(text: string, target: MarkdownTarget = "panel"): string {
   let out = esc(text);
+  const code =
+    target === "panel"
+      ? '<code class="rounded bg-surface-3 px-1 py-0.5 text-[0.92em]">$1</code>'
+      : `<code style="${CLIPBOARD_CODE_STYLE}padding:1px 4px;border-radius:3px;">$1</code>`;
+  const strong = target === "panel" ? '<strong class="font-semibold text-ink-primary">$1</strong>' : "<strong>$1</strong>";
   // Code spans first, so `**` inside backticks stays literal rather than
   // being eaten by the bold pass.
-  out = out.replace(/`([^`\n]+)`/g, '<code class="rounded bg-surface-3 px-1 py-0.5 text-[0.92em]">$1</code>');
-  out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong class="font-semibold text-ink-primary">$1</strong>');
+  out = out.replace(/`([^`\n]+)`/g, code);
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, strong);
   // Single asterisks, but not the leftovers of an unmatched bold marker.
   out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   return out;
@@ -5489,7 +5534,8 @@ function renderInlineMarkdown(text: string): string {
  * an unterminated fence renders what has arrived, so a half-written answer
  * looks half-written rather than vanishing.
  */
-function renderMarkdown(source: string): string {
+function renderMarkdown(source: string, target: MarkdownTarget = "panel"): string {
+  const panel = target === "panel";
   const lines = source.replace(/\r\n/g, "\n").split("\n");
   const out: string[] = [];
   let paragraph: string[] = [];
@@ -5525,20 +5571,24 @@ function renderMarkdown(source: string): string {
   // outranks these. That is worth checking rather than assuming — an unlayered
   // rule in that file beats any Tailwind utility on the same property.
   const codeBlock = (body: string[]) =>
-    `<pre class="mb-2 select-text overflow-auto whitespace-pre-wrap break-words rounded-md border border-gridline bg-surface-2 p-2 ${MONO_TEXT_CLASSES} last:mb-0">${esc(body.join("\n"))}</pre>`;
+    panel
+      ? `<pre class="mb-2 select-text overflow-auto whitespace-pre-wrap break-words rounded-md border border-gridline bg-surface-2 p-2 ${MONO_TEXT_CLASSES} last:mb-0">${esc(body.join("\n"))}</pre>`
+      : `<pre style="${CLIPBOARD_CODE_STYLE}padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-word;">${esc(body.join("\n"))}</pre>`;
 
   const flushParagraph = () => {
     if (!paragraph.length) return;
-    out.push(`<p class="mb-2 last:mb-0">${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+    const open = panel ? '<p class="mb-2 last:mb-0">' : '<p style="margin:0 0 8px;">';
+    out.push(`${open}${renderInlineMarkdown(paragraph.join(" "), target)}</p>`);
     paragraph = [];
   };
   const flushList = () => {
     if (!items.length) return;
     const tag = ordered ? "ol" : "ul";
     const start = ordered && listStart !== "1" ? ` start="${esc(listStart)}"` : "";
-    out.push(
-      `<${tag}${start} class="mb-2 ml-5 space-y-1 ${ordered ? "list-decimal" : "list-disc"} last:mb-0">${items.join("")}</${tag}>`,
-    );
+    const attrs = panel
+      ? ` class="mb-2 ml-5 space-y-1 ${ordered ? "list-decimal" : "list-disc"} last:mb-0"`
+      : ` style="list-style:${ordered ? "decimal" : "disc"};${CLIPBOARD_LIST_STYLE}"`;
+    out.push(`<${tag}${start}${attrs}>${items.join("")}</${tag}>`);
     items = [];
     listStart = "1";
   };
@@ -5573,8 +5623,13 @@ function renderMarkdown(source: string): string {
       // One level below the panel's own title, which is the heading this
       // content sits under, and clamped to the deepest level ARIA defines.
       const level = Math.min(heading[1].length + 1, 6);
+      // A real <h*> for the clipboard: `role="heading"` is an accessibility
+      // annotation, not a tag a paste target recognises, so Teams would render
+      // it as an ordinary line.
       out.push(
-        `<div role="heading" aria-level="${level}" class="mb-1 mt-3 font-semibold ${heading[1].length <= 2 ? "text-sm" : "text-xs"} text-ink-primary first:mt-0">${renderInlineMarkdown(heading[2])}</div>`,
+        panel
+          ? `<div role="heading" aria-level="${level}" class="mb-1 mt-3 font-semibold ${heading[1].length <= 2 ? "text-sm" : "text-xs"} text-ink-primary first:mt-0">${renderInlineMarkdown(heading[2])}</div>`
+          : `<h${level} style="${CLIPBOARD_HEADING_STYLE}font-size:${heading[1].length <= 2 ? "1.15em" : "1em"};">${renderInlineMarkdown(heading[2], target)}</h${level}>`,
       );
       continue;
     }
@@ -5592,7 +5647,7 @@ function renderMarkdown(source: string): string {
       // the browser, so an author numbering every item "1." still renders
       // 1, 2, 3 within one unbroken list, as markdown specifies.
       if (!items.length && numbered) listStart = numbered[1];
-      items.push(`<li>${renderInlineMarkdown(numbered ? numbered[2] : bullet![1])}</li>`);
+      items.push(`<li>${renderInlineMarkdown(numbered ? numbered[2] : bullet![1], target)}</li>`);
       continue;
     }
 
@@ -5691,8 +5746,20 @@ function renderClaudeDiagnosePanel(): string {
     ? `<div class="text-sm text-status-critical">${esc(d.error)}</div>`
     : d.sent
       ? `<div class="border-t border-gridline pt-3">
-          <div class="mb-1 flex items-center gap-2 text-xs font-medium text-ink-secondary">
-            Diagnosis ${d.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}
+          <div class="mb-1 flex items-center justify-between gap-2 text-xs font-medium text-ink-secondary">
+            <div class="flex items-center gap-2">
+              Diagnosis ${d.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}
+            </div>
+            ${
+              d.answer
+                ? `<button
+                    type="button"
+                    title="Copy the diagnosis — pastes with formatting into Teams, Outlook or a ticket"
+                    onclick="window.__app.copyDiagnosis()"
+                    class="rounded px-2 py-1 text-xs font-normal text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+                  >Copy</button>`
+                : ""
+            }
           </div>
           ${
             d.answer
@@ -6869,6 +6936,38 @@ function closeClaudeDiagnose() {
   claudeDiagnoseToken += 1;
   state.claudeDiagnose = null;
   render();
+}
+
+/**
+ * Copies the diagnosis for pasting elsewhere — Teams, a ticket, a postmortem.
+ *
+ * Plain text is the markdown as the model wrote it, which stays readable
+ * anywhere and renders properly in anything that understands markdown. The
+ * HTML flavour is the same content through the same renderer, so the two can
+ * never disagree about what the answer said.
+ *
+ * Both carry a header naming the subject and cluster. A diagnosis pasted into
+ * a channel without it is a wall of findings about an unnamed workload, and
+ * the reader has no way to tell which cluster it came from.
+ *
+ * Copies whatever has arrived, streaming or not, matching what is on screen.
+ */
+async function copyDiagnosis() {
+  const d = state.claudeDiagnose;
+  if (!d || !d.answer) return;
+
+  const subject = `${d.kind} ${d.namespace}/${d.name}`;
+  const where = d.kind === "Pod" && d.container ? `${d.ctx} · container ${d.container}` : d.ctx;
+  const heading = `Diagnosis — ${subject}`;
+
+  const text = `${heading}\n${where}\n\n${d.answer}`;
+  const html =
+    `<h2 style="${CLIPBOARD_HEADING_STYLE}font-size:1.3em;">${esc(heading)}</h2>` +
+    `<p style="margin:0 0 12px;"><em>${esc(where)}</em></p>` +
+    renderMarkdown(d.answer, "clipboard");
+
+  const ok = await copyRichTextToClipboard(text, html);
+  showCopyToast(ok ? "Diagnosis copied to clipboard" : "Copy failed");
 }
 
 function toggleDiagnosePayload() {
