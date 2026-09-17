@@ -1332,6 +1332,45 @@ pub async fn get_workload_revisions(
     Ok(revisions)
 }
 
+/// How many times an event has fired.
+///
+/// Three sources, because it depends on which API wrote the event. The legacy
+/// core/v1 path sets `count`. `events.k8s.io/v1` puts a repeat count in
+/// `series.count` and leaves `count` unset entirely for a single occurrence —
+/// so an absent count means *once*, not never.
+///
+/// Defaulting it to 0, as this did, rendered `FailedScheduling` as `x0`: an
+/// event the API only emits because it happened, displayed as having not
+/// happened. On one real cluster that covered 122 of 683 pod events.
+fn event_count(e: &Event) -> i32 {
+    e.series
+        .as_ref()
+        .and_then(|s| s.count)
+        .or(e.count)
+        .unwrap_or(1)
+}
+
+/// When an event was last observed, or `None` only if it genuinely carries no
+/// time at all.
+///
+/// Four sources, most authoritative first, for the same reason as the count:
+/// `events.k8s.io/v1` sets `event_time` (and `series.last_observed_time` once
+/// it repeats) while leaving both `Time` fields empty, and core/v1 sets
+/// `first_timestamp`/`last_timestamp`. Reading `last_timestamp` alone left
+/// every `Scheduled`, `FailedScheduling` and `Preempted` event with a blank
+/// timestamp — and, because `list_events_sorted` orders on this, sorted them
+/// below every timestamped event regardless of age, where the cluster-wide
+/// `take(300)` then cut them first.
+fn event_last_seen(e: &Event) -> Option<chrono::DateTime<Utc>> {
+    e.series
+        .as_ref()
+        .and_then(|s| s.last_observed_time.as_ref())
+        .map(|t| t.0)
+        .or_else(|| e.last_timestamp.as_ref().map(|t| t.0))
+        .or_else(|| e.event_time.as_ref().map(|t| t.0))
+        .or_else(|| e.first_timestamp.as_ref().map(|t| t.0))
+}
+
 fn event_to_info(e: Event) -> EventInfo {
     EventInfo {
         namespace: e.metadata.namespace.clone().unwrap_or_default(),
@@ -1343,8 +1382,8 @@ fn event_to_info(e: Event) -> EventInfo {
         reason: e.reason.clone().unwrap_or_default(),
         message: e.message.clone().unwrap_or_default(),
         event_type: e.type_.clone().unwrap_or_default(),
-        count: e.count.unwrap_or(0),
-        last_seen: e.last_timestamp.clone().map(|t| t.0.to_rfc3339()),
+        count: event_count(&e),
+        last_seen: event_last_seen(&e).map(|t| t.to_rfc3339()),
     }
 }
 
@@ -1358,11 +1397,13 @@ async fn list_events_sorted(client: &Client) -> Result<Vec<Event>, String> {
         .map_err(|e| format!("Failed to list events: {e}"))?
         .items;
 
-    items.sort_by(|a, b| {
-        let a_time = a.last_timestamp.clone().map(|t| t.0);
-        let b_time = b.last_timestamp.clone().map(|t| t.0);
-        b_time.cmp(&a_time)
-    });
+    // Sorted on the same effective timestamp the rows display, not on
+    // `last_timestamp` alone. `None` sorts below `Some` in Rust, so keying on
+    // a field that a fifth of real events never set sank exactly those events
+    // to the bottom — a `FailedScheduling` from a minute ago ordered below a
+    // `Killing` from two hours ago, and `get_events`' `take(300)` then dropped
+    // them off the cluster-wide tab entirely.
+    items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
     Ok(items)
 }
 
@@ -3660,6 +3701,87 @@ mod tests {
         }
     }
 
+    /// Builds a core/v1 Event the way `events.k8s.io/v1` writers emit it:
+    /// `eventTime` set, `count` and both `Time` fields absent.
+    fn modern_event(reason: &str, at: &str) -> Event {
+        Event {
+            reason: Some(reason.into()),
+            event_time: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime(
+                at.parse().expect("test timestamp"),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// The legacy core/v1 shape: `count` and `lastTimestamp` set.
+    fn legacy_event(reason: &str, at: &str, count: i32) -> Event {
+        Event {
+            reason: Some(reason.into()),
+            count: Some(count),
+            last_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                at.parse().expect("test timestamp"),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_event_with_no_count_fired_once_not_zero() {
+        // `events.k8s.io/v1` omits `count` for a single occurrence. Reporting
+        // that as 0 told the reader a FailedScheduling had not happened.
+        assert_eq!(event_count(&modern_event("FailedScheduling", "2026-09-17T11:10:06Z")), 1);
+        // An explicit count still wins.
+        assert_eq!(event_count(&legacy_event("BackOff", "2026-09-17T11:10:06Z", 42)), 42);
+        // And a series count outranks both, being the aggregated total.
+        let mut series = modern_event("Unhealthy", "2026-09-17T11:10:06Z");
+        series.series = Some(k8s_openapi::api::core::v1::EventSeries { count: Some(9), ..Default::default() });
+        assert_eq!(event_count(&series), 9);
+    }
+
+    #[test]
+    fn last_seen_falls_back_to_event_time() {
+        let modern = modern_event("Scheduled", "2026-09-17T11:10:06Z");
+        assert!(
+            event_last_seen(&modern).is_some(),
+            "an event carrying only eventTime still has a time; a blank column is a bug"
+        );
+        assert_eq!(
+            event_last_seen(&legacy_event("Pulled", "2026-09-17T09:00:00Z", 1))
+                .map(|t| t.to_rfc3339()),
+            Some("2026-09-17T09:00:00+00:00".to_string())
+        );
+        // series.lastObservedTime is the most recent of a repeating series, so
+        // it outranks the rest.
+        let mut series = legacy_event("BackOff", "2026-09-17T09:00:00Z", 5);
+        series.series = Some(k8s_openapi::api::core::v1::EventSeries {
+            count: Some(5),
+            last_observed_time: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime(
+                "2026-09-17T12:00:00Z".parse().expect("test timestamp"),
+            )),
+        });
+        assert_eq!(
+            event_last_seen(&series).map(|t| t.to_rfc3339()),
+            Some("2026-09-17T12:00:00+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn a_recent_event_without_last_timestamp_still_sorts_first() {
+        // The regression that mattered most: keyed on `last_timestamp` alone,
+        // `None` sorts below `Some`, so a FailedScheduling from now ordered
+        // below a Killing from hours earlier and was the first thing the
+        // cluster-wide `take(300)` discarded.
+        let mut items = vec![
+            legacy_event("Killing", "2026-09-17T09:00:00Z", 1),
+            modern_event("FailedScheduling", "2026-09-17T12:00:00Z"),
+            legacy_event("Pulled", "2026-09-17T10:00:00Z", 1),
+        ];
+        items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+
+        let order: Vec<&str> = items.iter().map(|e| e.reason.as_deref().unwrap_or("")).collect();
+        assert_eq!(order, vec!["FailedScheduling", "Pulled", "Killing"]);
+    }
+
     /// End to end against a real cluster, for the part the frontend harness
     /// has to stub: that the pod Events tab's backing read actually reaches a
     /// cluster, and that everything it returns belongs to the pod asked for.
@@ -3736,18 +3858,20 @@ mod tests {
                     e.namespace
                 );
 
-                // Deliberately NOT asserting `count >= 1` or `last_seen.is_some()`.
-                // Events from `events.k8s.io/v1` (Scheduled, FailedScheduling,
-                // Preempted) set `eventTime` and leave `count`, `firstTimestamp`
-                // and `lastTimestamp` unset, so both are legitimately absent on
-                // the wire. `event_to_info` currently renders that as `x0` with a
-                // blank Last seen, and `list_events_sorted` sinks them below
-                // every timestamped event — see the report accompanying this
-                // test. Asserting here would only re-fail on cluster data that
-                // is itself correct.
-                if e.count == 0 || e.last_seen.is_none() {
-                    eprintln!("      ^ no count/lastTimestamp on the wire (events.k8s.io/v1 style)");
-                }
+                // These two are the point of `event_count`/`event_last_seen`.
+                // `events.k8s.io/v1` events (Scheduled, FailedScheduling,
+                // Preempted) arrive with `count`, `firstTimestamp` and
+                // `lastTimestamp` all unset, and used to surface as `x0` with a
+                // blank Last seen. The unit tests pin the fallbacks against
+                // synthetic events; this pins them against whatever the cluster
+                // is actually emitting today, which is where the shapes that
+                // prompted the fix came from in the first place.
+                assert!(e.count >= 1, "{} fired, so it cannot have a count of 0", e.reason);
+                assert!(
+                    e.last_seen.is_some(),
+                    "{} has no timestamp from any of the four sources",
+                    e.reason
+                );
             }
         }
         eprintln!("verified {} pod(s), every event owned by the pod asked for", candidates.len());
