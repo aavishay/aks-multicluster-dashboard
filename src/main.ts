@@ -1161,7 +1161,15 @@ function columnWidth<T>(tab: TabId, col: ColumnDef<T>): number {
   return state.columnWidths[tab]?.[col.key] ?? defaultColumnWidth(col);
 }
 
-/** `leadingWidths` covers any unlabeled columns before `columns` (e.g. the status-dot column). */
+/**
+ * `leadingWidths` covers any unlabeled columns before `columns` (e.g. the
+ * status-dot column).
+ *
+ * The Pods and Workloads tables pass a wider status column than the rest
+ * because theirs also holds the Explain button for a failing row: measured,
+ * the dot, the gap and the button need 100px including the cell's padding, and
+ * a narrower column makes the fixed table layout ellipsise the button.
+ */
 function renderColGroup<T>(tab: TabId, columns: ColumnDef<T>[], leadingWidths: number[] = []): string {
   const leading = leadingWidths.map((w) => `<col style="width:${w}px">`).join("");
   const cols = columns
@@ -6282,7 +6290,7 @@ function renderWorkloads(): string {
     ${selectionToolbar("workloads")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:workloads">
       <table class="data-table">
-        ${renderColGroup("workloads", columns, [32, 36])}
+        ${renderColGroup("workloads", columns, [32, 104])}
         <thead>
           <tr>${selectAllCheckboxHeader("workloads", sorted, keyOf)}<th></th>${sortableHeaderRow("workloads", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("workloads", columns, rows)}</tr>
@@ -6295,7 +6303,7 @@ function renderWorkloads(): string {
                 return `
             <tr>
               ${rowCheckboxCell("workloads", keyOf(row))}
-              <td>${statusDot(w.healthy)}</td>
+              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(w.healthy)}${w.failure_message ? claudeExplainButton(`${w.name} (${w.kind})`, w.failure_message) : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter workloads by this cluster" onclick="window.__app.setEnumFilter('workloads','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -6425,7 +6433,7 @@ function renderPods(): string {
     ${selectionToolbar("pods")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:pods">
       <table class="data-table">
-        ${renderColGroup("pods", columns, [32, 36])}
+        ${renderColGroup("pods", columns, [32, 104])}
         <thead>
           <tr>${selectAllCheckboxHeader("pods", sorted, keyOf)}<th></th>${sortableHeaderRow("pods", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("pods", columns, rows)}</tr>
@@ -6437,7 +6445,7 @@ function renderPods(): string {
               return `
             <tr>
               ${rowCheckboxCell("pods", keyOf(row))}
-              <td>${statusDot(podHealthy(row))}</td>
+              <td title="${esc(p.failure_message ?? (podHealthy(row) ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(podHealthy(row))}${p.failure_message ? claudeExplainButton(`${p.name} (pod)`, p.failure_message) : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter pods by this cluster" onclick="window.__app.setEnumFilter('pods','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -6445,12 +6453,14 @@ function renderPods(): string {
               }
               <td><button type="button" title="Filter pods by this namespace" onclick="window.__app.setEnumFilter('pods','namespace',[${jsArg(p.namespace)}])" class="hover:text-series-blue hover:underline">${esc(p.namespace)}</button></td>
               <td>
+                <span class="inline-flex items-center gap-1.5">
                 <button
                   type="button"
                   title="View pod details"
                   data-row-open onclick="window.__app.openPodDetail(${jsArg(ctx)},${jsArg(p.namespace)},${jsArg(p.name)})"
                   class="text-ink-primary hover:text-series-blue hover:underline"
                 >${esc(p.name)}</button>
+                </span>
               </td>
               <td class="tabular">${esc(p.ready)}</td>
               <td class="tabular ${p.restarts > 0 ? "text-status-warning" : ""}">${p.restarts}</td>

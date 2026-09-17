@@ -467,6 +467,7 @@ mod tests {
             cpu_usage_millicores: None,
             memory_usage_ki: None,
             status_reason: None,
+            failure_message: None,
         }
     }
 
