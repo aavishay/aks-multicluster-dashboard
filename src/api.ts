@@ -178,11 +178,19 @@ export const api = {
   /** Assembles the redacted diagnosis payload without sending it, for preview. */
   aiBuildDiagnosis: (contextName: string, namespace: string, podName: string, container: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_diagnosis", { contextName, namespace, podName, container }),
-  /** Sends an already-previewed diagnosis payload; `onToken` fires per text delta. */
-  aiDiagnose: (prompt: string, onToken: (chunk: string) => void) => {
+  aiBuildWorkloadDiagnosis: (contextName: string, kind: string, namespace: string, name: string) =>
+    invoke<ClaudeDiagnosisPayload>("ai_build_workload_diagnosis", { contextName, kind, namespace, name }),
+  /**
+   * Sends an already-previewed diagnosis payload; `onToken` fires per text delta.
+   *
+   * `kind` selects the system prompt on the Rust side — "Pod" or a workload
+   * kind. It is not the prompt itself: what the model is told to do stays
+   * behind the IPC boundary.
+   */
+  aiDiagnose: (prompt: string, kind: string, onToken: (chunk: string) => void) => {
     const channel = new Channel<string>();
     channel.onmessage = onToken;
-    return invoke<void>("ai_diagnose", { prompt, onToken: channel });
+    return invoke<void>("ai_diagnose", { prompt, kind, onToken: channel });
   },
   /** Streams an explanation of one error string; `onToken` fires per text delta. */
   aiExplainError: (errorText: string, onToken: (chunk: string) => void) => {

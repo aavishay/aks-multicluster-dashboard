@@ -7,7 +7,7 @@
 //! provider is added.
 
 use crate::ai;
-use crate::models::ClaudeDiagnosisPayload;
+use crate::models::{ClaudeDiagnosisPayload, PodInfo};
 use crate::{k8s, redact};
 
 /// Generous for an explanation that should run a few paragraphs, while staying
@@ -65,6 +65,260 @@ name what would settle it.
 Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
+
+const DIAGNOSE_WORKLOAD_SYSTEM: &str = "\
+You diagnose failing Kubernetes workloads (Deployments, StatefulSets, \
+DaemonSets) for an experienced SRE.
+
+You are given the controller's replica counts, its recent events, its \
+manifest, a table of every pod it owns, and the events and recent logs of \
+the pod least likely to be healthy. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the event, log line, pod \
+row, or manifest field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Distinguish a controller-level problem from a pod-level one. If every pod \
+fails the same way the cause is usually the template or an admission \
+policy; if one pod differs, look at its node or its scheduling. A rollout \
+that is stuck with updated below desired is a different failure from one \
+where pods are crashlooping after a successful rollout — say which you are \
+looking at.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
+/// Ranks a workload's pods worst-first, so the logs in the payload come from
+/// the instance most likely to explain the trouble.
+///
+/// Sorted ascending on the tuple, so `false` — not running, not fully ready —
+/// comes first, and the negated restart count puts the most-restarted pod
+/// ahead of the rest. A healthy workload has no clear worst pod and simply
+/// yields its first, which is the right answer when nothing is wrong.
+fn diagnosis_pod_priority(p: &PodInfo) -> (bool, bool, i32) {
+    let all_ready = match p.ready.split_once('/') {
+        Some((r, t)) => r.trim() == t.trim(),
+        None => true,
+    };
+    (p.phase == "Running", all_ready, -p.restarts)
+}
+
+/// Assembles everything a workload diagnosis needs, redacted and trimmed.
+///
+/// Shaped like `build_diagnosis_payload` but a controller sees a different
+/// failure surface: the interesting signal is usually the spread across its
+/// pods — all of them failing identically points at the template, one of them
+/// at that pod's node — so the pod table is the part a pod-level diagnosis
+/// cannot provide.
+pub async fn build_workload_diagnosis_payload(
+    context_name: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    // Independent reads issued together, as in the pod path — it matters more
+    // here because there are four of them before the dependent log fetch.
+    let (workloads, events, manifest, pods) = tokio::join!(
+        k8s::get_workloads(context_name),
+        k8s::get_workload_events(context_name, kind, namespace, name),
+        k8s::get_workload_manifest(context_name, kind, namespace, name),
+        k8s::get_pods(context_name, Some(namespace.to_string())),
+    );
+
+    let status = workloads
+        .ok()
+        .and_then(|list| list.into_iter().find(|w| w.kind == kind && w.name == name && w.namespace == namespace))
+        .map(|w| {
+            format!(
+                "kind: {}\ndesired: {}\nready: {}\nupdated: {}\navailable: {}\nhealthy: {}\nage: {}s\nversion: {} ({})\nimages: {}",
+                w.kind,
+                w.desired,
+                w.ready,
+                w.updated,
+                w.available,
+                w.healthy,
+                w.age_seconds,
+                w.version,
+                if w.version_from_label { "from label" } else { "from image tag" },
+                w.images.join(", "),
+            )
+        })
+        .unwrap_or_else(|| "(workload status unavailable)".to_string());
+
+    let owned: Vec<PodInfo> = pods
+        .map(|list| {
+            let mut owned: Vec<PodInfo> = list
+                .into_iter()
+                .filter(|p| p.owner_kind.as_deref() == Some(kind) && p.owner_name.as_deref() == Some(name))
+                .collect();
+            owned.sort_by_key(diagnosis_pod_priority);
+            owned
+        })
+        .unwrap_or_default();
+
+    let pods_text = if owned.is_empty() {
+        "(this workload currently owns no pods)".to_string()
+    } else {
+        // Worst-first, so a truncated table keeps the pods worth reading.
+        let rows = owned
+            .iter()
+            .take(20)
+            .map(|p| {
+                format!(
+                    "{}  phase={} ready={} restarts={} node={} reason={}",
+                    p.name,
+                    p.phase,
+                    p.ready,
+                    p.restarts,
+                    p.node.as_deref().unwrap_or("(unscheduled)"),
+                    p.status_reason.as_deref().unwrap_or("(none)"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if owned.len() > 20 {
+            format!("{rows}\n(… {} more pods, worst-first)", owned.len() - 20)
+        } else {
+            rows
+        }
+    };
+
+    let events_text = match events {
+        Ok(list) if list.is_empty() => "(no events for this workload)".to_string(),
+        Ok(list) => list
+            .iter()
+            .take(25)
+            .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("(events unavailable: {e})"),
+    };
+
+    let (manifest_text, container) = match manifest {
+        Ok(m) => {
+            let container = m.containers.first().cloned().unwrap_or_default();
+            (m.yaml_without_managed_fields, container)
+        }
+        Err(e) => (format!("(manifest unavailable: {e})"), String::new()),
+    };
+
+    // Both of these depend on the worst pod and on nothing else, so they go out
+    // together rather than one after the other. They cannot join the batch
+    // above — which pod is worst is only known once the pod list has arrived —
+    // but serialising them here would add a whole round trip to every workload
+    // preview, and on a private-link cluster that is tens of seconds. Worse,
+    // the log fetch is the one that can sit on a timeout, and awaiting it first
+    // would make the events wait behind precisely the slowest call.
+    //
+    // Only the worst pod's logs: a Deployment's pods are usually near-identical,
+    // so every pod's logs would multiply the payload to say the same thing.
+    //
+    // Its *events* are here because a controller rarely has any of its own:
+    // Kubernetes attaches BackOff, Failed and Unhealthy to the pod, so a
+    // workload-only view of a crashlooping Deployment reads "(no events)" while
+    // the pod underneath carries "BackOff ×945" — the single most diagnostic
+    // line available. Verified against a real crashlooping Deployment.
+    let worst = owned.first();
+    let (logs, pod_events) = match worst {
+        Some(worst) => {
+            // `container` is empty only when the manifest read failed, in which
+            // case there is nothing to ask the log endpoint for.
+            let logs_fut = async {
+                if container.is_empty() {
+                    None
+                } else {
+                    Some(
+                        k8s::get_workload_logs(
+                            context_name,
+                            namespace,
+                            std::slice::from_ref(&worst.name),
+                            &container,
+                            true,
+                            DIAGNOSE_LOG_FETCH_LINES,
+                        )
+                        .await,
+                    )
+                }
+            };
+            let events_fut = k8s::get_pod_events(context_name, namespace, &worst.name);
+            let (logs, events) = tokio::join!(logs_fut, events_fut);
+            (logs, Some(events))
+        }
+        None => (None, None),
+    };
+
+    let (logs_text, log_note, log_source) = match (worst, logs) {
+        (Some(worst), Some(Ok(text))) if text.trim().is_empty() => {
+            ("(container produced no log output)".to_string(), None, Some(worst.name.clone()))
+        }
+        (Some(worst), Some(Ok(text))) => {
+            let (t, n) = redact::tail_lines(&text, DIAGNOSE_LOG_LINES);
+            (t, n, Some(worst.name.clone()))
+        }
+        (Some(worst), Some(Err(e))) => {
+            (format!("(logs unavailable: {e})"), None, Some(worst.name.clone()))
+        }
+        _ => ("(no pod available to read logs from)".to_string(), None, None),
+    };
+
+    let pod_events_text = match (worst, pod_events) {
+        (Some(worst), Some(Ok(list))) if list.is_empty() => format!("(no events for pod {})", worst.name),
+        (_, Some(Ok(list))) => list
+            .iter()
+            .take(15)
+            .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        (_, Some(Err(e))) => format!("(pod events unavailable: {e})"),
+        _ => "(no pod to read events from)".to_string(),
+    };
+
+    let status = redact::redact(&status);
+    let pods_r = redact::redact(&pods_text);
+    let events_r = redact::redact(&events_text);
+    let pod_events_r = redact::redact(&pod_events_text);
+    let manifest_r = redact::redact(&manifest_text);
+    let logs_r = redact::redact(&logs_text);
+
+    let redaction_summary =
+        redact::Redacted::merge([&status, &pods_r, &events_r, &pod_events_r, &manifest_r, &logs_r]).summary();
+
+    let log_heading = match (&log_source, &container) {
+        (Some(pod), c) if !c.is_empty() => format!(" (pod {pod}, container {c})"),
+        _ => String::new(),
+    };
+
+    let prompt = format!(
+        "{kind} {namespace}/{name}.\n\n\
+         ## Status\n{}\n\n\
+         ## Pods (worst first)\n{}\n\n\
+         ## Events ({kind})\n{}\n\n\
+         ## Events (worst pod{})\n{}\n\n\
+         ## Manifest\n```yaml\n{}\n```\n\n\
+         ## Logs{}{}\n```\n{}\n```",
+        status.text,
+        pods_r.text,
+        events_r.text,
+        log_source.as_ref().map(|p| format!(" {p}")).unwrap_or_default(),
+        pod_events_r.text,
+        manifest_r.text,
+        log_heading,
+        log_note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default(),
+        logs_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note,
+    })
+}
 
 /// Assembles everything a diagnosis needs, redacted and trimmed.
 ///
@@ -176,8 +430,12 @@ fn approx_tokens(text: &str) -> u32 {
 /// Takes the assembled prompt rather than re-gathering, so what is sent is
 /// exactly what the user was shown — re-fetching could send something different
 /// from the preview.
-pub async fn diagnose(prompt: &str, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
-    ai::stream(prompt, DIAGNOSE_SYSTEM, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
+pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
+    // Chosen here rather than passed in from the frontend: the system prompt is
+    // the instruction the model actually follows, so it stays on this side of
+    // the IPC boundary where the payload preview cannot misrepresent it.
+    let system = if kind == "Pod" { DIAGNOSE_SYSTEM } else { DIAGNOSE_WORKLOAD_SYSTEM };
+    ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
 }
 
 /// Streams an explanation of a single error message, emitting text deltas on
@@ -188,4 +446,86 @@ pub async fn diagnose(prompt: &str, on_token: tauri::ipc::Channel<String>) -> Re
 /// in the app.
 pub async fn explain_error(error_text: &str, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
     ai::stream(error_text, EXPLAIN_SYSTEM, EXPLAIN_MAX_TOKENS, EXPLAIN_EFFORT, on_token).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pod(name: &str, phase: &str, ready: &str, restarts: i32) -> PodInfo {
+        PodInfo {
+            name: name.into(),
+            namespace: "prod".into(),
+            node: Some("aks-general-1".into()),
+            phase: phase.into(),
+            ready: ready.into(),
+            restarts,
+            age_days: 1,
+            age_seconds: 86_400,
+            owner_kind: Some("Deployment".into()),
+            owner_name: Some("api".into()),
+            cpu_usage_millicores: None,
+            memory_usage_ki: None,
+            status_reason: None,
+        }
+    }
+
+    fn ranked(mut pods: Vec<PodInfo>) -> Vec<String> {
+        pods.sort_by_key(diagnosis_pod_priority);
+        pods.into_iter().map(|p| p.name).collect()
+    }
+
+    #[test]
+    fn the_worst_pod_is_the_one_whose_logs_go_in_the_payload() {
+        // Pending outranks everything: a pod that never started explains a
+        // stuck rollout better than one that is merely restarting.
+        assert_eq!(
+            ranked(vec![
+                pod("healthy", "Running", "1/1", 0),
+                pod("restarting", "Running", "1/1", 14),
+                pod("pending", "Pending", "0/1", 0),
+            ]),
+            vec!["pending", "restarting", "healthy"]
+        );
+    }
+
+    #[test]
+    fn a_running_but_unready_pod_outranks_a_ready_one() {
+        // Running with a failing readiness probe is the classic "rollout says
+        // it worked, nothing serves traffic" case, so it must beat a ready pod
+        // even when the ready pod has restarted more.
+        assert_eq!(
+            ranked(vec![
+                pod("ready-but-flappy", "Running", "2/2", 9),
+                pod("running-unready", "Running", "1/2", 0),
+            ]),
+            vec!["running-unready", "ready-but-flappy"]
+        );
+    }
+
+    #[test]
+    fn among_equals_the_most_restarted_pod_wins() {
+        assert_eq!(
+            ranked(vec![
+                pod("calm", "Running", "1/1", 1),
+                pod("crashy", "Running", "1/1", 57),
+                pod("quiet", "Running", "1/1", 0),
+            ]),
+            vec!["crashy", "calm", "quiet"]
+        );
+    }
+
+    #[test]
+    fn a_malformed_ready_string_is_treated_as_ready() {
+        // `ready` is rendered by the pod reader, not parsed from the API, but
+        // an unexpected shape must not silently promote a healthy pod to
+        // "worst" and send its logs instead of the crashlooping one's.
+        assert_eq!(
+            ranked(vec![
+                pod("odd-ready", "Running", "unknown", 0),
+                pod("crashy", "Running", "1/1", 33),
+            ]),
+            vec!["crashy", "odd-ready"]
+        );
+    }
 }
