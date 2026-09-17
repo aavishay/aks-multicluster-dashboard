@@ -207,51 +207,75 @@ pub async fn build_workload_diagnosis_payload(
         Err(e) => (format!("(manifest unavailable: {e})"), String::new()),
     };
 
-    // Dependent on the pod list, so it cannot join the batch above. Only the
-    // worst pod's logs: a Deployment's pods are usually near-identical, so
-    // every pod's logs would multiply the payload to say the same thing.
-    let (logs_text, log_note, log_source) = match (owned.first(), container.is_empty()) {
-        (Some(worst), false) => {
-            let fetched = k8s::get_workload_logs(
-                context_name,
-                namespace,
-                std::slice::from_ref(&worst.name),
-                &container,
-                true,
-                DIAGNOSE_LOG_FETCH_LINES,
-            )
-            .await;
-            match fetched {
-                Ok(text) if text.trim().is_empty() => {
-                    ("(container produced no log output)".to_string(), None, Some(worst.name.clone()))
+    // Both of these depend on the worst pod and on nothing else, so they go out
+    // together rather than one after the other. They cannot join the batch
+    // above — which pod is worst is only known once the pod list has arrived —
+    // but serialising them here would add a whole round trip to every workload
+    // preview, and on a private-link cluster that is tens of seconds. Worse,
+    // the log fetch is the one that can sit on a timeout, and awaiting it first
+    // would make the events wait behind precisely the slowest call.
+    //
+    // Only the worst pod's logs: a Deployment's pods are usually near-identical,
+    // so every pod's logs would multiply the payload to say the same thing.
+    //
+    // Its *events* are here because a controller rarely has any of its own:
+    // Kubernetes attaches BackOff, Failed and Unhealthy to the pod, so a
+    // workload-only view of a crashlooping Deployment reads "(no events)" while
+    // the pod underneath carries "BackOff ×945" — the single most diagnostic
+    // line available. Verified against a real crashlooping Deployment.
+    let worst = owned.first();
+    let (logs, pod_events) = match worst {
+        Some(worst) => {
+            // `container` is empty only when the manifest read failed, in which
+            // case there is nothing to ask the log endpoint for.
+            let logs_fut = async {
+                if container.is_empty() {
+                    None
+                } else {
+                    Some(
+                        k8s::get_workload_logs(
+                            context_name,
+                            namespace,
+                            std::slice::from_ref(&worst.name),
+                            &container,
+                            true,
+                            DIAGNOSE_LOG_FETCH_LINES,
+                        )
+                        .await,
+                    )
                 }
-                Ok(text) => {
-                    let (t, n) = redact::tail_lines(&text, DIAGNOSE_LOG_LINES);
-                    (t, n, Some(worst.name.clone()))
-                }
-                Err(e) => (format!("(logs unavailable: {e})"), None, Some(worst.name.clone())),
-            }
+            };
+            let events_fut = k8s::get_pod_events(context_name, namespace, &worst.name);
+            let (logs, events) = tokio::join!(logs_fut, events_fut);
+            (logs, Some(events))
+        }
+        None => (None, None),
+    };
+
+    let (logs_text, log_note, log_source) = match (worst, logs) {
+        (Some(worst), Some(Ok(text))) if text.trim().is_empty() => {
+            ("(container produced no log output)".to_string(), None, Some(worst.name.clone()))
+        }
+        (Some(worst), Some(Ok(text))) => {
+            let (t, n) = redact::tail_lines(&text, DIAGNOSE_LOG_LINES);
+            (t, n, Some(worst.name.clone()))
+        }
+        (Some(worst), Some(Err(e))) => {
+            (format!("(logs unavailable: {e})"), None, Some(worst.name.clone()))
         }
         _ => ("(no pod available to read logs from)".to_string(), None, None),
     };
 
-    // The worst pod's own events, because a controller rarely has any of its
-    // own: Kubernetes attaches BackOff, Failed and Unhealthy to the pod, so a
-    // workload-only view of a crashlooping Deployment reads "(no events)" while
-    // the pod underneath it carries "BackOff ×945" — the single most diagnostic
-    // line available. Verified against a real crashlooping Deployment.
-    let pod_events_text = match owned.first() {
-        Some(worst) => match k8s::get_pod_events(context_name, namespace, &worst.name).await {
-            Ok(list) if list.is_empty() => format!("(no events for pod {})", worst.name),
-            Ok(list) => list
-                .iter()
-                .take(15)
-                .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Err(e) => format!("(pod events unavailable: {e})"),
-        },
-        None => "(no pod to read events from)".to_string(),
+    let pod_events_text = match (worst, pod_events) {
+        (Some(worst), Some(Ok(list))) if list.is_empty() => format!("(no events for pod {})", worst.name),
+        (_, Some(Ok(list))) => list
+            .iter()
+            .take(15)
+            .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        (_, Some(Err(e))) => format!("(pod events unavailable: {e})"),
+        _ => "(no pod to read events from)".to_string(),
     };
 
     let status = redact::redact(&status);
