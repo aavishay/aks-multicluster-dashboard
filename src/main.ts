@@ -5503,8 +5503,15 @@ function renderMarkdown(source: string): string {
    * answer with a command under each step rendered as "1. 1. 1.". Carrying the
    * author's own number onto `start` restores the sequence without this
    * renderer having to track list nesting.
+   *
+   * Kept as the matched digits rather than a number: `\d+` accepts more than
+   * a JS number represents, and round-tripping through `Number` would emit
+   * something other than what the author wrote — 9007199254740993 comes back
+   * one lower, and a long enough run of digits stringifies as `1e+24` or
+   * `Infinity`, neither of which is a valid HTML integer. Passing the digits
+   * through untouched cannot misrepresent them.
    */
-  let listStart = 1;
+  let listStart = "1";
   let code: string[] | null = null;
 
   // Wrapped, not scrolled. These blocks hold the evidence a diagnosis rests on
@@ -5528,12 +5535,12 @@ function renderMarkdown(source: string): string {
   const flushList = () => {
     if (!items.length) return;
     const tag = ordered ? "ol" : "ul";
-    const start = ordered && listStart !== 1 ? ` start="${listStart}"` : "";
+    const start = ordered && listStart !== "1" ? ` start="${esc(listStart)}"` : "";
     out.push(
       `<${tag}${start} class="mb-2 ml-5 space-y-1 ${ordered ? "list-decimal" : "list-disc"} last:mb-0">${items.join("")}</${tag}>`,
     );
     items = [];
-    listStart = 1;
+    listStart = "1";
   };
   const flush = () => {
     flushParagraph();
@@ -5584,7 +5591,7 @@ function renderMarkdown(source: string): string {
       // Only the first item of a run sets the start: the rest are counted by
       // the browser, so an author numbering every item "1." still renders
       // 1, 2, 3 within one unbroken list, as markdown specifies.
-      if (!items.length && numbered) listStart = Number(numbered[1]);
+      if (!items.length && numbered) listStart = numbered[1];
       items.push(`<li>${renderInlineMarkdown(numbered ? numbered[2] : bullet![1])}</li>`);
       continue;
     }
