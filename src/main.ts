@@ -5505,19 +5505,35 @@ const CLIPBOARD_LIST_STYLE = "margin:0 0 8px;padding-left:24px;";
 const CLIPBOARD_HEADING_STYLE = "font-weight:600;margin:12px 0 4px;";
 
 function renderInlineMarkdown(text: string, target: MarkdownTarget = "panel"): string {
-  let out = esc(text);
-  const code =
+  const codeOpen =
     target === "panel"
-      ? '<code class="rounded bg-surface-3 px-1 py-0.5 text-[0.92em]">$1</code>'
-      : `<code style="${CLIPBOARD_CODE_STYLE}padding:1px 4px;border-radius:3px;">$1</code>`;
+      ? '<code class="rounded bg-surface-3 px-1 py-0.5 text-[0.92em]">'
+      : `<code style="${CLIPBOARD_CODE_STYLE}padding:1px 4px;border-radius:3px;">`;
   const strong = target === "panel" ? '<strong class="font-semibold text-ink-primary">$1</strong>' : "<strong>$1</strong>";
-  // Code spans first, so `**` inside backticks stays literal rather than
-  // being eaten by the bold pass.
-  out = out.replace(/`([^`\n]+)`/g, code);
+
+  // Code spans are lifted out before the emphasis passes and put back after.
+  //
+  // Running the code pass first does not protect them, though this used to
+  // claim it did: the bold and italic regexes then scan the HTML that pass
+  // generated, code span contents included. `a * b * c` in backticks came out
+  // as `a <em> b </em> c` — the asterisks deleted from a command meant to be
+  // copied and run — and `**-A**` inside backticks came out bolded.
+  //
+  // NUL is the placeholder delimiter because it cannot survive `esc` from any
+  // real answer; stripping it first makes that guarantee hold rather than
+  // assuming it. Emphasis may still span a placeholder, which is correct:
+  // `*see `x` here*` should emphasise across the code span, and restoring
+  // afterwards puts the span back inside the `<em>`.
+  const spans: string[] = [];
+  let out = esc(text)
+    .replace(/\u0000/g, "")
+    .replace(/`([^`\n]+)`/g, (_m, inner: string) => `\u0000${spans.push(inner) - 1}\u0000`);
+
   out = out.replace(/\*\*([^*\n]+)\*\*/g, strong);
   // Single asterisks, but not the leftovers of an unmatched bold marker.
   out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
-  return out;
+
+  return out.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => `${codeOpen}${spans[Number(i)]}</code>`);
 }
 
 /**
@@ -5742,13 +5758,21 @@ function renderClaudeDiagnosePanel(): string {
       </div>`
     : "";
 
-  const answer = d.error
+  // The error does not replace the answer when tokens arrived before it. A
+  // provider that streams half a diagnosis and then fails has still produced
+  // the half — often the root cause, since that comes first — and discarding
+  // it along with the Copy button loses work the user already paid for and
+  // cannot get back without re-running.
+  const answer = d.error && !d.answer
     ? `<div class="text-sm text-status-critical">${esc(d.error)}</div>`
     : d.sent
       ? `<div class="border-t border-gridline pt-3">
+          ${d.error ? `<div class="mb-2 text-sm text-status-critical">${esc(d.error)}</div>` : ""}
           <div class="mb-1 flex items-center justify-between gap-2 text-xs font-medium text-ink-secondary">
             <div class="flex items-center gap-2">
-              Diagnosis ${d.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}
+              Diagnosis ${d.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}${
+                d.error ? '<span class="text-status-warning">incomplete</span>' : ""
+              }
             </div>
             ${
               d.answer
@@ -6960,10 +6984,21 @@ async function copyDiagnosis() {
   const where = d.kind === "Pod" && d.container ? `${d.ctx} · container ${d.container}` : d.ctx;
   const heading = `Diagnosis — ${subject}`;
 
-  const text = `${heading}\n${where}\n\n${d.answer}`;
+  // The incomplete marker has to travel with the text, not just sit in the
+  // panel. A diagnosis that stopped mid-stream reads as a finished one once it
+  // is pasted into a channel — the reader has no way to tell — which is the
+  // whole reason the marker exists. Carrying the provider's error with it
+  // answers the obvious next question rather than leaving "incomplete"
+  // unexplained.
+  const incomplete = d.error ? `Incomplete — the diagnosis stopped early: ${d.error}` : "";
+
+  const text = [heading, where, incomplete, "", d.answer].filter((l, i) => l !== "" || i === 3).join("\n");
   const html =
     `<h2 style="${CLIPBOARD_HEADING_STYLE}font-size:1.3em;">${esc(heading)}</h2>` +
     `<p style="margin:0 0 12px;"><em>${esc(where)}</em></p>` +
+    (incomplete
+      ? `<p style="margin:0 0 12px;color:#b45309;"><strong>${esc(incomplete)}</strong></p>`
+      : "") +
     renderMarkdown(d.answer, "clipboard");
 
   const ok = await copyRichTextToClipboard(text, html);
