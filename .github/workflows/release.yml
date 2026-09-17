@@ -92,6 +92,8 @@ jobs:
           done
 
       - uses: softprops/action-gh-release@v2
+        id: publish-macos
+        continue-on-error: true
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist-release/*
@@ -115,6 +117,37 @@ jobs:
             ```
 
             Universal binary — runs natively on both Apple Silicon and Intel.
+
+      - name: Retry attaching macOS assets
+        if: steps.publish-macos.outcome == 'failure'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist-release/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```bash
+            brew trust --tap aavishay/aks-fleet-dashboard
+            brew tap aavishay/aks-fleet-dashboard
+            brew install --cask aks-fleet-dashboard
+            ```
+
+            ## Not notarized
+
+            This build is ad-hoc signed, not signed with an Apple Developer ID,
+            so macOS quarantines it on first launch. Clear the flag once:
+
+            ```bash
+            xattr -dr com.apple.quarantine "/Applications/AKS Fleet Dashboard.app"
+            ```
+
+            Universal binary — runs natively on both Apple Silicon and Intel.
+
+      - name: Say so if attaching macOS assets needed a retry
+        if: steps.publish-macos.outcome == 'failure'
+        run: echo "::warning::attaching macOS assets failed once and succeeded on retry"
 
   # Linux amd64, built by the same workflow pull requests run. It holds no
   # write access and produces only an artifact; attaching that artifact to the
