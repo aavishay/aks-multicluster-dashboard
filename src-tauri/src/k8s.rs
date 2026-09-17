@@ -3660,6 +3660,99 @@ mod tests {
         }
     }
 
+    /// End to end against a real cluster, for the part the frontend harness
+    /// has to stub: that the pod Events tab's backing read actually reaches a
+    /// cluster, and that everything it returns belongs to the pod asked for.
+    ///
+    /// Candidates come from one cluster-wide `get_events` rather than from a
+    /// prefix of the pod list. Kubernetes does not order pods by whether they
+    /// have events, so taking the first N and demanding one of them be noisy
+    /// fails on a quiet namespace while the read is perfectly correct — and
+    /// events expire after roughly an hour, so "no events anywhere" is a real
+    /// state, not a defect. Asking the cluster which pods have events also
+    /// costs one list instead of one per candidate.
+    ///
+    ///   POD_EVENTS_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml pod_events_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set POD_EVENTS_TEST_CONTEXT to run"]
+    async fn pod_events_against_a_live_cluster() {
+        let Ok(context) = std::env::var("POD_EVENTS_TEST_CONTEXT") else {
+            eprintln!("POD_EVENTS_TEST_CONTEXT not set — skipping");
+            return;
+        };
+
+        // One cluster-wide read, used only to choose pods worth asking about.
+        let all = get_events(&context, false).await.expect("events should be listable");
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for e in &all {
+            let Some(pod) = e.involved_object.strip_prefix("Pod/") else {
+                continue;
+            };
+            let key = (e.namespace.clone(), pod.to_string());
+            if !candidates.contains(&key) {
+                candidates.push(key);
+            }
+            if candidates.len() == 3 {
+                break;
+            }
+        }
+
+        if candidates.is_empty() {
+            eprintln!("no Pod events anywhere in {context} right now — nothing to verify, skipping");
+            return;
+        }
+
+        for (namespace, pod) in &candidates {
+            let events = get_pod_events(&context, namespace, pod)
+                .await
+                .expect("pod events should be readable");
+
+            eprintln!("{namespace}/{pod} -> {} event(s)", events.len());
+            assert!(
+                !events.is_empty(),
+                "{namespace}/{pod} had events in the cluster-wide list but none of its own"
+            );
+
+            for e in &events {
+                eprintln!(
+                    "    [{}] {} x{} last_seen={:?} {}",
+                    e.event_type, e.reason, e.count, e.last_seen, e.message
+                );
+                assert!(!e.reason.is_empty(), "an event with no reason means the mapping is wrong");
+
+                // The actual guarantee. Without these two, dropping the
+                // name/namespace predicates from `get_pod_events` — or
+                // returning the cluster-wide list outright — still passes.
+                assert_eq!(
+                    e.involved_object,
+                    format!("Pod/{pod}"),
+                    "{namespace}/{pod} was handed an event belonging to {}",
+                    e.involved_object
+                );
+                assert_eq!(
+                    &e.namespace, namespace,
+                    "{namespace}/{pod} was handed an event from namespace {}",
+                    e.namespace
+                );
+
+                // Deliberately NOT asserting `count >= 1` or `last_seen.is_some()`.
+                // Events from `events.k8s.io/v1` (Scheduled, FailedScheduling,
+                // Preempted) set `eventTime` and leave `count`, `firstTimestamp`
+                // and `lastTimestamp` unset, so both are legitimately absent on
+                // the wire. `event_to_info` currently renders that as `x0` with a
+                // blank Last seen, and `list_events_sorted` sinks them below
+                // every timestamped event — see the report accompanying this
+                // test. Asserting here would only re-fail on cluster data that
+                // is itself correct.
+                if e.count == 0 || e.last_seen.is_none() {
+                    eprintln!("      ^ no count/lastTimestamp on the wire (events.k8s.io/v1 style)");
+                }
+            }
+        }
+        eprintln!("verified {} pod(s), every event owned by the pod asked for", candidates.len());
+    }
+
     #[test]
     fn keda_scaled_object_defaults_its_target_kind_to_deployment() {
         // KEDA treats an omitted scaleTargetRef.kind as Deployment, so a
