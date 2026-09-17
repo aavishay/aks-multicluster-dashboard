@@ -7985,7 +7985,21 @@ function renderNodeYamlView(nd: NodeDetailState): string {
   });
 }
 
-/** Plain (non-sortable/filterable) events table shared by the Node and Workload detail panels — a small, already-scoped set doesn't need the full grid machinery the main Events tab has. */
+/**
+ * Plain (non-sortable/filterable) events table shared by every detail panel — a
+ * small, already-scoped set doesn't need the full grid machinery the main Events
+ * tab has.
+ *
+ * The `<colgroup>` is not optional decoration: `.data-table` is
+ * `table-layout: fixed`, so without one the browser splits the width evenly and
+ * `Count` — a one- or two-digit number — is handed exactly as much room as the
+ * message. Four columns hold a short, bounded token, so they are sized to that
+ * and `Message` is left to absorb everything else, growing as the panel is
+ * dragged wider. The `min-width` is the floor under that: at the panel's
+ * narrowest the remainder would otherwise collapse toward zero and wrap the
+ * message one character per line, so past that point the wrapper scrolls
+ * horizontally instead — the same trade the main tables already make.
+ */
 function renderEventsList(scrollId: string, events: EventInfo[] | null, error: string | null): string {
   if (error) {
     return `<div class="text-sm text-status-critical">${esc(error)}</div>`;
@@ -7998,7 +8012,14 @@ function renderEventsList(scrollId: string, events: EventInfo[] | null, error: s
   }
   return `
     <div class="h-full min-h-0 select-text overflow-auto rounded-md border border-gridline" data-scroll-id="${esc(scrollId)}">
-      <table class="data-table">
+      <table class="data-table" style="min-width:560px">
+        <colgroup>
+          <col style="width:84px">
+          <col style="width:148px">
+          <col>
+          <col style="width:68px">
+          <col style="width:104px">
+        </colgroup>
         <thead>
           <tr>
             <th>Type</th>
