@@ -626,7 +626,10 @@ interface ClaudeExplainState {
 interface ClaudeDiagnoseState {
   ctx: string;
   namespace: string;
-  podName: string;
+  /** "Pod", or the workload kind. Picks the payload builder, and the system prompt the backend uses. */
+  kind: string;
+  name: string;
+  /** The pod's container. Empty for a workload — the builder takes the first container off the pod template. */
   container: string;
   /** Assembled payload, or null while still being built. */
   payload: ClaudeDiagnosisPayload | null;
@@ -4645,6 +4648,7 @@ function setMetricsRange(minutes: number) {
   explainError,
   closeClaudeExplain,
   diagnosePod,
+  diagnoseWorkload,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -5623,7 +5627,11 @@ function renderClaudeDiagnosePanel(): string {
           </button>
         </div>
         <div class="flex flex-col gap-1 text-xs text-ink-muted">
-          <div>Status, events, manifest and the recent logs of this container.</div>
+          <div>${
+            d.kind === "Pod"
+              ? "Status, events, manifest and the recent logs of this container."
+              : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
+          }</div>
           <div class="${d.payload.redaction_summary.startsWith("Redacted") ? "text-status-warning" : ""}">${esc(d.payload.redaction_summary)}</div>
           ${d.payload.log_note ? `<div>Logs: ${esc(d.payload.log_note)}.</div>` : ""}
           <div>Roughly ${d.payload.approx_tokens.toLocaleString()} tokens.</div>
@@ -5666,8 +5674,11 @@ function renderClaudeDiagnosePanel(): string {
       ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
-            <div class="truncate text-sm font-medium text-ink-primary">Diagnose ${esc(d.podName)}</div>
-            <div class="truncate text-xs text-ink-muted">${esc(d.ctx)} · ${esc(d.namespace)} · ${esc(d.container)}</div>
+            <div class="truncate text-sm font-medium text-ink-primary">Diagnose ${esc(d.name)}</div>
+            <div class="truncate text-xs text-ink-muted">${[d.ctx, d.namespace, d.kind === "Pod" ? d.container : d.kind]
+              .filter(Boolean)
+              .map(esc)
+              .join(" · ")}</div>
           </div>
           <button type="button" onclick="window.__app.closeClaudeDiagnose()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
         </div>
@@ -6837,13 +6848,40 @@ function toggleDiagnosePayload() {
  * Step 1: assemble and show the payload. Nothing is sent yet — this exists so
  * the log data leaving the machine is reviewable rather than implied.
  */
-async function diagnosePod(ctx: string, namespace: string, podName: string, container: string) {
+function diagnosePod(ctx: string, namespace: string, podName: string, container: string) {
+  startDiagnosis(ctx, "Pod", namespace, podName, container, () =>
+    api.aiBuildDiagnosis(ctx, namespace, podName, container),
+  );
+}
+
+/**
+ * A controller rather than one of its pods. The payload is assembled on the
+ * Rust side from the workload's own status, events and manifest plus a table
+ * of every pod it owns — the spread across those pods being the thing a
+ * pod-level diagnosis cannot show.
+ */
+function diagnoseWorkload(ctx: string, kind: string, namespace: string, name: string) {
+  startDiagnosis(ctx, kind, namespace, name, "", () =>
+    api.aiBuildWorkloadDiagnosis(ctx, kind, namespace, name),
+  );
+}
+
+/** Step 1: build the payload and show it, without sending anything. */
+async function startDiagnosis(
+  ctx: string,
+  kind: string,
+  namespace: string,
+  name: string,
+  container: string,
+  build: () => Promise<ClaudeDiagnosisPayload>,
+) {
   const token = ++claudeDiagnoseToken;
   closeClaudeExplain();
   state.claudeDiagnose = {
     ctx,
+    kind,
     namespace,
-    podName,
+    name,
     container,
     payload: null,
     sent: false,
@@ -6855,7 +6893,7 @@ async function diagnosePod(ctx: string, namespace: string, podName: string, cont
   render();
 
   try {
-    const payload = await api.aiBuildDiagnosis(ctx, namespace, podName, container);
+    const payload = await build();
     if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
     state.claudeDiagnose.payload = payload;
   } catch (e) {
@@ -6878,7 +6916,7 @@ async function confirmDiagnose() {
   try {
     // Sends the previewed prompt rather than re-gathering, so what goes out is
     // exactly what was shown.
-    await api.aiDiagnose(d.payload.prompt, (chunk) => {
+    await api.aiDiagnose(d.payload.prompt, d.kind, (chunk) => {
       if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
       state.claudeDiagnose.answer += chunk;
       if (!claudeRenderScheduled) {
@@ -8488,6 +8526,16 @@ function renderWorkloadDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(wd.ctx)} · ${esc(wd.kind)} · ${esc(wd.namespace)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${
+              state.claudeAuth?.signed_in
+                ? `<button
+                    type="button"
+                    title="Diagnose this workload with Claude — you'll review exactly what is sent first"
+                    onclick="window.__app.diagnoseWorkload(${jsArg(wd.ctx)},${jsArg(wd.kind)},${jsArg(wd.namespace)},${jsArg(wd.name)})"
+                    class="rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+                  >Diagnose</button>`
+                : ""
+            }
             ${writeActionButton(
               "Restart",
               "Roll every pod through the controller's normal rollout",
