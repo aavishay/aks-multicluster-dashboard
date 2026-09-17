@@ -6984,10 +6984,21 @@ async function copyDiagnosis() {
   const where = d.kind === "Pod" && d.container ? `${d.ctx} · container ${d.container}` : d.ctx;
   const heading = `Diagnosis — ${subject}`;
 
-  const text = `${heading}\n${where}\n\n${d.answer}`;
+  // The incomplete marker has to travel with the text, not just sit in the
+  // panel. A diagnosis that stopped mid-stream reads as a finished one once it
+  // is pasted into a channel — the reader has no way to tell — which is the
+  // whole reason the marker exists. Carrying the provider's error with it
+  // answers the obvious next question rather than leaving "incomplete"
+  // unexplained.
+  const incomplete = d.error ? `Incomplete — the diagnosis stopped early: ${d.error}` : "";
+
+  const text = [heading, where, incomplete, "", d.answer].filter((l, i) => l !== "" || i === 3).join("\n");
   const html =
     `<h2 style="${CLIPBOARD_HEADING_STYLE}font-size:1.3em;">${esc(heading)}</h2>` +
     `<p style="margin:0 0 12px;"><em>${esc(where)}</em></p>` +
+    (incomplete
+      ? `<p style="margin:0 0 12px;color:#b45309;"><strong>${esc(incomplete)}</strong></p>`
+      : "") +
     renderMarkdown(d.answer, "clipboard");
 
   const ok = await copyRichTextToClipboard(text, html);
