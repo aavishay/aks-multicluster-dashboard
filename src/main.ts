@@ -7985,7 +7985,35 @@ function renderNodeYamlView(nd: NodeDetailState): string {
   });
 }
 
-/** Plain (non-sortable/filterable) events table shared by the Node and Workload detail panels — a small, already-scoped set doesn't need the full grid machinery the main Events tab has. */
+/**
+ * Plain (non-sortable/filterable) events table shared by every detail panel — a
+ * small, already-scoped set doesn't need the full grid machinery the main Events
+ * tab has.
+ *
+ * The `<colgroup>` is not optional decoration: `.data-table` is
+ * `table-layout: fixed`, so without one the browser splits the width evenly and
+ * `Count` — a one- or two-digit number — is handed exactly as much room as the
+ * message. Four columns hold a short token, so they are sized to that and
+ * `Message` is left to absorb everything else, growing as the panel is dragged
+ * wider. The `min-width` is the floor under that: at the panel's narrowest the
+ * remainder would otherwise collapse toward zero and wrap the message one
+ * character per line, so past that point the wrapper scrolls horizontally
+ * instead — the same trade the main tables already make.
+ *
+ * Every width here is in `rem`, not `px`, because `UI_SCALE_STEPS` runs from
+ * 75% to 175% by scaling the root font-size: a px column does not grow with the
+ * text it has to hold, and the inherited `nowrap`/`ellipsis` then eats the
+ * value. The binding case is the *smallest* step rather than the largest, since
+ * the cells' 12px side padding is fixed and so takes a proportionally bigger
+ * bite the further down the ladder you go; these are sized to clear 75%, which
+ * leaves them slack everywhere above it.
+ *
+ * `Reason` is sized for the long-but-real names — `FailedCreatePodSandBox` and
+ * the like — rather than for the short ones the happy path shows, and carries a
+ * `title` because Kubernetes can always emit a longer one
+ * (`FailedToRetrieveImagePullSecret`) and this table, unlike the main Events
+ * tab, has no other way to recover a clipped value.
+ */
 function renderEventsList(scrollId: string, events: EventInfo[] | null, error: string | null): string {
   if (error) {
     return `<div class="text-sm text-status-critical">${esc(error)}</div>`;
@@ -7998,7 +8026,14 @@ function renderEventsList(scrollId: string, events: EventInfo[] | null, error: s
   }
   return `
     <div class="h-full min-h-0 select-text overflow-auto rounded-md border border-gridline" data-scroll-id="${esc(scrollId)}">
-      <table class="data-table">
+      <table class="data-table" style="min-width:39rem">
+        <colgroup>
+          <col style="width:5.5rem">
+          <col style="width:12rem">
+          <col>
+          <col style="width:4.75rem">
+          <col style="width:7rem">
+        </colgroup>
         <thead>
           <tr>
             <th>Type</th>
@@ -8014,7 +8049,7 @@ function renderEventsList(scrollId: string, events: EventInfo[] | null, error: s
               (e) => `
             <tr>
               <td class="${e.event_type === "Warning" ? "text-status-warning" : ""}">${esc(e.event_type)}</td>
-              <td>${esc(e.reason)}</td>
+              <td title="${esc(e.reason)}">${esc(e.reason)}</td>
               <td class="whitespace-normal break-words">${esc(e.message)}</td>
               <td class="tabular">${e.count}</td>
               <td class="tabular">${esc(relativeTime(e.last_seen))}</td>
