@@ -5495,10 +5495,30 @@ function renderMarkdown(source: string): string {
   let paragraph: string[] = [];
   let items: string[] = [];
   let ordered = false;
+  /**
+   * The number the author gave the first item of the list being built.
+   *
+   * A code block or a paragraph between two numbered items closes the `<ol>`
+   * and opens another, and a fresh `<ol>` counts from 1 — so a three-step
+   * answer with a command under each step rendered as "1. 1. 1.". Carrying the
+   * author's own number onto `start` restores the sequence without this
+   * renderer having to track list nesting.
+   */
+  let listStart = 1;
   let code: string[] | null = null;
 
+  // Wrapped, not scrolled. These blocks hold the evidence a diagnosis rests on
+  // — a JSON log line, a kubectl command — and the panel is narrow, so a
+  // horizontal scrollbar hides the end of exactly the line you opened this to
+  // read. `break-words` rather than `break-all` so it breaks only where it has
+  // to, which for an unbroken JSON line is the only option anyway.
+  //
+  // Safe to express as utilities here: `styles.css` scopes all of its
+  // `white-space` rules to `table.data-table` cells, so nothing unlayered
+  // outranks these. That is worth checking rather than assuming — an unlayered
+  // rule in that file beats any Tailwind utility on the same property.
   const codeBlock = (body: string[]) =>
-    `<pre class="mb-2 select-text overflow-auto rounded-md border border-gridline bg-surface-2 p-2 ${MONO_TEXT_CLASSES} last:mb-0">${esc(body.join("\n"))}</pre>`;
+    `<pre class="mb-2 select-text overflow-auto whitespace-pre-wrap break-words rounded-md border border-gridline bg-surface-2 p-2 ${MONO_TEXT_CLASSES} last:mb-0">${esc(body.join("\n"))}</pre>`;
 
   const flushParagraph = () => {
     if (!paragraph.length) return;
@@ -5508,10 +5528,12 @@ function renderMarkdown(source: string): string {
   const flushList = () => {
     if (!items.length) return;
     const tag = ordered ? "ol" : "ul";
+    const start = ordered && listStart !== 1 ? ` start="${listStart}"` : "";
     out.push(
-      `<${tag} class="mb-2 ml-5 space-y-1 ${ordered ? "list-decimal" : "list-disc"} last:mb-0">${items.join("")}</${tag}>`,
+      `<${tag}${start} class="mb-2 ml-5 space-y-1 ${ordered ? "list-decimal" : "list-disc"} last:mb-0">${items.join("")}</${tag}>`,
     );
     items = [];
+    listStart = 1;
   };
   const flush = () => {
     flushParagraph();
@@ -5550,7 +5572,7 @@ function renderMarkdown(source: string): string {
       continue;
     }
 
-    const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    const numbered = /^\s*(\d+)[.)]\s+(.*)$/.exec(line);
     const bullet = /^\s*[-*+]\s+(.*)$/.exec(line);
     if (numbered || bullet) {
       flushParagraph();
@@ -5559,7 +5581,11 @@ function renderMarkdown(source: string): string {
       // bullets and numbers under one marker.
       if (items.length && isOrdered !== ordered) flushList();
       ordered = isOrdered;
-      items.push(`<li>${renderInlineMarkdown((numbered ?? bullet)![1])}</li>`);
+      // Only the first item of a run sets the start: the rest are counted by
+      // the browser, so an author numbering every item "1." still renders
+      // 1, 2, 3 within one unbroken list, as markdown specifies.
+      if (!items.length && numbered) listStart = Number(numbered[1]);
+      items.push(`<li>${renderInlineMarkdown(numbered ? numbered[2] : bullet![1])}</li>`);
       continue;
     }
 
