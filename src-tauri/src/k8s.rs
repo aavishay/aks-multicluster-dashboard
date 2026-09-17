@@ -559,8 +559,17 @@ fn pod_failure_message(status: &k8s_openapi::api::core::v1::PodStatus) -> Option
         }
     }
 
-    // A pod-level failure with no container to blame. `Evicted` is the one
+    // A pod-level failure with no container to blame — `Evicted` is the one
     // that matters, and it only appears here.
+    //
+    // Gated on `phase == "Failed"`, which every such failure carries. Without
+    // it a succeeded pod whose `reason` is `Completed` falls through to here
+    // after its exit-0 container was correctly skipped, and comes back as a
+    // failure — putting an Explain button on a CronJob that worked, which is
+    // exactly what the container-level exclusion exists to prevent.
+    if status.phase.as_deref() != Some("Failed") {
+        return None;
+    }
     match (&status.reason, &status.message) {
         (Some(r), Some(m)) if !r.is_empty() => Some(format!("{r}: {m}")),
         (Some(r), _) if !r.is_empty() => Some(r.clone()),
@@ -622,7 +631,12 @@ fn pick_failure_condition<'a>(conds: impl Iterator<Item = (&'a str, &'a str, &'a
             continue;
         }
         let text = if message.is_empty() { reason.to_string() } else { format!("{reason}: {message}") };
-        if reason == "ProgressDeadlineExceeded" || reason == "ReplicaFailure" {
+        // `ReplicaFailure` is matched on the type, not the reason: Kubernetes
+        // puts the cause in the reason — `FailedCreate`, `FailedDelete` — so
+        // comparing the reason against "ReplicaFailure" never matched, and the
+        // condition that names the real problem lost to whichever boilerplate
+        // happened to come first.
+        if reason == "ProgressDeadlineExceeded" || type_ == "ReplicaFailure" {
             return Some(text);
         }
         fallback.get_or_insert(text);
@@ -4335,6 +4349,48 @@ mod tests {
         assert_eq!(
             pod_failure_message(&st).as_deref(),
             Some("mcp-server: ImagePullBackOff: Back-off pulling image")
+        );
+    }
+
+    fn status_with_phase(phase: &str, reason: &str, containers: Vec<k8s_openapi::api::core::v1::ContainerStatus>) -> k8s_openapi::api::core::v1::PodStatus {
+        k8s_openapi::api::core::v1::PodStatus {
+            phase: Some(phase.into()),
+            reason: if reason.is_empty() { None } else { Some(reason.into()) },
+            container_statuses: Some(containers),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_succeeded_pod_with_a_pod_level_reason_is_still_not_a_failure() {
+        // The container-level exclusion skips the exit-0 container, and the
+        // pod-level fallback then has to not undo it: a CronJob pod reporting
+        // `Succeeded` / `Completed` must yield nothing, or the most common
+        // Explain button in the app would offer to explain a job that worked.
+        let st = status_with_phase("Succeeded", "Completed", vec![cs("cronjob", false, terminated_state("Completed", 0))]);
+        assert_eq!(pod_failure_message(&st), None);
+    }
+
+    #[test]
+    fn an_evicted_pod_is_a_failure() {
+        // The case the pod-level fallback exists for: no container to blame,
+        // and `phase` is Failed.
+        let st = status_with_phase("Failed", "Evicted", vec![]);
+        assert_eq!(pod_failure_message(&st).as_deref(), Some("Evicted"));
+    }
+
+    #[test]
+    fn a_named_replica_failure_outranks_boilerplate_that_came_first() {
+        // ReplicaFailure is the condition *type*; its reason names the cause
+        // (`FailedCreate`). Prioritising on the reason never matched, so with
+        // the boilerplate first this returned the boilerplate.
+        let conds = vec![
+            ("Available", "False", "MinimumReplicasUnavailable", "Deployment does not have minimum availability."),
+            ("ReplicaFailure", "True", "FailedCreate", "pods is forbidden: exceeded quota"),
+        ];
+        assert_eq!(
+            pick_failure_condition(conds.into_iter()).as_deref(),
+            Some("FailedCreate: pods is forbidden: exceeded quota")
         );
     }
 
