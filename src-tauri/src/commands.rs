@@ -561,8 +561,25 @@ pub async fn ai_build_diagnosis(
 }
 
 #[tauri::command]
-pub async fn ai_diagnose(prompt: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
-    claude::diagnose(&prompt, on_token).await
+pub async fn ai_build_workload_diagnosis(
+    context_name: String,
+    kind: String,
+    namespace: String,
+    name: String,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    with_retry(&context_name, || {
+        claude::build_workload_diagnosis_payload(&context_name, &kind, &namespace, &name)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn ai_diagnose(
+    prompt: String,
+    kind: String,
+    on_token: tauri::ipc::Channel<String>,
+) -> Result<(), String> {
+    claude::diagnose(&prompt, &kind, on_token).await
 }
 
 #[tauri::command]

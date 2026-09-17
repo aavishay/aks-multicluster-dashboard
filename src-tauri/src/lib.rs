@@ -157,6 +157,7 @@ pub fn run() {
             commands::ai_set_api_key,
             commands::ai_clear_api_key,
             commands::ai_build_diagnosis,
+            commands::ai_build_workload_diagnosis,
             commands::ai_diagnose,
             commands::ai_explain_error,
             commands::kubeconfig_path,
