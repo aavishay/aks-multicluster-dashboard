@@ -125,6 +125,7 @@ pub fn run() {
             commands::get_resource_usage,
             commands::get_metrics_over_time,
             commands::get_pod_manifest,
+            commands::get_pod_events,
             commands::get_pod_logs,
             commands::start_pod_log_stream,
             commands::stop_pod_log_stream,

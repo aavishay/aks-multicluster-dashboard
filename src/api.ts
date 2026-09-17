@@ -103,6 +103,8 @@ export const api = {
     invoke<MetricsOverTimeResult>("get_metrics_over_time", { contextName, rangeMinutes, overrideBackend }),
   getPodManifest: (contextName: string, namespace: string, podName: string) =>
     invoke<PodManifest>("get_pod_manifest", { contextName, namespace, podName }),
+  getPodEvents: (contextName: string, namespace: string, podName: string) =>
+    invoke<EventInfo[]>("get_pod_events", { contextName, namespace, podName }),
   getPodLogs: (contextName: string, namespace: string, podName: string, container: string, tail: boolean, lines: number) =>
     invoke<string>("get_pod_logs", { contextName, namespace, podName, container, tail, lines }),
   /** Starts a live-follow log stream; `onLine` fires once per line until `stopPodLogStream` cancels it. */

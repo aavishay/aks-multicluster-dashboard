@@ -272,6 +272,18 @@ pub async fn get_pod_manifest(
 }
 
 #[tauri::command]
+pub async fn get_pod_events(
+    context_name: String,
+    namespace: String,
+    pod_name: String,
+) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || {
+        k8s::get_pod_events(&context_name, &namespace, &pod_name)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn get_pod_logs(
     context_name: String,
     namespace: String,
