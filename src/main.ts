@@ -11122,17 +11122,22 @@ document.addEventListener("keydown", (e) => {
   // views don't close a detail panel when they open, so both can be up at
   // once. Without this, Cmd+F would move focus into the panel's search box
   // *behind* the overlay — every subsequent keystroke would vanish into a
-  // hidden input while the overlay looked focused.
+  // hidden input while the overlay looked focused. The guard runs after the
+  // key is claimed, so that case does nothing rather than falling through to
+  // the WebView.
   //
   // With no panel open at all it falls through to the table's own filter box,
   // so the key keeps one meaning — find in whatever is on screen — rather
   // than doing nothing on the tab where you most want it.
   if (e.key === "f" || e.key === "F") {
-    if (isNonPanelOverlayOpen()) return;
-    // Claimed either way. Unhandled it reaches the WebView, whose own find
-    // has no business searching a document the app is rewriting every 30
-    // seconds, and which the reader cannot dismiss from here.
+    // Claimed before the overlay guard, not after — this said "either way"
+    // while returning first, so with an overlay up it reached the WebView
+    // after all. That is the case the claim matters most in: the WebView's
+    // own find has no business searching a document the app is rewriting
+    // every 30 seconds, and the reader cannot dismiss it from here, so
+    // surfacing it over an open overlay is the worst version of that.
     e.preventDefault();
+    if (isNonPanelOverlayOpen()) return;
     if (focusDetailSearch()) return;
     // Several panel tabs carry no search box — Events, Graph and Revisions
     // among them — so `focusDetailSearch` failing does not mean the table is
