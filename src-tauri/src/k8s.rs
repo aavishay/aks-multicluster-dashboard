@@ -522,7 +522,8 @@ fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_ow
         cpu_usage_millicores: if has_metrics { Some(cpu) } else { None },
         memory_usage_ki: if has_metrics { Some(mem) } else { None },
         status_reason: status.reason.clone(),
-        failure_message: pod_failure_message(&status),
+        failure_container: pod_failure(&status).and_then(|(c, _)| c),
+        failure_message: pod_failure(&status).map(|(_, m)| m),
     }
 }
 
@@ -533,8 +534,13 @@ fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_ow
 /// to be told a container is being created.
 const TRANSIENT_WAITING_REASONS: [&str; 2] = ["ContainerCreating", "PodInitializing"];
 
-/// The message an operator would want explained, or `None` for a pod with
-/// nothing wrong.
+/// The failing container and the message describing it, or `None` for a pod
+/// with nothing wrong.
+///
+/// The container is returned so a row-level Diagnose can target the one that
+/// is actually broken rather than whichever the pod lists first — on a pod
+/// with a healthy sidecar those differ, and the sidecar's logs explain
+/// nothing.
 ///
 /// Reads the container states rather than `pod.status.reason`: that field is
 /// only set for pod-level failures such as `Evicted`, and was unset on all
@@ -547,7 +553,7 @@ const TRANSIENT_WAITING_REASONS: [&str; 2] = ["ContainerCreating", "PodInitializ
 /// still carries the exit code. Init containers come last: a pod stuck
 /// initializing has one as its cause, but a main container's failure is both
 /// more common and more specific.
-fn pod_failure_message(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<String> {
+fn pod_failure(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<(Option<String>, String)> {
     let main = status.container_statuses.iter().flatten();
     let init = status.init_container_statuses.iter().flatten();
 
@@ -555,7 +561,7 @@ fn pod_failure_message(status: &k8s_openapi::api::core::v1::PodStatus) -> Option
         let from_state = cs.state.as_ref().and_then(container_state_message);
         let from_last = cs.last_state.as_ref().and_then(container_state_message);
         if let Some(msg) = from_state.or(from_last) {
-            return Some(format!("{}: {msg}", cs.name));
+            return Some((Some(cs.name.clone()), format!("{}: {msg}", cs.name)));
         }
     }
 
@@ -570,9 +576,10 @@ fn pod_failure_message(status: &k8s_openapi::api::core::v1::PodStatus) -> Option
     if status.phase.as_deref() != Some("Failed") {
         return None;
     }
+    // No container to name: an evicted pod's failure belongs to the pod.
     match (&status.reason, &status.message) {
-        (Some(r), Some(m)) if !r.is_empty() => Some(format!("{r}: {m}")),
-        (Some(r), _) if !r.is_empty() => Some(r.clone()),
+        (Some(r), Some(m)) if !r.is_empty() => Some((None, format!("{r}: {m}"))),
+        (Some(r), _) if !r.is_empty() => Some((None, r.clone())),
         _ => None,
     }
 }
@@ -4347,7 +4354,7 @@ mod tests {
     fn a_failing_container_reports_its_reason_and_message() {
         let st = status_of(vec![cs("mcp-server", false, waiting_state("ImagePullBackOff", "Back-off pulling image"))]);
         assert_eq!(
-            pod_failure_message(&st).as_deref(),
+            pod_failure(&st).map(|(_, m)| m).as_deref(),
             Some("mcp-server: ImagePullBackOff: Back-off pulling image")
         );
     }
@@ -4368,7 +4375,7 @@ mod tests {
         // `Succeeded` / `Completed` must yield nothing, or the most common
         // Explain button in the app would offer to explain a job that worked.
         let st = status_with_phase("Succeeded", "Completed", vec![cs("cronjob", false, terminated_state("Completed", 0))]);
-        assert_eq!(pod_failure_message(&st), None);
+        assert_eq!(pod_failure(&st), None);
     }
 
     #[test]
@@ -4376,7 +4383,7 @@ mod tests {
         // The case the pod-level fallback exists for: no container to blame,
         // and `phase` is Failed.
         let st = status_with_phase("Failed", "Evicted", vec![]);
-        assert_eq!(pod_failure_message(&st).as_deref(), Some("Evicted"));
+        assert_eq!(pod_failure(&st).map(|(_, m)| m).as_deref(), Some("Evicted"));
     }
 
     #[test]
@@ -4400,18 +4407,32 @@ mod tests {
         // real cluster those were half the not-ready pods; offering to explain
         // a job that worked is worse than offering nothing.
         let done = status_of(vec![cs("cronjob-alerts", false, terminated_state("Completed", 0))]);
-        assert_eq!(pod_failure_message(&done), None);
+        assert_eq!(pod_failure(&done), None);
 
         let failed = status_of(vec![cs("worker", false, terminated_state("Error", 137))]);
-        assert_eq!(pod_failure_message(&failed).as_deref(), Some("worker: Error (exit 137)"));
+        assert_eq!(pod_failure(&failed).map(|(_, m)| m).as_deref(), Some("worker: Error (exit 137)"));
     }
 
     #[test]
     fn still_starting_is_not_a_failure() {
         for reason in TRANSIENT_WAITING_REASONS {
             let st = status_of(vec![cs("app", false, waiting_state(reason, ""))]);
-            assert_eq!(pod_failure_message(&st), None, "{reason} should not read as a failure");
+            assert_eq!(pod_failure(&st), None, "{reason} should not read as a failure");
         }
+    }
+
+    #[test]
+    fn the_container_returned_is_the_failing_one_not_the_first() {
+        // A row-level Diagnose targets this container, so returning the wrong
+        // one sends a healthy sidecar's logs to explain a broken app.
+        let st = status_of(vec![
+            cs("istio-proxy", true, waiting_state("ImagePullBackOff", "ignore me")),
+            cs("app", false, waiting_state("CrashLoopBackOff", "back-off restarting")),
+        ]);
+        assert_eq!(pod_failure(&st).and_then(|(c, _)| c).as_deref(), Some("app"));
+        // An evicted pod belongs to no container.
+        let evicted = status_with_phase("Failed", "Evicted", vec![]);
+        assert_eq!(pod_failure(&evicted).and_then(|(c, _)| c), None);
     }
 
     #[test]
@@ -4421,7 +4442,7 @@ mod tests {
             cs("app", false, waiting_state("CrashLoopBackOff", "back-off 5m0s restarting")),
         ]);
         assert_eq!(
-            pod_failure_message(&st).as_deref(),
+            pod_failure(&st).map(|(_, m)| m).as_deref(),
             Some("app: CrashLoopBackOff: back-off 5m0s restarting")
         );
     }
