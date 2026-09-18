@@ -1166,9 +1166,10 @@ function columnWidth<T>(tab: TabId, col: ColumnDef<T>): number {
  * status-dot column).
  *
  * The Pods and Workloads tables pass a wider status column than the rest
- * because theirs also holds the Explain button for a failing row: measured,
- * the dot, the gap and the button need 100px including the cell's padding, and
- * a narrower column makes the fixed table layout ellipsise the button.
+ * because theirs also holds the Diagnose button for a failing row. Measured
+ * rather than guessed: the dot, the gap and the button stop overflowing at
+ * 112px including the cell's padding, and below that the fixed table layout
+ * ellipsises the button. 116 leaves a little slack.
  */
 function renderColGroup<T>(tab: TabId, columns: ColumnDef<T>[], leadingWidths: number[] = []): string {
   const leading = leadingWidths.map((w) => `<col style="width:${w}px">`).join("");
@@ -5307,6 +5308,33 @@ function uiScaleButton(): string {
 // Claude UI
 // ---------------------------------------------------------------------------
 
+/**
+ * Small "Diagnose" affordance for a failing table row.
+ *
+ * Diagnose rather than Explain because Explain sends only the error string,
+ * and on a row that is one line of status text — enough for the model to
+ * restate what `ImagePullBackOff` means and no more. Diagnose sends the
+ * status, events, manifest and logs behind that row, which is the difference
+ * between naming the failure and explaining it.
+ *
+ * `onclick` is passed in rather than built here: a pod and a workload reach
+ * different entry points, and the two need different arguments.
+ */
+function claudeDiagnoseRowButton(onclick: string, what: string): string {
+  const signedIn = state.claudeAuth?.signed_in === true;
+  const title = signedIn
+    ? `Diagnose this ${what} with Claude — you'll review exactly what is sent first`
+    : "Sign in to Claude first — see the AI button in the top bar";
+  return `
+    <button
+      type="button"
+      title="${esc(title)}"
+      ${signedIn ? "" : "disabled"}
+      onclick="${onclick}"
+      class="shrink-0 rounded border border-gridline px-1.5 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
+    >Diagnose</button>`;
+}
+
 /** Small "Explain" affordance, rendered only where an error string exists. */
 function claudeExplainButton(subject: string, errorText: string): string {
   if (!errorText.trim()) return "";
@@ -6290,7 +6318,7 @@ function renderWorkloads(): string {
     ${selectionToolbar("workloads")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:workloads">
       <table class="data-table">
-        ${renderColGroup("workloads", columns, [32, 104])}
+        ${renderColGroup("workloads", columns, [32, 116])}
         <thead>
           <tr>${selectAllCheckboxHeader("workloads", sorted, keyOf)}<th></th>${sortableHeaderRow("workloads", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("workloads", columns, rows)}</tr>
@@ -6303,7 +6331,7 @@ function renderWorkloads(): string {
                 return `
             <tr>
               ${rowCheckboxCell("workloads", keyOf(row))}
-              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(w.healthy)}${w.failure_message ? claudeExplainButton(`${w.name} (${w.kind})`, w.failure_message) : ""}</span></td>
+              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(w.healthy)}${w.failure_message ? claudeDiagnoseRowButton(`window.__app.diagnoseWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})`, w.kind.toLowerCase()) : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter workloads by this cluster" onclick="window.__app.setEnumFilter('workloads','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -6433,7 +6461,7 @@ function renderPods(): string {
     ${selectionToolbar("pods")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:pods">
       <table class="data-table">
-        ${renderColGroup("pods", columns, [32, 104])}
+        ${renderColGroup("pods", columns, [32, 116])}
         <thead>
           <tr>${selectAllCheckboxHeader("pods", sorted, keyOf)}<th></th>${sortableHeaderRow("pods", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("pods", columns, rows)}</tr>
@@ -6445,7 +6473,7 @@ function renderPods(): string {
               return `
             <tr>
               ${rowCheckboxCell("pods", keyOf(row))}
-              <td title="${esc(p.failure_message ?? (podHealthy(row) ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(podHealthy(row))}${p.failure_message ? claudeExplainButton(`${p.name} (pod)`, p.failure_message) : ""}</span></td>
+              <td title="${esc(p.failure_message ?? (podHealthy(row) ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(podHealthy(row))}${p.failure_message ? claudeDiagnoseRowButton(`window.__app.diagnosePod(${jsArg(ctx)},${jsArg(p.namespace)},${jsArg(p.name)},${jsArg(p.failure_container ?? "")})`, "pod") : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter pods by this cluster" onclick="window.__app.setEnumFilter('pods','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`

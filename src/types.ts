@@ -59,6 +59,8 @@ export interface PodInfo {
   cpu_usage_millicores: number | null;
   memory_usage_ki: number | null;
   status_reason: string | null;
+  /** The container that is failing, so a row-level Diagnose targets it. Null for a pod-level failure such as Evicted. */
+  failure_container: string | null;
   /** The failing container's reason and message, or null when nothing is wrong. */
   failure_message: string | null;
 }
