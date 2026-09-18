@@ -522,7 +522,126 @@ fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_ow
         cpu_usage_millicores: if has_metrics { Some(cpu) } else { None },
         memory_usage_ki: if has_metrics { Some(mem) } else { None },
         status_reason: status.reason.clone(),
+        failure_message: pod_failure_message(&status),
     }
+}
+
+/// Waiting reasons that mean "still starting", not "broken".
+///
+/// A pod is briefly in both on every normal rollout and neither carries a
+/// message. Offering to explain `ContainerCreating` would spend a round trip
+/// to be told a container is being created.
+const TRANSIENT_WAITING_REASONS: [&str; 2] = ["ContainerCreating", "PodInitializing"];
+
+/// The message an operator would want explained, or `None` for a pod with
+/// nothing wrong.
+///
+/// Reads the container states rather than `pod.status.reason`: that field is
+/// only set for pod-level failures such as `Evicted`, and was unset on all
+/// 1091 pods of the cluster this was checked against, while the useful text
+/// sits in a container's waiting or terminated state.
+///
+/// Ready containers are skipped so a healthy sidecar cannot mask the one that
+/// is actually broken. `last_state` is the fallback for a container between
+/// restarts, where the current state is bare but the previous termination
+/// still carries the exit code. Init containers come last: a pod stuck
+/// initializing has one as its cause, but a main container's failure is both
+/// more common and more specific.
+fn pod_failure_message(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<String> {
+    let main = status.container_statuses.iter().flatten();
+    let init = status.init_container_statuses.iter().flatten();
+
+    for cs in main.chain(init).filter(|cs| !cs.ready) {
+        let from_state = cs.state.as_ref().and_then(container_state_message);
+        let from_last = cs.last_state.as_ref().and_then(container_state_message);
+        if let Some(msg) = from_state.or(from_last) {
+            return Some(format!("{}: {msg}", cs.name));
+        }
+    }
+
+    // A pod-level failure with no container to blame — `Evicted` is the one
+    // that matters, and it only appears here.
+    //
+    // Gated on `phase == "Failed"`, which every such failure carries. Without
+    // it a succeeded pod whose `reason` is `Completed` falls through to here
+    // after its exit-0 container was correctly skipped, and comes back as a
+    // failure — putting an Explain button on a CronJob that worked, which is
+    // exactly what the container-level exclusion exists to prevent.
+    if status.phase.as_deref() != Some("Failed") {
+        return None;
+    }
+    match (&status.reason, &status.message) {
+        (Some(r), Some(m)) if !r.is_empty() => Some(format!("{r}: {m}")),
+        (Some(r), _) if !r.is_empty() => Some(r.clone()),
+        _ => None,
+    }
+}
+
+/// A container state as "Reason: message", or `None` when it is not a failure.
+///
+/// A clean exit is not a failure even though the container is not ready: a
+/// finished CronJob pod sits at `Completed (exit 0)` indefinitely, and on one
+/// real cluster those were half the not-ready pods. Offering to explain a job
+/// that worked is worse than offering nothing.
+fn container_state_message(state: &k8s_openapi::api::core::v1::ContainerState) -> Option<String> {
+    if let Some(w) = &state.waiting {
+        let reason = w.reason.clone().unwrap_or_default();
+        if reason.is_empty() || TRANSIENT_WAITING_REASONS.contains(&reason.as_str()) {
+            return None;
+        }
+        return Some(match &w.message {
+            Some(m) if !m.is_empty() => format!("{reason}: {m}"),
+            _ => reason,
+        });
+    }
+    if let Some(t) = &state.terminated {
+        let reason = t.reason.clone().unwrap_or_default();
+        if reason.is_empty() || t.exit_code == 0 {
+            return None;
+        }
+        let head = format!("{reason} (exit {})", t.exit_code);
+        return Some(match &t.message {
+            Some(m) if !m.is_empty() => format!("{head}: {m}"),
+            _ => head,
+        });
+    }
+    None
+}
+
+/// The most informative failing condition on a workload, or `None`.
+///
+/// Takes the fields rather than a condition type: Deployment, StatefulSet and
+/// DaemonSet each have their own condition struct with identical field names,
+/// and normalising at the call site is shorter than three near-identical
+/// functions.
+///
+/// `ProgressDeadlineExceeded` and `ReplicaFailure` are preferred because they
+/// name a cause. Everything else is usually `MinimumReplicasUnavailable:
+/// Deployment does not have minimum availability`, which restates the ready
+/// count the row already shows — on a real fleet that was the only condition
+/// on four of six unready Deployments. It is still returned when nothing
+/// better exists, since it is what the controller reports, but it sorts last.
+fn pick_failure_condition<'a>(conds: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>) -> Option<String> {
+    let mut fallback = None;
+    for (type_, cond_status, reason, message) in conds {
+        // A failing condition is either False on a "things are fine" type, or
+        // True on a "something is wrong" type — ReplicaFailure is the latter.
+        let failing = cond_status == "False" || (type_ == "ReplicaFailure" && cond_status == "True");
+        if !failing || reason.is_empty() {
+            continue;
+        }
+        let text = if message.is_empty() { reason.to_string() } else { format!("{reason}: {message}") };
+        // `ReplicaFailure` is matched on the type, not the reason: Kubernetes
+        // puts the cause in the reason — `FailedCreate`, `FailedDelete` — so
+        // comparing the reason against "ReplicaFailure" never matched, and the
+        // condition that names the real problem lost to whichever boilerplate
+        // happened to come first.
+        if reason == "ProgressDeadlineExceeded" || type_ == "ReplicaFailure" {
+            return Some(text);
+        }
+        fallback.get_or_insert(text);
+    }
+    fallback
 }
 
 /// Resolves each ReplicaSet's own controller owner, for tracing a pod back to
@@ -1122,6 +1241,14 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 version_from_label: v.version_from_label,
                 images: v.images,
                 chart: v.chart,
+                failure_message: pick_failure_condition(status.conditions.iter().flatten().map(|c| {
+                    (
+                        c.type_.as_str(),
+                        c.status.as_str(),
+                        c.reason.as_deref().unwrap_or(""),
+                        c.message.as_deref().unwrap_or(""),
+                    )
+                })),
             });
         }
     }
@@ -1148,6 +1275,14 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 version_from_label: v.version_from_label,
                 images: v.images,
                 chart: v.chart,
+                failure_message: pick_failure_condition(status.conditions.iter().flatten().map(|c| {
+                    (
+                        c.type_.as_str(),
+                        c.status.as_str(),
+                        c.reason.as_deref().unwrap_or(""),
+                        c.message.as_deref().unwrap_or(""),
+                    )
+                })),
             });
         }
     }
@@ -1173,6 +1308,14 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 version_from_label: v.version_from_label,
                 images: v.images,
                 chart: v.chart,
+                failure_message: pick_failure_condition(status.conditions.iter().flatten().map(|c| {
+                    (
+                        c.type_.as_str(),
+                        c.status.as_str(),
+                        c.reason.as_deref().unwrap_or(""),
+                        c.message.as_deref().unwrap_or(""),
+                    )
+                })),
             });
         }
     }
@@ -4170,5 +4313,152 @@ mod tests {
         // amount, not silently become 0 from an unmatched suffix.
         assert_eq!(parse_memory_ki("16k"), 15);
         assert_eq!(parse_memory_ki("16K"), 15);
+    }
+
+    // -- failure messages for the Explain affordance --------------------------
+
+    fn cs(name: &str, ready: bool, state: k8s_openapi::api::core::v1::ContainerState) -> k8s_openapi::api::core::v1::ContainerStatus {
+        k8s_openapi::api::core::v1::ContainerStatus { name: name.into(), ready, state: Some(state), ..Default::default() }
+    }
+    fn waiting_state(reason: &str, message: &str) -> k8s_openapi::api::core::v1::ContainerState {
+        k8s_openapi::api::core::v1::ContainerState {
+            waiting: Some(k8s_openapi::api::core::v1::ContainerStateWaiting {
+                reason: Some(reason.into()),
+                message: if message.is_empty() { None } else { Some(message.into()) },
+            }),
+            ..Default::default()
+        }
+    }
+    fn terminated_state(reason: &str, exit_code: i32) -> k8s_openapi::api::core::v1::ContainerState {
+        k8s_openapi::api::core::v1::ContainerState {
+            terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                reason: Some(reason.into()),
+                exit_code,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+    fn status_of(containers: Vec<k8s_openapi::api::core::v1::ContainerStatus>) -> k8s_openapi::api::core::v1::PodStatus {
+        k8s_openapi::api::core::v1::PodStatus { container_statuses: Some(containers), ..Default::default() }
+    }
+
+    #[test]
+    fn a_failing_container_reports_its_reason_and_message() {
+        let st = status_of(vec![cs("mcp-server", false, waiting_state("ImagePullBackOff", "Back-off pulling image"))]);
+        assert_eq!(
+            pod_failure_message(&st).as_deref(),
+            Some("mcp-server: ImagePullBackOff: Back-off pulling image")
+        );
+    }
+
+    fn status_with_phase(phase: &str, reason: &str, containers: Vec<k8s_openapi::api::core::v1::ContainerStatus>) -> k8s_openapi::api::core::v1::PodStatus {
+        k8s_openapi::api::core::v1::PodStatus {
+            phase: Some(phase.into()),
+            reason: if reason.is_empty() { None } else { Some(reason.into()) },
+            container_statuses: Some(containers),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_succeeded_pod_with_a_pod_level_reason_is_still_not_a_failure() {
+        // The container-level exclusion skips the exit-0 container, and the
+        // pod-level fallback then has to not undo it: a CronJob pod reporting
+        // `Succeeded` / `Completed` must yield nothing, or the most common
+        // Explain button in the app would offer to explain a job that worked.
+        let st = status_with_phase("Succeeded", "Completed", vec![cs("cronjob", false, terminated_state("Completed", 0))]);
+        assert_eq!(pod_failure_message(&st), None);
+    }
+
+    #[test]
+    fn an_evicted_pod_is_a_failure() {
+        // The case the pod-level fallback exists for: no container to blame,
+        // and `phase` is Failed.
+        let st = status_with_phase("Failed", "Evicted", vec![]);
+        assert_eq!(pod_failure_message(&st).as_deref(), Some("Evicted"));
+    }
+
+    #[test]
+    fn a_named_replica_failure_outranks_boilerplate_that_came_first() {
+        // ReplicaFailure is the condition *type*; its reason names the cause
+        // (`FailedCreate`). Prioritising on the reason never matched, so with
+        // the boilerplate first this returned the boilerplate.
+        let conds = vec![
+            ("Available", "False", "MinimumReplicasUnavailable", "Deployment does not have minimum availability."),
+            ("ReplicaFailure", "True", "FailedCreate", "pods is forbidden: exceeded quota"),
+        ];
+        assert_eq!(
+            pick_failure_condition(conds.into_iter()).as_deref(),
+            Some("FailedCreate: pods is forbidden: exceeded quota")
+        );
+    }
+
+    #[test]
+    fn a_finished_job_is_not_a_failure() {
+        // A completed CronJob pod sits at exit 0 and never becomes ready. On a
+        // real cluster those were half the not-ready pods; offering to explain
+        // a job that worked is worse than offering nothing.
+        let done = status_of(vec![cs("cronjob-alerts", false, terminated_state("Completed", 0))]);
+        assert_eq!(pod_failure_message(&done), None);
+
+        let failed = status_of(vec![cs("worker", false, terminated_state("Error", 137))]);
+        assert_eq!(pod_failure_message(&failed).as_deref(), Some("worker: Error (exit 137)"));
+    }
+
+    #[test]
+    fn still_starting_is_not_a_failure() {
+        for reason in TRANSIENT_WAITING_REASONS {
+            let st = status_of(vec![cs("app", false, waiting_state(reason, ""))]);
+            assert_eq!(pod_failure_message(&st), None, "{reason} should not read as a failure");
+        }
+    }
+
+    #[test]
+    fn a_ready_container_cannot_mask_a_failing_one() {
+        let st = status_of(vec![
+            cs("istio-proxy", true, waiting_state("ImagePullBackOff", "ignore me")),
+            cs("app", false, waiting_state("CrashLoopBackOff", "back-off 5m0s restarting")),
+        ]);
+        assert_eq!(
+            pod_failure_message(&st).as_deref(),
+            Some("app: CrashLoopBackOff: back-off 5m0s restarting")
+        );
+    }
+
+    #[test]
+    fn a_named_cause_outranks_the_availability_boilerplate() {
+        // Every unready Deployment carries MinimumReplicasUnavailable, which
+        // only restates the ready count; ProgressDeadlineExceeded names a
+        // cause, so it wins regardless of the order they appear in.
+        let conds = vec![
+            ("Available", "False", "MinimumReplicasUnavailable", "Deployment does not have minimum availability."),
+            ("Progressing", "False", "ProgressDeadlineExceeded", "ReplicaSet has timed out progressing."),
+        ];
+        assert_eq!(
+            pick_failure_condition(conds.into_iter()).as_deref(),
+            Some("ProgressDeadlineExceeded: ReplicaSet has timed out progressing.")
+        );
+    }
+
+    #[test]
+    fn the_boilerplate_is_still_returned_when_nothing_better_exists() {
+        let only = vec![("Available", "False", "MinimumReplicasUnavailable", "Deployment does not have minimum availability.")];
+        assert_eq!(
+            pick_failure_condition(only.into_iter()).as_deref(),
+            Some("MinimumReplicasUnavailable: Deployment does not have minimum availability.")
+        );
+        let healthy = vec![("Available", "True", "MinimumReplicasAvailable", "Deployment has minimum availability.")];
+        assert_eq!(pick_failure_condition(healthy.into_iter()), None);
+    }
+
+    #[test]
+    fn replica_failure_counts_as_failing_when_true() {
+        // The one condition where True means broken rather than fine.
+        let conds = vec![("ReplicaFailure", "True", "FailedCreate", "forbidden: exceeded quota")];
+        assert_eq!(
+            pick_failure_condition(conds.into_iter()).as_deref(),
+            Some("FailedCreate: forbidden: exceeded quota")
+        );
     }
 }
