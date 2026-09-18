@@ -5311,7 +5311,8 @@ function uiScaleButton(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Small "Diagnose" affordance for a failing table row.
+ * The "Diagnose" affordance, on a failing table row and in a detail panel's
+ * header.
  *
  * Diagnose rather than Explain because Explain sends only the error string,
  * and on a row that is one line of status text — enough for the model to
@@ -5321,8 +5322,14 @@ function uiScaleButton(): string {
  *
  * `onclick` is passed in rather than built here: a pod and a workload reach
  * different entry points, and the two need different arguments.
+ *
+ * Rendered disabled rather than omitted when signed out, and that matters
+ * beyond appearance. `diagnoseFromKeyboard` finds its subject by looking for
+ * `data-diagnose` inside the open panel first: omitting the button there left
+ * nothing to find, so Cmd+D fell through to the row cursor behind the panel
+ * and resolved against a row the reader could not see.
  */
-function claudeDiagnoseRowButton(onclick: string, what: string): string {
+function claudeDiagnoseButton(onclick: string, what: string, size: "row" | "panel" = "row"): string {
   const signedIn = state.claudeAuth?.signed_in === true;
   const title = signedIn
     ? `Diagnose this ${what} with Claude — you'll review exactly what is sent first`
@@ -5334,7 +5341,7 @@ function claudeDiagnoseRowButton(onclick: string, what: string): string {
       ${signedIn ? "" : "disabled"}
       data-diagnose
       onclick="${onclick}"
-      class="shrink-0 rounded border border-gridline px-1.5 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
+      class="shrink-0 rounded border border-gridline ${size === "row" ? "px-1.5 py-0.5" : "px-2 py-1"} text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
     >Diagnose</button>`;
 }
 
@@ -6334,7 +6341,7 @@ function renderWorkloads(): string {
                 return `
             <tr>
               ${rowCheckboxCell("workloads", keyOf(row))}
-              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(w.healthy)}${w.failure_message ? claudeDiagnoseRowButton(`window.__app.diagnoseWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})`, w.kind.toLowerCase()) : ""}</span></td>
+              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(w.healthy)}${w.failure_message ? claudeDiagnoseButton(`window.__app.diagnoseWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})`, w.kind.toLowerCase()) : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter workloads by this cluster" onclick="window.__app.setEnumFilter('workloads','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -6476,7 +6483,7 @@ function renderPods(): string {
               return `
             <tr>
               ${rowCheckboxCell("pods", keyOf(row))}
-              <td title="${esc(p.failure_message ?? (podHealthy(row) ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(podHealthy(row))}${p.failure_message ? claudeDiagnoseRowButton(`window.__app.diagnosePod(${jsArg(ctx)},${jsArg(p.namespace)},${jsArg(p.name)},${jsArg(p.failure_container ?? "")})`, "pod") : ""}</span></td>
+              <td title="${esc(p.failure_message ?? (podHealthy(row) ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(podHealthy(row))}${p.failure_message ? claudeDiagnoseButton(`window.__app.diagnosePod(${jsArg(ctx)},${jsArg(p.namespace)},${jsArg(p.name)},${jsArg(p.failure_container ?? "")})`, "pod") : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter pods by this cluster" onclick="window.__app.setEnumFilter('pods','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -8231,17 +8238,11 @@ function renderPodDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(pd.ctx)} · ${esc(pd.namespace)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
-            ${
-              state.claudeAuth?.signed_in
-                ? `<button
-                    type="button"
-                    data-diagnose
-                    title="Diagnose this pod with Claude — you'll review exactly what is sent first"
-                    onclick="window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer)})"
-                    class="rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
-                  >Diagnose</button>`
-                : ""
-            }
+            ${claudeDiagnoseButton(
+              `window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer)})`,
+              "pod",
+              "panel",
+            )}
             ${writeActionButton(
               "Shell",
               "Open an interactive shell in this container",
@@ -8801,17 +8802,11 @@ function renderWorkloadDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(wd.ctx)} · ${esc(wd.kind)} · ${esc(wd.namespace)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
-            ${
-              state.claudeAuth?.signed_in
-                ? `<button
-                    type="button"
-                    data-diagnose
-                    title="Diagnose this workload with Claude — you'll review exactly what is sent first"
-                    onclick="window.__app.diagnoseWorkload(${jsArg(wd.ctx)},${jsArg(wd.kind)},${jsArg(wd.namespace)},${jsArg(wd.name)})"
-                    class="rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
-                  >Diagnose</button>`
-                : ""
-            }
+            ${claudeDiagnoseButton(
+              `window.__app.diagnoseWorkload(${jsArg(wd.ctx)},${jsArg(wd.kind)},${jsArg(wd.namespace)},${jsArg(wd.name)})`,
+              wd.kind.toLowerCase(),
+              "panel",
+            )}
             ${writeActionButton(
               "Restart",
               "Roll every pod through the controller's normal rollout",
@@ -11097,11 +11092,12 @@ document.addEventListener("keydown", (e) => {
   // is no competing meaning for it inside a plain text input, and this app has
   // no rich text editor where Cmd+D would mean something else.
   if (e.key === "d" || e.key === "D") {
-    if (isNonPanelOverlayOpen()) return;
-    // Claimed regardless of outcome. Unhandled it reaches the WebView, where
-    // Cmd+D is "add bookmark" — meaningless here and impossible to undo from
-    // inside the app.
+    // Claimed before the overlay guard, not after. Unhandled it reaches the
+    // WebView as "add bookmark" — meaningless here and not dismissible from
+    // inside the app — and the guarded case is exactly the one that invites a
+    // second press: the diagnosis panel is already on screen.
     e.preventDefault();
+    if (isNonPanelOverlayOpen()) return;
     if (diagnoseFromKeyboard() === "signed-out") {
       showCopyToast("Sign in to Claude first — see the AI button in the top bar");
     }
