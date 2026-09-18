@@ -335,11 +335,26 @@ pub async fn build_diagnosis_payload(
     // Independent reads, issued concurrently — the same reasoning as the
     // tokio::join! conversions in k8s.rs, and it matters more here because a
     // private-link cluster costs tens of seconds per round trip.
+    // The container can be empty when Diagnose is reached from a table row for
+    // a pod-level failure: an evicted pod belongs to no container, and asking
+    // the log endpoint for one named "" is an error rather than a default.
+    // `None` means there was no container to ask, which is a different fact
+    // from a container that answered with nothing — and the prompt has to say
+    // which, or it asserts that a container produced no output when none was
+    // ever read.
+    let logs_fut = async {
+        if container.is_empty() {
+            None
+        } else {
+            Some(k8s::get_pod_logs(context_name, namespace, pod_name, container, true, DIAGNOSE_LOG_FETCH_LINES).await)
+        }
+    };
+
     let (pods, events, manifest, logs) = tokio::join!(
         k8s::get_pods(context_name, Some(namespace.to_string())),
         k8s::get_pod_events(context_name, namespace, pod_name),
         k8s::get_pod_manifest(context_name, namespace, pod_name),
-        k8s::get_pod_logs(context_name, namespace, pod_name, container, true, DIAGNOSE_LOG_FETCH_LINES),
+        logs_fut,
     );
 
     let status = pods
@@ -381,9 +396,15 @@ pub async fn build_diagnosis_payload(
     };
 
     let (logs_text, log_note) = match logs {
-        Ok(text) if text.trim().is_empty() => ("(container produced no log output)".to_string(), None),
-        Ok(text) => redact::tail_lines(&text, DIAGNOSE_LOG_LINES),
-        Err(e) => (format!("(logs unavailable: {e})"), None),
+        // An evicted pod belongs to no container, so nothing was asked for
+        // logs. Saying so is not the same as saying a container was silent.
+        None => (
+            "(this is a pod-level failure with no container to read logs from)".to_string(),
+            None,
+        ),
+        Some(Ok(text)) if text.trim().is_empty() => ("(container produced no log output)".to_string(), None),
+        Some(Ok(text)) => redact::tail_lines(&text, DIAGNOSE_LOG_LINES),
+        Some(Err(e)) => (format!("(logs unavailable: {e})"), None),
     };
 
     // Redact each document, then merge the findings so the summary reflects the
@@ -395,8 +416,14 @@ pub async fn build_diagnosis_payload(
 
     let redaction_summary = redact::Redacted::merge([&status, &events_r, &manifest_r, &logs_r]).summary();
 
+    let container_note = if container.is_empty() {
+        String::new()
+    } else {
+        format!(", container {container}")
+    };
+
     let prompt = format!(
-        "Pod {namespace}/{pod_name}, container {container}.\n\n\
+        "Pod {namespace}/{pod_name}{container_note}.\n\n\
          ## Status\n{}\n\n\
          ## Events\n{}\n\n\
          ## Manifest\n```yaml\n{}\n```\n\n\
@@ -467,6 +494,7 @@ mod tests {
             cpu_usage_millicores: None,
             memory_usage_ki: None,
             status_reason: None,
+            failure_container: None,
             failure_message: None,
         }
     }
