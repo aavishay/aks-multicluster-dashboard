@@ -59,6 +59,8 @@ export interface PodInfo {
   cpu_usage_millicores: number | null;
   memory_usage_ki: number | null;
   status_reason: string | null;
+  /** The failing container's reason and message, or null when nothing is wrong. */
+  failure_message: string | null;
 }
 
 export interface PodManifest {
@@ -93,6 +95,8 @@ export interface WorkloadInfo {
   version_from_label: boolean;
   images: string[];
   chart: string | null;
+  /** The most informative failing condition, or null when the workload is healthy. */
+  failure_message: string | null;
 }
 
 export interface WorkloadRevisionInfo {
