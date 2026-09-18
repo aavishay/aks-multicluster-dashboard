@@ -70,7 +70,11 @@ pub struct PodInfo {
     pub cpu_usage_millicores: Option<i64>,
     pub memory_usage_ki: Option<i64>,
     pub status_reason: Option<String>,
-    /// The failing container's reason and message, for the Explain affordance.
+    /// The container that is failing, so a row-level Diagnose can target it
+    /// rather than the pod's first container. `None` for a pod-level failure
+    /// such as `Evicted`, which belongs to no container.
+    pub failure_container: Option<String>,
+    /// The failing container's reason and message.
     ///
     /// Separate from `status_reason`, which is `pod.status.reason` and is only
     /// set for pod-level failures like `Evicted` — unset on every pod of a

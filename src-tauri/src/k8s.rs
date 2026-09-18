@@ -522,7 +522,8 @@ fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_ow
         cpu_usage_millicores: if has_metrics { Some(cpu) } else { None },
         memory_usage_ki: if has_metrics { Some(mem) } else { None },
         status_reason: status.reason.clone(),
-        failure_message: pod_failure_message(&status),
+        failure_container: pod_failure(&status).and_then(|(c, _)| c),
+        failure_message: pod_failure(&status).map(|(_, m)| m),
     }
 }
 
@@ -533,8 +534,13 @@ fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_ow
 /// to be told a container is being created.
 const TRANSIENT_WAITING_REASONS: [&str; 2] = ["ContainerCreating", "PodInitializing"];
 
-/// The message an operator would want explained, or `None` for a pod with
-/// nothing wrong.
+/// The failing container and the message describing it, or `None` for a pod
+/// with nothing wrong.
+///
+/// The container is returned so a row-level Diagnose can target the one that
+/// is actually broken rather than whichever the pod lists first — on a pod
+/// with a healthy sidecar those differ, and the sidecar's logs explain
+/// nothing.
 ///
 /// Reads the container states rather than `pod.status.reason`: that field is
 /// only set for pod-level failures such as `Evicted`, and was unset on all
@@ -547,7 +553,30 @@ const TRANSIENT_WAITING_REASONS: [&str; 2] = ["ContainerCreating", "PodInitializ
 /// still carries the exit code. Init containers come last: a pod stuck
 /// initializing has one as its cause, but a main container's failure is both
 /// more common and more specific.
-fn pod_failure_message(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<String> {
+fn pod_failure(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<(Option<String>, String)> {
+    // Pod-level first, and only when `phase` is Failed.
+    //
+    // An evicted pod keeps its container statuses — typically terminated with
+    // `ContainerStatusUnknown` and exit 137 — so scanning containers first
+    // claimed one of them and returned it as the failing container. That is
+    // wrong twice over: "ContainerStatusUnknown (exit 137)" is less use than
+    // "Evicted: The node was low on resource: memory", and naming a container
+    // makes the row ask for logs from a container the node has already
+    // reclaimed.
+    //
+    // Gated on `phase == "Failed"` so a succeeded pod whose `reason` is
+    // `Completed` does not read as a failure, and on `reason` being set so a
+    // Job pod that failed through its container — which carries no pod-level
+    // reason — still reaches the container scan below.
+    if status.phase.as_deref() == Some("Failed") {
+        if let Some(r) = status.reason.as_deref().filter(|r| !r.is_empty()) {
+            return Some(match status.message.as_deref().filter(|m| !m.is_empty()) {
+                Some(m) => (None, format!("{r}: {m}")),
+                None => (None, r.to_string()),
+            });
+        }
+    }
+
     let main = status.container_statuses.iter().flatten();
     let init = status.init_container_statuses.iter().flatten();
 
@@ -555,26 +584,11 @@ fn pod_failure_message(status: &k8s_openapi::api::core::v1::PodStatus) -> Option
         let from_state = cs.state.as_ref().and_then(container_state_message);
         let from_last = cs.last_state.as_ref().and_then(container_state_message);
         if let Some(msg) = from_state.or(from_last) {
-            return Some(format!("{}: {msg}", cs.name));
+            return Some((Some(cs.name.clone()), format!("{}: {msg}", cs.name)));
         }
     }
 
-    // A pod-level failure with no container to blame — `Evicted` is the one
-    // that matters, and it only appears here.
-    //
-    // Gated on `phase == "Failed"`, which every such failure carries. Without
-    // it a succeeded pod whose `reason` is `Completed` falls through to here
-    // after its exit-0 container was correctly skipped, and comes back as a
-    // failure — putting an Explain button on a CronJob that worked, which is
-    // exactly what the container-level exclusion exists to prevent.
-    if status.phase.as_deref() != Some("Failed") {
-        return None;
-    }
-    match (&status.reason, &status.message) {
-        (Some(r), Some(m)) if !r.is_empty() => Some(format!("{r}: {m}")),
-        (Some(r), _) if !r.is_empty() => Some(r.clone()),
-        _ => None,
-    }
+    None
 }
 
 /// A container state as "Reason: message", or `None` when it is not a failure.
@@ -4347,7 +4361,7 @@ mod tests {
     fn a_failing_container_reports_its_reason_and_message() {
         let st = status_of(vec![cs("mcp-server", false, waiting_state("ImagePullBackOff", "Back-off pulling image"))]);
         assert_eq!(
-            pod_failure_message(&st).as_deref(),
+            pod_failure(&st).map(|(_, m)| m).as_deref(),
             Some("mcp-server: ImagePullBackOff: Back-off pulling image")
         );
     }
@@ -4368,7 +4382,7 @@ mod tests {
         // `Succeeded` / `Completed` must yield nothing, or the most common
         // Explain button in the app would offer to explain a job that worked.
         let st = status_with_phase("Succeeded", "Completed", vec![cs("cronjob", false, terminated_state("Completed", 0))]);
-        assert_eq!(pod_failure_message(&st), None);
+        assert_eq!(pod_failure(&st), None);
     }
 
     #[test]
@@ -4376,7 +4390,7 @@ mod tests {
         // The case the pod-level fallback exists for: no container to blame,
         // and `phase` is Failed.
         let st = status_with_phase("Failed", "Evicted", vec![]);
-        assert_eq!(pod_failure_message(&st).as_deref(), Some("Evicted"));
+        assert_eq!(pod_failure(&st).map(|(_, m)| m).as_deref(), Some("Evicted"));
     }
 
     #[test]
@@ -4400,18 +4414,61 @@ mod tests {
         // real cluster those were half the not-ready pods; offering to explain
         // a job that worked is worse than offering nothing.
         let done = status_of(vec![cs("cronjob-alerts", false, terminated_state("Completed", 0))]);
-        assert_eq!(pod_failure_message(&done), None);
+        assert_eq!(pod_failure(&done), None);
 
         let failed = status_of(vec![cs("worker", false, terminated_state("Error", 137))]);
-        assert_eq!(pod_failure_message(&failed).as_deref(), Some("worker: Error (exit 137)"));
+        assert_eq!(pod_failure(&failed).map(|(_, m)| m).as_deref(), Some("worker: Error (exit 137)"));
     }
 
     #[test]
     fn still_starting_is_not_a_failure() {
         for reason in TRANSIENT_WAITING_REASONS {
             let st = status_of(vec![cs("app", false, waiting_state(reason, ""))]);
-            assert_eq!(pod_failure_message(&st), None, "{reason} should not read as a failure");
+            assert_eq!(pod_failure(&st), None, "{reason} should not read as a failure");
         }
+    }
+
+    #[test]
+    fn an_evicted_pod_keeps_its_pod_level_reason_despite_retained_container_status() {
+        // The node leaves terminated container statuses behind on eviction —
+        // typically ContainerStatusUnknown, exit 137. Scanning containers
+        // first claimed one of those, which both buried the eviction reason
+        // and made the row ask for logs from a container already reclaimed.
+        let mut st = status_with_phase(
+            "Failed",
+            "Evicted",
+            vec![cs("app", false, terminated_state("ContainerStatusUnknown", 137))],
+        );
+        st.message = Some("The node was low on resource: memory.".into());
+
+        let (container, message) = pod_failure(&st).expect("an evicted pod is a failure");
+        assert_eq!(container, None, "no container should be named for a pod-level failure");
+        assert_eq!(message, "Evicted: The node was low on resource: memory.");
+    }
+
+    #[test]
+    fn a_failed_pod_without_a_pod_level_reason_still_uses_its_container() {
+        // A Job pod that failed through its container carries no pod-level
+        // reason, so the container scan must still run for it.
+        let st = status_with_phase("Failed", "", vec![cs("worker", false, terminated_state("Error", 1))]);
+        assert_eq!(
+            pod_failure(&st),
+            Some((Some("worker".to_string()), "worker: Error (exit 1)".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_container_returned_is_the_failing_one_not_the_first() {
+        // A row-level Diagnose targets this container, so returning the wrong
+        // one sends a healthy sidecar's logs to explain a broken app.
+        let st = status_of(vec![
+            cs("istio-proxy", true, waiting_state("ImagePullBackOff", "ignore me")),
+            cs("app", false, waiting_state("CrashLoopBackOff", "back-off restarting")),
+        ]);
+        assert_eq!(pod_failure(&st).and_then(|(c, _)| c).as_deref(), Some("app"));
+        // An evicted pod belongs to no container.
+        let evicted = status_with_phase("Failed", "Evicted", vec![]);
+        assert_eq!(pod_failure(&evicted).and_then(|(c, _)| c), None);
     }
 
     #[test]
@@ -4421,7 +4478,7 @@ mod tests {
             cs("app", false, waiting_state("CrashLoopBackOff", "back-off 5m0s restarting")),
         ]);
         assert_eq!(
-            pod_failure_message(&st).as_deref(),
+            pod_failure(&st).map(|(_, m)| m).as_deref(),
             Some("app: CrashLoopBackOff: back-off 5m0s restarting")
         );
     }
