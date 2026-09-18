@@ -5134,6 +5134,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       ["↑ ↓", "Move the row cursor"],
       ["Enter", "Open the focused row's details"],
+      [withMod("D"), "Diagnose the focused row with Claude"],
       ["Space", "Select or deselect the focused row"],
       ["⇧↑ ⇧↓", "Extend the selection"],
       [withMod("A"), "Select every matching row"],
@@ -5164,6 +5165,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       ["← →", "Switch between the panel's tabs"],
       ["↑ ↓", "Scroll the panel"],
+      [withMod("D"), "Diagnose what the panel is showing"],
     ],
   },
   {
@@ -5330,6 +5332,7 @@ function claudeDiagnoseRowButton(onclick: string, what: string): string {
       type="button"
       title="${esc(title)}"
       ${signedIn ? "" : "disabled"}
+      data-diagnose
       onclick="${onclick}"
       class="shrink-0 rounded border border-gridline px-1.5 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
     >Diagnose</button>`;
@@ -8232,6 +8235,7 @@ function renderPodDetailPanel(): string {
               state.claudeAuth?.signed_in
                 ? `<button
                     type="button"
+                    data-diagnose
                     title="Diagnose this pod with Claude — you'll review exactly what is sent first"
                     onclick="window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer)})"
                     class="rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
@@ -8801,6 +8805,7 @@ function renderWorkloadDetailPanel(): string {
               state.claudeAuth?.signed_in
                 ? `<button
                     type="button"
+                    data-diagnose
                     title="Diagnose this workload with Claude — you'll review exactly what is sent first"
                     onclick="window.__app.diagnoseWorkload(${jsArg(wd.ctx)},${jsArg(wd.kind)},${jsArg(wd.namespace)},${jsArg(wd.name)})"
                     class="rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
@@ -10727,6 +10732,31 @@ function activateFocusedRow(): boolean {
   return true;
 }
 
+/**
+ * Cmd/Ctrl+D: clicks whichever Diagnose button is in play.
+ *
+ * Clicked rather than called directly, for the same reason as
+ * `activateFocusedRow`: the button already carries the right arguments — which
+ * container a pod row diagnoses, which kind a workload row is — and the
+ * shortcut cannot then disagree with what clicking does. It also inherits the
+ * signed-out gating for free, since a disabled button ignores a click.
+ *
+ * An open detail panel wins over the row cursor because it covers the table:
+ * diagnosing a row you cannot see, while a panel for something else is in
+ * front of you, would be the wrong subject.
+ */
+function diagnoseFromKeyboard(): "done" | "signed-out" | "nothing" {
+  const inPanel = document.querySelector<HTMLButtonElement>("[data-detail-panel] [data-diagnose]");
+  const inRow = focusedRowElement()?.querySelector<HTMLButtonElement>("[data-diagnose]") ?? null;
+  const button = inPanel ?? inRow;
+  if (!button) return "nothing";
+  // Say why nothing happened rather than swallowing the keypress: a disabled
+  // button gives no feedback to someone who never reached for the mouse.
+  if (button.disabled) return "signed-out";
+  button.click();
+  return "done";
+}
+
 /** Space: toggles the focused row's selection — the same checkbox the "N rows selected" toolbar and its Copy to clipboard act on. Clicked rather than called directly, for the same reason as `activateFocusedRow`. */
 function toggleFocusedRowSelection(): boolean {
   const box = focusedRowElement()?.querySelector<HTMLInputElement>('input[type="checkbox"]');
@@ -11053,6 +11083,28 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "b" || e.key === "B") {
     e.preventDefault();
     toggleSidebar();
+    return;
+  }
+
+  // Cmd+D diagnoses what is in focus — an open pod or workload panel, or the
+  // focused row on Pods and Workloads.
+  //
+  // Gated on isNonPanelOverlayOpen so it cannot fire while the diagnosis it
+  // just opened is on screen: `claudeDiagnose` is one of that predicate's
+  // members, which makes a second press a no-op rather than a re-request.
+  //
+  // Not gated on isEditableTarget, for the same reason as Cmd+K below — there
+  // is no competing meaning for it inside a plain text input, and this app has
+  // no rich text editor where Cmd+D would mean something else.
+  if (e.key === "d" || e.key === "D") {
+    if (isNonPanelOverlayOpen()) return;
+    // Claimed regardless of outcome. Unhandled it reaches the WebView, where
+    // Cmd+D is "add bookmark" — meaningless here and impossible to undo from
+    // inside the app.
+    e.preventDefault();
+    if (diagnoseFromKeyboard() === "signed-out") {
+      showCopyToast("Sign in to Claude first — see the AI button in the top bar");
+    }
     return;
   }
 
