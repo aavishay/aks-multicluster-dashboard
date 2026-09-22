@@ -93,6 +93,167 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_GITOPS_SYSTEM: &str = "\
+You diagnose failing ArgoCD Applications for an experienced SRE.
+
+You are given the Application's sync and health status, where it syncs from, \
+its recent events, its manifest, and — for an app that has drifted — a diff \
+per resource between what was last applied and what is live in the cluster. \
+Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the drifted field, the \
+event, or the manifest setting.
+3. Concrete next steps: the exact command to run or field to change.
+
+Separate the two failure modes rather than blurring them. OutOfSync means the \
+cluster no longer matches Git, and the diff says which fields; Degraded means \
+the resources synced but are not working, and the events and the resource \
+health say why. An app can be both, and then the order matters: say which one \
+caused the other.
+
+The diff is drift against the last applied configuration, not against Git. A \
+field changed by a mutating webhook, an autoscaler, or a controller shows up \
+here exactly like a hand edit does, so do not assume a human changed it — \
+name the likely writer.
+
+Be direct; assume fluency with kubectl and ArgoCD. Prefer one well-supported \
+cause over a list of possibilities. If the evidence is genuinely \
+insufficient, say so and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
+/// How many drifted resources go into a diagnosis.
+///
+/// An app with dozens of drifted resources is usually drifted the same way in
+/// all of them, so the first few carry the story and the rest would crowd out
+/// the events and the manifest.
+const DIAGNOSE_DIFF_RESOURCES: usize = 5;
+
+/// Assembles everything an ArgoCD Application diagnosis needs, redacted.
+///
+/// The drift diff is the part no other subject has. For an OutOfSync app the
+/// whole question is *which fields* stopped matching, and that is exactly what
+/// `get_gitops_diff` computes — so this reuses it rather than sending the
+/// model two manifests to compare itself.
+pub async fn build_gitops_diagnosis_payload(
+    context_name: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    let (apps, events, manifest, diffs) = tokio::join!(
+        k8s::get_gitops_apps(context_name),
+        k8s::get_gitops_events(context_name, namespace, name),
+        k8s::get_gitops_manifest(context_name, namespace, name),
+        k8s::get_gitops_diff(context_name, namespace, name),
+    );
+
+    let status = apps
+        .ok()
+        .and_then(|r| r.apps.into_iter().find(|a| a.name == name && a.namespace == namespace))
+        .map(|a| {
+            format!(
+                "sync: {}\nhealth: {}\ndestination namespace: {}\nrepo: {}\npath: {}\ntarget revision: {}\nlive revision: {}\nlast synced: {}\nage: {}s",
+                a.sync_status,
+                a.health_status,
+                a.destination_namespace,
+                a.repo_url,
+                a.path,
+                a.target_revision,
+                a.revision,
+                a.last_synced_at.unwrap_or_else(|| "(never)".to_string()),
+                a.age_seconds,
+            )
+        })
+        .unwrap_or_else(|| "(application status unavailable)".to_string());
+
+    let events_text = match events {
+        Ok(list) if list.is_empty() => "(no events for this application)".to_string(),
+        Ok(list) => list
+            .iter()
+            .take(25)
+            .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("(events unavailable: {e})"),
+    };
+
+    let manifest_text = match manifest {
+        Ok(m) => m.yaml_without_managed_fields,
+        Err(e) => format!("(manifest unavailable: {e})"),
+    };
+
+    // Only the resources that actually drifted, and only those whose desired
+    // state could be read: a resource applied server-side carries no
+    // last-applied-configuration, so there is nothing to compare and saying so
+    // is better than an empty diff that reads as "no drift".
+    let diff_text = match diffs {
+        Ok(list) => {
+            let drifted: Vec<_> = list
+                .iter()
+                .filter(|d| d.desired_available && d.desired_yaml != d.live_yaml)
+                .collect();
+            let unreadable = list.iter().filter(|d| !d.desired_available).count();
+            if drifted.is_empty() {
+                let mut note = "(no resource drift detected)".to_string();
+                if unreadable > 0 {
+                    note.push_str(&format!(
+                        "\n({unreadable} resource(s) could not be compared: applied server-side, so no last-applied-configuration)"
+                    ));
+                }
+                note
+            } else {
+                let shown = drifted.len().min(DIAGNOSE_DIFF_RESOURCES);
+                let mut out = drifted
+                    .iter()
+                    .take(DIAGNOSE_DIFF_RESOURCES)
+                    .map(|d| {
+                        format!(
+                            "### {}/{} {} ({})\n--- last applied\n{}\n--- live\n{}",
+                            if d.namespace.is_empty() { "cluster" } else { &d.namespace },
+                            d.name,
+                            d.kind,
+                            d.sync_status,
+                            d.desired_yaml,
+                            d.live_yaml,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if drifted.len() > shown {
+                    out.push_str(&format!("\n\n(… {} more drifted resource(s))", drifted.len() - shown));
+                }
+                out
+            }
+        }
+        Err(e) => format!("(diff unavailable: {e})"),
+    };
+
+    let status = redact::redact(&status);
+    let events_r = redact::redact(&events_text);
+    let manifest_r = redact::redact(&manifest_text);
+    let diff_r = redact::redact(&diff_text);
+
+    let redaction_summary = redact::Redacted::merge([&status, &events_r, &manifest_r, &diff_r]).summary();
+
+    let prompt = format!(
+        "ArgoCD Application {namespace}/{name}.\n\n\
+         ## Status\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Drift (last applied vs live)\n{}\n\n\
+         ## Manifest\n```yaml\n{}\n```",
+        status.text, events_r.text, diff_r.text, manifest_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
+}
+
 /// Ranks a workload's pods worst-first, so the logs in the payload come from
 /// the instance most likely to explain the trouble.
 ///
@@ -461,7 +622,11 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
     // Chosen here rather than passed in from the frontend: the system prompt is
     // the instruction the model actually follows, so it stays on this side of
     // the IPC boundary where the payload preview cannot misrepresent it.
-    let system = if kind == "Pod" { DIAGNOSE_SYSTEM } else { DIAGNOSE_WORKLOAD_SYSTEM };
+    let system = match kind {
+        "Pod" => DIAGNOSE_SYSTEM,
+        "Application" => DIAGNOSE_GITOPS_SYSTEM,
+        _ => DIAGNOSE_WORKLOAD_SYSTEM,
+    };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
 }
 

@@ -4665,6 +4665,7 @@ function setMetricsRange(minutes: number) {
   closeClaudeExplain,
   diagnosePod,
   diagnoseWorkload,
+  diagnoseGitOpsApp,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -5799,7 +5800,9 @@ function renderClaudeDiagnosePanel(): string {
           <div>${
             d.kind === "Pod"
               ? "Status, events, manifest and the recent logs of this container."
-              : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
+              : d.kind === "Application"
+                ? "Sync and health status, where it syncs from, its events and manifest, and the drift between what was last applied and what is live."
+                : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
           }</div>
           <div class="${d.payload.redaction_summary.startsWith("Redacted") ? "text-status-warning" : ""}">${esc(d.payload.redaction_summary)}</div>
           ${d.payload.log_note ? `<div>Logs: ${esc(d.payload.log_note)}.</div>` : ""}
@@ -7089,6 +7092,20 @@ async function copyClaudeAnswer(opts: {
 
   const ok = await copyRichTextToClipboard(lines.join("\n"), html);
   showCopyToast(ok ? opts.toast : "Copy failed");
+}
+
+/**
+ * An ArgoCD Application. `kind` is "Application", which also selects the
+ * GitOps system prompt on the Rust side.
+ *
+ * Worth its own entry point rather than reusing the workload one: the
+ * interesting evidence is the drift between what was last applied and what is
+ * live, which no other subject has.
+ */
+function diagnoseGitOpsApp(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "Application", namespace, name, "", () =>
+    api.aiBuildGitOpsDiagnosis(ctx, namespace, name),
+  );
 }
 
 /**
@@ -9310,6 +9327,11 @@ function renderGitOpsDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(gd.ctx)} · ${esc(gd.namespace)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${claudeDiagnoseButton(
+              `window.__app.diagnoseGitOpsApp(${jsArg(gd.ctx)},${jsArg(gd.namespace)},${jsArg(gd.name)})`,
+              "application",
+              "panel",
+            )}
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeGitOpsDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
@@ -9888,7 +9910,7 @@ function renderGitOps(): string {
     ${selectionToolbar("gitops")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:gitops">
       <table class="data-table">
-        ${renderColGroup("gitops", columns, [32, 36])}
+        ${renderColGroup("gitops", columns, [32, 116])}
         <thead>
           <tr>${selectAllCheckboxHeader("gitops", sorted, keyOf)}<th></th>${sortableHeaderRow("gitops", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("gitops", columns, rows)}</tr>
@@ -9900,7 +9922,7 @@ function renderGitOps(): string {
               return `
             <tr>
               ${rowCheckboxCell("gitops", keyOf(row))}
-              <td>${statusDot(gitOpsAppHealthy(row.a))}</td>
+              <td title="${esc(gitOpsAppHealthy(a) ? "" : `${a.sync_status} · ${a.health_status}`)}"><span class="inline-flex items-center gap-1.5">${statusDot(gitOpsAppHealthy(a))}${!gitOpsAppHealthy(a) ? claudeDiagnoseButton(`window.__app.diagnoseGitOpsApp(${jsArg(ctx)},${jsArg(a.namespace)},${jsArg(a.name)})`, "application") : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter GitOps apps by this cluster" onclick="window.__app.setEnumFilter('gitops','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
