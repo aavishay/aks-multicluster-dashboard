@@ -1215,6 +1215,21 @@ fn workload_version_fields(
     }
 }
 
+/// Whether a workload has at least as many ready replicas as it wants.
+///
+/// `>=`, not `==`: a rolling update with `maxSurge` runs more ready replicas
+/// than desired for the length of the rollout, and a scale-down does the same
+/// while the old pods drain. Measured on a live fleet, `wms-service` sat at 5
+/// ready against 3 desired with maxSurge 2 — `Available=True`,
+/// `Progressing=True`, serving normally, and reported red.
+///
+/// One function rather than the comparison written out at each reader, so the
+/// three cannot diverge and a test can exercise what actually runs. The three
+/// readers below are its only callers.
+fn workload_healthy(ready: i32, desired: i32) -> bool {
+    ready >= desired
+}
+
 pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, String> {
     let client = client_for_context(context_name).await?;
 
@@ -1248,13 +1263,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 ready,
                 updated: status.updated_replicas.unwrap_or(0),
                 available: status.available_replicas.unwrap_or(0),
-                // `>=`, not `==`: a rolling update with `maxSurge` runs more
-                // ready replicas than desired for the length of the rollout,
-                // and a scale-down does the same while the old pods drain.
-                // Measured on a live fleet, `wms-service` sat at 5 ready
-                // against 3 desired with maxSurge 2 — serving fine, reported
-                // red, and now offered a Diagnose button it did not need.
-                healthy: ready >= desired,
+                healthy: workload_healthy(ready, desired),
                 age_days: age_days(d.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(d.metadata.creation_timestamp.clone()),
                 version: v.version,
@@ -1288,7 +1297,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 ready,
                 updated: status.updated_replicas.unwrap_or(0),
                 available: status.available_replicas.unwrap_or(0),
-                healthy: ready >= desired,
+                healthy: workload_healthy(ready, desired),
                 age_days: age_days(s.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(s.metadata.creation_timestamp.clone()),
                 version: v.version,
@@ -1321,7 +1330,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 ready,
                 updated: status.updated_number_scheduled.unwrap_or(0),
                 available: status.number_available.unwrap_or(0),
-                healthy: ready >= desired,
+                healthy: workload_healthy(ready, desired),
                 age_days: age_days(d.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(d.metadata.creation_timestamp.clone()),
                 version: v.version,
@@ -4489,13 +4498,11 @@ mod tests {
         );
     }
 
-    /// The health rule the three workload readers share, extracted so a test
-    /// can state it without building a Deployment, a StatefulSet and a
-    /// DaemonSet to assert the same thing three times.
-    fn workload_healthy(ready: i32, desired: i32) -> bool {
-        ready >= desired
-    }
-
+    /// Exercises the production `workload_healthy`, which is the only thing
+    /// the three readers call. An earlier version of this test defined its own
+    /// copy of the comparison inside `#[cfg(test)]`, so it passed no matter
+    /// what the readers did — and "reverting it to `==` makes the test fail"
+    /// proved only that the test tested itself.
     #[test]
     fn a_surging_rollout_is_not_unhealthy() {
         // maxSurge runs more ready replicas than desired for the length of a
