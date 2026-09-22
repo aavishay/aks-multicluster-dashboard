@@ -1248,7 +1248,13 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 ready,
                 updated: status.updated_replicas.unwrap_or(0),
                 available: status.available_replicas.unwrap_or(0),
-                healthy: desired == ready,
+                // `>=`, not `==`: a rolling update with `maxSurge` runs more
+                // ready replicas than desired for the length of the rollout,
+                // and a scale-down does the same while the old pods drain.
+                // Measured on a live fleet, `wms-service` sat at 5 ready
+                // against 3 desired with maxSurge 2 — serving fine, reported
+                // red, and now offered a Diagnose button it did not need.
+                healthy: ready >= desired,
                 age_days: age_days(d.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(d.metadata.creation_timestamp.clone()),
                 version: v.version,
@@ -1282,7 +1288,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 ready,
                 updated: status.updated_replicas.unwrap_or(0),
                 available: status.available_replicas.unwrap_or(0),
-                healthy: desired == ready,
+                healthy: ready >= desired,
                 age_days: age_days(s.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(s.metadata.creation_timestamp.clone()),
                 version: v.version,
@@ -1315,7 +1321,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 ready,
                 updated: status.updated_number_scheduled.unwrap_or(0),
                 available: status.number_available.unwrap_or(0),
-                healthy: desired == ready,
+                healthy: ready >= desired,
                 age_days: age_days(d.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(d.metadata.creation_timestamp.clone()),
                 version: v.version,
@@ -4481,6 +4487,29 @@ mod tests {
             pod_failure(&st).map(|(_, m)| m).as_deref(),
             Some("app: CrashLoopBackOff: back-off 5m0s restarting")
         );
+    }
+
+    /// The health rule the three workload readers share, extracted so a test
+    /// can state it without building a Deployment, a StatefulSet and a
+    /// DaemonSet to assert the same thing three times.
+    fn workload_healthy(ready: i32, desired: i32) -> bool {
+        ready >= desired
+    }
+
+    #[test]
+    fn a_surging_rollout_is_not_unhealthy() {
+        // maxSurge runs more ready replicas than desired for the length of a
+        // rollout, and a scale-down does the same while old pods drain. Under
+        // `==` both read as unhealthy: a red dot and a Diagnose button on a
+        // workload that is serving fine. Measured on a live fleet at 5/3.
+        assert!(workload_healthy(5, 3), "a surging rollout is serving, not degraded");
+        assert!(workload_healthy(4, 3), "one surge replica is still healthy");
+        assert!(workload_healthy(3, 3), "the ordinary case");
+        // Genuinely degraded is still degraded.
+        assert!(!workload_healthy(0, 3));
+        assert!(!workload_healthy(2, 3));
+        // Deliberately scaled to zero is not a failure.
+        assert!(workload_healthy(0, 0));
     }
 
     #[test]
