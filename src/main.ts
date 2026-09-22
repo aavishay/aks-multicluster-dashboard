@@ -6285,6 +6285,18 @@ function renderWorkloads(): string {
   const rows = state.unhealthyOnly.workloads ? allRows.filter((r) => !r.w.healthy) : allRows;
   const keyOf = (r: WorkloadRow) => `${r.ctx}:${r.w.namespace}:${r.w.kind}:${r.w.name}`;
 
+  // The Diagnose button keys off `healthy`, not `failure_message`, which is
+  // the opposite of the Pods table one row-renderer down.
+  //
+  // A workload's `healthy` is `desired == ready` and is computed for every
+  // kind, whereas `failure_message` comes from `status.conditions` — and
+  // measured against a real fleet, 0 of 30 StatefulSets and DaemonSets carry
+  // any conditions at all. Gating on the message hid the button from two of
+  // the three kinds entirely.
+  //
+  // Pods are the other way round for an equally concrete reason: `podHealthy`
+  // is phase-based, and a crashlooping pod sits in phase Running, so it reads
+  // as healthy. There `failure_message` is the trustworthy signal.
   const columns: ColumnDef<WorkloadRow>[] = [
     ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: WorkloadRow) => r.ctx, filter: "enum" as const }] : []),
     { key: "kind", label: "Kind", value: (r) => r.w.kind, filter: "enum" },
@@ -6341,7 +6353,7 @@ function renderWorkloads(): string {
                 return `
             <tr>
               ${rowCheckboxCell("workloads", keyOf(row))}
-              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(w.healthy)}${w.failure_message ? claudeDiagnoseButton(`window.__app.diagnoseWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})`, w.kind.toLowerCase()) : ""}</span></td>
+              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(w.healthy)}${!w.healthy ? claudeDiagnoseButton(`window.__app.diagnoseWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})`, w.kind.toLowerCase()) : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter workloads by this cluster" onclick="window.__app.setEnumFilter('workloads','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
