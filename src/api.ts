@@ -180,6 +180,8 @@ export const api = {
     invoke<ClaudeDiagnosisPayload>("ai_build_diagnosis", { contextName, namespace, podName, container }),
   aiBuildWorkloadDiagnosis: (contextName: string, kind: string, namespace: string, name: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_workload_diagnosis", { contextName, kind, namespace, name }),
+  aiBuildGitOpsDiagnosis: (contextName: string, namespace: string, name: string) =>
+    invoke<ClaudeDiagnosisPayload>("ai_build_gitops_diagnosis", { contextName, namespace, name }),
   /**
    * Sends an already-previewed diagnosis payload; `onToken` fires per text delta.
    *
