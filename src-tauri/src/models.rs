@@ -529,6 +529,13 @@ pub struct HelmReleaseInfo {
     pub first_deployed: Option<String>,
     /// How many revisions Helm still has stored for this release.
     pub revision_count: i64,
+    /// How many of those are in `failed` state.
+    ///
+    /// Read off the `status` label the listing already walks, so it costs no
+    /// extra request. Worth carrying because the current revision alone hides
+    /// it completely: a release that failed to upgrade fifteen times and then
+    /// succeeded reads as plain `deployed`.
+    pub failed_revisions: i64,
     /// Age since `last_deployed`, matching the other tabs' Age columns.
     pub age_days: i64,
     pub age_seconds: i64,
@@ -550,6 +557,22 @@ pub struct ClaudeDiagnosisPayload {
     /// Rough size estimate (~4 chars/token) for conveying scale. Not a
     /// count_tokens call — that would send the payload before approval.
     pub approx_tokens: u32,
+}
+
+/// One stored revision of a Helm release.
+///
+/// `description` is the field worth having: on a failure Helm records the
+/// actual error there — the RBAC denial, the timeout, the immutable field —
+/// and it exists nowhere else once the revision is superseded.
+#[derive(Serialize, Clone, Debug)]
+pub struct HelmRevisionInfo {
+    pub revision: i64,
+    pub status: String,
+    /// Empty when this revision's payload was not read. The listing knows
+    /// every revision's status from its label, but the description costs a
+    /// decode, so only the ones worth reading are fetched.
+    pub description: String,
+    pub deployed_at: Option<String>,
 }
 
 /// `helm get values` / `helm get manifest` / `helm get notes` for one release,
