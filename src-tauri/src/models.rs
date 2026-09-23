@@ -339,6 +339,19 @@ pub struct GitOpsResourceDiff {
     pub error: Option<String>,
 }
 
+impl GitOpsResourceDiff {
+    /// Whether this resource actually drifted.
+    ///
+    /// One definition, because the two readers disagreeing would mean a
+    /// bounded scan stopping on a different count than the one it reports.
+    /// Note what it excludes: `desired_available == false` is *not* drift —
+    /// there was nothing to compare, and an empty desired side would
+    /// otherwise make every server-side-applied resource look rewritten.
+    pub fn has_drift(&self) -> bool {
+        self.desired_available && self.desired_yaml != self.live_yaml
+    }
+}
+
 /// Azure Node Auto Provisioning (NAP) is AKS's managed Karpenter, so the
 /// resources are Karpenter's own CRDs rather than anything Azure-specific.
 /// `installed: false` distinguishes "this cluster has no NAP" from "NAP is on

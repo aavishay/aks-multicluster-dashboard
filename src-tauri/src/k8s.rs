@@ -2907,9 +2907,74 @@ fn build_resource_diff(entry: &serde_json::Value, live_object: &serde_json::Valu
     })
 }
 
+/// Whether a `status.resources[]` entry is worth reading for a drift diff.
+///
+/// Pure, and shared by the counting pass and the reading loop so a bounded
+/// scan's "examined N of M" can never describe a different population than
+/// the one it actually walked.
+fn is_diff_candidate(entry: &serde_json::Value) -> bool {
+    let (_, _, kind, _, child_name, sync_status) = resource_identity(entry);
+    // Anything ArgoCD is content with has no drift worth showing, and an
+    // entry with no status at all is one it has not compared yet.
+    !sync_status.is_empty() && sync_status != "Synced" && !kind.is_empty() && !child_name.is_empty()
+}
+
+/// How far a bounded diff scan may go.
+///
+/// Every candidate costs its own sequential GET, so a caller that wants a
+/// handful of examples should not pay for an Application that manages two
+/// hundred of them. `max_reads` is the hard ceiling — it is what bounds an
+/// app whose resources are all OutOfSync but none comparable, where no amount
+/// of reading yields drift. `enough` stops sooner in the case the ceiling
+/// exists for: a heavily drifted app, where the first few candidates are
+/// drifted the same way as the rest.
+#[derive(Clone, Copy, Debug)]
+pub struct DiffScanLimit {
+    pub max_reads: usize,
+    pub enough: usize,
+}
+
+/// A diff scan's results together with what it declined to look at.
+///
+/// `candidates` counts every not-Synced resource the Application lists;
+/// `examined` counts the ones actually walked. They differ only for a bounded
+/// scan, and that gap is precisely the part a caller must not present as the
+/// whole picture.
+pub struct GitOpsDiffScan {
+    pub diffs: Vec<GitOpsResourceDiff>,
+    pub candidates: usize,
+    pub examined: usize,
+}
+
+/// True once a bounded scan has done all it was asked to.
+///
+/// Split out and pure because the loop it governs needs a live cluster and
+/// this does not: the stopping rule is the part worth testing.
+fn diff_scan_done(limit: Option<DiffScanLimit>, examined: usize, drifted: usize) -> bool {
+    match limit {
+        None => false,
+        Some(limit) => examined >= limit.max_reads || drifted >= limit.enough,
+    }
+}
+
 /// Every not-Synced resource an Application manages, with both sides of its
 /// drift diff normalised and ready to line-diff.
 pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) -> Result<Vec<GitOpsResourceDiff>, String> {
+    Ok(get_gitops_diff_scan(context_name, namespace, name, None).await?.diffs)
+}
+
+/// The same scan, optionally bounded.
+///
+/// `limit` bounds cluster work, not just output: the loop stops reading, so a
+/// caller that only needs examples does not make the Application's resource
+/// count into its own latency. `None` reads everything, which is what the
+/// detail view wants — it renders all of them.
+pub async fn get_gitops_diff_scan(
+    context_name: &str,
+    namespace: &str,
+    name: &str,
+    limit: Option<DiffScanLimit>,
+) -> Result<GitOpsDiffScan, String> {
     let client = client_for_context(context_name).await?;
     let ar = argocd_application_resource();
     let app_api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
@@ -2932,17 +2997,22 @@ pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) ->
     let mut resolved: HashMap<GroupVersionKind, Option<(ApiResource, Scope)>> = HashMap::new();
     let mut diffs = Vec::new();
 
-    for entry in &entries {
-        let (group, version, kind, child_namespace, child_name, sync_status) = resource_identity(entry);
+    // Counted up front, over the same predicate the loop uses, so stopping
+    // early still knows how much it skipped.
+    let candidates = entries.iter().filter(|e| is_diff_candidate(e)).count();
+    let mut examined = 0usize;
+    let mut drifted = 0usize;
 
-        // Anything ArgoCD is content with has no drift worth showing, and an
-        // entry with no status at all is one it has not compared yet.
-        if sync_status.is_empty() || sync_status == "Synced" {
+    for entry in &entries {
+        if !is_diff_candidate(entry) {
             continue;
         }
-        if kind.is_empty() || child_name.is_empty() {
-            continue;
+        if diff_scan_done(limit, examined, drifted) {
+            break;
         }
+        examined += 1;
+
+        let (group, version, kind, child_namespace, child_name, _) = resource_identity(entry);
 
         let gvk = GroupVersionKind::gvk(&group, &version, &kind);
         if !resolved.contains_key(&gvk) {
@@ -2983,7 +3053,12 @@ pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) ->
                     }
                 };
                 match build_resource_diff(entry, &live_value) {
-                    Ok(diff) => diffs.push(diff),
+                    Ok(diff) => {
+                        if diff.has_drift() {
+                            drifted += 1;
+                        }
+                        diffs.push(diff);
+                    }
                     Err(e) => diffs.push(unavailable_resource_diff(entry, e)),
                 }
             }
@@ -2991,7 +3066,7 @@ pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) ->
         }
     }
 
-    Ok(diffs)
+    Ok(GitOpsDiffScan { diffs, candidates, examined })
 }
 
 #[cfg(test)]
@@ -4553,5 +4628,245 @@ mod tests {
             pick_failure_condition(conds.into_iter()).as_deref(),
             Some("FailedCreate: forbidden: exceeded quota")
         );
+    }
+
+    fn resource_entry(kind: &str, name: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({ "kind": kind, "name": name, "namespace": "ns", "version": "v1", "status": status })
+    }
+
+    #[test]
+    fn diff_candidates_are_the_resources_argocd_is_unhappy_with() {
+        assert!(is_diff_candidate(&resource_entry("Deployment", "api", "OutOfSync")));
+        // Synced needs no diff, and no status at all means ArgoCD has not
+        // compared it yet — neither is worth a round trip.
+        assert!(!is_diff_candidate(&resource_entry("Deployment", "api", "Synced")));
+        assert!(!is_diff_candidate(&resource_entry("Deployment", "api", "")));
+        // Unaddressable: nothing to GET.
+        assert!(!is_diff_candidate(&resource_entry("", "api", "OutOfSync")));
+        assert!(!is_diff_candidate(&resource_entry("Deployment", "", "OutOfSync")));
+    }
+
+    #[test]
+    fn unbounded_scan_never_stops_early() {
+        // The detail view renders every resource, so it must not inherit the
+        // diagnosis budget by accident.
+        assert!(!diff_scan_done(None, 10_000, 10_000));
+    }
+
+    #[test]
+    fn bounded_scan_stops_on_either_bound() {
+        let limit = Some(DiffScanLimit { max_reads: 20, enough: 5 });
+        assert!(!diff_scan_done(limit, 0, 0));
+        assert!(!diff_scan_done(limit, 19, 4));
+        // Enough examples in hand: the heavily-drifted case.
+        assert!(diff_scan_done(limit, 5, 5));
+        // Ceiling reached with nothing to show for it: the all-server-side
+        // case, which is exactly what `enough` alone fails to bound.
+        assert!(diff_scan_done(limit, 20, 0));
+    }
+
+    /// A throwaway apiserver serving exactly the surface one diff scan
+    /// touches, and counting the only thing under test: how many resource
+    /// GETs the scan actually issues.
+    ///
+    /// `diff_scan_done` is tested above as a pure rule, but nothing there
+    /// proves the loop *obeys* it — a `break` on the far side of the GET, or
+    /// `examined` incremented in the wrong branch, would leave every other
+    /// test in this file green while the bound saved no round trips at all.
+    /// That is the entire claim, so it is measured rather than read.
+    struct FakeApiServer {
+        port: u16,
+        resource_gets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn start_fake_apiserver(resources: usize, last_applied: bool) -> FakeApiServer {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let resource_gets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = resource_gets.clone();
+
+        let entries: Vec<serde_json::Value> = (0..resources)
+            .map(|i| {
+                serde_json::json!({
+                    "group": "", "version": "v1", "kind": "ConfigMap",
+                    "namespace": "default", "name": format!("cm-{i}"), "status": "OutOfSync"
+                })
+            })
+            .collect();
+        let app = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": { "name": "app", "namespace": "argocd" },
+            "status": { "resources": entries }
+        })
+        .to_string();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = counter.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    // Read until the headers end: one `read` usually suffices
+                    // for a bodyless GET, but "usually" is how a test starts
+                    // failing on a busy machine only.
+                    let mut req = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                req.extend_from_slice(&chunk[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).to_string();
+                    let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+
+                    let body = if path.contains("/applications/") {
+                        app
+                    } else if path.starts_with("/api/v1/namespaces/") && path.contains("/configmaps/") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let name = path.rsplit('/').next().unwrap_or("cm").to_string();
+                        let mut metadata = serde_json::json!({ "name": name, "namespace": "default" });
+                        if last_applied {
+                            // Differs from the live body, so this resource has drifted.
+                            let desired = serde_json::json!({
+                                "apiVersion": "v1", "kind": "ConfigMap",
+                                "metadata": { "name": name, "namespace": "default" },
+                                "data": { "k": "old" }
+                            })
+                            .to_string();
+                            metadata["annotations"] = serde_json::json!({ LAST_APPLIED_ANNOTATION: desired });
+                        }
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "ConfigMap",
+                            "metadata": metadata, "data": { "k": "new" }
+                        })
+                        .to_string()
+                    } else if path == "/api/v1" {
+                        serde_json::json!({
+                            "kind": "APIResourceList", "groupVersion": "v1",
+                            "resources": [{
+                                "name": "configmaps", "singularName": "", "namespaced": true,
+                                "kind": "ConfigMap", "verbs": ["get"]
+                            }]
+                        })
+                        .to_string()
+                    } else if path == "/api" {
+                        serde_json::json!({ "kind": "APIVersions", "versions": ["v1"] }).to_string()
+                    } else if path == "/apis" {
+                        serde_json::json!({ "kind": "APIGroupList", "groups": [] }).to_string()
+                    } else {
+                        serde_json::json!({ "kind": "Status", "status": "Failure", "code": 404 }).to_string()
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        FakeApiServer { port, resource_gets }
+    }
+
+    /// Writes a kubeconfig pointing at the fake, runs `f`, restores the env.
+    async fn against_fake<F, Fut, T>(context_name: &str, port: u16, f: F) -> T
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _guard = crate::kubeconfig::KUBECONFIG_ENV_LOCK.lock().unwrap();
+        let mut path = std::env::temp_dir();
+        path.push(format!("aks-dashboard-diffscan-{}-{context_name}", std::process::id()));
+        std::fs::write(
+            &path,
+            format!(
+                "apiVersion: v1\nkind: Config\ncurrent-context: {context_name}\n\
+                 clusters:\n- name: {context_name}\n  cluster:\n    server: http://127.0.0.1:{port}\n\
+                 contexts:\n- name: {context_name}\n  context:\n    cluster: {context_name}\n    user: {context_name}\n    namespace: default\n\
+                 users:\n- name: {context_name}\n  user:\n    token: faketoken\n"
+            ),
+        )
+        .expect("write kubeconfig");
+
+        let previous = std::env::var("KUBECONFIG").ok();
+        std::env::set_var("KUBECONFIG", &path);
+        let result = f(context_name.to_string()).await;
+        match previous {
+            Some(v) => std::env::set_var("KUBECONFIG", v),
+            None => std::env::remove_var("KUBECONFIG"),
+        }
+        std::fs::remove_file(&path).ok();
+        result
+    }
+
+    #[tokio::test]
+    async fn the_bound_saves_round_trips_on_a_heavily_drifted_app() {
+        let server = start_fake_apiserver(40, true).await;
+        let gets = server.resource_gets.clone();
+
+        let scan = against_fake("drifted", server.port, |ctx| async move {
+            get_gitops_diff_scan(&ctx, "argocd", "app", Some(DiffScanLimit { max_reads: 20, enough: 5 }))
+                .await
+                .expect("scan")
+        })
+        .await;
+
+        // Five examples were asked for, so five resources were read — not
+        // forty read and thirty-five thrown away, which is what capping only
+        // the serialisation did.
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(scan.examined, 5);
+        assert_eq!(scan.candidates, 40, "it still knows how much it skipped");
+        assert_eq!(scan.diffs.iter().filter(|d| d.has_drift()).count(), 5);
+    }
+
+    #[tokio::test]
+    async fn the_hard_ceiling_is_what_bounds_an_app_that_never_yields_drift() {
+        // Every resource OutOfSync but applied server-side: no amount of
+        // reading produces a drifted one, so the "enough drifted" stop never
+        // fires and only `max_reads` ends the scan.
+        let server = start_fake_apiserver(40, false).await;
+        let gets = server.resource_gets.clone();
+
+        let scan = against_fake("serverside", server.port, |ctx| async move {
+            get_gitops_diff_scan(&ctx, "argocd", "app", Some(DiffScanLimit { max_reads: 20, enough: 5 }))
+                .await
+                .expect("scan")
+        })
+        .await;
+
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 20);
+        assert_eq!(scan.examined, 20);
+        assert_eq!(scan.diffs.iter().filter(|d| d.has_drift()).count(), 0);
+        assert!(scan.diffs.iter().all(|d| !d.desired_available && d.error.is_none()));
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_scan_still_reads_everything() {
+        // The detail view renders every resource, so it must not inherit the
+        // diagnosis budget.
+        let server = start_fake_apiserver(40, true).await;
+        let gets = server.resource_gets.clone();
+
+        let scan = against_fake("unbounded", server.port, |ctx| async move {
+            get_gitops_diff_scan(&ctx, "argocd", "app", None).await.expect("scan")
+        })
+        .await;
+
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 40);
+        assert_eq!(scan.examined, scan.candidates);
     }
 }

@@ -93,6 +93,207 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_GITOPS_SYSTEM: &str = "\
+You diagnose failing ArgoCD Applications for an experienced SRE.
+
+You are given the Application's sync and health status, where it syncs from, \
+its recent events, its manifest, and — for an app that has drifted — a diff \
+per resource between what was last applied and what is live in the cluster. \
+Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the drifted field, the \
+event, or the manifest setting.
+3. Concrete next steps: the exact command to run or field to change.
+
+Separate the two failure modes rather than blurring them. OutOfSync means the \
+cluster no longer matches Git, and the diff says which fields; Degraded means \
+the resources synced but are not working, and the events and the resource \
+health say why. An app can be both, and then the order matters: say which one \
+caused the other.
+
+The diff is drift against the last applied configuration, not against Git. A \
+field changed by a mutating webhook, an autoscaler, or a controller shows up \
+here exactly like a hand edit does, so do not assume a human changed it — \
+name the likely writer.
+
+Be direct; assume fluency with kubectl and ArgoCD. Prefer one well-supported \
+cause over a list of possibilities. If the evidence is genuinely \
+insufficient, say so and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
+/// How many drifted resources go into a diagnosis.
+///
+/// An app with dozens of drifted resources is usually drifted the same way in
+/// all of them, so the first few carry the story and the rest would crowd out
+/// the events and the manifest.
+const DIAGNOSE_DIFF_RESOURCES: usize = 5;
+
+/// Hard ceiling on how many not-Synced resources a diagnosis will read.
+///
+/// `DIAGNOSE_DIFF_RESOURCES` alone does not bound the cluster work: an app
+/// whose resources are all OutOfSync but applied server-side yields no drift
+/// however many are read, so the "enough drifted" stop never fires and the
+/// scan would walk every one of them — sequentially, inside the same deadline
+/// the status, events and manifest fetches share.
+///
+/// Above the display cap on purpose. The budget is spent on *candidates*, and
+/// an uncomparable or unchanged one consumes a slot without producing an
+/// example, so a ceiling equal to the cap would routinely send fewer than
+/// five diffs when five were available.
+const DIAGNOSE_DIFF_READS: usize = 20;
+
+/// Renders the drift section of a GitOps diagnosis.
+///
+/// Pure, and separate from the payload builder, because the distinction it
+/// draws is the testable part: "drifted", "could not be compared" and "could
+/// not be read" are three different statements about the cluster, and a
+/// payload that collapses them tells a model reasoning about cluster state
+/// something untrue. A read failure reported as server-side apply is the
+/// worst of the three — it turns a gap in what we know into a design choice.
+fn render_diff_section(scan: &k8s::GitOpsDiffScan) -> String {
+    let drifted: Vec<_> = scan.diffs.iter().filter(|d| d.has_drift()).collect();
+    // No last-applied-configuration to compare against. Normal, not a
+    // failure: that is what server-side apply looks like from here.
+    let uncomparable = scan.diffs.iter().filter(|d| !d.desired_available && d.error.is_none()).count();
+    // Could not be read at all — RBAC, or deleted since ArgoCD looked.
+    let unreadable: Vec<_> = scan.diffs.iter().filter_map(|d| d.error.as_deref()).collect();
+
+    let mut out = if drifted.is_empty() {
+        "(no resource drift detected)".to_string()
+    } else {
+        let shown = drifted.len().min(DIAGNOSE_DIFF_RESOURCES);
+        let mut rendered = drifted
+            .iter()
+            .take(DIAGNOSE_DIFF_RESOURCES)
+            .map(|d| {
+                format!(
+                    "### {}/{} {} ({})\n--- last applied\n{}\n--- live\n{}",
+                    if d.namespace.is_empty() { "cluster" } else { &d.namespace },
+                    d.name,
+                    d.kind,
+                    d.sync_status,
+                    d.desired_yaml,
+                    d.live_yaml,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if drifted.len() > shown {
+            rendered.push_str(&format!("\n\n(… {} more drifted resource(s))", drifted.len() - shown));
+        }
+        rendered
+    };
+
+    if uncomparable > 0 {
+        out.push_str(&format!(
+            "\n\n({uncomparable} resource(s) could not be compared: applied server-side, so they carry no last-applied-configuration. This is not a fault and says nothing about whether they drifted.)"
+        ));
+    }
+    if let Some(first) = unreadable.first() {
+        out.push_str(&format!(
+            "\n\n({} resource(s) could not be read at all, so any drift in them is invisible here — e.g. {first})",
+            unreadable.len()
+        ));
+    }
+    if scan.examined < scan.candidates {
+        out.push_str(&format!(
+            "\n\n(scan stopped after {} of {} not-Synced resources; the drift above is a sample, not its full extent)",
+            scan.examined, scan.candidates
+        ));
+    }
+    out
+}
+
+/// Assembles everything an ArgoCD Application diagnosis needs, redacted.
+///
+/// The drift diff is the part no other subject has. For an OutOfSync app the
+/// whole question is *which fields* stopped matching, and that is exactly what
+/// `get_gitops_diff` computes — so this reuses it rather than sending the
+/// model two manifests to compare itself.
+pub async fn build_gitops_diagnosis_payload(
+    context_name: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    let (apps, events, manifest, diffs) = tokio::join!(
+        k8s::get_gitops_apps(context_name),
+        k8s::get_gitops_events(context_name, namespace, name),
+        k8s::get_gitops_manifest(context_name, namespace, name),
+        k8s::get_gitops_diff_scan(
+            context_name,
+            namespace,
+            name,
+            Some(k8s::DiffScanLimit { max_reads: DIAGNOSE_DIFF_READS, enough: DIAGNOSE_DIFF_RESOURCES }),
+        ),
+    );
+
+    let status = apps
+        .ok()
+        .and_then(|r| r.apps.into_iter().find(|a| a.name == name && a.namespace == namespace))
+        .map(|a| {
+            format!(
+                "sync: {}\nhealth: {}\ndestination namespace: {}\nrepo: {}\npath: {}\ntarget revision: {}\nlive revision: {}\nlast synced: {}\nage: {}s",
+                a.sync_status,
+                a.health_status,
+                a.destination_namespace,
+                a.repo_url,
+                a.path,
+                a.target_revision,
+                a.revision,
+                a.last_synced_at.unwrap_or_else(|| "(never)".to_string()),
+                a.age_seconds,
+            )
+        })
+        .unwrap_or_else(|| "(application status unavailable)".to_string());
+
+    let events_text = match events {
+        Ok(list) if list.is_empty() => "(no events for this application)".to_string(),
+        Ok(list) => list
+            .iter()
+            .take(25)
+            .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("(events unavailable: {e})"),
+    };
+
+    let manifest_text = match manifest {
+        Ok(m) => m.yaml_without_managed_fields,
+        Err(e) => format!("(manifest unavailable: {e})"),
+    };
+
+    let diff_text = match diffs {
+        Ok(scan) => render_diff_section(&scan),
+        Err(e) => format!("(diff unavailable: {e})"),
+    };
+
+    let status = redact::redact(&status);
+    let events_r = redact::redact(&events_text);
+    let manifest_r = redact::redact(&manifest_text);
+    let diff_r = redact::redact(&diff_text);
+
+    let redaction_summary = redact::Redacted::merge([&status, &events_r, &manifest_r, &diff_r]).summary();
+
+    let prompt = format!(
+        "ArgoCD Application {namespace}/{name}.\n\n\
+         ## Status\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Drift (last applied vs live)\n{}\n\n\
+         ## Manifest\n```yaml\n{}\n```",
+        status.text, events_r.text, diff_r.text, manifest_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
+}
+
 /// Ranks a workload's pods worst-first, so the logs in the payload come from
 /// the instance most likely to explain the trouble.
 ///
@@ -461,7 +662,11 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
     // Chosen here rather than passed in from the frontend: the system prompt is
     // the instruction the model actually follows, so it stays on this side of
     // the IPC boundary where the payload preview cannot misrepresent it.
-    let system = if kind == "Pod" { DIAGNOSE_SYSTEM } else { DIAGNOSE_WORKLOAD_SYSTEM };
+    let system = match kind {
+        "Pod" => DIAGNOSE_SYSTEM,
+        "Application" => DIAGNOSE_GITOPS_SYSTEM,
+        _ => DIAGNOSE_WORKLOAD_SYSTEM,
+    };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
 }
 
@@ -478,6 +683,7 @@ pub async fn explain_error(error_text: &str, on_token: tauri::ipc::Channel<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::GitOpsResourceDiff;
 
     fn pod(name: &str, phase: &str, ready: &str, restarts: i32) -> PodInfo {
         PodInfo {
@@ -556,5 +762,75 @@ mod tests {
             ]),
             vec!["crashy", "odd-ready"]
         );
+    }
+
+    fn diff_entry(name: &str, desired: &str, live: &str, desired_available: bool, error: Option<&str>) -> GitOpsResourceDiff {
+        GitOpsResourceDiff {
+            group: String::new(),
+            version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            name: name.into(),
+            sync_status: "OutOfSync".into(),
+            desired_yaml: desired.into(),
+            live_yaml: live.into(),
+            live_yaml_full: live.into(),
+            suppressed_lines: 0,
+            desired_available,
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn scan(diffs: Vec<GitOpsResourceDiff>) -> k8s::GitOpsDiffScan {
+        let n = diffs.len();
+        k8s::GitOpsDiffScan { diffs, candidates: n, examined: n }
+    }
+
+    #[test]
+    fn a_resource_that_could_not_be_read_is_not_reported_as_server_side_apply() {
+        // The distinction this whole function exists for. Both entries have
+        // `desired_available: false`, and calling both "applied server-side"
+        // would turn a permissions failure into a design choice — the model
+        // would then have no reason to suspect its view is incomplete.
+        let out = render_diff_section(&scan(vec![
+            diff_entry("ssa", "", "a: 1", false, None),
+            diff_entry("denied", "", "", false, Some("Failed to get Secret/tls: forbidden")),
+        ]));
+        assert!(out.contains("1 resource(s) could not be compared"), "{out}");
+        assert!(out.contains("1 resource(s) could not be read at all"), "{out}");
+        assert!(out.contains("forbidden"), "{out}");
+    }
+
+    #[test]
+    fn caveats_survive_alongside_real_drift() {
+        // They used to print only when nothing had drifted, so the case where
+        // the model most needs to know its diff is partial — it has some real
+        // evidence and will reason from it — was the one case that hid it.
+        let out = render_diff_section(&scan(vec![
+            diff_entry("drifted", "replicas: 1", "replicas: 3", true, None),
+            diff_entry("denied", "", "", false, Some("forbidden")),
+        ]));
+        assert!(out.contains("### ns/drifted"), "{out}");
+        assert!(out.contains("could not be read at all"), "{out}");
+    }
+
+    #[test]
+    fn an_unreadable_resource_is_not_counted_as_drift() {
+        // Its yamls differ from nothing to nothing, but `has_drift` gates on
+        // `desired_available` — otherwise every unreadable resource would
+        // arrive as a phantom drift with two empty sides.
+        let out = render_diff_section(&scan(vec![diff_entry("ssa", "", "a: 1", false, None)]));
+        assert!(out.starts_with("(no resource drift detected)"), "{out}");
+    }
+
+    #[test]
+    fn a_bounded_scan_says_it_stopped_early() {
+        let mut s = scan(vec![diff_entry("d", "a: 1", "a: 2", true, None)]);
+        s.candidates = 60;
+        s.examined = 5;
+        let out = render_diff_section(&s);
+        assert!(out.contains("scan stopped after 5 of 60"), "{out}");
+        // ... and an unbounded one does not.
+        assert!(!render_diff_section(&scan(vec![diff_entry("d", "a: 1", "a: 2", true, None)])).contains("scan stopped"));
     }
 }
