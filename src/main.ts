@@ -10372,13 +10372,19 @@ function isBlockingOverlayOpen(): boolean {
     state.shortcutsOpen ||
     !!state.confirm ||
     !!state.clusterPalette ||
+    // Claude's *setup* panel belongs here and not below: it is a floating
+    // settings popover, not a slide-over, with no scroll container and so no
+    // `data-detail-body` of its own. Routing it down the scrollable path made
+    // `detailPanelScroller` fall through to whatever detail panel happened to
+    // be open underneath — scrolling a panel hidden behind it.
+    state.claudePanelOpen ||
     !!state.metricsBackendEditor ||
     state.openEnumFilter !== null
   );
 }
 
 /**
- * Claude's panel, explain and diagnose views.
+ * Claude's explain and diagnose views — the slide-over ones.
  *
  * Split out of `isNonPanelOverlayOpen` because they are the one overlay family
  * that *has* somewhere to put a navigation key: each renders a slide-over
@@ -10393,7 +10399,7 @@ function isBlockingOverlayOpen(): boolean {
  * table behind an open panel.
  */
 function isClaudeOverlayOpen(): boolean {
-  return !!state.claudeExplain || !!state.claudeDiagnose || state.claudePanelOpen;
+  return !!state.claudeExplain || !!state.claudeDiagnose;
 }
 
 /** True while anything at all covers the tab content, detail panels included — the broad guard for keys that no overlay should let through. */
