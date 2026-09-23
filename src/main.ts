@@ -10327,6 +10327,25 @@ function isAnyDetailPanelOpen(): boolean {
  * meaning there, so widening that helper instead would needlessly disable
  * view-history navigation while a dropdown happens to hold focus.
  */
+/**
+ * The subset of `consumesPlainNavKeys` that applies to PageUp/PageDown.
+ *
+ * A single-line `<input>` does nothing at all with these two — unlike Home/End,
+ * which move its caret, and unlike the arrows, which do the same. Treating
+ * every input alike meant that after typing in a column's `Filter…` box, the
+ * very next thing a reader wants — page through what they just filtered to —
+ * silently did nothing, because focus was still in the box and the guard
+ * dropped the key before the table ever saw it.
+ *
+ * `<select>` still consumes: PageUp/PageDown step through its options.
+ * `<textarea>` and contenteditable still consume: they scroll.
+ */
+function consumesPageKeys(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.tagName === "INPUT") return false;
+  return consumesPlainNavKeys(target);
+}
+
 function consumesPlainNavKeys(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
   if (target instanceof HTMLInputElement && (target.type === "checkbox" || target.type === "radio")) {
@@ -11210,7 +11229,7 @@ document.addEventListener("keydown", (e) => {
   // PageUp/PageDown step the table's pagination where there is any, else
   // jump the cursor to the far end. Same two guards as the arrows.
   if ((e.key === "PageUp" || e.key === "PageDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainNavKeys(e.target) || isBlockingOverlayOpen()) return;
+    if (consumesPageKeys(e.target) || isBlockingOverlayOpen()) return;
     const delta = e.key === "PageDown" ? 1 : -1;
     if (isClaudeOverlayOpen()) {
       if (scrollDetailPanel("page", delta)) e.preventDefault();
