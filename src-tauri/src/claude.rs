@@ -131,6 +131,82 @@ contents, and do not ask for them.";
 /// the events and the manifest.
 const DIAGNOSE_DIFF_RESOURCES: usize = 5;
 
+/// Hard ceiling on how many not-Synced resources a diagnosis will read.
+///
+/// `DIAGNOSE_DIFF_RESOURCES` alone does not bound the cluster work: an app
+/// whose resources are all OutOfSync but applied server-side yields no drift
+/// however many are read, so the "enough drifted" stop never fires and the
+/// scan would walk every one of them — sequentially, inside the same deadline
+/// the status, events and manifest fetches share.
+///
+/// Above the display cap on purpose. The budget is spent on *candidates*, and
+/// an uncomparable or unchanged one consumes a slot without producing an
+/// example, so a ceiling equal to the cap would routinely send fewer than
+/// five diffs when five were available.
+const DIAGNOSE_DIFF_READS: usize = 20;
+
+/// Renders the drift section of a GitOps diagnosis.
+///
+/// Pure, and separate from the payload builder, because the distinction it
+/// draws is the testable part: "drifted", "could not be compared" and "could
+/// not be read" are three different statements about the cluster, and a
+/// payload that collapses them tells a model reasoning about cluster state
+/// something untrue. A read failure reported as server-side apply is the
+/// worst of the three — it turns a gap in what we know into a design choice.
+fn render_diff_section(scan: &k8s::GitOpsDiffScan) -> String {
+    let drifted: Vec<_> = scan.diffs.iter().filter(|d| d.has_drift()).collect();
+    // No last-applied-configuration to compare against. Normal, not a
+    // failure: that is what server-side apply looks like from here.
+    let uncomparable = scan.diffs.iter().filter(|d| !d.desired_available && d.error.is_none()).count();
+    // Could not be read at all — RBAC, or deleted since ArgoCD looked.
+    let unreadable: Vec<_> = scan.diffs.iter().filter_map(|d| d.error.as_deref()).collect();
+
+    let mut out = if drifted.is_empty() {
+        "(no resource drift detected)".to_string()
+    } else {
+        let shown = drifted.len().min(DIAGNOSE_DIFF_RESOURCES);
+        let mut rendered = drifted
+            .iter()
+            .take(DIAGNOSE_DIFF_RESOURCES)
+            .map(|d| {
+                format!(
+                    "### {}/{} {} ({})\n--- last applied\n{}\n--- live\n{}",
+                    if d.namespace.is_empty() { "cluster" } else { &d.namespace },
+                    d.name,
+                    d.kind,
+                    d.sync_status,
+                    d.desired_yaml,
+                    d.live_yaml,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if drifted.len() > shown {
+            rendered.push_str(&format!("\n\n(… {} more drifted resource(s))", drifted.len() - shown));
+        }
+        rendered
+    };
+
+    if uncomparable > 0 {
+        out.push_str(&format!(
+            "\n\n({uncomparable} resource(s) could not be compared: applied server-side, so they carry no last-applied-configuration. This is not a fault and says nothing about whether they drifted.)"
+        ));
+    }
+    if let Some(first) = unreadable.first() {
+        out.push_str(&format!(
+            "\n\n({} resource(s) could not be read at all, so any drift in them is invisible here — e.g. {first})",
+            unreadable.len()
+        ));
+    }
+    if scan.examined < scan.candidates {
+        out.push_str(&format!(
+            "\n\n(scan stopped after {} of {} not-Synced resources; the drift above is a sample, not its full extent)",
+            scan.examined, scan.candidates
+        ));
+    }
+    out
+}
+
 /// Assembles everything an ArgoCD Application diagnosis needs, redacted.
 ///
 /// The drift diff is the part no other subject has. For an OutOfSync app the
@@ -146,7 +222,12 @@ pub async fn build_gitops_diagnosis_payload(
         k8s::get_gitops_apps(context_name),
         k8s::get_gitops_events(context_name, namespace, name),
         k8s::get_gitops_manifest(context_name, namespace, name),
-        k8s::get_gitops_diff(context_name, namespace, name),
+        k8s::get_gitops_diff_scan(
+            context_name,
+            namespace,
+            name,
+            Some(k8s::DiffScanLimit { max_reads: DIAGNOSE_DIFF_READS, enough: DIAGNOSE_DIFF_RESOURCES }),
+        ),
     );
 
     let status = apps
@@ -184,49 +265,8 @@ pub async fn build_gitops_diagnosis_payload(
         Err(e) => format!("(manifest unavailable: {e})"),
     };
 
-    // Only the resources that actually drifted, and only those whose desired
-    // state could be read: a resource applied server-side carries no
-    // last-applied-configuration, so there is nothing to compare and saying so
-    // is better than an empty diff that reads as "no drift".
     let diff_text = match diffs {
-        Ok(list) => {
-            let drifted: Vec<_> = list
-                .iter()
-                .filter(|d| d.desired_available && d.desired_yaml != d.live_yaml)
-                .collect();
-            let unreadable = list.iter().filter(|d| !d.desired_available).count();
-            if drifted.is_empty() {
-                let mut note = "(no resource drift detected)".to_string();
-                if unreadable > 0 {
-                    note.push_str(&format!(
-                        "\n({unreadable} resource(s) could not be compared: applied server-side, so no last-applied-configuration)"
-                    ));
-                }
-                note
-            } else {
-                let shown = drifted.len().min(DIAGNOSE_DIFF_RESOURCES);
-                let mut out = drifted
-                    .iter()
-                    .take(DIAGNOSE_DIFF_RESOURCES)
-                    .map(|d| {
-                        format!(
-                            "### {}/{} {} ({})\n--- last applied\n{}\n--- live\n{}",
-                            if d.namespace.is_empty() { "cluster" } else { &d.namespace },
-                            d.name,
-                            d.kind,
-                            d.sync_status,
-                            d.desired_yaml,
-                            d.live_yaml,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                if drifted.len() > shown {
-                    out.push_str(&format!("\n\n(… {} more drifted resource(s))", drifted.len() - shown));
-                }
-                out
-            }
-        }
+        Ok(scan) => render_diff_section(&scan),
         Err(e) => format!("(diff unavailable: {e})"),
     };
 
@@ -643,6 +683,7 @@ pub async fn explain_error(error_text: &str, on_token: tauri::ipc::Channel<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::GitOpsResourceDiff;
 
     fn pod(name: &str, phase: &str, ready: &str, restarts: i32) -> PodInfo {
         PodInfo {
@@ -721,5 +762,75 @@ mod tests {
             ]),
             vec!["crashy", "odd-ready"]
         );
+    }
+
+    fn diff_entry(name: &str, desired: &str, live: &str, desired_available: bool, error: Option<&str>) -> GitOpsResourceDiff {
+        GitOpsResourceDiff {
+            group: String::new(),
+            version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            name: name.into(),
+            sync_status: "OutOfSync".into(),
+            desired_yaml: desired.into(),
+            live_yaml: live.into(),
+            live_yaml_full: live.into(),
+            suppressed_lines: 0,
+            desired_available,
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn scan(diffs: Vec<GitOpsResourceDiff>) -> k8s::GitOpsDiffScan {
+        let n = diffs.len();
+        k8s::GitOpsDiffScan { diffs, candidates: n, examined: n }
+    }
+
+    #[test]
+    fn a_resource_that_could_not_be_read_is_not_reported_as_server_side_apply() {
+        // The distinction this whole function exists for. Both entries have
+        // `desired_available: false`, and calling both "applied server-side"
+        // would turn a permissions failure into a design choice — the model
+        // would then have no reason to suspect its view is incomplete.
+        let out = render_diff_section(&scan(vec![
+            diff_entry("ssa", "", "a: 1", false, None),
+            diff_entry("denied", "", "", false, Some("Failed to get Secret/tls: forbidden")),
+        ]));
+        assert!(out.contains("1 resource(s) could not be compared"), "{out}");
+        assert!(out.contains("1 resource(s) could not be read at all"), "{out}");
+        assert!(out.contains("forbidden"), "{out}");
+    }
+
+    #[test]
+    fn caveats_survive_alongside_real_drift() {
+        // They used to print only when nothing had drifted, so the case where
+        // the model most needs to know its diff is partial — it has some real
+        // evidence and will reason from it — was the one case that hid it.
+        let out = render_diff_section(&scan(vec![
+            diff_entry("drifted", "replicas: 1", "replicas: 3", true, None),
+            diff_entry("denied", "", "", false, Some("forbidden")),
+        ]));
+        assert!(out.contains("### ns/drifted"), "{out}");
+        assert!(out.contains("could not be read at all"), "{out}");
+    }
+
+    #[test]
+    fn an_unreadable_resource_is_not_counted_as_drift() {
+        // Its yamls differ from nothing to nothing, but `has_drift` gates on
+        // `desired_available` — otherwise every unreadable resource would
+        // arrive as a phantom drift with two empty sides.
+        let out = render_diff_section(&scan(vec![diff_entry("ssa", "", "a: 1", false, None)]));
+        assert!(out.starts_with("(no resource drift detected)"), "{out}");
+    }
+
+    #[test]
+    fn a_bounded_scan_says_it_stopped_early() {
+        let mut s = scan(vec![diff_entry("d", "a: 1", "a: 2", true, None)]);
+        s.candidates = 60;
+        s.examined = 5;
+        let out = render_diff_section(&s);
+        assert!(out.contains("scan stopped after 5 of 60"), "{out}");
+        // ... and an unbounded one does not.
+        assert!(!render_diff_section(&scan(vec![diff_entry("d", "a: 1", "a: 2", true, None)])).contains("scan stopped"));
     }
 }
