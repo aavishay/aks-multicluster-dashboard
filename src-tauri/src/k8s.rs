@@ -1622,12 +1622,18 @@ pub struct NodePodSummary {
 }
 
 /// Everything a node diagnosis needs, fetched in one round.
+///
+/// The two lists keep their errors rather than collapsing to empty. A node
+/// whose pods could not be listed is a different statement from a node with no
+/// pods, and the payload has to be able to say which — a 403 or a timeout
+/// rendered as "no pods on this node" would have the model reason from a fact
+/// that is not true.
 pub struct NodeDiagnostics {
     pub node: Node,
     /// Unhealthy first, then by restart count — the same worst-first
     /// convention the workload payload uses.
-    pub pods: Vec<NodePodSummary>,
-    pub events: Vec<EventInfo>,
+    pub pods: Result<Vec<NodePodSummary>, String>,
+    pub events: Result<Vec<EventInfo>, String>,
 }
 
 pub async fn get_node_diagnostics(context_name: &str, node_name: &str) -> Result<NodeDiagnostics, String> {
@@ -1649,9 +1655,11 @@ pub async fn get_node_diagnostics(context_name: &str, node_name: &str) -> Result
 
     let node = node.map_err(|e| format!("Failed to get node '{node_name}': {e}"))?;
 
-    let mut pods: Vec<NodePodSummary> = pods
+    let pods = pods
+        .map_err(|e| format!("Failed to list pods on '{node_name}': {e}"))
         .map(|list| {
-            list.items
+            let mut summaries: Vec<NodePodSummary> = list
+                .items
                 .into_iter()
                 .map(|p| {
                     let status = p.status.clone().unwrap_or_default();
@@ -1669,12 +1677,12 @@ pub async fn get_node_diagnostics(context_name: &str, node_name: &str) -> Result
                         phase,
                     }
                 })
-                .collect()
-        })
-        .unwrap_or_default();
-    pods.sort_by(|a, b| a.healthy.cmp(&b.healthy).then_with(|| b.restarts.cmp(&a.restarts)));
+                .collect();
+            summaries.sort_by(|a, b| a.healthy.cmp(&b.healthy).then_with(|| b.restarts.cmp(&a.restarts)));
+            summaries
+        });
 
-    Ok(NodeDiagnostics { node, pods, events: events.unwrap_or_default() })
+    Ok(NodeDiagnostics { node, pods, events })
 }
 
 /// Same reasoning as `get_node_events` (filter before the cap, not after).

@@ -347,6 +347,37 @@ fn split_node_conditions(
     (problems, clear)
 }
 
+/// Renders the pods a node is holding.
+///
+/// Pure, and separate, because of the distinction it has to keep: a node whose
+/// pods could not be listed is not a node with no pods. Collapsing the two —
+/// which is what `unwrap_or_default` did here — hands the model "no pods on
+/// this node" as a fact when the truth is that nobody looked, and a node
+/// holding a crashing workload would then read as idle.
+fn render_node_pods(pods: &Result<Vec<crate::k8s::NodePodSummary>, String>) -> String {
+    let pods = match pods {
+        Ok(pods) => pods,
+        Err(e) => return format!("(pods unavailable: {e})"),
+    };
+    if pods.is_empty() {
+        return "(no pods on this node)".to_string();
+    }
+    let unhealthy = pods.iter().filter(|p| !p.healthy).count();
+    let mut out = format!(
+        "{} pod(s), {unhealthy} not running cleanly. Worst first:\n{}",
+        pods.len(),
+        pods.iter()
+            .take(DIAGNOSE_NODE_PODS)
+            .map(|p| format!("{}/{}  {}  ready {}  restarts {}", p.namespace, p.name, p.phase, p.ready, p.restarts))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    if pods.len() > DIAGNOSE_NODE_PODS {
+        out.push_str(&format!("\n… and {} more", pods.len() - DIAGNOSE_NODE_PODS));
+    }
+    out
+}
+
 /// Assembles everything a node diagnosis needs, redacted.
 ///
 /// The conditions are the part no other subject has, and on a real fleet they
@@ -388,7 +419,10 @@ pub async fn build_node_diagnosis_payload(
         quantity(&node_status.allocatable, "cpu"),
         quantity(&node_status.capacity, "memory"),
         quantity(&node_status.allocatable, "memory"),
-        d.pods.len(),
+        match &d.pods {
+            Ok(pods) => pods.len().to_string(),
+            Err(_) => "(could not be listed)".to_string(),
+        },
     );
 
     let (problems, clear) = split_node_conditions(node_status.conditions.as_deref().unwrap_or_default());
@@ -412,35 +446,18 @@ pub async fn build_node_diagnosis_payload(
             .join("\n")
     };
 
-    let events_text = if d.events.is_empty() {
-        "(no events for this node)".to_string()
-    } else {
-        d.events
+    let events_text = match &d.events {
+        Ok(list) if list.is_empty() => "(no events for this node)".to_string(),
+        Ok(list) => list
             .iter()
             .take(25)
             .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        Err(e) => format!("(events unavailable: {e})"),
     };
 
-    let unhealthy = d.pods.iter().filter(|p| !p.healthy).count();
-    let mut pods_text = if d.pods.is_empty() {
-        "(no pods on this node)".to_string()
-    } else {
-        format!(
-            "{} pod(s), {unhealthy} not running cleanly. Worst first:\n{}",
-            d.pods.len(),
-            d.pods
-                .iter()
-                .take(DIAGNOSE_NODE_PODS)
-                .map(|p| format!("{}/{}  {}  ready {}  restarts {}", p.namespace, p.name, p.phase, p.ready, p.restarts))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    };
-    if d.pods.len() > DIAGNOSE_NODE_PODS {
-        pods_text.push_str(&format!("\n… and {} more", d.pods.len() - DIAGNOSE_NODE_PODS));
-    }
+    let pods_text = render_node_pods(&d.pods);
 
     let manifest_text = node_manifest_without_images(&d.node)?;
 
@@ -1606,5 +1623,41 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         // and keeps what a diagnosis needs
         assert!(yaml.contains("cpu: '8'") || yaml.contains("cpu: \"8\"") || yaml.contains("cpu: 8"), "{yaml}");
         assert!(yaml.contains("kind: Node"), "{yaml}");
+    }
+
+    fn pod_summary(name: &str, phase: &str, healthy: bool, restarts: i32) -> crate::k8s::NodePodSummary {
+        crate::k8s::NodePodSummary {
+            namespace: "ns".into(),
+            name: name.into(),
+            phase: phase.into(),
+            ready: "1/1".into(),
+            restarts,
+            healthy,
+        }
+    }
+
+    #[test]
+    fn pods_that_could_not_be_listed_are_not_reported_as_no_pods() {
+        // The distinction this function exists for. A 403 or a timeout used to
+        // collapse to an empty list, so the payload told the model "no pods on
+        // this node" — and a node holding a crashing workload read as idle.
+        let unavailable = render_node_pods(&Err("Failed to list pods on 'n1': forbidden".to_string()));
+        assert!(unavailable.starts_with("(pods unavailable:"), "{unavailable}");
+        assert!(unavailable.contains("forbidden"), "{unavailable}");
+
+        let genuinely_empty = render_node_pods(&Ok(vec![]));
+        assert_eq!(genuinely_empty, "(no pods on this node)");
+        assert_ne!(unavailable, genuinely_empty);
+    }
+
+    #[test]
+    fn the_pod_list_counts_the_unhealthy_ones_and_caps_the_rest() {
+        let mut pods = vec![pod_summary("crashing", "CrashLoopBackOff", false, 7)];
+        pods.extend((0..DIAGNOSE_NODE_PODS).map(|i| pod_summary(&format!("ok-{i}"), "Running", true, 0)));
+
+        let out = render_node_pods(&Ok(pods));
+        assert!(out.starts_with(&format!("{} pod(s), 1 not running cleanly", DIAGNOSE_NODE_PODS + 1)), "{out}");
+        assert!(out.contains("ns/crashing  CrashLoopBackOff"), "{out}");
+        assert!(out.contains("… and 1 more"), "{out}");
     }
 }
