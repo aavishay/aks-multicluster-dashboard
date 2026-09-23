@@ -143,6 +143,13 @@ const DIAGNOSE_DIFF_RESOURCES: usize = 5;
 /// an uncomparable or unchanged one consumes a slot without producing an
 /// example, so a ceiling equal to the cap would routinely send fewer than
 /// five diffs when five were available.
+///
+/// Measured against both fleets on 2026-09-23: example-dev-ns's 116 Applications had
+/// no not-Synced resources at all, and example-prod-ns's 68 had thirteen between
+/// them, the worst single app carrying nine. So twenty clears today's real
+/// worst case twice over and never engages — which is what a ceiling should
+/// look like. It is insurance against an app that drifts wholesale, not a
+/// routine trimmer, and the `enough` stop is what does the everyday work.
 const DIAGNOSE_DIFF_READS: usize = 20;
 
 /// Renders the drift section of a GitOps diagnosis.
@@ -832,5 +839,67 @@ mod tests {
         assert!(out.contains("scan stopped after 5 of 60"), "{out}");
         // ... and an unbounded one does not.
         assert!(!render_diff_section(&scan(vec![diff_entry("d", "a: 1", "a: 2", true, None)])).contains("scan stopped"));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set GITOPS_DIAG_TEST_* to run"]
+    async fn gitops_diagnosis_against_a_live_cluster() {
+        let (Ok(context), Ok(namespace), Ok(app)) = (
+            std::env::var("GITOPS_DIAG_TEST_CONTEXT"),
+            std::env::var("GITOPS_DIAG_TEST_NS"),
+            std::env::var("GITOPS_DIAG_TEST_APP"),
+        ) else {
+            eprintln!("GITOPS_DIAG_TEST_* not set — skipping");
+            return;
+        };
+
+        // The scan on its own first, so the payload's diff section can be read
+        // against what the cluster actually held.
+        let started = std::time::Instant::now();
+        let bounded = k8s::get_gitops_diff_scan(
+            &context,
+            &namespace,
+            &app,
+            Some(k8s::DiffScanLimit { max_reads: DIAGNOSE_DIFF_READS, enough: DIAGNOSE_DIFF_RESOURCES }),
+        )
+        .await
+        .expect("scan");
+        let bounded_ms = started.elapsed().as_millis();
+
+        let started = std::time::Instant::now();
+        let unbounded = k8s::get_gitops_diff_scan(&context, &namespace, &app, None).await.expect("scan");
+        let unbounded_ms = started.elapsed().as_millis();
+
+        eprintln!(
+            "scan: candidates={} bounded examined={} ({bounded_ms}ms) unbounded examined={} ({unbounded_ms}ms)",
+            bounded.candidates, bounded.examined, unbounded.examined
+        );
+        for d in &unbounded.diffs {
+            eprintln!(
+                "  {}/{} {} drift={} desired_available={} error={:?}",
+                if d.namespace.is_empty() { "cluster" } else { &d.namespace },
+                d.name,
+                d.kind,
+                d.has_drift(),
+                d.desired_available,
+                d.error
+            );
+        }
+
+        let started = std::time::Instant::now();
+        let payload = build_gitops_diagnosis_payload(&context, &namespace, &app)
+            .await
+            .expect("payload should build");
+        eprintln!(
+            "\npayload: {} chars, ~{} tokens, built in {}ms\nredaction: {}",
+            payload.prompt.len(),
+            payload.approx_tokens,
+            started.elapsed().as_millis(),
+            payload.redaction_summary
+        );
+
+        // Status, events and drift — the manifest would bury them.
+        let head = payload.prompt.split("## Manifest").next().unwrap_or(&payload.prompt);
+        eprintln!("\n--- payload (manifest omitted) ---\n{}", &head[..head.len().min(4000)]);
     }
 }
