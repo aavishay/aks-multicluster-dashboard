@@ -4666,6 +4666,7 @@ function setMetricsRange(minutes: number) {
   diagnosePod,
   diagnoseWorkload,
   diagnoseGitOpsApp,
+  diagnoseHelmRelease,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -5824,7 +5825,9 @@ function renderClaudeDiagnosePanel(): string {
               ? "Status, events, manifest and the recent logs of this container."
               : d.kind === "Application"
                 ? "Sync and health status, where it syncs from, its events and manifest, and the drift between what was last applied and what is live."
-                : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
+                : d.kind === "Release"
+                  ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
+                  : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
           }</div>
           <div class="${d.payload.redaction_summary.startsWith("Redacted") ? "text-status-warning" : ""}">${esc(d.payload.redaction_summary)}</div>
           ${d.payload.log_note ? `<div>Logs: ${esc(d.payload.log_note)}.</div>` : ""}
@@ -7127,6 +7130,16 @@ async function copyClaudeAnswer(opts: {
 function diagnoseGitOpsApp(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "Application", namespace, name, "", () =>
     api.aiBuildGitOpsDiagnosis(ctx, namespace, name),
+  );
+}
+
+/**
+ * A Helm release. `kind` is "Release", which also selects the Helm system
+ * prompt on the Rust side.
+ */
+function diagnoseHelmRelease(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "Release", namespace, name, "", () =>
+    api.aiBuildHelmDiagnosis(ctx, namespace, name),
   );
 }
 
@@ -9983,6 +9996,24 @@ function helmReleaseHealthy(r: HelmReleaseInfo): boolean {
   return r.status === "deployed";
 }
 
+/**
+ * Why this release is worth diagnosing, or null if it isn't.
+ *
+ * Deliberately wider than `helmReleaseHealthy`. Helm marks a release
+ * `deployed` the moment one upgrade succeeds, so a chart that failed fifteen
+ * times and was then rolled back reads as healthy — and on both live clusters
+ * that is *every* failure there is: 36 failed revisions between them, and not
+ * one release whose current revision is anything but `deployed`. Gating the
+ * button on the status alone would have shipped it invisible.
+ */
+function helmReleaseConcern(r: HelmReleaseInfo): string | null {
+  if (!helmReleaseHealthy(r)) return `Release is ${r.status}`;
+  if (r.failed_revisions > 0) {
+    return `${r.failed_revisions} of ${r.revision_count} stored revisions failed`;
+  }
+  return null;
+}
+
 function helmStatusClass(status: string): string {
   if (status === "deployed") return "";
   if (status === "failed") return "text-status-critical";
@@ -10046,7 +10077,7 @@ function renderHelm(): string {
     ${selectionToolbar("helm")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:helm">
       <table class="data-table">
-        ${renderColGroup("helm", columns, [32, 36])}
+        ${renderColGroup("helm", columns, [32, 116])}
         <thead>
           <tr>${selectAllCheckboxHeader("helm", sorted, keyOf)}<th></th>${sortableHeaderRow("helm", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("helm", columns, rows)}</tr>
@@ -10058,7 +10089,7 @@ function renderHelm(): string {
               return `
             <tr>
               ${rowCheckboxCell("helm", keyOf(row))}
-              <td>${statusDot(helmReleaseHealthy(r))}</td>
+              <td title="${esc(helmReleaseConcern(r) ?? "")}"><span class="inline-flex items-center gap-1.5">${statusDot(helmReleaseHealthy(r))}${helmReleaseConcern(r) ? claudeDiagnoseButton(`window.__app.diagnoseHelmRelease(${jsArg(ctx)},${jsArg(r.namespace)},${jsArg(r.name)})`, "release") : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter releases by this cluster" onclick="window.__app.setEnumFilter('helm','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`

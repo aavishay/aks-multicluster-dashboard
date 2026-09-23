@@ -124,6 +124,43 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_HELM_SYSTEM: &str = "\
+You diagnose Helm releases for an experienced SRE.
+
+You are given the release's current status and chart, its user-supplied \
+values, an inventory of the resources it renders, and its revision history \
+with the description Helm recorded for each one. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the failing revision's \
+description, the value that was set, or the resource named in the error.
+3. Concrete next steps: the exact command to run or value to change.
+
+Read the history, not just the status. A release shows `deployed` the moment \
+one upgrade succeeds, so a release that has failed repeatedly and then been \
+rolled back or fixed looks healthy in its current revision while the actual \
+problem is still there. Repeated identical failures are collapsed with a \
+count and a time range; a failure recurring on a fixed interval usually means \
+an operator or CI job is retrying, not that a person tried that many times.
+
+Helm's own failure and the workload's failure are different things. A failed \
+or pending revision means Helm could not apply the chart — the description \
+names the object and the reason. A `deployed` release whose pods are broken \
+is not a Helm problem, and this payload deliberately carries nothing about \
+pod health: say so and point at the workload rather than guessing.
+
+The rendered manifest is not included — for large charts it runs to megabytes \
+of CRD schemas. You get the resource inventory instead, which is enough to \
+place the object an error names. Ask for a specific resource if you need its \
+body.
+
+Be direct; assume fluency with kubectl and helm. Prefer one well-supported \
+cause over a list of possibilities. If the evidence is genuinely \
+insufficient, say so and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 /// How many drifted resources go into a diagnosis.
 ///
 /// An app with dozens of drifted resources is usually drifted the same way in
@@ -212,6 +249,190 @@ fn render_diff_section(scan: &k8s::GitOpsDiffScan) -> String {
         ));
     }
     out
+}
+
+/// Cuts a `&str` to at most `max` bytes without splitting a character.
+///
+/// `&s[..max]` panics mid-character. It was written for the live probe, whose
+/// own caveat lines are full of `—` and `…`; it is production code now because
+/// a release's values YAML is arbitrary user text, and truncating it is a
+/// thing the payload builder does on every large release rather than a thing a
+/// developer opts into.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// How many resources from a release's inventory go into a diagnosis.
+///
+/// The inventory is cheap — one short line each, 66 for the largest release
+/// measured — so this is a guard against a pathological chart rather than a
+/// routine trim.
+const DIAGNOSE_INVENTORY_RESOURCES: usize = 80;
+
+/// How many failed revisions to open for their descriptions.
+///
+/// Failures repeat: one release had fifteen, all carrying the same RBAC
+/// denial an hour apart. Identical descriptions collapse below, so a handful
+/// is enough to establish both the error and that it is recurring, and each
+/// one costs a decode of a payload that can run to megabytes.
+const DIAGNOSE_HELM_FAILURES: usize = 6;
+
+/// How much of a release's values YAML to send.
+const DIAGNOSE_VALUES_CHARS: usize = 8000;
+
+/// How much of one revision's description to send.
+///
+/// Helm concatenates every per-resource failure into a single description
+/// with ` && `. One real release's webhook outage produced a description
+/// naming forty resources, each with its own admission URL: 65 kB of one
+/// sentence repeated, which took the whole payload to 18k tokens while the
+/// first clause already said what went wrong. The cap is on the description
+/// rather than the payload because that is where the pathology is.
+const DIAGNOSE_DESCRIPTION_CHARS: usize = 1200;
+
+/// Renders a release's revision history, collapsing repeats.
+///
+/// Pure, and separate, because the collapsing is the part worth testing: a
+/// release that failed fifteen times with the same message should read as one
+/// recurring failure with a count and a span, not as fifteen entries that
+/// crowd out everything else in the payload.
+fn render_helm_history(revisions: &[crate::models::HelmRevisionInfo]) -> String {
+    if revisions.is_empty() {
+        return "(no revision history)".to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < revisions.len() {
+        let here = &revisions[i];
+        let mut j = i + 1;
+        // Only consecutive runs collapse. A failure that recurs either side of
+        // a success is a different story from one continuous outage, and
+        // merging them across the success would hide the success.
+        while j < revisions.len()
+            && revisions[j].status == here.status
+            && revisions[j].description == here.description
+        {
+            j += 1;
+        }
+        let last = &revisions[j - 1];
+        let when = match (&here.deployed_at, &last.deployed_at) {
+            (Some(newest), Some(oldest)) if j - i > 1 => format!(" between {oldest} and {newest}"),
+            (Some(newest), _) => format!(" at {newest}"),
+            _ => String::new(),
+        };
+        let span = if j - i > 1 {
+            format!("v{}–v{} ({}× {}){when}", last.revision, here.revision, j - i, here.status)
+        } else {
+            format!("v{} ({}){when}", here.revision, here.status)
+        };
+        // An unread run collapses on an empty description, which would let a
+        // reader take it for a repeat of the failure above. Say which it is:
+        // these were not opened, so nothing is known about whether they match.
+        let description = if here.description.is_empty() {
+            format!(
+                "(not opened — only the {DIAGNOSE_HELM_FAILURES} most recent failures are read, so whether these match the above is unknown)"
+            )
+        } else if here.description.len() > DIAGNOSE_DESCRIPTION_CHARS {
+            format!(
+                "{}\n  … (description truncated; {} chars in total, and Helm joins one clause per failing resource with ` && `)",
+                truncate_on_char_boundary(&here.description, DIAGNOSE_DESCRIPTION_CHARS),
+                here.description.len()
+            )
+        } else {
+            here.description.clone()
+        };
+        out.push(format!("{span}\n  {description}"));
+        i = j;
+    }
+    out.join("\n")
+}
+
+/// Assembles everything a Helm release diagnosis needs, redacted.
+///
+/// The revision history is the part no other subject has, and it is the part
+/// the release's own status hides: Helm marks a release `deployed` as soon as
+/// one upgrade succeeds, so a chart that has failed fifteen times and then
+/// been rolled back presents as healthy.
+pub async fn build_helm_diagnosis_payload(
+    context_name: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    let snapshot =
+        crate::helm::get_helm_release_diagnostics(context_name, namespace, name, DIAGNOSE_HELM_FAILURES).await?;
+    let r = &snapshot.release;
+    // No `description` here. It is the current revision's, so the history
+    // below already carries it as its first entry — and carries it *capped*,
+    // where this copy was raw: a current revision that failed the way example-metrics did
+    // would have put 65 kB of it in the status block alone.
+    let status = format!(
+        "status: {}\nchart: {} {}\napp version: {}\ncurrent revision: {}\nrevisions stored: {} ({} failed)\nlast deployed: {}\nfirst deployed: {}",
+        r.status,
+        r.chart_name,
+        r.chart_version,
+        if r.app_version.is_empty() { "(none)" } else { &r.app_version },
+        r.revision,
+        r.revision_count,
+        r.failed_revisions,
+        r.last_deployed.clone().unwrap_or_else(|| "(unknown)".to_string()),
+        r.first_deployed.clone().unwrap_or_else(|| "(unknown)".to_string()),
+    );
+
+    let history_text = render_helm_history(&snapshot.history);
+
+    let values_text = if snapshot.values_yaml.is_empty() {
+        "(installed with no value overrides)".to_string()
+    } else if snapshot.values_yaml.len() > DIAGNOSE_VALUES_CHARS {
+        let cut = truncate_on_char_boundary(&snapshot.values_yaml, DIAGNOSE_VALUES_CHARS);
+        format!("{cut}\n… (values truncated; {} chars in total)", snapshot.values_yaml.len())
+    } else {
+        snapshot.values_yaml.clone()
+    };
+
+    let shown = snapshot.inventory.len().min(DIAGNOSE_INVENTORY_RESOURCES);
+    let mut inventory_text = if snapshot.inventory.is_empty() {
+        "(the rendered manifest lists no resources)".to_string()
+    } else {
+        snapshot.inventory.iter().take(DIAGNOSE_INVENTORY_RESOURCES).cloned().collect::<Vec<_>>().join("\n")
+    };
+    if snapshot.inventory.len() > shown {
+        inventory_text.push_str(&format!("\n… and {} more", snapshot.inventory.len() - shown));
+    }
+    inventory_text.push_str(&format!(
+        "\n\n(the rendered manifest itself is {} chars and is not included)",
+        snapshot.manifest_chars
+    ));
+
+    let status = redact::redact(&status);
+    let history_r = redact::redact(&history_text);
+    let values_r = redact::redact(&values_text);
+    let inventory_r = redact::redact(&inventory_text);
+
+    let redaction_summary =
+        redact::Redacted::merge([&status, &history_r, &values_r, &inventory_r]).summary();
+
+    let prompt = format!(
+        "Helm release {namespace}/{name}.\n\n\
+         ## Status\n{}\n\n\
+         ## Revision history (newest first)\n{}\n\n\
+         ## Values (user-supplied)\n```yaml\n{}\n```\n\n\
+         ## Resources this release renders\n{}",
+        status.text, history_r.text, values_r.text, inventory_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
 }
 
 /// Assembles everything an ArgoCD Application diagnosis needs, redacted.
@@ -672,6 +893,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
     let system = match kind {
         "Pod" => DIAGNOSE_SYSTEM,
         "Application" => DIAGNOSE_GITOPS_SYSTEM,
+        "Release" => DIAGNOSE_HELM_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -841,24 +1063,6 @@ mod tests {
         assert!(!render_diff_section(&scan(vec![diff_entry("d", "a: 1", "a: 2", true, None)])).contains("scan stopped"));
     }
 
-    /// Cuts a `&str` to at most `max` bytes without splitting a character.
-    ///
-    /// `&s[..max]` panics mid-character, and this payload is full of the
-    /// multi-byte punctuation the caveat lines are written with (`—`, `…`,
-    /// `×`), so the naive slice would abort the probe instead of printing the
-    /// diagnostic it exists for — and only for some applications, which is the
-    /// worst way to find out.
-    fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
-        if s.len() <= max {
-            return s;
-        }
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        &s[..end]
-    }
-
     #[test]
     fn truncating_the_probe_output_never_splits_a_character() {
         // An em dash straddling the cut: `&s[..max]` panics on exactly this,
@@ -876,6 +1080,54 @@ mod tests {
         // lands on a boundary is taken as-is.
         assert_eq!(truncate_on_char_boundary("short", 4000), "short");
         assert_eq!(truncate_on_char_boundary(&s, 10), "a".repeat(10));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set HELM_DIAG_TEST_* to run"]
+    async fn helm_diagnosis_against_a_live_cluster() {
+        let (Ok(context), Ok(namespace), Ok(release)) = (
+            std::env::var("HELM_DIAG_TEST_CONTEXT"),
+            std::env::var("HELM_DIAG_TEST_NS"),
+            std::env::var("HELM_DIAG_TEST_RELEASE"),
+        ) else {
+            eprintln!("HELM_DIAG_TEST_* not set — skipping");
+            return;
+        };
+
+        let started = std::time::Instant::now();
+        let snapshot =
+            crate::helm::get_helm_release_diagnostics(&context, &namespace, &release, DIAGNOSE_HELM_FAILURES)
+                .await
+                .expect("diagnostics");
+        eprintln!(
+            "fetch in {}ms: {} {} rev {} ({}), {} revisions, {} failed | manifest {} chars -> {} inventory lines | values {} chars",
+            started.elapsed().as_millis(),
+            snapshot.release.chart_name,
+            snapshot.release.chart_version,
+            snapshot.release.revision,
+            snapshot.release.status,
+            snapshot.release.revision_count,
+            snapshot.release.failed_revisions,
+            snapshot.manifest_chars,
+            snapshot.inventory.len(),
+            snapshot.values_yaml.len(),
+        );
+
+        let started = std::time::Instant::now();
+        let payload = build_helm_diagnosis_payload(&context, &namespace, &release)
+            .await
+            .expect("payload should build");
+        eprintln!(
+            "\npayload: {} bytes / {} chars, ~{} tokens, built in {}ms\nredaction: {}",
+            payload.prompt.len(),
+            payload.prompt.chars().count(),
+            payload.approx_tokens,
+            started.elapsed().as_millis(),
+            payload.redaction_summary
+        );
+
+        let head = payload.prompt.split("## Values").next().unwrap_or(&payload.prompt);
+        eprintln!("\n--- status and history ---\n{}", truncate_on_char_boundary(head, 3500));
     }
 
     #[tokio::test]
@@ -946,5 +1198,92 @@ mod tests {
         // Status, events and drift — the manifest would bury them.
         let head = payload.prompt.split("## Manifest").next().unwrap_or(&payload.prompt);
         eprintln!("\n--- payload (manifest omitted) ---\n{}", truncate_on_char_boundary(head, 4000));
+    }
+
+    fn rev(revision: i64, status: &str, description: &str, at: &str) -> crate::models::HelmRevisionInfo {
+        crate::models::HelmRevisionInfo {
+            revision,
+            status: status.into(),
+            description: description.into(),
+            deployed_at: Some(at.into()),
+        }
+    }
+
+    #[test]
+    fn a_failure_that_repeats_collapses_into_one_entry_with_a_span() {
+        // The real shape this exists for: one release had fifteen identical
+        // RBAC denials an hour apart. Listed individually they would crowd the
+        // values and the inventory out of the payload while saying one thing.
+        let out = render_helm_history(&[
+            rev(75, "failed", "Upgrade failed: forbidden", "2026-08-24T15:19:28Z"),
+            rev(74, "failed", "Upgrade failed: forbidden", "2026-08-24T14:19:09Z"),
+            rev(73, "failed", "Upgrade failed: forbidden", "2026-08-24T13:18:50Z"),
+        ]);
+        assert!(out.contains("v73–v75 (3× failed)"), "{out}");
+        assert!(out.contains("between 2026-08-24T13:18:50Z and 2026-08-24T15:19:28Z"), "{out}");
+        assert_eq!(out.matches("Upgrade failed: forbidden").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn a_success_between_failures_is_not_collapsed_away() {
+        // Two outages either side of a working release is a different story
+        // from one continuous outage, and merging them would delete the
+        // evidence that it ever worked.
+        let out = render_helm_history(&[
+            rev(4, "failed", "Upgrade failed: forbidden", "d"),
+            rev(3, "deployed", "Upgrade complete", "c"),
+            rev(2, "failed", "Upgrade failed: forbidden", "b"),
+            rev(1, "deployed", "Install complete", "a"),
+        ]);
+        assert_eq!(out.matches("Upgrade failed: forbidden").count(), 2, "{out}");
+        assert!(out.contains("v4 (failed)") && out.contains("v2 (failed)"), "{out}");
+        assert!(!out.contains("×"), "nothing should collapse here: {out}");
+    }
+
+
+    #[test]
+    fn a_description_naming_every_failing_resource_is_capped() {
+        // Helm joins one clause per resource with ` && `. A webhook outage on
+        // a large chart produced 65 kB of the same sentence with forty
+        // different resource names, which alone took the payload to 18k
+        // tokens — the cap is on the description because that is where the
+        // pathology is, not in the payload as a whole.
+        // Clause length matters as much as the count: the real ones carry a
+        // full admission URL, which is most of the 65 kB.
+        let clause = "cannot patch \"example-metrics-victoria-metrics-k8s-stack-etcd\" with kind VMRule: Internal error \
+occurred: failed calling webhook \"vmrules.operator.victoriametrics.com\": failed to call webhook: Post \
+\"https://example-metrics-victoria-metrics-operator.example-metrics.svc:9443/validate-operator-victoriametrics-com-v1beta1-vmrule?timeout=10s\": \
+no endpoints available for service \"example-metrics-victoria-metrics-operator\"";
+        let huge = std::iter::repeat(clause).take(40).collect::<Vec<_>>().join(" && ");
+        assert!(huge.len() > DIAGNOSE_DESCRIPTION_CHARS * 4, "the fixture must actually be oversized");
+
+        let out = render_helm_history(&[rev(9, "failed", &huge, "t")]);
+        assert!(out.len() < huge.len() / 2, "should be much shorter: {} vs {}", out.len(), huge.len());
+        assert!(out.contains("description truncated"), "{out}");
+        assert!(out.contains(&format!("{} chars in total", huge.len())), "{out}");
+        // The cause survives the cut.
+        assert!(out.contains("failed calling webhook"), "{out}");
+    }
+
+    #[test]
+    fn revisions_whose_payload_was_not_opened_say_so() {
+        // Only the newest revision and the newest failures are decoded, so a
+        // superseded success has no description. Blank would read as "Helm
+        // recorded nothing", which is a different claim.
+        let out = render_helm_history(&[crate::models::HelmRevisionInfo {
+            revision: 9,
+            status: "superseded".into(),
+            description: String::new(),
+            deployed_at: None,
+        }]);
+        assert!(out.contains("not opened"), "{out}");
+        // Says why, rather than leaving a blank that reads as "Helm recorded
+        // nothing" or as a repeat of the failure printed above it.
+        assert!(out.contains("unknown"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_history_does_not_render_as_nothing() {
+        assert_eq!(render_helm_history(&[]), "(no revision history)");
     }
 }
