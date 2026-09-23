@@ -5535,8 +5535,30 @@ function renderClaudePanel(): string {
  */
 type MarkdownTarget = "panel" | "clipboard";
 
+/**
+ * Stated on every clipboard block, because leaving it unset does not mean
+ * "inherit the paste target's colour" — it means WebKit supplies whatever the
+ * app's theme computed.
+ *
+ * WKWebView re-serialises the `text/html` flavour with computed styles folded
+ * in. Copying from the app in dark mode put `color: rgb(255, 255, 255)` on 24
+ * elements of one real diagnosis: every block that carried a `style`
+ * attribute (`h2`, `h4`, `p`, `ol`, `ul`), with `li`, `code` and `strong`
+ * inheriting it. Nothing in this file asked for that.
+ *
+ * It collides with `background:#f4f4f4` below, which is hard-coded light on
+ * the sound assumption that paste targets are light: a pasted code span came
+ * out white on light grey. Teams discards `color`, which is why it looked
+ * right there and went unnoticed — Outlook and Word honour more of it, and
+ * the Copy tooltip promises them both.
+ *
+ * So the foreground now agrees with the background this file already chose,
+ * rather than being whatever the window happened to be showing.
+ */
+const CLIPBOARD_TEXT_COLOR = "color:#1a1a1a;";
+
 const CLIPBOARD_CODE_STYLE =
-  "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f4f4f4;";
+  `font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f4f4f4;${CLIPBOARD_TEXT_COLOR}`;
 
 /**
  * Every clipboard block carries its own layout inline, rather than leaning on
@@ -5549,8 +5571,8 @@ const CLIPBOARD_CODE_STYLE =
  * this, which is how it was caught: rendering the copied HTML inside the app
  * produced a diagnosis with no step numbers at all.
  */
-const CLIPBOARD_LIST_STYLE = "margin:0 0 8px;padding-left:24px;";
-const CLIPBOARD_HEADING_STYLE = "font-weight:600;margin:12px 0 4px;";
+const CLIPBOARD_LIST_STYLE = `margin:0 0 8px;padding-left:24px;${CLIPBOARD_TEXT_COLOR}`;
+const CLIPBOARD_HEADING_STYLE = `font-weight:600;margin:12px 0 4px;${CLIPBOARD_TEXT_COLOR}`;
 
 function renderInlineMarkdown(text: string, target: MarkdownTarget = "panel"): string {
   const codeOpen =
@@ -5641,7 +5663,7 @@ function renderMarkdown(source: string, target: MarkdownTarget = "panel"): strin
 
   const flushParagraph = () => {
     if (!paragraph.length) return;
-    const open = panel ? '<p class="mb-2 last:mb-0">' : '<p style="margin:0 0 8px;">';
+    const open = panel ? '<p class="mb-2 last:mb-0">' : `<p style="margin:0 0 8px;${CLIPBOARD_TEXT_COLOR}">`;
     out.push(`${open}${renderInlineMarkdown(paragraph.join(" "), target)}</p>`);
     paragraph = [];
   };
@@ -7083,7 +7105,7 @@ async function copyClaudeAnswer(opts: {
 
   const html =
     `<h2 style="${CLIPBOARD_HEADING_STYLE}font-size:1.3em;">${esc(opts.heading)}</h2>` +
-    (opts.subtitle ? `<p style="margin:0 0 12px;"><em>${esc(opts.subtitle)}</em></p>` : "") +
+    (opts.subtitle ? `<p style="margin:0 0 12px;${CLIPBOARD_TEXT_COLOR}"><em>${esc(opts.subtitle)}</em></p>` : "") +
     (incomplete ? `<p style="margin:0 0 12px;color:#b45309;"><strong>${esc(incomplete)}</strong></p>` : "") +
     (opts.context
       ? `<pre style="${CLIPBOARD_CODE_STYLE}padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-word;margin:0 0 12px;">${esc(opts.context)}</pre>`
