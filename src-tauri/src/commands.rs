@@ -598,6 +598,11 @@ pub async fn ai_build_helm_diagnosis(
 }
 
 #[tauri::command]
+pub async fn ai_build_node_diagnosis(context_name: String, node_name: String) -> Result<ClaudeDiagnosisPayload, String> {
+    with_retry(&context_name, || claude::build_node_diagnosis_payload(&context_name, &node_name)).await
+}
+
+#[tauri::command]
 pub async fn ai_diagnose(
     prompt: String,
     kind: String,

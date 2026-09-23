@@ -1606,6 +1606,77 @@ pub async fn get_node_events(context_name: &str, node_name: &str) -> Result<Vec<
         .collect())
 }
 
+/// One pod as a node diagnosis needs it.
+///
+/// Deliberately not `PodInfo`: that carries owner resolution and a metrics
+/// join, both of which cost extra requests to answer a question this does not
+/// ask. What matters here is how many pods the node is holding and which of
+/// them are not running.
+pub struct NodePodSummary {
+    pub namespace: String,
+    pub name: String,
+    pub phase: String,
+    pub ready: String,
+    pub restarts: i32,
+    pub healthy: bool,
+}
+
+/// Everything a node diagnosis needs, fetched in one round.
+pub struct NodeDiagnostics {
+    pub node: Node,
+    /// Unhealthy first, then by restart count — the same worst-first
+    /// convention the workload payload uses.
+    pub pods: Vec<NodePodSummary>,
+    pub events: Vec<EventInfo>,
+}
+
+pub async fn get_node_diagnostics(context_name: &str, node_name: &str) -> Result<NodeDiagnostics, String> {
+    let client = client_for_context(context_name).await?;
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let pods_api: Api<Pod> = Api::all(client.clone());
+
+    // Asked of the apiserver rather than filtered here: a fleet node holds a
+    // few dozen pods out of a thousand-odd on the cluster, and listing them
+    // all to discard 98% of them is the kind of thing that makes a detail
+    // panel slow on exactly the cluster where it matters.
+    let pod_params = ListParams::default().fields(&format!("spec.nodeName={node_name}"));
+
+    let (node, pods, events) = tokio::join!(
+        nodes_api.get(node_name),
+        pods_api.list(&pod_params),
+        get_node_events(context_name, node_name),
+    );
+
+    let node = node.map_err(|e| format!("Failed to get node '{node_name}': {e}"))?;
+
+    let mut pods: Vec<NodePodSummary> = pods
+        .map(|list| {
+            list.items
+                .into_iter()
+                .map(|p| {
+                    let status = p.status.clone().unwrap_or_default();
+                    let statuses = status.container_statuses.clone().unwrap_or_default();
+                    let ready_count = statuses.iter().filter(|c| c.ready).count();
+                    let phase = status.phase.clone().unwrap_or_default();
+                    NodePodSummary {
+                        namespace: p.namespace().unwrap_or_default(),
+                        name: p.name_any(),
+                        ready: format!("{ready_count}/{}", statuses.len()),
+                        restarts: statuses.iter().map(|c| c.restart_count).sum(),
+                        // Succeeded is a finished Job's pod, not a problem.
+                        healthy: (phase == "Running" && ready_count == statuses.len() && !statuses.is_empty())
+                            || phase == "Succeeded",
+                        phase,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    pods.sort_by(|a, b| a.healthy.cmp(&b.healthy).then_with(|| b.restarts.cmp(&a.restarts)));
+
+    Ok(NodeDiagnostics { node, pods, events: events.unwrap_or_default() })
+}
+
 /// Same reasoning as `get_node_events` (filter before the cap, not after).
 /// Namespace is included in the match since a Deployment/StatefulSet/DaemonSet
 /// name is only unique within its namespace, not cluster-wide.

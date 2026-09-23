@@ -4667,6 +4667,7 @@ function setMetricsRange(minutes: number) {
   diagnoseWorkload,
   diagnoseGitOpsApp,
   diagnoseHelmRelease,
+  diagnoseNode,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -5825,7 +5826,9 @@ function renderClaudeDiagnosePanel(): string {
               ? "Status, events, manifest and the recent logs of this container."
               : d.kind === "Application"
                 ? "Sync and health status, where it syncs from, its events and manifest, and the drift between what was last applied and what is live."
-                : d.kind === "Release"
+                : d.kind === "Node"
+                  ? "Capacity and kubelet details, every condition the cluster reports on it, its taints and events, the pods it is holding, and its manifest without the image cache."
+                  : d.kind === "Release"
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
                   : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
           }</div>
@@ -6226,7 +6229,7 @@ function renderNodes(): string {
     ${selectionToolbar("nodes")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:nodes">
       <table class="data-table">
-        ${renderColGroup("nodes", columns, [32, 36])}
+        ${renderColGroup("nodes", columns, [32, 116])}
         <thead>
           <tr>${selectAllCheckboxHeader("nodes", sorted, keyOf)}<th></th>${sortableHeaderRow("nodes", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("nodes", columns, rows)}</tr>
@@ -6239,7 +6242,7 @@ function renderNodes(): string {
                 return `
             <tr>
               ${rowCheckboxCell("nodes", keyOf(row))}
-              <td>${statusDot(n.ready)}</td>
+              <td title="${esc(nodeConcern(n) ?? "")}"><span class="inline-flex items-center gap-1.5">${statusDot(n.ready)}${nodeConcern(n) ? claudeDiagnoseButton(`window.__app.diagnoseNode(${jsArg(ctx)},${jsArg(n.name)})`, "node") : ""}</span></td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter nodes by this cluster" onclick="window.__app.setEnumFilter('nodes','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -7144,6 +7147,14 @@ function diagnoseHelmRelease(ctx: string, namespace: string, name: string) {
 }
 
 /**
+ * A node. `kind` is "Node", which also selects the node system prompt on the
+ * Rust side. Nodes are cluster-scoped, so the namespace travels empty.
+ */
+function diagnoseNode(ctx: string, name: string) {
+  startDiagnosis(ctx, "Node", "", name, "", () => api.aiBuildNodeDiagnosis(ctx, name));
+}
+
+/**
  * The subject and cluster travel with the diagnosis.
  *
  * Pasted into a channel without them it is a wall of findings about an
@@ -7154,7 +7165,9 @@ async function copyDiagnosis() {
   const d = state.claudeDiagnose;
   if (!d || !d.answer) return;
   await copyClaudeAnswer({
-    heading: `Diagnosis — ${d.kind} ${d.namespace}/${d.name}`,
+    // Nodes are cluster-scoped and travel with an empty namespace, which
+    // spelled unconditionally reads "Node /aks-paravision-5bs5m".
+    heading: `Diagnosis — ${d.kind} ${d.namespace ? `${d.namespace}/` : ""}${d.name}`,
     subtitle: d.kind === "Pod" && d.container ? `${d.ctx} · container ${d.container}` : d.ctx,
     answer: d.answer,
     error: d.error,
@@ -9992,6 +10005,27 @@ function renderGitOps(): string {
 }
 
 /** `deployed` is Helm's own success status; everything else (failed, pending-*, superseded, unknown) is worth flagging. */
+/**
+ * Why this node is worth diagnosing, or null if it isn't.
+ *
+ * `ready` alone is not the question. Across 185 nodes on the two live
+ * clusters every single one was Ready, and the one node actually worth
+ * looking at was carrying `VMEventScheduled` — Azure had scheduled a redeploy
+ * after the VM faulted. Readiness says nothing about that until the node goes
+ * away.
+ *
+ * `conditions` already holds only the conditions whose status is True, so
+ * anything in it besides `Ready` is a condition reporting a problem — the
+ * polarity convention Kubernetes uses, where `Ready` is the odd one out.
+ */
+function nodeConcern(n: NodeInfo): string | null {
+  if (!n.ready) return "Node is not Ready";
+  const flagged = n.conditions.filter((c) => c !== "Ready");
+  if (flagged.length > 0) return flagged.join(", ");
+  if (n.unschedulable) return "Node is cordoned";
+  return null;
+}
+
 function helmReleaseHealthy(r: HelmReleaseInfo): boolean {
   return r.status === "deployed";
 }
