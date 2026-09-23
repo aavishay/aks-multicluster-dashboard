@@ -365,15 +365,15 @@ pub async fn build_helm_diagnosis_payload(
     namespace: &str,
     name: &str,
 ) -> Result<ClaudeDiagnosisPayload, String> {
-    let (snapshot, history) = tokio::join!(
-        crate::helm::get_helm_release_snapshot(context_name, namespace, name),
-        crate::helm::get_helm_release_history(context_name, namespace, name, DIAGNOSE_HELM_FAILURES),
-    );
-
-    let snapshot = snapshot?;
+    let snapshot =
+        crate::helm::get_helm_release_diagnostics(context_name, namespace, name, DIAGNOSE_HELM_FAILURES).await?;
     let r = &snapshot.release;
+    // No `description` here. It is the current revision's, so the history
+    // below already carries it as its first entry — and carries it *capped*,
+    // where this copy was raw: a current revision that failed the way example-metrics did
+    // would have put 65 kB of it in the status block alone.
     let status = format!(
-        "status: {}\nchart: {} {}\napp version: {}\ncurrent revision: {}\nrevisions stored: {} ({} failed)\nlast deployed: {}\nfirst deployed: {}\nHelm's description of the current revision: {}",
+        "status: {}\nchart: {} {}\napp version: {}\ncurrent revision: {}\nrevisions stored: {} ({} failed)\nlast deployed: {}\nfirst deployed: {}",
         r.status,
         r.chart_name,
         r.chart_version,
@@ -383,13 +383,9 @@ pub async fn build_helm_diagnosis_payload(
         r.failed_revisions,
         r.last_deployed.clone().unwrap_or_else(|| "(unknown)".to_string()),
         r.first_deployed.clone().unwrap_or_else(|| "(unknown)".to_string()),
-        r.description,
     );
 
-    let history_text = match history {
-        Ok(revs) => render_helm_history(revs.as_slice()),
-        Err(e) => format!("(revision history unavailable: {e})"),
-    };
+    let history_text = render_helm_history(&snapshot.history);
 
     let values_text = if snapshot.values_yaml.is_empty() {
         "(installed with no value overrides)".to_string()
@@ -432,7 +428,7 @@ pub async fn build_helm_diagnosis_payload(
     );
 
     Ok(ClaudeDiagnosisPayload {
-        approx_tokens: (prompt.len() / 4) as u32,
+        approx_tokens: approx_tokens(&prompt),
         prompt,
         redaction_summary,
         log_note: None,
@@ -1099,11 +1095,12 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        let snapshot = crate::helm::get_helm_release_snapshot(&context, &namespace, &release)
-            .await
-            .expect("snapshot");
+        let snapshot =
+            crate::helm::get_helm_release_diagnostics(&context, &namespace, &release, DIAGNOSE_HELM_FAILURES)
+                .await
+                .expect("diagnostics");
         eprintln!(
-            "snapshot in {}ms: {} {} rev {} ({}), {} revisions, {} failed | manifest {} chars -> {} inventory lines | values {} chars",
+            "fetch in {}ms: {} {} rev {} ({}), {} revisions, {} failed | manifest {} chars -> {} inventory lines | values {} chars",
             started.elapsed().as_millis(),
             snapshot.release.chart_name,
             snapshot.release.chart_version,

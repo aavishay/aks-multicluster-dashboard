@@ -38,6 +38,7 @@ const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The label-derived facts about one revision Secret, available without
 /// fetching its payload.
+#[derive(Clone)]
 struct RevisionRef {
     namespace: String,
     secret_name: String,
@@ -327,15 +328,14 @@ pub fn manifest_inventory(manifest: &str) -> Vec<String> {
     out
 }
 
-/// Everything a diagnosis needs from a release's *current* revision, decoded
-/// once.
+/// Everything a diagnosis needs about a release, from one listing.
 ///
-/// One struct rather than composing `get_helm_release_detail` with a lookup
-/// in the cluster-wide listing, for two measured reasons: that listing decodes
-/// every release on the cluster to answer about one, and the current
-/// revision's payload — 1.9 MB for argocd — would otherwise be decoded twice,
-/// once for its status and once for its manifest.
-pub struct HelmReleaseSnapshot {
+/// A single function rather than a snapshot plus a history call, because the
+/// two overlap on the expensive part: both need the current revision, whose
+/// payload runs to 1.9 MB for argocd. Fetched separately — even concurrently —
+/// that payload is listed twice and decoded twice, and the decode costs more
+/// than the round trip it would overlap with.
+pub struct HelmReleaseDiagnostics {
     pub release: HelmReleaseInfo,
     /// User-supplied overrides only. Chart defaults are left out: they are
     /// large, they are public, and a diagnosis is about what *this* install
@@ -344,66 +344,24 @@ pub struct HelmReleaseSnapshot {
     pub inventory: Vec<String>,
     /// Size of the manifest that was *not* sent, so the payload can say so.
     pub manifest_chars: usize,
+    /// Every stored revision, newest first. `description` is filled only for
+    /// the ones actually opened.
+    pub history: Vec<HelmRevisionInfo>,
 }
 
-/// One release's current revision, without listing the whole cluster.
-pub async fn get_helm_release_snapshot(
-    context_name: &str,
-    namespace: &str,
-    name: &str,
-) -> Result<HelmReleaseSnapshot, String> {
-    let client = client_for_context(context_name).await?;
-    let secrets: Api<Secret> = Api::namespaced(client, namespace);
-    let lp = ListParams::default()
-        .labels(&format!("{HELM_OWNER_LABEL},name={name}"))
-        .fields(&format!("type={HELM_SECRET_TYPE}"));
-    let metas = secrets
-        .list_metadata(&lp)
-        .await
-        .map_err(|e| format!("Failed to list revisions of '{name}': {e}"))?
-        .items;
-
-    let revs: Vec<RevisionRef> = metas.iter().filter_map(parse_revision_metadata).collect();
-    let count = revs.len() as i64;
-    let failed = revs.iter().filter(|r| r.status == "failed").count() as i64;
-    let newest = revs
-        .into_iter()
-        .max_by_key(|r| r.revision)
-        .ok_or_else(|| format!("No stored revisions for release '{name}' in '{namespace}'"))?;
-
-    let secret = secrets
-        .get(&newest.secret_name)
-        .await
-        .map_err(|e| format!("Failed to get '{}': {e}", newest.secret_name))?;
-    let raw = secret
-        .data
-        .as_ref()
-        .and_then(|d| d.get("release"))
-        .ok_or_else(|| format!("Secret '{}' has no 'release' key", newest.secret_name))?;
-    let payload = decode_release_payload(&raw.0)?;
-
-    let manifest = payload.get("manifest").and_then(|m| m.as_str()).unwrap_or_default();
-    Ok(HelmReleaseSnapshot {
-        release: release_info_from_payload(&newest, count, failed, &payload),
-        values_yaml: json_to_yaml_or_empty(payload.get("config")),
-        inventory: manifest_inventory(manifest),
-        manifest_chars: manifest.len(),
-    })
-}
-
-/// A release's stored revisions, newest first.
+/// One release's current revision and history, without listing the cluster.
 ///
-/// `status` comes free from each secret's label. `description` — the only
-/// place Helm records *why* an upgrade failed — costs a decode, so it is
-/// fetched only for the revisions worth reading: the current one, and the
-/// most recent `failed_descriptions` failures. A release with a clean history
-/// therefore costs exactly one decode however long that history is.
-pub async fn get_helm_release_history(
+/// Revision *status* comes free from each secret's label. `description` — the
+/// only place Helm records why an upgrade failed — costs a decode, so only the
+/// current revision and the `failed_descriptions` most recent failures are
+/// opened. A release with a clean history therefore costs exactly one decode
+/// however long that history is.
+pub async fn get_helm_release_diagnostics(
     context_name: &str,
     namespace: &str,
     name: &str,
     failed_descriptions: usize,
-) -> Result<Vec<HelmRevisionInfo>, String> {
+) -> Result<HelmReleaseDiagnostics, String> {
     let client = client_for_context(context_name).await?;
     let secrets: Api<Secret> = Api::namespaced(client, namespace);
     let lp = ListParams::default()
@@ -417,22 +375,19 @@ pub async fn get_helm_release_history(
 
     let mut revs: Vec<RevisionRef> = metas.iter().filter_map(parse_revision_metadata).collect();
     revs.sort_by(|a, b| b.revision.cmp(&a.revision));
+    let count = revs.len() as i64;
+    let failed = revs.iter().filter(|r| r.status == "failed").count() as i64;
+    let newest = revs
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("No stored revisions for release '{name}' in '{namespace}'"))?;
 
-    // Which ones to open: the newest, plus the newest failures.
-    let newest = revs.first().map(|r| r.revision);
-    let mut wanted: Vec<&RevisionRef> = revs.iter().take(1).collect();
-    wanted.extend(
-        revs.iter()
-            .filter(|r| r.status == "failed" && Some(r.revision) != newest)
-            .take(failed_descriptions),
-    );
-
-    let fetches = wanted.iter().map(|rev| {
+    // The newest is opened once, here, and its payload serves both the release
+    // info and its own history entry.
+    let open = |secret_name: String| {
         let secrets = secrets.clone();
-        let secret_name = rev.secret_name.clone();
-        let revision = rev.revision;
         async move {
-            let decoded = match secrets.get(&secret_name).await {
+            match secrets.get(&secret_name).await {
                 Ok(secret) => secret
                     .data
                     .as_ref()
@@ -440,27 +395,72 @@ pub async fn get_helm_release_history(
                     .ok_or_else(|| "secret has no 'release' key".to_string())
                     .and_then(|bytes| decode_release_payload(&bytes.0)),
                 Err(e) => Err(e.to_string()),
-            };
-            (revision, decoded)
+            }
         }
-    });
-    let opened: HashMap<i64, Result<serde_json::Value, String>> =
-        futures::future::join_all(fetches).await.into_iter().collect();
+    };
 
-    Ok(revs
-        .into_iter()
+    let failures: Vec<&RevisionRef> = revs
+        .iter()
+        .filter(|r| r.status == "failed" && r.revision != newest.revision)
+        .take(failed_descriptions)
+        .collect();
+
+    let (current, opened_failures) = tokio::join!(
+        open(newest.secret_name.clone()),
+        futures::future::join_all(
+            failures.iter().map(|r| {
+                let revision = r.revision;
+                let fut = open(r.secret_name.clone());
+                async move { (revision, fut.await) }
+            })
+        )
+    );
+    let current = current?;
+
+    let opened: HashMap<i64, Result<serde_json::Value, String>> = opened_failures.into_iter().collect();
+    // The newest is read from `current` rather than inserted into the map:
+    // cloning a 1.9 MB JSON tree to look up one field is a copy this avoids.
+    let info_of = |p: &serde_json::Value| {
+        (
+            str_at(p, &["info", "description"]).to_string(),
+            Some(str_at(p, &["info", "last_deployed"]).to_string()).filter(|s| !s.is_empty()),
+        )
+    };
+
+    let history = revs
+        .iter()
         .map(|rev| {
+            if rev.revision == newest.revision {
+                let (description, deployed_at) = info_of(&current);
+                return HelmRevisionInfo {
+                    revision: rev.revision,
+                    status: rev.status.clone(),
+                    description,
+                    deployed_at,
+                };
+            }
             let (description, deployed_at) = match opened.get(&rev.revision) {
-                Some(Ok(p)) => (
-                    str_at(p, &["info", "description"]).to_string(),
-                    Some(str_at(p, &["info", "last_deployed"]).to_string()).filter(|s| !s.is_empty()),
-                ),
+                Some(Ok(p)) => info_of(p),
                 Some(Err(e)) => (format!("[could not read revision payload: {e}]"), None),
                 None => (String::new(), None),
             };
-            HelmRevisionInfo { revision: rev.revision, status: rev.status, description, deployed_at }
+            HelmRevisionInfo {
+                revision: rev.revision,
+                status: rev.status.clone(),
+                description,
+                deployed_at,
+            }
         })
-        .collect())
+        .collect();
+
+    let manifest = current.get("manifest").and_then(|m| m.as_str()).unwrap_or_default();
+    Ok(HelmReleaseDiagnostics {
+        release: release_info_from_payload(&newest, count, failed, &current),
+        values_yaml: json_to_yaml_or_empty(current.get("config")),
+        inventory: manifest_inventory(manifest),
+        manifest_chars: manifest.len(),
+        history,
+    })
 }
 
 #[cfg(test)]
