@@ -282,6 +282,7 @@ export interface HelmReleaseInfo {
   last_deployed: string | null;
   first_deployed: string | null;
   revision_count: number;
+  failed_revisions: number;
   age_days: number;
   age_seconds: number;
 }
