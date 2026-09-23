@@ -841,6 +841,43 @@ mod tests {
         assert!(!render_diff_section(&scan(vec![diff_entry("d", "a: 1", "a: 2", true, None)])).contains("scan stopped"));
     }
 
+    /// Cuts a `&str` to at most `max` bytes without splitting a character.
+    ///
+    /// `&s[..max]` panics mid-character, and this payload is full of the
+    /// multi-byte punctuation the caveat lines are written with (`—`, `…`,
+    /// `×`), so the naive slice would abort the probe instead of printing the
+    /// diagnostic it exists for — and only for some applications, which is the
+    /// worst way to find out.
+    fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+        if s.len() <= max {
+            return s;
+        }
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    #[test]
+    fn truncating_the_probe_output_never_splits_a_character() {
+        // An em dash straddling the cut: `&s[..max]` panics on exactly this,
+        // and the caveat lines this probe prints are written with em dashes,
+        // so whether it aborted came down to which application was passed in.
+        let s = format!("{}—tail", "a".repeat(10));
+        let max = 11; // one byte into the three-byte dash
+        assert!(!s.is_char_boundary(max), "the test string must actually straddle the cut");
+
+        let cut = truncate_on_char_boundary(&s, max);
+        assert_eq!(cut, "a".repeat(10));
+        assert!(cut.len() <= max);
+
+        // Shorter than the limit is returned whole, and a cut that already
+        // lands on a boundary is taken as-is.
+        assert_eq!(truncate_on_char_boundary("short", 4000), "short");
+        assert_eq!(truncate_on_char_boundary(&s, 10), "a".repeat(10));
+    }
+
     #[tokio::test]
     #[ignore = "needs a reachable cluster; set GITOPS_DIAG_TEST_* to run"]
     async fn gitops_diagnosis_against_a_live_cluster() {
@@ -871,19 +908,26 @@ mod tests {
         let unbounded_ms = started.elapsed().as_millis();
 
         eprintln!(
-            "scan: candidates={} bounded examined={} ({bounded_ms}ms) unbounded examined={} ({unbounded_ms}ms)",
+            "candidates={} | bounded examined={} ({bounded_ms}ms) | unbounded examined={} ({unbounded_ms}ms)",
             bounded.candidates, bounded.examined, unbounded.examined
         );
-        for d in &unbounded.diffs {
-            eprintln!(
-                "  {}/{} {} drift={} desired_available={} error={:?}",
-                if d.namespace.is_empty() { "cluster" } else { &d.namespace },
-                d.name,
-                d.kind,
-                d.has_drift(),
-                d.desired_available,
-                d.error
-            );
+        // Both lists, labelled. The counts alone cannot show *which* resources
+        // the diagnosis actually looked at, and the whole point of comparing
+        // the two scans is that the bounded one may have stopped somewhere
+        // specific — reading that off requires seeing its rows.
+        for (label, scan) in [("bounded", &bounded), ("unbounded", &unbounded)] {
+            eprintln!("  --- {label} ({} resource(s)) ---", scan.diffs.len());
+            for d in &scan.diffs {
+                eprintln!(
+                    "    {}/{} {} drift={} desired_available={} error={:?}",
+                    if d.namespace.is_empty() { "cluster" } else { &d.namespace },
+                    d.name,
+                    d.kind,
+                    d.has_drift(),
+                    d.desired_available,
+                    d.error
+                );
+            }
         }
 
         let started = std::time::Instant::now();
@@ -891,8 +935,9 @@ mod tests {
             .await
             .expect("payload should build");
         eprintln!(
-            "\npayload: {} chars, ~{} tokens, built in {}ms\nredaction: {}",
+            "\npayload: {} bytes / {} chars, ~{} tokens, built in {}ms\nredaction: {}",
             payload.prompt.len(),
+            payload.prompt.chars().count(),
             payload.approx_tokens,
             started.elapsed().as_millis(),
             payload.redaction_summary
@@ -900,6 +945,6 @@ mod tests {
 
         // Status, events and drift — the manifest would bury them.
         let head = payload.prompt.split("## Manifest").next().unwrap_or(&payload.prompt);
-        eprintln!("\n--- payload (manifest omitted) ---\n{}", &head[..head.len().min(4000)]);
+        eprintln!("\n--- payload (manifest omitted) ---\n{}", truncate_on_char_boundary(head, 4000));
     }
 }
