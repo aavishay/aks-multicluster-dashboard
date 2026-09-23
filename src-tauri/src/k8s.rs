@@ -4664,4 +4664,209 @@ mod tests {
         // case, which is exactly what `enough` alone fails to bound.
         assert!(diff_scan_done(limit, 20, 0));
     }
+
+    /// A throwaway apiserver serving exactly the surface one diff scan
+    /// touches, and counting the only thing under test: how many resource
+    /// GETs the scan actually issues.
+    ///
+    /// `diff_scan_done` is tested above as a pure rule, but nothing there
+    /// proves the loop *obeys* it — a `break` on the far side of the GET, or
+    /// `examined` incremented in the wrong branch, would leave every other
+    /// test in this file green while the bound saved no round trips at all.
+    /// That is the entire claim, so it is measured rather than read.
+    struct FakeApiServer {
+        port: u16,
+        resource_gets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn start_fake_apiserver(resources: usize, last_applied: bool) -> FakeApiServer {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let resource_gets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = resource_gets.clone();
+
+        let entries: Vec<serde_json::Value> = (0..resources)
+            .map(|i| {
+                serde_json::json!({
+                    "group": "", "version": "v1", "kind": "ConfigMap",
+                    "namespace": "default", "name": format!("cm-{i}"), "status": "OutOfSync"
+                })
+            })
+            .collect();
+        let app = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": { "name": "app", "namespace": "argocd" },
+            "status": { "resources": entries }
+        })
+        .to_string();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = counter.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    // Read until the headers end: one `read` usually suffices
+                    // for a bodyless GET, but "usually" is how a test starts
+                    // failing on a busy machine only.
+                    let mut req = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                req.extend_from_slice(&chunk[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).to_string();
+                    let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+
+                    let body = if path.contains("/applications/") {
+                        app
+                    } else if path.starts_with("/api/v1/namespaces/") && path.contains("/configmaps/") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let name = path.rsplit('/').next().unwrap_or("cm").to_string();
+                        let mut metadata = serde_json::json!({ "name": name, "namespace": "default" });
+                        if last_applied {
+                            // Differs from the live body, so this resource has drifted.
+                            let desired = serde_json::json!({
+                                "apiVersion": "v1", "kind": "ConfigMap",
+                                "metadata": { "name": name, "namespace": "default" },
+                                "data": { "k": "old" }
+                            })
+                            .to_string();
+                            metadata["annotations"] = serde_json::json!({ LAST_APPLIED_ANNOTATION: desired });
+                        }
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "ConfigMap",
+                            "metadata": metadata, "data": { "k": "new" }
+                        })
+                        .to_string()
+                    } else if path == "/api/v1" {
+                        serde_json::json!({
+                            "kind": "APIResourceList", "groupVersion": "v1",
+                            "resources": [{
+                                "name": "configmaps", "singularName": "", "namespaced": true,
+                                "kind": "ConfigMap", "verbs": ["get"]
+                            }]
+                        })
+                        .to_string()
+                    } else if path == "/api" {
+                        serde_json::json!({ "kind": "APIVersions", "versions": ["v1"] }).to_string()
+                    } else if path == "/apis" {
+                        serde_json::json!({ "kind": "APIGroupList", "groups": [] }).to_string()
+                    } else {
+                        serde_json::json!({ "kind": "Status", "status": "Failure", "code": 404 }).to_string()
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        FakeApiServer { port, resource_gets }
+    }
+
+    /// Writes a kubeconfig pointing at the fake, runs `f`, restores the env.
+    async fn against_fake<F, Fut, T>(context_name: &str, port: u16, f: F) -> T
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _guard = crate::kubeconfig::KUBECONFIG_ENV_LOCK.lock().unwrap();
+        let mut path = std::env::temp_dir();
+        path.push(format!("aks-dashboard-diffscan-{}-{context_name}", std::process::id()));
+        std::fs::write(
+            &path,
+            format!(
+                "apiVersion: v1\nkind: Config\ncurrent-context: {context_name}\n\
+                 clusters:\n- name: {context_name}\n  cluster:\n    server: http://127.0.0.1:{port}\n\
+                 contexts:\n- name: {context_name}\n  context:\n    cluster: {context_name}\n    user: {context_name}\n    namespace: default\n\
+                 users:\n- name: {context_name}\n  user:\n    token: faketoken\n"
+            ),
+        )
+        .expect("write kubeconfig");
+
+        let previous = std::env::var("KUBECONFIG").ok();
+        std::env::set_var("KUBECONFIG", &path);
+        let result = f(context_name.to_string()).await;
+        match previous {
+            Some(v) => std::env::set_var("KUBECONFIG", v),
+            None => std::env::remove_var("KUBECONFIG"),
+        }
+        std::fs::remove_file(&path).ok();
+        result
+    }
+
+    #[tokio::test]
+    async fn the_bound_saves_round_trips_on_a_heavily_drifted_app() {
+        let server = start_fake_apiserver(40, true).await;
+        let gets = server.resource_gets.clone();
+
+        let scan = against_fake("drifted", server.port, |ctx| async move {
+            get_gitops_diff_scan(&ctx, "argocd", "app", Some(DiffScanLimit { max_reads: 20, enough: 5 }))
+                .await
+                .expect("scan")
+        })
+        .await;
+
+        // Five examples were asked for, so five resources were read — not
+        // forty read and thirty-five thrown away, which is what capping only
+        // the serialisation did.
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(scan.examined, 5);
+        assert_eq!(scan.candidates, 40, "it still knows how much it skipped");
+        assert_eq!(scan.diffs.iter().filter(|d| d.has_drift()).count(), 5);
+    }
+
+    #[tokio::test]
+    async fn the_hard_ceiling_is_what_bounds_an_app_that_never_yields_drift() {
+        // Every resource OutOfSync but applied server-side: no amount of
+        // reading produces a drifted one, so the "enough drifted" stop never
+        // fires and only `max_reads` ends the scan.
+        let server = start_fake_apiserver(40, false).await;
+        let gets = server.resource_gets.clone();
+
+        let scan = against_fake("serverside", server.port, |ctx| async move {
+            get_gitops_diff_scan(&ctx, "argocd", "app", Some(DiffScanLimit { max_reads: 20, enough: 5 }))
+                .await
+                .expect("scan")
+        })
+        .await;
+
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 20);
+        assert_eq!(scan.examined, 20);
+        assert_eq!(scan.diffs.iter().filter(|d| d.has_drift()).count(), 0);
+        assert!(scan.diffs.iter().all(|d| !d.desired_available && d.error.is_none()));
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_scan_still_reads_everything() {
+        // The detail view renders every resource, so it must not inherit the
+        // diagnosis budget.
+        let server = start_fake_apiserver(40, true).await;
+        let gets = server.resource_gets.clone();
+
+        let scan = against_fake("unbounded", server.port, |ctx| async move {
+            get_gitops_diff_scan(&ctx, "argocd", "app", None).await.expect("scan")
+        })
+        .await;
+
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 40);
+        assert_eq!(scan.examined, scan.candidates);
+    }
 }

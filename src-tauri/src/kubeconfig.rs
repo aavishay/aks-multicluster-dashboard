@@ -143,6 +143,15 @@ fn kubeconfig_stamp(path: &Path) -> Option<SystemTime> {
 
 /// Return a `kube::Client` scoped to the named context, reusing a previously
 /// built one when possible. See [`ClientCache`] for why reuse matters.
+/// Serialises every test that swaps `KUBECONFIG`.
+///
+/// Crate-wide rather than per-module: `k8s`'s diff-scan test points the env
+/// var at a fake apiserver, and two independent mutexes in two modules would
+/// not exclude each other — the tests would race for one process-wide
+/// variable and fail in whichever order the scheduler picked.
+#[cfg(test)]
+pub(crate) static KUBECONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub async fn client_for_context(context_name: &str) -> Result<Client, String> {
     let path = kubeconfig_path().ok_or_else(|| "Could not determine home directory".to_string())?;
     let stamp = kubeconfig_stamp(&path);
@@ -258,13 +267,9 @@ users:
 
     /// Points `KUBECONFIG` at a freshly-written temp file for the duration of
     /// the closure, restoring (or clearing) the previous value afterwards.
-    /// Tests in this module run serially via `cargo test -- --test-threads=1`
-    /// implied by the shared env var, but we guard with a mutex to be safe if
-    /// that assumption ever changes.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_sample_kubeconfig<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = super::KUBECONFIG_ENV_LOCK.lock().unwrap();
         let mut path = std::env::temp_dir();
         path.push(format!("aks-dashboard-test-kubeconfig-{}", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("write temp kubeconfig");
@@ -318,7 +323,7 @@ users:
 
     #[test]
     fn list_contexts_errors_clearly_when_kubeconfig_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = super::KUBECONFIG_ENV_LOCK.lock().unwrap();
         let previous = std::env::var("KUBECONFIG").ok();
         std::env::set_var("KUBECONFIG", "/nonexistent/path/kubeconfig-does-not-exist");
         let result = list_contexts();
