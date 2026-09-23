@@ -2907,9 +2907,74 @@ fn build_resource_diff(entry: &serde_json::Value, live_object: &serde_json::Valu
     })
 }
 
+/// Whether a `status.resources[]` entry is worth reading for a drift diff.
+///
+/// Pure, and shared by the counting pass and the reading loop so a bounded
+/// scan's "examined N of M" can never describe a different population than
+/// the one it actually walked.
+fn is_diff_candidate(entry: &serde_json::Value) -> bool {
+    let (_, _, kind, _, child_name, sync_status) = resource_identity(entry);
+    // Anything ArgoCD is content with has no drift worth showing, and an
+    // entry with no status at all is one it has not compared yet.
+    !sync_status.is_empty() && sync_status != "Synced" && !kind.is_empty() && !child_name.is_empty()
+}
+
+/// How far a bounded diff scan may go.
+///
+/// Every candidate costs its own sequential GET, so a caller that wants a
+/// handful of examples should not pay for an Application that manages two
+/// hundred of them. `max_reads` is the hard ceiling — it is what bounds an
+/// app whose resources are all OutOfSync but none comparable, where no amount
+/// of reading yields drift. `enough` stops sooner in the case the ceiling
+/// exists for: a heavily drifted app, where the first few candidates are
+/// drifted the same way as the rest.
+#[derive(Clone, Copy, Debug)]
+pub struct DiffScanLimit {
+    pub max_reads: usize,
+    pub enough: usize,
+}
+
+/// A diff scan's results together with what it declined to look at.
+///
+/// `candidates` counts every not-Synced resource the Application lists;
+/// `examined` counts the ones actually walked. They differ only for a bounded
+/// scan, and that gap is precisely the part a caller must not present as the
+/// whole picture.
+pub struct GitOpsDiffScan {
+    pub diffs: Vec<GitOpsResourceDiff>,
+    pub candidates: usize,
+    pub examined: usize,
+}
+
+/// True once a bounded scan has done all it was asked to.
+///
+/// Split out and pure because the loop it governs needs a live cluster and
+/// this does not: the stopping rule is the part worth testing.
+fn diff_scan_done(limit: Option<DiffScanLimit>, examined: usize, drifted: usize) -> bool {
+    match limit {
+        None => false,
+        Some(limit) => examined >= limit.max_reads || drifted >= limit.enough,
+    }
+}
+
 /// Every not-Synced resource an Application manages, with both sides of its
 /// drift diff normalised and ready to line-diff.
 pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) -> Result<Vec<GitOpsResourceDiff>, String> {
+    Ok(get_gitops_diff_scan(context_name, namespace, name, None).await?.diffs)
+}
+
+/// The same scan, optionally bounded.
+///
+/// `limit` bounds cluster work, not just output: the loop stops reading, so a
+/// caller that only needs examples does not make the Application's resource
+/// count into its own latency. `None` reads everything, which is what the
+/// detail view wants — it renders all of them.
+pub async fn get_gitops_diff_scan(
+    context_name: &str,
+    namespace: &str,
+    name: &str,
+    limit: Option<DiffScanLimit>,
+) -> Result<GitOpsDiffScan, String> {
     let client = client_for_context(context_name).await?;
     let ar = argocd_application_resource();
     let app_api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
@@ -2932,17 +2997,22 @@ pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) ->
     let mut resolved: HashMap<GroupVersionKind, Option<(ApiResource, Scope)>> = HashMap::new();
     let mut diffs = Vec::new();
 
-    for entry in &entries {
-        let (group, version, kind, child_namespace, child_name, sync_status) = resource_identity(entry);
+    // Counted up front, over the same predicate the loop uses, so stopping
+    // early still knows how much it skipped.
+    let candidates = entries.iter().filter(|e| is_diff_candidate(e)).count();
+    let mut examined = 0usize;
+    let mut drifted = 0usize;
 
-        // Anything ArgoCD is content with has no drift worth showing, and an
-        // entry with no status at all is one it has not compared yet.
-        if sync_status.is_empty() || sync_status == "Synced" {
+    for entry in &entries {
+        if !is_diff_candidate(entry) {
             continue;
         }
-        if kind.is_empty() || child_name.is_empty() {
-            continue;
+        if diff_scan_done(limit, examined, drifted) {
+            break;
         }
+        examined += 1;
+
+        let (group, version, kind, child_namespace, child_name, _) = resource_identity(entry);
 
         let gvk = GroupVersionKind::gvk(&group, &version, &kind);
         if !resolved.contains_key(&gvk) {
@@ -2983,7 +3053,12 @@ pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) ->
                     }
                 };
                 match build_resource_diff(entry, &live_value) {
-                    Ok(diff) => diffs.push(diff),
+                    Ok(diff) => {
+                        if diff.has_drift() {
+                            drifted += 1;
+                        }
+                        diffs.push(diff);
+                    }
                     Err(e) => diffs.push(unavailable_resource_diff(entry, e)),
                 }
             }
@@ -2991,7 +3066,7 @@ pub async fn get_gitops_diff(context_name: &str, namespace: &str, name: &str) ->
         }
     }
 
-    Ok(diffs)
+    Ok(GitOpsDiffScan { diffs, candidates, examined })
 }
 
 #[cfg(test)]
@@ -4553,5 +4628,40 @@ mod tests {
             pick_failure_condition(conds.into_iter()).as_deref(),
             Some("FailedCreate: forbidden: exceeded quota")
         );
+    }
+
+    fn resource_entry(kind: &str, name: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({ "kind": kind, "name": name, "namespace": "ns", "version": "v1", "status": status })
+    }
+
+    #[test]
+    fn diff_candidates_are_the_resources_argocd_is_unhappy_with() {
+        assert!(is_diff_candidate(&resource_entry("Deployment", "api", "OutOfSync")));
+        // Synced needs no diff, and no status at all means ArgoCD has not
+        // compared it yet — neither is worth a round trip.
+        assert!(!is_diff_candidate(&resource_entry("Deployment", "api", "Synced")));
+        assert!(!is_diff_candidate(&resource_entry("Deployment", "api", "")));
+        // Unaddressable: nothing to GET.
+        assert!(!is_diff_candidate(&resource_entry("", "api", "OutOfSync")));
+        assert!(!is_diff_candidate(&resource_entry("Deployment", "", "OutOfSync")));
+    }
+
+    #[test]
+    fn unbounded_scan_never_stops_early() {
+        // The detail view renders every resource, so it must not inherit the
+        // diagnosis budget by accident.
+        assert!(!diff_scan_done(None, 10_000, 10_000));
+    }
+
+    #[test]
+    fn bounded_scan_stops_on_either_bound() {
+        let limit = Some(DiffScanLimit { max_reads: 20, enough: 5 });
+        assert!(!diff_scan_done(limit, 0, 0));
+        assert!(!diff_scan_done(limit, 19, 4));
+        // Enough examples in hand: the heavily-drifted case.
+        assert!(diff_scan_done(limit, 5, 5));
+        // Ceiling reached with nothing to show for it: the all-server-side
+        // case, which is exactly what `enough` alone fails to bound.
+        assert!(diff_scan_done(limit, 20, 0));
     }
 }
