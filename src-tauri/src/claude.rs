@@ -143,6 +143,13 @@ const DIAGNOSE_DIFF_RESOURCES: usize = 5;
 /// an uncomparable or unchanged one consumes a slot without producing an
 /// example, so a ceiling equal to the cap would routinely send fewer than
 /// five diffs when five were available.
+///
+/// Measured against both fleets on 2026-09-23: example-dev-ns's 116 Applications had
+/// no not-Synced resources at all, and example-prod-ns's 68 had thirteen between
+/// them, the worst single app carrying nine. So twenty clears today's real
+/// worst case twice over and never engages — which is what a ceiling should
+/// look like. It is insurance against an app that drifts wholesale, not a
+/// routine trimmer, and the `enough` stop is what does the everyday work.
 const DIAGNOSE_DIFF_READS: usize = 20;
 
 /// Renders the drift section of a GitOps diagnosis.
@@ -832,5 +839,112 @@ mod tests {
         assert!(out.contains("scan stopped after 5 of 60"), "{out}");
         // ... and an unbounded one does not.
         assert!(!render_diff_section(&scan(vec![diff_entry("d", "a: 1", "a: 2", true, None)])).contains("scan stopped"));
+    }
+
+    /// Cuts a `&str` to at most `max` bytes without splitting a character.
+    ///
+    /// `&s[..max]` panics mid-character, and this payload is full of the
+    /// multi-byte punctuation the caveat lines are written with (`—`, `…`,
+    /// `×`), so the naive slice would abort the probe instead of printing the
+    /// diagnostic it exists for — and only for some applications, which is the
+    /// worst way to find out.
+    fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+        if s.len() <= max {
+            return s;
+        }
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    #[test]
+    fn truncating_the_probe_output_never_splits_a_character() {
+        // An em dash straddling the cut: `&s[..max]` panics on exactly this,
+        // and the caveat lines this probe prints are written with em dashes,
+        // so whether it aborted came down to which application was passed in.
+        let s = format!("{}—tail", "a".repeat(10));
+        let max = 11; // one byte into the three-byte dash
+        assert!(!s.is_char_boundary(max), "the test string must actually straddle the cut");
+
+        let cut = truncate_on_char_boundary(&s, max);
+        assert_eq!(cut, "a".repeat(10));
+        assert!(cut.len() <= max);
+
+        // Shorter than the limit is returned whole, and a cut that already
+        // lands on a boundary is taken as-is.
+        assert_eq!(truncate_on_char_boundary("short", 4000), "short");
+        assert_eq!(truncate_on_char_boundary(&s, 10), "a".repeat(10));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set GITOPS_DIAG_TEST_* to run"]
+    async fn gitops_diagnosis_against_a_live_cluster() {
+        let (Ok(context), Ok(namespace), Ok(app)) = (
+            std::env::var("GITOPS_DIAG_TEST_CONTEXT"),
+            std::env::var("GITOPS_DIAG_TEST_NS"),
+            std::env::var("GITOPS_DIAG_TEST_APP"),
+        ) else {
+            eprintln!("GITOPS_DIAG_TEST_* not set — skipping");
+            return;
+        };
+
+        // The scan on its own first, so the payload's diff section can be read
+        // against what the cluster actually held.
+        let started = std::time::Instant::now();
+        let bounded = k8s::get_gitops_diff_scan(
+            &context,
+            &namespace,
+            &app,
+            Some(k8s::DiffScanLimit { max_reads: DIAGNOSE_DIFF_READS, enough: DIAGNOSE_DIFF_RESOURCES }),
+        )
+        .await
+        .expect("scan");
+        let bounded_ms = started.elapsed().as_millis();
+
+        let started = std::time::Instant::now();
+        let unbounded = k8s::get_gitops_diff_scan(&context, &namespace, &app, None).await.expect("scan");
+        let unbounded_ms = started.elapsed().as_millis();
+
+        eprintln!(
+            "candidates={} | bounded examined={} ({bounded_ms}ms) | unbounded examined={} ({unbounded_ms}ms)",
+            bounded.candidates, bounded.examined, unbounded.examined
+        );
+        // Both lists, labelled. The counts alone cannot show *which* resources
+        // the diagnosis actually looked at, and the whole point of comparing
+        // the two scans is that the bounded one may have stopped somewhere
+        // specific — reading that off requires seeing its rows.
+        for (label, scan) in [("bounded", &bounded), ("unbounded", &unbounded)] {
+            eprintln!("  --- {label} ({} resource(s)) ---", scan.diffs.len());
+            for d in &scan.diffs {
+                eprintln!(
+                    "    {}/{} {} drift={} desired_available={} error={:?}",
+                    if d.namespace.is_empty() { "cluster" } else { &d.namespace },
+                    d.name,
+                    d.kind,
+                    d.has_drift(),
+                    d.desired_available,
+                    d.error
+                );
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let payload = build_gitops_diagnosis_payload(&context, &namespace, &app)
+            .await
+            .expect("payload should build");
+        eprintln!(
+            "\npayload: {} bytes / {} chars, ~{} tokens, built in {}ms\nredaction: {}",
+            payload.prompt.len(),
+            payload.prompt.chars().count(),
+            payload.approx_tokens,
+            started.elapsed().as_millis(),
+            payload.redaction_summary
+        );
+
+        // Status, events and drift — the manifest would bury them.
+        let head = payload.prompt.split("## Manifest").next().unwrap_or(&payload.prompt);
+        eprintln!("\n--- payload (manifest omitted) ---\n{}", truncate_on_char_boundary(head, 4000));
     }
 }
