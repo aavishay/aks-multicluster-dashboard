@@ -124,6 +124,48 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_NODE_SYSTEM: &str = "\
+You diagnose Kubernetes nodes for an experienced SRE.
+
+You are given the node's identity and capacity, every condition the cluster \
+reports on it, its taints, its recent events, the pods it is holding, and its \
+manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition message, the \
+event, or the taint.
+3. Concrete next steps: the exact command to run or setting to change.
+
+`Ready` is the only condition where True is good. Every other one — \
+MemoryPressure, DiskPressure, KernelDeadlock, FrequentKubeletRestart, \
+VMEventScheduled and the rest — reports a problem when True. Conditions that \
+are False are listed by name only, because their messages are boilerplate; \
+that they were checked and are clear is the useful part.
+
+Separate a node fault from a workload fault. A node whose kubelet, disk, \
+kernel or underlying VM is unwell is a node problem, and the condition \
+message usually names it. A Ready node holding crashing pods is not: the pods \
+are listed here so you can see that is the case, and the answer is to \
+diagnose the workload rather than the node.
+
+A cordoned or draining node whose pods will not leave is usually held by a \
+PodDisruptionBudget or a do-not-disrupt annotation, and the events name the \
+pod responsible. Say which one, not just that draining is blocked.
+
+There are no live CPU or memory readings here. The pressure conditions are \
+the cluster's own answer to that question, so use them rather than \
+speculating about utilisation.
+
+`status.images` is omitted from the manifest — it is the node's image cache, \
+and on a real node it is nearly half the object.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_HELM_SYSTEM: &str = "\
 You diagnose Helm releases for an experienced SRE.
 
@@ -267,6 +309,206 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// How many of a node's pods go into a diagnosis, worst first.
+const DIAGNOSE_NODE_PODS: usize = 25;
+
+/// Splits a node's conditions into the ones reporting a problem and the names
+/// of the ones that are clear.
+///
+/// Pure, because the polarity is the part worth pinning down: `Ready` is the
+/// only condition where True is the good state, and getting that backwards
+/// would either drop the one condition that matters or report every healthy
+/// node as broken. Both mistakes look plausible in a diff.
+fn split_node_conditions(
+    conditions: &[k8s_openapi::api::core::v1::NodeCondition],
+) -> (Vec<String>, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut clear = Vec::new();
+    for c in conditions {
+        let reports_problem = if c.type_ == "Ready" { c.status != "True" } else { c.status == "True" };
+        if reports_problem {
+            let mut line = format!("{}={}", c.type_, c.status);
+            if let Some(reason) = c.reason.as_deref().filter(|r| !r.is_empty()) {
+                line.push_str(&format!(" ({reason})"));
+            }
+            if let Some(at) = c.last_transition_time.as_ref() {
+                line.push_str(&format!(" since {}", at.0.to_rfc3339()));
+            }
+            if let Some(message) = c.message.as_deref().filter(|m| !m.is_empty()) {
+                line.push_str(&format!("\n  {message}"));
+            }
+            problems.push(line);
+        } else {
+            clear.push(c.type_.clone());
+        }
+    }
+    (problems, clear)
+}
+
+/// Renders the pods a node is holding.
+///
+/// Pure, and separate, because of the distinction it has to keep: a node whose
+/// pods could not be listed is not a node with no pods. Collapsing the two —
+/// which is what `unwrap_or_default` did here — hands the model "no pods on
+/// this node" as a fact when the truth is that nobody looked, and a node
+/// holding a crashing workload would then read as idle.
+fn render_node_pods(pods: &Result<Vec<crate::k8s::NodePodSummary>, String>) -> String {
+    let pods = match pods {
+        Ok(pods) => pods,
+        Err(e) => return format!("(pods unavailable: {e})"),
+    };
+    if pods.is_empty() {
+        return "(no pods on this node)".to_string();
+    }
+    let unhealthy = pods.iter().filter(|p| !p.healthy).count();
+    let mut out = format!(
+        "{} pod(s), {unhealthy} not running cleanly. Worst first:\n{}",
+        pods.len(),
+        pods.iter()
+            .take(DIAGNOSE_NODE_PODS)
+            .map(|p| format!("{}/{}  {}  ready {}  restarts {}", p.namespace, p.name, p.phase, p.ready, p.restarts))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    if pods.len() > DIAGNOSE_NODE_PODS {
+        out.push_str(&format!("\n… and {} more", pods.len() - DIAGNOSE_NODE_PODS));
+    }
+    out
+}
+
+/// Assembles everything a node diagnosis needs, redacted.
+///
+/// The conditions are the part no other subject has, and on a real fleet they
+/// are the *only* part that moves: across 185 nodes every one was `Ready`, and
+/// the single node worth looking at was flagged by `VMEventScheduled` — a
+/// scheduled Azure redeploy after a VM fault, invisible in readiness.
+pub async fn build_node_diagnosis_payload(
+    context_name: &str,
+    node_name: &str,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = crate::k8s::get_node_diagnostics(context_name, node_name).await?;
+
+    let spec = d.node.spec.clone().unwrap_or_default();
+    let node_status = d.node.status.clone().unwrap_or_default();
+    let info = node_status.node_info.clone();
+    let label = |key: &str| {
+        d.node
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(key))
+            .cloned()
+            .unwrap_or_else(|| "(none)".to_string())
+    };
+    let quantity = |map: &Option<std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>, key: &str| {
+        map.as_ref().and_then(|m| m.get(key)).map(|q| q.0.clone()).unwrap_or_else(|| "(unknown)".to_string())
+    };
+
+    let status = format!(
+        "schedulable: {}\nkubelet: {}\nOS image: {}\ncontainer runtime: {}\ninstance type: {}\nnode pool: {}\nzone: {}\ncpu capacity/allocatable: {} / {}\nmemory capacity/allocatable: {} / {}\npods on this node: {}",
+        if spec.unschedulable.unwrap_or(false) { "no (cordoned)" } else { "yes" },
+        info.as_ref().map(|i| i.kubelet_version.clone()).unwrap_or_default(),
+        info.as_ref().map(|i| i.os_image.clone()).unwrap_or_default(),
+        info.as_ref().map(|i| i.container_runtime_version.clone()).unwrap_or_default(),
+        label("node.kubernetes.io/instance-type"),
+        label("karpenter.sh/nodepool"),
+        label("topology.kubernetes.io/zone"),
+        quantity(&node_status.capacity, "cpu"),
+        quantity(&node_status.allocatable, "cpu"),
+        quantity(&node_status.capacity, "memory"),
+        quantity(&node_status.allocatable, "memory"),
+        match &d.pods {
+            Ok(pods) => pods.len().to_string(),
+            Err(_) => "(could not be listed)".to_string(),
+        },
+    );
+
+    let (problems, clear) = split_node_conditions(node_status.conditions.as_deref().unwrap_or_default());
+    let mut conditions_text = if problems.is_empty() {
+        "(no condition reports a problem)".to_string()
+    } else {
+        problems.join("\n")
+    };
+    if !clear.is_empty() {
+        conditions_text.push_str(&format!("\n\nchecked and clear: {}", clear.join(", ")));
+    }
+
+    let taints = spec.taints.unwrap_or_default();
+    let taints_text = if taints.is_empty() {
+        "(none)".to_string()
+    } else {
+        taints
+            .iter()
+            .map(|t| format!("{}={} :{}", t.key, t.value.clone().unwrap_or_default(), t.effect))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let events_text = match &d.events {
+        Ok(list) if list.is_empty() => "(no events for this node)".to_string(),
+        Ok(list) => list
+            .iter()
+            .take(25)
+            .map(|e| format!("[{}] {} — {} (×{})", e.event_type, e.reason, e.message, e.count))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("(events unavailable: {e})"),
+    };
+
+    let pods_text = render_node_pods(&d.pods);
+
+    let manifest_text = node_manifest_without_images(&d.node)?;
+
+    let status = redact::redact(&status);
+    let conditions_r = redact::redact(&conditions_text);
+    let taints_r = redact::redact(&taints_text);
+    let events_r = redact::redact(&events_text);
+    let pods_r = redact::redact(&pods_text);
+    let manifest_r = redact::redact(&manifest_text);
+
+    let redaction_summary =
+        redact::Redacted::merge([&status, &conditions_r, &taints_r, &events_r, &pods_r, &manifest_r]).summary();
+
+    let prompt = format!(
+        "Node {node_name}.\n\n\
+         ## Status\n{}\n\n\
+         ## Conditions\n{}\n\n\
+         ## Taints\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Pods on this node\n{}\n\n\
+         ## Manifest (managed fields and status.images omitted)\n```yaml\n{}\n```",
+        status.text, conditions_r.text, taints_r.text, events_r.text, pods_r.text, manifest_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
+}
+
+/// The node as YAML, without managed fields or the image cache.
+///
+/// `status.images` is every container image the kubelet has pulled, with all
+/// of its digests: 6,528 of one real node's 15,089 characters. It says
+/// nothing about why a node is unwell, and dropping it is most of the reason
+/// this payload stays small enough to include the manifest at all.
+fn node_manifest_without_images(node: &k8s_openapi::api::core::v1::Node) -> Result<String, String> {
+    let mut value = serde_json::to_value(node).map_err(|e| format!("Failed to serialise node: {e}"))?;
+    if let Some(metadata) = value.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        metadata.remove("managedFields");
+    }
+    if let Some(status) = value.get_mut("status").and_then(|m| m.as_object_mut()) {
+        status.remove("images");
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert("apiVersion".to_string(), serde_json::json!("v1"));
+        object.insert("kind".to_string(), serde_json::json!("Node"));
+    }
+    serde_yaml::to_string(&value).map_err(|e| format!("Failed to render node YAML: {e}"))
 }
 
 /// How many resources from a release's inventory go into a diagnosis.
@@ -894,6 +1136,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Pod" => DIAGNOSE_SYSTEM,
         "Application" => DIAGNOSE_GITOPS_SYSTEM,
         "Release" => DIAGNOSE_HELM_SYSTEM,
+        "Node" => DIAGNOSE_NODE_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -1080,6 +1323,32 @@ mod tests {
         // lands on a boundary is taken as-is.
         assert_eq!(truncate_on_char_boundary("short", 4000), "short");
         assert_eq!(truncate_on_char_boundary(&s, 10), "a".repeat(10));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set NODE_DIAG_TEST_* to run"]
+    async fn node_diagnosis_against_a_live_cluster() {
+        let (Ok(context), Ok(node)) = (
+            std::env::var("NODE_DIAG_TEST_CONTEXT"),
+            std::env::var("NODE_DIAG_TEST_NODE"),
+        ) else {
+            eprintln!("NODE_DIAG_TEST_* not set — skipping");
+            return;
+        };
+
+        let started = std::time::Instant::now();
+        let payload = build_node_diagnosis_payload(&context, &node).await.expect("payload should build");
+        eprintln!(
+            "payload: {} bytes / {} chars, ~{} tokens, built in {}ms\nredaction: {}",
+            payload.prompt.len(),
+            payload.prompt.chars().count(),
+            payload.approx_tokens,
+            started.elapsed().as_millis(),
+            payload.redaction_summary
+        );
+
+        let head = payload.prompt.split("## Manifest").next().unwrap_or(&payload.prompt);
+        eprintln!("\n--- payload (manifest omitted) ---\n{}", truncate_on_char_boundary(head, 3500));
     }
 
     #[tokio::test]
@@ -1285,5 +1554,110 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
     #[test]
     fn an_empty_history_does_not_render_as_nothing() {
         assert_eq!(render_helm_history(&[]), "(no revision history)");
+    }
+
+    fn cond(type_: &str, status: &str, reason: &str, message: &str) -> k8s_openapi::api::core::v1::NodeCondition {
+        k8s_openapi::api::core::v1::NodeCondition {
+            type_: type_.into(),
+            status: status.into(),
+            reason: if reason.is_empty() { None } else { Some(reason.into()) },
+            message: if message.is_empty() { None } else { Some(message.into()) },
+            last_heartbeat_time: None,
+            last_transition_time: None,
+        }
+    }
+
+    #[test]
+    fn ready_is_the_one_condition_where_true_is_good() {
+        // Getting this backwards fails in both directions and looks plausible
+        // either way: treat Ready like the rest and every healthy node reports
+        // a problem; treat the rest like Ready and the only node worth looking
+        // at reports none.
+        let (problems, clear) = split_node_conditions(&[
+            cond("Ready", "True", "KubeletReady", "kubelet is posting ready status"),
+            cond("MemoryPressure", "False", "KubeletHasSufficientMemory", "kubelet has sufficient memory"),
+        ]);
+        assert!(problems.is_empty(), "a healthy node has no problems: {problems:?}");
+        assert_eq!(clear, vec!["Ready".to_string(), "MemoryPressure".to_string()]);
+
+        let (problems, _) = split_node_conditions(&[cond("Ready", "Unknown", "NodeStatusUnknown", "kubelet stopped posting")]);
+        assert_eq!(problems.len(), 1, "Ready=Unknown is a problem: {problems:?}");
+        assert!(problems[0].contains("Ready=Unknown"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_flagged_condition_carries_its_message_and_a_clear_one_does_not() {
+        // The real case this exists for: a node Azure had scheduled for
+        // redeploy after a VM fault, which `Ready=True` hides entirely. The
+        // message is the whole diagnosis, and the seventeen boilerplate
+        // "kubelet has sufficient X" messages are what would bury it.
+        let (problems, clear) = split_node_conditions(&[
+            cond("Ready", "True", "KubeletReady", "kubelet is posting ready status"),
+            cond("DiskPressure", "False", "KubeletHasNoDiskPressure", "kubelet has no disk pressure"),
+            cond("VMEventScheduled", "True", "VMEventScheduled", "Redeploy Scheduled: Sun, 27 Sep 2026. Virtual machine has encountered a failure."),
+        ]);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("VMEventScheduled=True (VMEventScheduled)"), "{problems:?}");
+        assert!(problems[0].contains("Virtual machine has encountered a failure"), "{problems:?}");
+        assert_eq!(clear, vec!["Ready".to_string(), "DiskPressure".to_string()]);
+        // The boilerplate messages do not travel.
+        assert!(!problems.concat().contains("no disk pressure"));
+    }
+
+    #[test]
+    fn the_node_manifest_drops_the_image_cache() {
+        // 6,528 of one real node's 15,089 characters. It is a list of pulled
+        // images with digests and says nothing about why a node is unwell.
+        let node: k8s_openapi::api::core::v1::Node = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "n1", "managedFields": [{ "manager": "kubelet" }] },
+            "status": {
+                "images": [{ "names": ["registry.io/a@sha256:deadbeef"], "sizeBytes": 1 }],
+                "capacity": { "cpu": "8" }
+            }
+        }))
+        .expect("node fixture");
+
+        let yaml = node_manifest_without_images(&node).expect("yaml");
+        assert!(!yaml.contains("sha256:deadbeef"), "{yaml}");
+        assert!(!yaml.contains("managedFields"), "{yaml}");
+        // and keeps what a diagnosis needs
+        assert!(yaml.contains("cpu: '8'") || yaml.contains("cpu: \"8\"") || yaml.contains("cpu: 8"), "{yaml}");
+        assert!(yaml.contains("kind: Node"), "{yaml}");
+    }
+
+    fn pod_summary(name: &str, phase: &str, healthy: bool, restarts: i32) -> crate::k8s::NodePodSummary {
+        crate::k8s::NodePodSummary {
+            namespace: "ns".into(),
+            name: name.into(),
+            phase: phase.into(),
+            ready: "1/1".into(),
+            restarts,
+            healthy,
+        }
+    }
+
+    #[test]
+    fn pods_that_could_not_be_listed_are_not_reported_as_no_pods() {
+        // The distinction this function exists for. A 403 or a timeout used to
+        // collapse to an empty list, so the payload told the model "no pods on
+        // this node" — and a node holding a crashing workload read as idle.
+        let unavailable = render_node_pods(&Err("Failed to list pods on 'n1': forbidden".to_string()));
+        assert!(unavailable.starts_with("(pods unavailable:"), "{unavailable}");
+        assert!(unavailable.contains("forbidden"), "{unavailable}");
+
+        let genuinely_empty = render_node_pods(&Ok(vec![]));
+        assert_eq!(genuinely_empty, "(no pods on this node)");
+        assert_ne!(unavailable, genuinely_empty);
+    }
+
+    #[test]
+    fn the_pod_list_counts_the_unhealthy_ones_and_caps_the_rest() {
+        let mut pods = vec![pod_summary("crashing", "CrashLoopBackOff", false, 7)];
+        pods.extend((0..DIAGNOSE_NODE_PODS).map(|i| pod_summary(&format!("ok-{i}"), "Running", true, 0)));
+
+        let out = render_node_pods(&Ok(pods));
+        assert!(out.starts_with(&format!("{} pod(s), 1 not running cleanly", DIAGNOSE_NODE_PODS + 1)), "{out}");
+        assert!(out.contains("ns/crashing  CrashLoopBackOff"), "{out}");
+        assert!(out.contains("… and 1 more"), "{out}");
     }
 }
