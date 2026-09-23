@@ -2216,7 +2216,7 @@ dependencies = [
 
 [[package]]
 name = "k8s-view"
-version = "0.7.24"
+version = "0.7.25"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
