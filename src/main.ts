@@ -5776,7 +5776,7 @@ function renderClaudeExplainPanel(): string {
           <button type="button" onclick="window.__app.closeClaudeExplain()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
         </div>
 
-        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4" data-scroll-id="${scrollId}">
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4" data-detail-body data-scroll-id="${scrollId}">
           <div>
             <div class="mb-1 text-xs font-medium text-ink-secondary">Sent to Claude</div>
             <pre class="max-h-32 overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-secondary">${esc(ex.errorText)}</pre>
@@ -5838,7 +5838,7 @@ function renderClaudeDiagnosePanel(): string {
         </div>
         ${
           d.showPayload
-            ? `<pre class="max-h-64 select-text overflow-auto whitespace-pre-wrap rounded border border-gridline bg-surface-1 p-2 text-xs text-ink-secondary">${esc(d.payload.prompt)}</pre>`
+            ? `<pre data-scroll-id="claude-diagnose-payload" class="max-h-64 select-text overflow-auto whitespace-pre-wrap rounded border border-gridline bg-surface-1 p-2 text-xs text-ink-secondary">${esc(d.payload.prompt)}</pre>`
             : ""
         }
       </div>`
@@ -5902,7 +5902,7 @@ function renderClaudeDiagnosePanel(): string {
           </div>
           <button type="button" onclick="window.__app.closeClaudeDiagnose()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
         </div>
-        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4" data-scroll-id="claude-diagnose">
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4" data-detail-body data-scroll-id="claude-diagnose">
           ${review}
           ${action}
           ${answer}
@@ -10360,16 +10360,40 @@ function consumesPlainNavKeys(target: EventTarget | null): boolean {
  * detail panel should still get a say.
  */
 function isNonPanelOverlayOpen(): boolean {
+  return isBlockingOverlayOpen() || isClaudeOverlayOpen();
+}
+
+/**
+ * The overlays that take a navigation key outright, with nothing of their own
+ * to scroll: a dialog, a palette, a dropdown, the shortcuts list.
+ */
+function isBlockingOverlayOpen(): boolean {
   return (
     state.shortcutsOpen ||
     !!state.confirm ||
     !!state.clusterPalette ||
-    !!state.claudeExplain ||
-    !!state.claudeDiagnose ||
-    state.claudePanelOpen ||
     !!state.metricsBackendEditor ||
     state.openEnumFilter !== null
   );
+}
+
+/**
+ * Claude's panel, explain and diagnose views.
+ *
+ * Split out of `isNonPanelOverlayOpen` because they are the one overlay family
+ * that *has* somewhere to put a navigation key: each renders a slide-over
+ * whose body is an `overflow-auto` scroll container. Lumping them in with the
+ * dialogs meant PageUp/PageDown, Home/End and the arrows were all dropped by
+ * the first guard, so a diagnosis five thousand pixels tall could not be
+ * scrolled by keyboard at all — and because Diagnose is only reachable from an
+ * unhealthy row, it looked like the keys broke whenever the table had red
+ * rows in it.
+ *
+ * Still modal, so they consume the key either way: nothing should page the
+ * table behind an open panel.
+ */
+function isClaudeOverlayOpen(): boolean {
+  return !!state.claudeExplain || !!state.claudeDiagnose || state.claudePanelOpen;
 }
 
 /** True while anything at all covers the tab content, detail panels included — the broad guard for keys that no overlay should let through. */
@@ -10563,7 +10587,11 @@ function isScrollable(el: HTMLElement): boolean {
  * or a short manifest — so the caller can leave the key alone.
  */
 function detailPanelScroller(): HTMLElement | null {
-  const body = document.querySelector<HTMLElement>("[data-detail-body]");
+  // Last, not first: `render` emits the detail panels before Claude's, so with
+  // a diagnosis open over a detail panel the topmost one is the last in the
+  // document — and it is the one the reader is looking at.
+  const bodies = document.querySelectorAll<HTMLElement>("[data-detail-body]");
+  const body = bodies[bodies.length - 1];
   if (!body) return null;
   const pane = [...body.querySelectorAll<HTMLElement>("[data-scroll-id]")].find(isScrollable);
   return pane ?? (isScrollable(body) ? body : null);
@@ -11131,8 +11159,12 @@ document.addEventListener("keydown", (e) => {
   // counterpart to Left/Right above and gated on exactly the same two
   // guards.
   if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainNavKeys(e.target) || isNonPanelOverlayOpen()) return;
+    if (consumesPlainNavKeys(e.target) || isBlockingOverlayOpen()) return;
     const delta = e.key === "ArrowDown" ? 1 : -1;
+    if (isClaudeOverlayOpen()) {
+      if (scrollDetailPanel("line", delta)) e.preventDefault();
+      return;
+    }
     // With a panel open these scroll its content instead of moving the row
     // cursor hidden behind it — see `detailPanelScroller` for why the browser
     // won't do this on its own.
@@ -11156,8 +11188,12 @@ document.addEventListener("keydown", (e) => {
   }
   // Home/End jump the cursor to the ends of what's on screen.
   if ((e.key === "Home" || e.key === "End") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainNavKeys(e.target) || isNonPanelOverlayOpen()) return;
+    if (consumesPlainNavKeys(e.target) || isBlockingOverlayOpen()) return;
     const toEnd = e.key === "End";
+    if (isClaudeOverlayOpen()) {
+      if (scrollDetailPanel("edge", toEnd ? 1 : -1)) e.preventDefault();
+      return;
+    }
     if (isAnyDetailPanelOpen()) {
       if (scrollDetailPanel("edge", toEnd ? 1 : -1)) e.preventDefault();
       return;
@@ -11168,8 +11204,12 @@ document.addEventListener("keydown", (e) => {
   // PageUp/PageDown step the table's pagination where there is any, else
   // jump the cursor to the far end. Same two guards as the arrows.
   if ((e.key === "PageUp" || e.key === "PageDown") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    if (consumesPlainNavKeys(e.target) || isNonPanelOverlayOpen()) return;
+    if (consumesPlainNavKeys(e.target) || isBlockingOverlayOpen()) return;
     const delta = e.key === "PageDown" ? 1 : -1;
+    if (isClaudeOverlayOpen()) {
+      if (scrollDetailPanel("page", delta)) e.preventDefault();
+      return;
+    }
     if (isAnyDetailPanelOpen()) {
       if (scrollDetailPanel("page", delta)) e.preventDefault();
       return;
