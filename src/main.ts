@@ -308,9 +308,25 @@ function currentPage(tab: TabId, total: number): number {
   return Math.min(Math.max(1, state.tablePage[tab] ?? 1), pageCount(total));
 }
 
+/**
+ * Set while a deliberate page step is rendering, so `settleAutoPageSize` may
+ * re-size the page but must not re-anchor it. See the note at that call.
+ *
+ * Saved and restored rather than simply cleared: the render below can settle
+ * recursively, and each nested render must stay inside the step rather than
+ * the innermost one declaring it over.
+ */
+let pageStepInFlight = false;
+
 function setTablePage(tab: TabId, page: number) {
   state.tablePage[tab] = Math.max(1, page);
-  render();
+  const outer = pageStepInFlight;
+  pageStepInFlight = true;
+  try {
+    render();
+  } finally {
+    pageStepInFlight = outer;
+  }
 }
 
 /** Back to page 1, for when the row set changes under the reader (a filter edit, say) and holding the old page would land them somewhere unrelated. */
@@ -396,6 +412,19 @@ interface PodDetailState extends MetricsViewState {
   view: "yaml" | "logs" | "events" | "graph";
   containers: string[];
   activeContainer: string;
+  /**
+   * The container the pod list says is failing, captured when the panel opens.
+   *
+   * Held separately from `activeContainer` because the two answer different
+   * questions and only one of them survives the reader touching the container
+   * picker. It is what the panel's Diagnose falls back to, and it seeds
+   * `activeContainer` once the manifest names the containers.
+   *
+   * Empty when nothing is failing, or when the panel was opened for a pod that
+   * is not in the loaded pod list — in which case this behaves exactly as it
+   * did before it existed.
+   */
+  failureContainer: string;
   manifest: PodManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
@@ -1165,11 +1194,17 @@ function columnWidth<T>(tab: TabId, col: ColumnDef<T>): number {
  * `leadingWidths` covers any unlabeled columns before `columns` (e.g. the
  * status-dot column).
  *
- * The Pods and Workloads tables pass a wider status column than the rest
+ * The GitOps and Helm tables pass a wider status column than the rest
  * because theirs also holds the Diagnose button for a failing row. Measured
  * rather than guessed: the dot, the gap and the button stop overflowing at
  * 112px including the cell's padding, and below that the fixed table layout
  * ellipsises the button. 116 leaves a little slack.
+ *
+ * Nodes, Workloads and Pods used to be in that list and are now back to the
+ * dot-only 36px. Their row button made a failing row ~2px taller than a
+ * healthy one, and `settleAutoPageSize` derives the whole page size from the
+ * first rendered row — so the page size flipped between pages and its
+ * re-anchor threw the reader back to page 1. See that function for the rest.
  */
 function renderColGroup<T>(tab: TabId, columns: ColumnDef<T>[], leadingWidths: number[] = []): string {
   const leading = leadingWidths.map((w) => `<col style="width:${w}px">`).join("");
@@ -3130,6 +3165,11 @@ function nodeRowFor(ctx: string, name: string): NodeInfo | undefined {
   return state.nodes.get(ctx)?.find((n) => n.name === name);
 }
 
+/** Same, for the failing container a pod's diagnosis should target. */
+function podRowFor(ctx: string, namespace: string, name: string): PodInfo | undefined {
+  return state.pods.get(ctx)?.find((p) => p.namespace === namespace && p.name === name);
+}
+
 /** Same, for the replica count a scale dialog should open on. */
 function workloadRowFor(ctx: string, kind: string, namespace: string, name: string): WorkloadInfo | undefined {
   return state.workloads.get(ctx)?.find((w) => w.kind === kind && w.namespace === namespace && w.name === name);
@@ -4247,6 +4287,7 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
     view: "yaml",
     containers: [],
     activeContainer: "",
+    failureContainer: podRowFor(ctx, namespace, name)?.failure_container ?? "",
     manifest: null,
     manifestError: null,
     showManagedFields: false,
@@ -4275,7 +4316,13 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
       if (token !== podDetailToken || !state.podDetail) return;
       state.podDetail.manifest = manifest;
       state.podDetail.containers = manifest.containers;
-      state.podDetail.activeContainer = manifest.containers[0] ?? "";
+      // The failing container, when the manifest still lists it — not
+      // whichever happens to be first. A sidecar is routinely declared ahead
+      // of the app container, so defaulting to [0] pointed both the log view
+      // and Diagnose at a container with nothing wrong with it.
+      const failing = state.podDetail.failureContainer;
+      state.podDetail.activeContainer =
+        (failing && manifest.containers.includes(failing) ? failing : manifest.containers[0]) ?? "";
       render();
       if (state.podDetail.activeContainer) fetchPodLogs();
     })
@@ -5331,6 +5378,13 @@ function uiScaleButton(): string {
  * `data-diagnose` inside the open panel first: omitting the button there left
  * nothing to find, so Cmd+D fell through to the row cursor behind the panel
  * and resolved against a row the reader could not see.
+ *
+ * The `"row"` size is now GitOps and Helm only. Nodes, Workloads and Pods
+ * render it in their detail panel instead — a row-height difference of a
+ * couple of pixels was enough to break table paging, and the panel button is
+ * a superset of the row one anyway, since it is not gated on the object
+ * being unhealthy. Cmd+D still reaches those three rows; they carry the
+ * diagnosis in data attributes rather than a button. See `diagnoseFocusedRow`.
  */
 function claudeDiagnoseButton(onclick: string, what: string, size: "row" | "panel" = "row"): string {
   const signedIn = state.claudeAuth?.signed_in === true;
@@ -6229,7 +6283,7 @@ function renderNodes(): string {
     ${selectionToolbar("nodes")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:nodes">
       <table class="data-table">
-        ${renderColGroup("nodes", columns, [32, 116])}
+        ${renderColGroup("nodes", columns, [32, 36])}
         <thead>
           <tr>${selectAllCheckboxHeader("nodes", sorted, keyOf)}<th></th>${sortableHeaderRow("nodes", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("nodes", columns, rows)}</tr>
@@ -6240,9 +6294,9 @@ function renderNodes(): string {
               (row) => {
                 const { ctx, n } = row;
                 return `
-            <tr>
+            <tr data-diagnose-what="node" data-diagnose-ctx="${esc(ctx)}" data-diagnose-name="${esc(n.name)}">
               ${rowCheckboxCell("nodes", keyOf(row))}
-              <td title="${esc(nodeConcern(n) ?? "")}"><span class="inline-flex items-center gap-1.5">${statusDot(n.ready)}${nodeConcern(n) ? claudeDiagnoseButton(`window.__app.diagnoseNode(${jsArg(ctx)},${jsArg(n.name)})`, "node") : ""}</span></td>
+              <td title="${esc(nodeConcern(n) ?? "")}">${statusDot(n.ready)}</td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter nodes by this cluster" onclick="window.__app.setEnumFilter('nodes','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -6316,8 +6370,10 @@ function renderWorkloads(): string {
   const rows = state.unhealthyOnly.workloads ? allRows.filter((r) => !r.w.healthy) : allRows;
   const keyOf = (r: WorkloadRow) => `${r.ctx}:${r.w.namespace}:${r.w.kind}:${r.w.name}`;
 
-  // The Diagnose button keys off `healthy`, not `failure_message`, which is
-  // the opposite of the Pods table one row-renderer down.
+  // The status cell keys off `healthy`, not `failure_message`, which is the
+  // opposite of the Pods table one row-renderer down. (Until the row-level
+  // Diagnose button moved into the detail panel this governed that button
+  // too; it still governs the dot and the unhealthy-only filter.)
   //
   // A workload's `healthy` is `desired == ready` and is computed for every
   // kind, whereas `failure_message` comes from `status.conditions` — and
@@ -6371,7 +6427,7 @@ function renderWorkloads(): string {
     ${selectionToolbar("workloads")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:workloads">
       <table class="data-table">
-        ${renderColGroup("workloads", columns, [32, 116])}
+        ${renderColGroup("workloads", columns, [32, 36])}
         <thead>
           <tr>${selectAllCheckboxHeader("workloads", sorted, keyOf)}<th></th>${sortableHeaderRow("workloads", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("workloads", columns, rows)}</tr>
@@ -6382,9 +6438,9 @@ function renderWorkloads(): string {
               (row) => {
                 const { ctx, w } = row;
                 return `
-            <tr>
+            <tr data-diagnose-what="workload" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="${esc(w.kind)}" data-diagnose-ns="${esc(w.namespace)}" data-diagnose-name="${esc(w.name)}">
               ${rowCheckboxCell("workloads", keyOf(row))}
-              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(w.healthy)}${!w.healthy ? claudeDiagnoseButton(`window.__app.diagnoseWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})`, w.kind.toLowerCase()) : ""}</span></td>
+              <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}">${statusDot(w.healthy)}</td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter workloads by this cluster" onclick="window.__app.setEnumFilter('workloads','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -6514,7 +6570,7 @@ function renderPods(): string {
     ${selectionToolbar("pods")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:pods">
       <table class="data-table">
-        ${renderColGroup("pods", columns, [32, 116])}
+        ${renderColGroup("pods", columns, [32, 36])}
         <thead>
           <tr>${selectAllCheckboxHeader("pods", sorted, keyOf)}<th></th>${sortableHeaderRow("pods", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("pods", columns, rows)}</tr>
@@ -6524,9 +6580,9 @@ function renderPods(): string {
             .map((row) => {
               const { ctx, p } = row;
               return `
-            <tr>
+            <tr data-diagnose-what="pod" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(p.namespace)}" data-diagnose-name="${esc(p.name)}" data-diagnose-container="${esc(p.failure_container ?? "")}">
               ${rowCheckboxCell("pods", keyOf(row))}
-              <td title="${esc(p.failure_message ?? (podHealthy(row) ? "" : "Not ready"))}"><span class="inline-flex items-center gap-1.5">${statusDot(podHealthy(row))}${p.failure_message ? claudeDiagnoseButton(`window.__app.diagnosePod(${jsArg(ctx)},${jsArg(p.namespace)},${jsArg(p.name)},${jsArg(p.failure_container ?? "")})`, "pod") : ""}</span></td>
+              <td title="${esc(p.failure_message ?? (podHealthy(row) ? "" : "Not ready"))}">${statusDot(podHealthy(row))}</td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter pods by this cluster" onclick="window.__app.setEnumFilter('pods','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -8316,7 +8372,11 @@ function renderPodDetailPanel(): string {
           </div>
           <div class="flex shrink-0 items-center gap-2">
             ${claudeDiagnoseButton(
-              `window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer)})`,
+              // Falls back to the failing container so the button is still
+              // aimed correctly in the window before the manifest lands, when
+              // `activeContainer` is still empty. Once it is set the reader's
+              // own pick wins, which is the point of the picker.
+              `window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer || pd.failureContainer)})`,
               "pod",
               "panel",
             )}
@@ -8482,6 +8542,7 @@ function renderNodeDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(nd.ctx)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${claudeDiagnoseButton(`window.__app.diagnoseNode(${jsArg(nd.ctx)},${jsArg(nd.name)})`, "node", "panel")}
             ${(() => {
               // The state the button would move the node *to*, not the one it
               // is in: offer the direction it isn't already in. Unknown (the
@@ -10476,7 +10537,16 @@ function settleAutoPageSize(app: HTMLElement, available: number | null, pre: Pre
   const tab = state.activeTab;
   const anchorRow = (currentPage(tab, tableSnapshots[tab]?.rows.length ?? 0) - 1) * state.pageSize;
   state.pageSize = fits;
-  state.tablePage[tab] = Math.floor(anchorRow / fits) + 1;
+  // ...unless the reader just asked for a specific page, in which case they
+  // get it. Anchoring on the first visible row is right for a resize and
+  // wrong for a page step: the first row of page N is row (N-1) * oldSize,
+  // and dividing that by a LARGER `fits` floors to N-1 — so page 2 lands back
+  // on page 1 and the keypress looks dead. It needs the row height to differ
+  // between two pages, which is rarer than it sounds but entirely reachable:
+  // any per-row control that only some rows carry does it, the Pods table's
+  // node glyph among them, and the unhealthy-first sort does not reliably
+  // keep the odd row out of first place.
+  if (!pageStepInFlight) state.tablePage[tab] = Math.floor(anchorRow / fits) + 1;
 
   settleDepth += 1;
   render(pre);
@@ -10914,16 +10984,57 @@ function activateFocusedRow(): boolean {
  * diagnosing a row you cannot see, while a panel for something else is in
  * front of you, would be the wrong subject.
  */
+/**
+ * Cmd+D on a focused Nodes, Workloads or Pods row.
+ *
+ * Those three tables no longer render a Diagnose button — one made a failing
+ * row taller than a healthy one, and `settleAutoPageSize` sizes the page from
+ * the first row's height, so paging broke. The row carries what a diagnosis
+ * needs in data attributes instead. Attributes cost no height, so the
+ * shortcut survives without the affordance coming back.
+ *
+ * Unconditional, unlike the button it stands in for: that appeared only on an
+ * unhealthy row, whereas the detail panel offers Diagnose for any of the
+ * three. The shortcut should agree with the panel it now proxies for rather
+ * than with the button that is gone.
+ */
+function diagnoseFocusedRow(): boolean {
+  const d = focusedRowElement()?.dataset;
+  const ctx = d?.diagnoseCtx ?? "";
+  const ns = d?.diagnoseNs ?? "";
+  const name = d?.diagnoseName ?? "";
+  switch (d?.diagnoseWhat) {
+    case "node":
+      diagnoseNode(ctx, name);
+      return true;
+    case "pod":
+      diagnosePod(ctx, ns, name, d.diagnoseContainer ?? "");
+      return true;
+    case "workload":
+      diagnoseWorkload(ctx, d.diagnoseKind ?? "", ns, name);
+      return true;
+    default:
+      return false;
+  }
+}
+
 function diagnoseFromKeyboard(): "done" | "signed-out" | "nothing" {
   const inPanel = document.querySelector<HTMLButtonElement>("[data-detail-panel] [data-diagnose]");
   const inRow = focusedRowElement()?.querySelector<HTMLButtonElement>("[data-diagnose]") ?? null;
   const button = inPanel ?? inRow;
-  if (!button) return "nothing";
-  // Say why nothing happened rather than swallowing the keypress: a disabled
-  // button gives no feedback to someone who never reached for the mouse.
-  if (button.disabled) return "signed-out";
-  button.click();
-  return "done";
+  if (button) {
+    // Say why nothing happened rather than swallowing the keypress: a disabled
+    // button gives no feedback to someone who never reached for the mouse.
+    if (button.disabled) return "signed-out";
+    button.click();
+    return "done";
+  }
+  // No button anywhere, so this is one of the three tables that carry the
+  // diagnosis on the row itself. Signed out answers the same as a disabled
+  // button would, for the same reason — the keypress must not vanish.
+  if (!focusedRowElement()?.dataset.diagnoseWhat) return "nothing";
+  if (state.claudeAuth?.signed_in !== true) return "signed-out";
+  return diagnoseFocusedRow() ? "done" : "nothing";
 }
 
 /** Space: toggles the focused row's selection — the same checkbox the "N rows selected" toolbar and its Copy to clipboard act on. Clicked rather than called directly, for the same reason as `activateFocusedRow`. */
