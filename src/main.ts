@@ -412,6 +412,19 @@ interface PodDetailState extends MetricsViewState {
   view: "yaml" | "logs" | "events" | "graph";
   containers: string[];
   activeContainer: string;
+  /**
+   * The container the pod list says is failing, captured when the panel opens.
+   *
+   * Held separately from `activeContainer` because the two answer different
+   * questions and only one of them survives the reader touching the container
+   * picker. It is what the panel's Diagnose falls back to, and it seeds
+   * `activeContainer` once the manifest names the containers.
+   *
+   * Empty when nothing is failing, or when the panel was opened for a pod that
+   * is not in the loaded pod list — in which case this behaves exactly as it
+   * did before it existed.
+   */
+  failureContainer: string;
   manifest: PodManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
@@ -3152,6 +3165,11 @@ function nodeRowFor(ctx: string, name: string): NodeInfo | undefined {
   return state.nodes.get(ctx)?.find((n) => n.name === name);
 }
 
+/** Same, for the failing container a pod's diagnosis should target. */
+function podRowFor(ctx: string, namespace: string, name: string): PodInfo | undefined {
+  return state.pods.get(ctx)?.find((p) => p.namespace === namespace && p.name === name);
+}
+
 /** Same, for the replica count a scale dialog should open on. */
 function workloadRowFor(ctx: string, kind: string, namespace: string, name: string): WorkloadInfo | undefined {
   return state.workloads.get(ctx)?.find((w) => w.kind === kind && w.namespace === namespace && w.name === name);
@@ -4269,6 +4287,7 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
     view: "yaml",
     containers: [],
     activeContainer: "",
+    failureContainer: podRowFor(ctx, namespace, name)?.failure_container ?? "",
     manifest: null,
     manifestError: null,
     showManagedFields: false,
@@ -4297,7 +4316,13 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
       if (token !== podDetailToken || !state.podDetail) return;
       state.podDetail.manifest = manifest;
       state.podDetail.containers = manifest.containers;
-      state.podDetail.activeContainer = manifest.containers[0] ?? "";
+      // The failing container, when the manifest still lists it — not
+      // whichever happens to be first. A sidecar is routinely declared ahead
+      // of the app container, so defaulting to [0] pointed both the log view
+      // and Diagnose at a container with nothing wrong with it.
+      const failing = state.podDetail.failureContainer;
+      state.podDetail.activeContainer =
+        (failing && manifest.containers.includes(failing) ? failing : manifest.containers[0]) ?? "";
       render();
       if (state.podDetail.activeContainer) fetchPodLogs();
     })
@@ -8349,7 +8374,11 @@ function renderPodDetailPanel(): string {
           </div>
           <div class="flex shrink-0 items-center gap-2">
             ${claudeDiagnoseButton(
-              `window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer)})`,
+              // Falls back to the failing container so the button is still
+              // aimed correctly in the window before the manifest lands, when
+              // `activeContainer` is still empty. Once it is set the reader's
+              // own pick wins, which is the point of the picker.
+              `window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer || pd.failureContainer)})`,
               "pod",
               "panel",
             )}
