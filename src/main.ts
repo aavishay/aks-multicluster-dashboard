@@ -11057,26 +11057,39 @@ document.addEventListener("click", (e) => {
   row.setAttribute("data-row-focused", "");
 });
 
-// TEMPORARY DIAGNOSTIC — not for release. Shows what the webview actually
-// delivers for each keypress, so a key that "does nothing" can be told apart
-// from a key that never arrives under that name.
-{
+// TEMPORARY DIAGNOSTIC — not for release, and gated so it cannot run by
+// accident. Shows what the webview actually delivers for a keypress, so a key
+// that "does nothing" can be told apart from one that never arrives under
+// that name.
+//
+// MUST be false on any branch heading for main. It is true only on the
+// throwaway branch this was built from.
+const TEMP_KEY_PROBE = true;
+
+if (TEMP_KEY_PROBE) {
   const badge = document.createElement("div");
   badge.style.cssText =
     "position:fixed;left:8px;bottom:8px;z-index:99999;background:#111;color:#0f0;" +
     "font:12px ui-monospace,monospace;padding:6px 10px;border:1px solid #0f0;border-radius:4px;pointer-events:none;white-space:pre";
-  badge.textContent = "key probe ready — press a key";
+  badge.textContent = "key probe ready — press a navigation key";
   document.body.append(badge);
   document.addEventListener(
     "keydown",
     (e) => {
+      // Never echo what was typed. A printable key is one character long, and
+      // the only question here is about *named* keys — PageDown, ArrowDown and
+      // the like. Showing the character would put whatever is being typed on
+      // screen, including the API key in Claude's setup panel.
+      const named = e.key.length > 1;
+      const shown = named ? JSON.stringify(e.key) : "<printable character, withheld>";
+      const code = named ? JSON.stringify(e.code) : "<withheld>";
       const mods = [e.metaKey && "cmd", e.ctrlKey && "ctrl", e.altKey && "alt", e.shiftKey && "shift"]
         .filter(Boolean)
         .join("+");
       badge.textContent =
-        `key=${JSON.stringify(e.key)}  code=${JSON.stringify(e.code)}\n` +
+        `key=${shown}  code=${code}\n` +
         `mods=${mods || "(none)"}  target=${(e.target as HTMLElement)?.tagName ?? "?"}\n` +
-        `keyCode=${e.keyCode}  repeat=${e.repeat}`;
+        `keyCode=${named ? e.keyCode : "<withheld>"}  repeat=${e.repeat}`;
     },
     true,
   );
