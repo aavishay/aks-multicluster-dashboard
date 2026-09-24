@@ -5184,10 +5184,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       ["↑ ↓", "Move the row cursor"],
       ["Enter", "Open the focused row's details"],
-      // Only GitOps and Helm still render a row-level Diagnose button, and
-      // this shortcut clicks whichever button is rendered — so on the other
-      // tabs it is the panel entry below that applies, not this one.
-      [withMod("D"), "Diagnose the focused row with Claude (GitOps and Helm)"],
+      [withMod("D"), "Diagnose the focused row with Claude"],
       ["Space", "Select or deselect the focused row"],
       ["⇧↑ ⇧↓", "Extend the selection"],
       [withMod("A"), "Select every matching row"],
@@ -5386,7 +5383,8 @@ function uiScaleButton(): string {
  * render it in their detail panel instead — a row-height difference of a
  * couple of pixels was enough to break table paging, and the panel button is
  * a superset of the row one anyway, since it is not gated on the object
- * being unhealthy.
+ * being unhealthy. Cmd+D still reaches those three rows; they carry the
+ * diagnosis in data attributes rather than a button. See `diagnoseFocusedRow`.
  */
 function claudeDiagnoseButton(onclick: string, what: string, size: "row" | "panel" = "row"): string {
   const signedIn = state.claudeAuth?.signed_in === true;
@@ -6296,7 +6294,7 @@ function renderNodes(): string {
               (row) => {
                 const { ctx, n } = row;
                 return `
-            <tr>
+            <tr data-diagnose-what="node" data-diagnose-ctx="${esc(ctx)}" data-diagnose-name="${esc(n.name)}">
               ${rowCheckboxCell("nodes", keyOf(row))}
               <td title="${esc(nodeConcern(n) ?? "")}">${statusDot(n.ready)}</td>
               ${
@@ -6440,7 +6438,7 @@ function renderWorkloads(): string {
               (row) => {
                 const { ctx, w } = row;
                 return `
-            <tr>
+            <tr data-diagnose-what="workload" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="${esc(w.kind)}" data-diagnose-ns="${esc(w.namespace)}" data-diagnose-name="${esc(w.name)}">
               ${rowCheckboxCell("workloads", keyOf(row))}
               <td title="${esc(w.failure_message ?? (w.healthy ? "" : "Not ready"))}">${statusDot(w.healthy)}</td>
               ${
@@ -6582,7 +6580,7 @@ function renderPods(): string {
             .map((row) => {
               const { ctx, p } = row;
               return `
-            <tr>
+            <tr data-diagnose-what="pod" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(p.namespace)}" data-diagnose-name="${esc(p.name)}" data-diagnose-container="${esc(p.failure_container ?? "")}">
               ${rowCheckboxCell("pods", keyOf(row))}
               <td title="${esc(p.failure_message ?? (podHealthy(row) ? "" : "Not ready"))}">${statusDot(podHealthy(row))}</td>
               ${
@@ -10986,16 +10984,57 @@ function activateFocusedRow(): boolean {
  * diagnosing a row you cannot see, while a panel for something else is in
  * front of you, would be the wrong subject.
  */
+/**
+ * Cmd+D on a focused Nodes, Workloads or Pods row.
+ *
+ * Those three tables no longer render a Diagnose button — one made a failing
+ * row taller than a healthy one, and `settleAutoPageSize` sizes the page from
+ * the first row's height, so paging broke. The row carries what a diagnosis
+ * needs in data attributes instead. Attributes cost no height, so the
+ * shortcut survives without the affordance coming back.
+ *
+ * Unconditional, unlike the button it stands in for: that appeared only on an
+ * unhealthy row, whereas the detail panel offers Diagnose for any of the
+ * three. The shortcut should agree with the panel it now proxies for rather
+ * than with the button that is gone.
+ */
+function diagnoseFocusedRow(): boolean {
+  const d = focusedRowElement()?.dataset;
+  const ctx = d?.diagnoseCtx ?? "";
+  const ns = d?.diagnoseNs ?? "";
+  const name = d?.diagnoseName ?? "";
+  switch (d?.diagnoseWhat) {
+    case "node":
+      diagnoseNode(ctx, name);
+      return true;
+    case "pod":
+      diagnosePod(ctx, ns, name, d.diagnoseContainer ?? "");
+      return true;
+    case "workload":
+      diagnoseWorkload(ctx, d.diagnoseKind ?? "", ns, name);
+      return true;
+    default:
+      return false;
+  }
+}
+
 function diagnoseFromKeyboard(): "done" | "signed-out" | "nothing" {
   const inPanel = document.querySelector<HTMLButtonElement>("[data-detail-panel] [data-diagnose]");
   const inRow = focusedRowElement()?.querySelector<HTMLButtonElement>("[data-diagnose]") ?? null;
   const button = inPanel ?? inRow;
-  if (!button) return "nothing";
-  // Say why nothing happened rather than swallowing the keypress: a disabled
-  // button gives no feedback to someone who never reached for the mouse.
-  if (button.disabled) return "signed-out";
-  button.click();
-  return "done";
+  if (button) {
+    // Say why nothing happened rather than swallowing the keypress: a disabled
+    // button gives no feedback to someone who never reached for the mouse.
+    if (button.disabled) return "signed-out";
+    button.click();
+    return "done";
+  }
+  // No button anywhere, so this is one of the three tables that carry the
+  // diagnosis on the row itself. Signed out answers the same as a disabled
+  // button would, for the same reason — the keypress must not vanish.
+  if (!focusedRowElement()?.dataset.diagnoseWhat) return "nothing";
+  if (state.claudeAuth?.signed_in !== true) return "signed-out";
+  return diagnoseFocusedRow() ? "done" : "nothing";
 }
 
 /** Space: toggles the focused row's selection — the same checkbox the "N rows selected" toolbar and its Copy to clipboard act on. Clicked rather than called directly, for the same reason as `activateFocusedRow`. */
