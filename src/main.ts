@@ -11057,6 +11057,31 @@ document.addEventListener("click", (e) => {
   row.setAttribute("data-row-focused", "");
 });
 
+// TEMPORARY DIAGNOSTIC — not for release. Shows what the webview actually
+// delivers for each keypress, so a key that "does nothing" can be told apart
+// from a key that never arrives under that name.
+{
+  const badge = document.createElement("div");
+  badge.style.cssText =
+    "position:fixed;left:8px;bottom:8px;z-index:99999;background:#111;color:#0f0;" +
+    "font:12px ui-monospace,monospace;padding:6px 10px;border:1px solid #0f0;border-radius:4px;pointer-events:none;white-space:pre";
+  badge.textContent = "key probe ready — press a key";
+  document.body.append(badge);
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      const mods = [e.metaKey && "cmd", e.ctrlKey && "ctrl", e.altKey && "alt", e.shiftKey && "shift"]
+        .filter(Boolean)
+        .join("+");
+      badge.textContent =
+        `key=${JSON.stringify(e.key)}  code=${JSON.stringify(e.code)}\n` +
+        `mods=${mods || "(none)"}  target=${(e.target as HTMLElement)?.tagName ?? "?"}\n` +
+        `keyCode=${e.keyCode}  repeat=${e.repeat}`;
+    },
+    true,
+  );
+}
+
 document.addEventListener("keydown", (e) => {
   // Everything below belongs to the container while a shell is open — Escape
   // included, or vim would be unusable, and Cmd+B/K/F/R/A too, since none of
