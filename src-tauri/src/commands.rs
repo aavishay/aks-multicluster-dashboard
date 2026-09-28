@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::{ai, claude, helm, k8s, kubeconfig, metrics_backend, mutate, retry, secrets};
+use crate::{ai, claude, external_secrets, helm, k8s, kubeconfig, metrics_backend, mutate, retry, secrets};
 use std::future::Future;
 use std::time::Duration;
 
@@ -431,6 +431,21 @@ pub async fn get_secret_detail(context_name: String, namespace: String, name: St
 #[tauri::command]
 pub async fn get_secret_value(context_name: String, namespace: String, name: String, key: String) -> Result<SecretValue, String> {
     with_retry(&context_name, || secrets::get_secret_value(&context_name, &namespace, &name, &key)).await
+}
+
+#[tauri::command]
+pub async fn get_external_secrets(context_name: String) -> Result<ExternalSecretsResult, String> {
+    with_retry(&context_name, || external_secrets::get_external_secrets(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_external_secret_detail(context_name: String, namespace: String, name: String) -> Result<ExternalSecretDetail, String> {
+    with_retry(&context_name, || external_secrets::get_external_secret_detail(&context_name, &namespace, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_external_secret_events(context_name: String, namespace: String, name: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || external_secrets::get_external_secret_events(&context_name, &namespace, &name)).await
 }
 
 #[tauri::command]

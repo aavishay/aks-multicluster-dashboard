@@ -15,6 +15,9 @@ import type {
   GitOpsAppManifest,
   GitOpsResourceDiff,
   GitOpsResult,
+  ExternalSecretDetail,
+  ExternalSecretInfo,
+  ExternalSecretsResult,
   HpaInfo,
   KedaResult,
   SecretDetail,
@@ -603,6 +606,23 @@ interface SecretDetailState {
   revealed: Record<string, SecretReveal>;
 }
 
+interface ExternalSecretDetailState {
+  ctx: string;
+  namespace: string;
+  name: string;
+  /** The row as listed, for the status strip before the detail call returns. Null if opened for one the list has not loaded. */
+  row: ExternalSecretInfo | null;
+  view: "keys" | "yaml" | "events";
+  detail: ExternalSecretDetail | null;
+  detailError: string | null;
+  showManagedFields: boolean;
+  yamlSearch: string;
+  yamlSearchIndex: number;
+  events: EventInfo[] | null;
+  eventsError: string | null;
+  eventsLoading: boolean;
+}
+
 interface KedaDetailState extends MetricsViewState {
   ctx: string;
   namespace: string;
@@ -736,6 +756,7 @@ interface AppState {
   /** Plain list, not a `*Result`: `autoscaling/v2` is never absent. */
   hpa: Map<string, HpaInfo[]>;
   secrets: Map<string, SecretInfo[]>;
+  externalSecrets: Map<string, ExternalSecretsResult>;
   keda: Map<string, KedaResult>;
   gitops: Map<string, GitOpsResult>;
   helm: Map<string, HelmReleaseInfo[]>;
@@ -828,6 +849,7 @@ interface AppState {
   napDetail: NapDetailState | null;
   hpaDetail: HpaDetailState | null;
   secretDetail: SecretDetailState | null;
+  externalSecretDetail: ExternalSecretDetailState | null;
   kedaDetail: KedaDetailState | null;
   helmDetail: HelmDetailState | null;
 }
@@ -855,6 +877,7 @@ const state: AppState = {
   nap: new Map(),
   hpa: new Map(),
   secrets: new Map(),
+  externalSecrets: new Map(),
   keda: new Map(),
   gitops: new Map(),
   helm: new Map(),
@@ -904,6 +927,7 @@ const state: AppState = {
   napDetail: null,
   hpaDetail: null,
   secretDetail: null,
+  externalSecretDetail: null,
   kedaDetail: null,
   helmDetail: null,
 };
@@ -926,6 +950,7 @@ let napDetailToken = 0;
 /** Same idea as `podDetailToken`, for the KEDA scaled object detail panel. */
 let hpaDetailToken = 0;
 let secretDetailToken = 0;
+let externalSecretDetailToken = 0;
 let kedaDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
 let helmDetailToken = 0;
@@ -1704,6 +1729,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "gitops", label: "GitOps" },
   { id: "helm", label: "Helm" },
   { id: "secrets", label: "Secrets" },
+  { id: "externalsecrets", label: "ExternalSecrets" },
   { id: "cost", label: "Cost" },
 ];
 
@@ -1903,6 +1929,9 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
     case "secrets":
       state.secrets.set(ctx, await api.getSecrets(ctx));
       break;
+    case "externalsecrets":
+      state.externalSecrets.set(ctx, await api.getExternalSecrets(ctx));
+      break;
     case "cost":
       break;
   }
@@ -1936,6 +1965,8 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
       return state.helm.has(ctx);
     case "secrets":
       return state.secrets.has(ctx);
+    case "externalsecrets":
+      return state.externalSecrets.has(ctx);
     case "cost":
       return true;
   }
@@ -2406,6 +2437,7 @@ function openNodeDetail(ctx: string, name: string) {
   closeNapDetail();
   closeKedaDetail();
   closeSecretDetail();
+  closeExternalSecretDetail();
     closeHpaDetail();
   const token = ++nodeDetailToken;
   state.nodeDetail = {
@@ -2546,6 +2578,7 @@ function openHelmDetail(ctx: string, namespace: string, name: string, revision: 
   closeNapDetail();
   closeKedaDetail();
   closeSecretDetail();
+  closeExternalSecretDetail();
     closeHpaDetail();
   const token = ++helmDetailToken;
   state.helmDetail = {
@@ -2646,6 +2679,7 @@ function openGitOpsDetail(ctx: string, namespace: string, name: string) {
   closeNapDetail();
   closeKedaDetail();
   closeSecretDetail();
+  closeExternalSecretDetail();
     closeHpaDetail();
   const token = ++gitOpsDetailToken;
   state.gitOpsDetail = {
@@ -2803,6 +2837,7 @@ function openNapDetail(ctx: string, name: string) {
   closeHelmDetail();
   closeKedaDetail();
   closeSecretDetail();
+  closeExternalSecretDetail();
     closeHpaDetail();
   const token = ++napDetailToken;
   state.napDetail = {
@@ -3660,6 +3695,7 @@ function openHpaDetail(ctx: string, namespace: string, name: string) {
   closeNapDetail();
   closeKedaDetail();
   closeSecretDetail();
+  closeExternalSecretDetail();
   const token = ++hpaDetailToken;
   state.hpaDetail = {
     ctx,
@@ -3773,6 +3809,7 @@ function openSecretDetail(ctx: string, namespace: string, name: string, secretTy
   closeNapDetail();
   closeKedaDetail();
   closeHpaDetail();
+  closeExternalSecretDetail();
   const token = ++secretDetailToken;
   state.secretDetail = {
     ctx,
@@ -3927,6 +3964,122 @@ async function copySecretKey(key: string) {
   showCopyToast(ok ? `Copied ${key}${binary ? " (as base64)" : ""}` : "Copy failed");
 }
 
+// ---------------------------------------------------------------------------
+// ExternalSecret detail panel (Keys / YAML / Events)
+// ---------------------------------------------------------------------------
+//
+// An ExternalSecret holds references — a store, a remote key, a property —
+// never values, so none of the Secret panel's masking applies. Events are
+// worth their cluster-wide list here, unlike for a Secret: ESO reports every
+// failed sync as a Warning on the object, and the history shows how long it
+// has been failing, which the Ready condition alone cannot.
+
+function openExternalSecretDetail(ctx: string, namespace: string, name: string) {
+  closePodDetail();
+  closeNodeDetail();
+  closeWorkloadDetail();
+  closeGitOpsDetail();
+  closeHelmDetail();
+  closeNapDetail();
+  closeKedaDetail();
+  closeHpaDetail();
+  closeSecretDetail();
+  const token = ++externalSecretDetailToken;
+  const row = state.externalSecrets.get(ctx)?.external_secrets.find((e) => e.namespace === namespace && e.name === name) ?? null;
+  state.externalSecretDetail = {
+    ctx,
+    namespace,
+    name,
+    row,
+    view: "keys",
+    detail: null,
+    detailError: null,
+    showManagedFields: false,
+    yamlSearch: "",
+    yamlSearchIndex: 0,
+    events: null,
+    eventsError: null,
+    eventsLoading: false,
+  };
+  render();
+
+  api
+    .getExternalSecretDetail(ctx, namespace, name)
+    .then((detail) => {
+      if (token !== externalSecretDetailToken || !state.externalSecretDetail) return;
+      state.externalSecretDetail.detail = detail;
+      render();
+    })
+    .catch((e) => {
+      if (token !== externalSecretDetailToken || !state.externalSecretDetail) return;
+      state.externalSecretDetail.detailError = String(e);
+      render();
+    });
+}
+
+function closeExternalSecretDetail() {
+  externalSecretDetailToken += 1;
+  state.externalSecretDetail = null;
+  render();
+}
+
+function setExternalSecretDetailView(view: ExternalSecretDetailState["view"]) {
+  const ed = state.externalSecretDetail;
+  if (!ed) return;
+  ed.view = view;
+  render();
+  if (view === "events" && !ed.events && !ed.eventsLoading) void fetchExternalSecretEvents();
+}
+
+function toggleExternalSecretManagedFields() {
+  if (!state.externalSecretDetail) return;
+  state.externalSecretDetail.showManagedFields = !state.externalSecretDetail.showManagedFields;
+  render();
+}
+
+async function fetchExternalSecretEvents() {
+  const ed = state.externalSecretDetail;
+  if (!ed) return;
+  const token = externalSecretDetailToken;
+  ed.eventsLoading = true;
+  ed.eventsError = null;
+  render();
+  try {
+    const events = await api.getExternalSecretEvents(ed.ctx, ed.namespace, ed.name);
+    if (token !== externalSecretDetailToken || !state.externalSecretDetail) return;
+    state.externalSecretDetail.events = events;
+  } catch (e) {
+    if (token !== externalSecretDetailToken || !state.externalSecretDetail) return;
+    state.externalSecretDetail.eventsError = String(e);
+  } finally {
+    if (token === externalSecretDetailToken && state.externalSecretDetail) state.externalSecretDetail.eventsLoading = false;
+    render();
+  }
+}
+
+function currentExternalSecretYamlText(ed: ExternalSecretDetailState): string {
+  if (!ed.detail) return "";
+  return ed.showManagedFields ? ed.detail.manifest.yaml_full : ed.detail.manifest.yaml_without_managed_fields;
+}
+
+function setExternalSecretSearch(_view: string, query: string) {
+  if (!state.externalSecretDetail) return;
+  state.externalSecretDetail.yamlSearch = query;
+  state.externalSecretDetail.yamlSearchIndex = 0;
+  pendingSearchScroll = true;
+  render();
+}
+
+function moveExternalSecretSearch(_view: string, delta: number) {
+  const ed = state.externalSecretDetail;
+  if (!ed || !ed.yamlSearch) return;
+  const count = countSearchMatches(currentExternalSecretYamlText(ed), ed.yamlSearch);
+  if (count === 0) return;
+  ed.yamlSearchIndex = (((ed.yamlSearchIndex + delta) % count) + count) % count;
+  pendingSearchScroll = true;
+  render();
+}
+
 function openKedaDetail(ctx: string, namespace: string, kind: string, name: string) {
   closePodDetail();
   closeNodeDetail();
@@ -3936,6 +4089,7 @@ function openKedaDetail(ctx: string, namespace: string, kind: string, name: stri
   closeNapDetail();
     closeHpaDetail();
     closeSecretDetail();
+    closeExternalSecretDetail();
   const token = ++kedaDetailToken;
   // The row already carries the resolved target — KEDA defaults an omitted
   // `scaleTargetRef.kind` to Deployment and the backend applies that on the
@@ -4093,6 +4247,7 @@ function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: 
   closeNapDetail();
   closeKedaDetail();
   closeSecretDetail();
+  closeExternalSecretDetail();
   stopWorkloadLogFollow();
     closeHpaDetail();
   const token = ++workloadDetailToken;
@@ -4492,6 +4647,7 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
   closeNapDetail();
   closeKedaDetail();
   closeSecretDetail();
+  closeExternalSecretDetail();
   stopPodLogFollow();
     closeHpaDetail();
   const token = ++podDetailToken;
@@ -4907,6 +5063,12 @@ function setMetricsRange(minutes: number) {
   revealSecretKey,
   hideSecretKey,
   copySecretKey,
+  openExternalSecretDetail,
+  closeExternalSecretDetail,
+  setExternalSecretDetailView,
+  toggleExternalSecretManagedFields,
+  setExternalSecretSearch,
+  moveExternalSecretSearch,
   openKedaDetail,
   closeKedaDetail,
   setKedaDetailView,
@@ -5120,6 +5282,7 @@ function render(carried?: PreRenderState) {
     ${renderNapDetailPanel()}
     ${renderHpaDetailPanel()}
     ${renderSecretDetailPanel()}
+    ${renderExternalSecretDetailPanel()}
     ${renderKedaDetailPanel()}
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
@@ -6271,6 +6434,8 @@ function renderTabContentBody(): string {
       return renderHelm();
     case "secrets":
       return renderSecrets();
+    case "externalsecrets":
+      return renderExternalSecrets();
     case "cost":
       return renderCost();
   }
@@ -8057,7 +8222,7 @@ function highlightSearchMatches(html: string, query: string, currentIndex: numbe
  * to be unique within that panel for the `data-filter-key` focus-restore tag.
  */
 function renderSearchBox(
-  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret",
+  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret" | "ExternalSecret",
   view: string,
   query: string,
   matchCount: number,
@@ -8111,7 +8276,7 @@ function renderYamlPane(o: {
   editableYaml: string;
   showManagedFields: boolean;
   toggleHandler: string;
-  searchKind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret";
+  searchKind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret" | "ExternalSecret";
   search: string;
   searchIndex: number;
   scrollId: string;
@@ -9411,6 +9576,133 @@ function renderSecretDetailPanel(): string {
     </div>`;
 }
 
+function renderExternalSecretKeysView(ed: ExternalSecretDetailState): string {
+  if (ed.detailError) return `<div class="text-sm text-status-critical">${esc(ed.detailError)}</div>`;
+  if (!ed.detail) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const { mappings, data_from } = ed.detail;
+  if (mappings.length === 0 && data_from.length === 0) {
+    return `<div class="text-sm text-ink-muted">This ExternalSecret maps no keys.</div>`;
+  }
+  // Only when some entry pins one: a column that is empty on every row is noise.
+  const withVersion = mappings.some((m) => m.version);
+  const table = mappings.length
+    ? `
+      <table class="data-table">
+        <thead><tr><th>Secret key</th><th>Remote key</th><th>Property</th>${withVersion ? "<th>Version</th>" : ""}</tr></thead>
+        <tbody>
+          ${mappings
+            .map(
+              (m) => `
+            <tr>
+              <td class="font-mono text-ink-primary" title="${esc(m.secret_key)}">${esc(m.secret_key)}</td>
+              <td class="font-mono" title="${esc(m.remote_key)}">${esc(m.remote_key)}</td>
+              <td class="font-mono" title="${esc(m.property)}">${esc(m.property) || '<span class="text-ink-muted">—</span>'}</td>
+              ${withVersion ? `<td class="font-mono">${esc(m.version) || '<span class="text-ink-muted">latest</span>'}</td>` : ""}
+            </tr>`,
+            )
+            .join("")}
+        </tbody>
+      </table>`
+    : "";
+  const from = data_from.length
+    ? `
+      <div>
+        <div class="mb-1 text-xs font-medium text-ink-secondary">dataFrom <span class="font-normal text-ink-muted">— each adds any number of keys, known only once synced</span></div>
+        <ul class="flex flex-col gap-1">${data_from.map((d) => `<li class="rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary">${esc(d)}</li>`).join("")}</ul>
+      </div>`
+    : "";
+  return `
+    <div class="flex flex-col gap-3">
+      <div class="text-xs text-ink-muted">Where each key of the Secret comes from. References only — the values live in the store.</div>
+      ${table}
+      ${from}
+    </div>`;
+}
+
+/** The sync status, always on screen above the tabs: it is the reason anyone opens an ExternalSecret. */
+function renderExternalSecretStatusStrip(ed: ExternalSecretDetailState): string {
+  const e = ed.row;
+  if (!e) return "";
+  const status = externalSecretStatus(e);
+  return `
+    <div class="border-b border-gridline px-4 py-3 text-xs">
+      <div class="flex flex-wrap items-center gap-2">
+        ${statusDot(e.ready)}
+        <span class="font-medium text-ink-primary">${esc(status)}</span>
+        <span class="text-ink-muted" title="${esc(e.last_refresh ?? "")}">${e.last_refresh ? `last sync ${relativeTime(e.last_refresh)}` : "never synced"}</span>
+      </div>
+      ${!e.ready && e.message ? `<div class="mt-1 break-words text-status-critical">${esc(e.message)}</div>` : ""}
+      <div class="mt-1 text-ink-muted">
+        From ${esc(e.store_kind)} <span class="text-ink-primary">${esc(e.store_name)}</span>
+        · refreshes ${e.refresh_interval ? `every ${esc(e.refresh_interval)}` : "on ESO's default"}
+        · writes Secret <button type="button" title="Open the Secret this writes" onclick="window.__app.openSecretDetail(${jsArg(ed.ctx)},${jsArg(ed.namespace)},${jsArg(e.target_name)},${jsArg(e.target_type)})" class="text-ink-primary hover:text-series-blue hover:underline">${esc(e.target_name)}</button>
+      </div>
+    </div>`;
+}
+
+function renderExternalSecretDetailPanel(): string {
+  const ed = state.externalSecretDetail;
+  if (!ed) return "";
+
+  const tabs: { id: ExternalSecretDetailState["view"]; label: string }[] = [
+    { id: "keys", label: "Keys" },
+    { id: "yaml", label: "YAML" },
+    { id: "events", label: "Events" },
+  ];
+
+  const body =
+    ed.view === "keys"
+      ? renderExternalSecretKeysView(ed)
+      : ed.view === "yaml"
+        ? renderYamlPane({
+            error: ed.detailError,
+            loaded: !!ed.detail,
+            yaml: currentExternalSecretYamlText(ed),
+            editableYaml: ed.detail?.manifest.yaml_without_managed_fields ?? "",
+            showManagedFields: ed.showManagedFields,
+            toggleHandler: "toggleExternalSecretManagedFields",
+            searchKind: "ExternalSecret",
+            search: ed.yamlSearch,
+            searchIndex: ed.yamlSearchIndex,
+            scrollId: `externalsecret-yaml:${esc(ed.ctx)}:${esc(ed.namespace)}:${esc(ed.name)}`,
+            // Editable like the other CRD panels: it holds references, not
+            // values, so there is nothing redacted to write back.
+            target: { ctx: ed.ctx, kind: "ExternalSecret", namespace: ed.namespace, name: ed.name },
+          })
+        : renderEventsList(`externalsecret-events:${ed.ctx}:${ed.namespace}:${ed.name}`, ed.events, ed.eventsError);
+
+  return `
+    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeExternalSecretDetail()">
+      ${slideOverShell()}
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">${esc(ed.name)}</div>
+            <div class="truncate text-xs text-ink-muted">ExternalSecret · ${esc(ed.namespace)} · ${esc(ed.ctx)}</div>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeExternalSecretDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
+        </div>
+        ${renderExternalSecretStatusStrip(ed)}
+        <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
+          ${tabs
+            .map(
+              (t) => `
+            <button
+              type="button"
+              onclick="window.__app.setExternalSecretDetailView(${jsArg(t.id)})"
+              data-detail-tab ${ed.view === t.id ? "data-detail-tab-active" : ""}
+              class="rounded-md px-3 py-1.5 text-xs font-medium ${ed.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
+            >${t.label}</button>`,
+            )
+            .join("")}
+        </div>
+        <div ${detailBodyAttrs(`externalsecret:${ed.ctx}:${ed.namespace}:${ed.name}:${ed.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+      </div>
+    </div>`;
+}
+
 function renderKedaDetailPanel(): string {
   const kd = state.kedaDetail;
   if (!kd) return "";
@@ -10160,6 +10452,133 @@ function renderSecrets(): string {
     ${renderPagination("secrets", sorted.length)}`;
 }
 
+/** "Synced", or why not. A brand new object with no condition yet is pending, not failing. */
+function externalSecretStatus(e: ExternalSecretInfo): string {
+  if (e.ready) return "Synced";
+  return e.reason || "Not synced yet";
+}
+
+/**
+ * The ExternalSecrets tab: which store each Secret is synced from, into which
+ * Secret, and whether the last sync worked. The status dot is the Ready
+ * condition, so a failing sync sorts to the top and carries the provider's
+ * own error as its tooltip.
+ */
+function renderExternalSecrets(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  const results = ctxs.map((ctx) => ({ ctx, result: state.externalSecrets.get(ctx) }));
+  const answered = results.filter((r) => r.result);
+  const notInstalled = answered.filter((r) => !r.result!.installed).map((r) => r.ctx);
+
+  type EsRow = { ctx: string; e: ExternalSecretInfo };
+  const allRows: EsRow[] = results.flatMap((r) => (r.result?.external_secrets ?? []).map((e) => ({ ctx: r.ctx, e })));
+
+  if (allRows.length === 0 && !state.tabLoading) {
+    if (notInstalled.length > 0 && notInstalled.length === answered.length) {
+      return addonNotInstalledPanel("External Secrets Operator not installed", "External Secrets Operator", "externalsecrets.external-secrets.io", ctxs.length > 1);
+    }
+    // Same as Secrets: a failed cluster already has its banner, and "none found"
+    // beneath it would state the opposite as fact.
+    if (state.tabErrorsByContext.size > 0) return addonPartialNotice("External Secrets Operator", notInstalled);
+    return `
+      ${addonPartialNotice("External Secrets Operator", notInstalled)}
+      <div class="text-sm text-ink-muted">No ExternalSecrets found.</div>`;
+  }
+
+  const rows = state.unhealthyOnly.externalsecrets ? allRows.filter((r) => !r.e.ready) : allRows;
+  const keyOf = (r: EsRow) => `${r.ctx}:${r.e.namespace}:${r.e.name}`;
+  const refreshTime = (r: EsRow) => (r.e.last_refresh ? Date.parse(r.e.last_refresh) : 0);
+
+  const columns: ColumnDef<EsRow>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: EsRow) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.e.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.e.name, filter: "string" },
+    { key: "store", label: "Store", value: (r) => `${r.e.store_kind}/${r.e.store_name}`, filter: "string" },
+    { key: "target", label: "Target Secret", value: (r) => r.e.target_name, filter: "string" },
+    {
+      key: "keys",
+      label: "Keys",
+      value: (r) => r.e.data_count,
+      filter: "number",
+      copyText: (r) => `${r.e.data_count}${r.e.data_from_count ? ` + ${r.e.data_from_count} dataFrom` : ""}`,
+    },
+    { key: "refresh", label: "Refresh", value: (r) => r.e.refresh_interval || "default", filter: "enum" },
+    {
+      key: "synced",
+      label: "Last sync",
+      value: (r) => relativeTime(r.e.last_refresh),
+      sortValue: refreshTime,
+      copyText: (r) => r.e.last_refresh ?? "—",
+    },
+    {
+      key: "age",
+      label: "Age",
+      value: (r) => r.e.age_days,
+      filter: "number",
+      copyText: (r) => formatAgeDetailed(r.e.age_days, r.e.age_seconds),
+      sortValue: (r) => r.e.age_seconds,
+    },
+  ];
+  const filtered = applyFilters("externalsecrets", rows, columns);
+  const sorted = sortRows("externalsecrets", filtered, columns, (r) => !r.e.ready);
+  recordTableSnapshot("externalsecrets", columns, sorted, keyOf, { header: "Status", text: (r) => externalSecretStatus(r.e) });
+  const paged = pageSlice("externalsecrets", sorted);
+
+  return `
+    ${addonPartialNotice("External Secrets Operator", notInstalled)}
+    <div class="mb-2 flex items-center justify-between">
+      <div class="text-xs text-ink-muted">${state.unhealthyOnly.externalsecrets ? `${rows.length} of ${allRows.length} not synced` : ""}</div>
+      ${unhealthyOnlyToggle("externalsecrets")}
+    </div>
+    ${filterSummary("externalsecrets", rows.length, filtered.length)}
+    ${selectionToolbar("externalsecrets")}
+    <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:externalsecrets">
+      <table class="data-table">
+        ${renderColGroup("externalsecrets", columns, [32, 36])}
+        <thead>
+          <tr>${selectAllCheckboxHeader("externalsecrets", sorted, keyOf)}<th></th>${sortableHeaderRow("externalsecrets", columns)}</tr>
+          <tr class="filter-row"><th></th><th></th>${filterRowCells("externalsecrets", columns, rows)}</tr>
+        </thead>
+        <tbody>
+          ${paged
+            .map((row) => {
+              const { ctx, e } = row;
+              const status = externalSecretStatus(e);
+              return `
+            <tr>
+              ${rowCheckboxCell("externalsecrets", keyOf(row))}
+              <td title="${esc(e.message ? `${status}: ${e.message}` : status)}">${statusDot(e.ready)}</td>
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter by this cluster" onclick="window.__app.setEnumFilter('externalsecrets','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
+              <td><button type="button" title="Filter by this namespace" onclick="window.__app.setEnumFilter('externalsecrets','namespace',[${jsArg(e.namespace)}])" class="hover:text-series-blue hover:underline">${esc(e.namespace)}</button></td>
+              <td>
+                <button
+                  type="button"
+                  title="View ExternalSecret details (keys, YAML, events)"
+                  data-row-open onclick="window.__app.openExternalSecretDetail(${jsArg(ctx)},${jsArg(e.namespace)},${jsArg(e.name)})"
+                  class="text-ink-primary hover:text-series-blue hover:underline"
+                >${esc(e.name)}</button>
+              </td>
+              <td class="truncate" title="${esc(`${e.store_kind} ${e.store_name}`)}"><span class="text-ink-muted">${esc(e.store_kind)}/</span>${esc(e.store_name)}</td>
+              <td><button type="button" title="Open the Secret this writes" onclick="window.__app.openSecretDetail(${jsArg(ctx)},${jsArg(e.namespace)},${jsArg(e.target_name)},${jsArg(e.target_type)})" class="hover:text-series-blue hover:underline">${esc(e.target_name)}</button></td>
+              <td class="tabular">${e.data_count}${e.data_from_count ? ` <span class="text-ink-muted" title="${e.data_from_count} dataFrom entr${e.data_from_count === 1 ? "y" : "ies"}, each adding any number of keys">+ ${e.data_from_count} dataFrom</span>` : ""}</td>
+              <td class="tabular" ${e.refresh_interval ? "" : 'title="ESO\'s default interval"'}>${esc(e.refresh_interval) || '<span class="text-ink-muted">default</span>'}</td>
+              <td class="tabular" title="${esc(e.last_refresh ?? "Never synced")}">${e.last_refresh ? relativeTime(e.last_refresh) : '<span class="text-ink-muted">never</span>'}</td>
+              <td class="tabular">${formatAgeDetailed(e.age_days, e.age_seconds)}</td>
+            </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+      ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching ExternalSecrets.</div>' : ""}
+    </div>
+    ${renderPagination("externalsecrets", sorted.length)}`;
+}
+
 function renderKeda(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
@@ -10700,6 +11119,7 @@ const DETAIL_PANEL_CLOSERS: { isOpen: () => boolean; close: () => void }[] = [
   { isOpen: () => !!state.napDetail, close: closeNapDetail },
   { isOpen: () => !!state.kedaDetail, close: closeKedaDetail },
   { isOpen: () => !!state.secretDetail, close: closeSecretDetail },
+  { isOpen: () => !!state.externalSecretDetail, close: closeExternalSecretDetail },
 ];
 
 function isAnyDetailPanelOpen(): boolean {

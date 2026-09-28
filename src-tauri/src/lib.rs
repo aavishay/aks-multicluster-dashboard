@@ -2,6 +2,7 @@ mod ai;
 mod claude;
 mod commands;
 mod exec;
+mod external_secrets;
 mod helm;
 mod k8s;
 mod kubeconfig;
@@ -140,6 +141,9 @@ pub fn run() {
             commands::get_secrets,
             commands::get_secret_detail,
             commands::get_secret_value,
+            commands::get_external_secrets,
+            commands::get_external_secret_detail,
+            commands::get_external_secret_events,
             commands::get_nap_node_pools,
             commands::get_hpas,
             commands::get_hpa_manifest,

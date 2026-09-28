@@ -1542,7 +1542,7 @@ fn event_last_seen(e: &Event) -> Option<chrono::DateTime<Utc>> {
         .or_else(|| e.first_timestamp.as_ref().map(|t| t.0))
 }
 
-fn event_to_info(e: Event) -> EventInfo {
+pub(crate) fn event_to_info(e: Event) -> EventInfo {
     EventInfo {
         namespace: e.metadata.namespace.clone().unwrap_or_default(),
         involved_object: format!(
@@ -1560,7 +1560,7 @@ fn event_to_info(e: Event) -> EventInfo {
 
 /// Every `get_*_events` variant below needs the same cluster-wide list,
 /// newest-first — factored out so each only has to say what it filters for.
-async fn list_events_sorted(client: &Client) -> Result<Vec<Event>, String> {
+pub(crate) async fn list_events_sorted(client: &Client) -> Result<Vec<Event>, String> {
     let events_api: Api<Event> = Api::all(client.clone());
     let mut items = events_api
         .list(&ListParams::default())
@@ -1777,7 +1777,7 @@ fn argocd_application_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(&gvk, "applications")
 }
 
-fn json_str<'a>(value: Option<&'a serde_json::Value>, key: &str) -> &'a str {
+pub(crate) fn json_str<'a>(value: Option<&'a serde_json::Value>, key: &str) -> &'a str {
     value.and_then(|v| v.get(key)).and_then(|v| v.as_str()).unwrap_or_default()
 }
 
@@ -2031,7 +2031,7 @@ async fn get_karpenter(client: &Client, kind: &str, plural: &str, name: &str) ->
 /// panel's toggle flips: managedFields is pure server bookkeeping that often
 /// dwarfs the spec, so it is hidden by default, but the object has already
 /// been fetched and stripping a field is far cheaper than another API call.
-fn object_manifest(obj: DynamicObject) -> Result<ObjectManifest, String> {
+pub(crate) fn object_manifest(obj: DynamicObject) -> Result<ObjectManifest, String> {
     let yaml_full = serde_yaml::to_string(&obj).map_err(|e| format!("Failed to render YAML: {e}"))?;
 
     let mut stripped = obj;

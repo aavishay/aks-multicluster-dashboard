@@ -376,6 +376,67 @@ pub struct ObjectManifest {
     pub yaml_without_managed_fields: String,
 }
 
+/// An External Secrets Operator `ExternalSecret`. Mirrors `ExternalSecretInfo`
+/// in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ExternalSecretInfo {
+    pub namespace: String,
+    pub name: String,
+    /// `SecretStore` or `ClusterSecretStore` — which one decides where the
+    /// store lives, so it is shown alongside the name.
+    pub store_kind: String,
+    pub store_name: String,
+    /// The Secret it writes. `spec.target.name`, which defaults to the
+    /// ExternalSecret's own name.
+    pub target_name: String,
+    /// `spec.target.template.type`, or `Opaque` — what ESO creates by default.
+    pub target_type: String,
+    /// `spec.refreshInterval` as written, e.g. `1h`. Empty means ESO's default.
+    pub refresh_interval: String,
+    /// Entries in `spec.data` — one Secret key each.
+    pub data_count: usize,
+    /// Entries in `spec.dataFrom` — each can yield any number of keys.
+    pub data_from_count: usize,
+    /// The `Ready` condition is `True`.
+    pub ready: bool,
+    /// Why not, from the `Ready` condition: `SecretSyncedError`, say. Empty
+    /// when there is no condition yet — a brand new object ESO has not reached.
+    pub reason: String,
+    /// The condition's message: the provider's own error when a sync fails.
+    pub message: String,
+    /// `status.refreshTime` — when ESO last synced it.
+    pub last_refresh: Option<String>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+}
+
+/// `installed: false` means no served version of the CRD answered — ESO is not
+/// on this cluster.
+#[derive(Serialize, Clone, Debug)]
+pub struct ExternalSecretsResult {
+    pub installed: bool,
+    pub error: Option<String>,
+    pub external_secrets: Vec<ExternalSecretInfo>,
+}
+
+/// One `spec.data` entry: which remote key feeds which Secret key.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ExternalSecretMapping {
+    pub secret_key: String,
+    pub remote_key: String,
+    pub property: String,
+    pub version: String,
+}
+
+/// What the ExternalSecret panel loads.
+#[derive(Serialize, Clone, Debug)]
+pub struct ExternalSecretDetail {
+    pub mappings: Vec<ExternalSecretMapping>,
+    /// `spec.dataFrom`, one readable line per entry.
+    pub data_from: Vec<String>,
+    pub manifest: ObjectManifest,
+}
+
 /// One key of a Secret: its name and decoded size, never its value.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct SecretKeyInfo {

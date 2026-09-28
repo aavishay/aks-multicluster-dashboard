@@ -25,6 +25,8 @@ import type {
   GitOpsResourceDiff,
   GitOpsResult,
   HpaInfo,
+  ExternalSecretDetail,
+  ExternalSecretsResult,
   SecretDetail,
   SecretInfo,
   SecretValue,
@@ -219,6 +221,11 @@ export const api = {
   /** The one call that returns a Secret value — a single key, on an explicit Reveal. */
   getSecretValue: (contextName: string, namespace: string, name: string, key: string) =>
     invoke<SecretValue>("get_secret_value", { contextName, namespace, name, key }),
+  getExternalSecrets: (contextName: string) => invoke<ExternalSecretsResult>("get_external_secrets", { contextName }),
+  getExternalSecretDetail: (contextName: string, namespace: string, name: string) =>
+    invoke<ExternalSecretDetail>("get_external_secret_detail", { contextName, namespace, name }),
+  getExternalSecretEvents: (contextName: string, namespace: string, name: string) =>
+    invoke<EventInfo[]>("get_external_secret_events", { contextName, namespace, name }),
   getHpas: (contextName: string) => invoke<HpaInfo[]>("get_hpas", { contextName }),
   getHpaManifest: (contextName: string, namespace: string, name: string) =>
     invoke<ObjectManifest>("get_hpa_manifest", { contextName, namespace, name }),
