@@ -11,6 +11,14 @@ export function formatKi(ki: number | null | undefined): string {
   return `${mi.toFixed(0)} MiB`;
 }
 
+/** A byte count for a reader: "512 B", "1.4 KiB", "2.1 MiB". */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kib = bytes / 1024;
+  if (kib < 1024) return `${kib.toFixed(1)} KiB`;
+  return `${(kib / 1024).toFixed(1)} MiB`;
+}
+
 export function formatAge(days: number): string {
   if (days < 1) return "<1d";
   if (days < 90) return `${days}d`;

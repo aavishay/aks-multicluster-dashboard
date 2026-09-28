@@ -376,6 +376,49 @@ pub struct ObjectManifest {
     pub yaml_without_managed_fields: String,
 }
 
+/// One key of a Secret: its name and decoded size, never its value.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct SecretKeyInfo {
+    pub name: String,
+    /// Decoded length, not the base64 length the API sends — what a reader
+    /// means by "how big is this value".
+    pub bytes: usize,
+}
+
+/// One Secret as the Secrets tab lists it. Mirrors `SecretInfo` in types.ts.
+#[derive(Serialize, Clone, Debug)]
+pub struct SecretInfo {
+    pub namespace: String,
+    pub name: String,
+    /// `type` in the API, e.g. `Opaque` or `kubernetes.io/tls`.
+    pub secret_type: String,
+    /// `None` for a Helm release Secret, which is listed metadata-only and so
+    /// has no key list to report — see `secrets.rs` for why. Not an empty
+    /// list: an empty list would claim the Secret has no keys, which is false.
+    pub keys: Option<Vec<SecretKeyInfo>>,
+    pub immutable: bool,
+    pub age_days: i64,
+    pub age_seconds: i64,
+}
+
+/// What the Secret detail panel loads: the key list and the redacted YAML.
+#[derive(Serialize, Clone, Debug)]
+pub struct SecretDetail {
+    pub keys: Vec<SecretKeyInfo>,
+    pub manifest: ObjectManifest,
+}
+
+/// One revealed value. Exactly one of `text` and `base64` is set.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct SecretValue {
+    pub bytes: usize,
+    /// The value, when it is valid UTF-8 — passwords, tokens, PEM files.
+    pub text: Option<String>,
+    /// Otherwise the raw bytes as base64 (a keystore, say), so a binary value
+    /// can still be copied without being mangled into text.
+    pub base64: Option<String>,
+}
+
 pub type NapNodePoolManifest = ObjectManifest;
 
 /// One Karpenter `NodePool` — the provisioning policy — plus its own live

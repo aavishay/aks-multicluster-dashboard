@@ -160,6 +160,12 @@ Resource Usage tab) `metrics.k8s.io` — e.g. bind your Azure AD user/group to
 the built-in `view` ClusterRole, or `Azure Kubernetes Service RBAC Reader`
 at the Azure role-assignment level.
 
+The Secrets tab needs more than that: both of those roles leave Secrets out
+on purpose, so with either one the tab shows a permission error for every
+cluster. It needs `list` and `get` on `secrets` — for example
+`Azure Kubernetes Service RBAC Writer`, or a role of your own that adds just
+those two verbs.
+
 ## 3. Install dependencies and run
 
 ```bash
@@ -186,7 +192,11 @@ running — live usage), zone, instance type, and cordon status. Workloads
 covers Deployments/StatefulSets/DaemonSets with desired-vs-ready replica
 counts. Pods is a live pod table with restarts and per-pod CPU/memory. Resource
 Usage rolls the fleet's CPU/memory usage-vs-allocatable into two bars.
-Events surfaces recent cluster events, defaulting to warnings only. The
+Events surfaces recent cluster events, defaulting to warnings only. Secrets
+lists every Secret with its type and key count; its panel shows each key's
+name and size, keeps values masked until you reveal one, and forgets them
+when it closes. Helm's own release Secrets are listed without their contents,
+which the Helm tab already shows. The
 sidebar auto-refreshes cluster health badges, and there's a refresh interval
 selector (15s/30s/60s/5m/off) for the active tab, defaulting to 15s.
 

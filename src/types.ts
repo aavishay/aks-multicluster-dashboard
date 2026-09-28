@@ -287,6 +287,37 @@ export interface HelmReleaseInfo {
   age_seconds: number;
 }
 
+/** One key of a Secret — its name and decoded size, never its value. Mirrors `SecretKeyInfo` in models.rs. */
+export interface SecretKeyInfo {
+  name: string;
+  bytes: number;
+}
+
+/** One Secret as the Secrets tab lists it. Mirrors `SecretInfo` in models.rs. */
+export interface SecretInfo {
+  namespace: string;
+  name: string;
+  secret_type: string;
+  /** Null for a Helm release Secret, which is listed metadata-only: unknown, not empty. */
+  keys: SecretKeyInfo[] | null;
+  immutable: boolean;
+  age_days: number;
+  age_seconds: number;
+}
+
+/** What the Secret panel loads: the key list and the redacted YAML. */
+export interface SecretDetail {
+  keys: SecretKeyInfo[];
+  manifest: ObjectManifest;
+}
+
+/** One revealed value. Exactly one of `text` and `base64` is set. */
+export interface SecretValue {
+  bytes: number;
+  text: string | null;
+  base64: string | null;
+}
+
 export interface HelmReleaseDetail {
   values_yaml: string;
   default_values_yaml: string;
@@ -317,7 +348,7 @@ export interface ClaudeDiagnosisPayload {
   approx_tokens: number;
 }
 
-export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "nap" | "hpa" | "keda" | "gitops" | "helm" | "cost";
+export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "nap" | "hpa" | "keda" | "gitops" | "helm" | "secrets" | "cost";
 
 /** Azure Node Auto Provisioning (managed Karpenter). `installed: false` means the CRDs aren't registered, i.e. NAP is off for this cluster. */
 export interface NapResult {

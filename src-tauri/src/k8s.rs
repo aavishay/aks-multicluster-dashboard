@@ -144,14 +144,14 @@ async fn fetch_pod_metrics(client: &Client, namespace: &Option<String>) -> HashM
     out
 }
 
-fn age_days(ts: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> i64 {
+pub(crate) fn age_days(ts: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> i64 {
     match ts {
         Some(t) => (Utc::now() - t.0).num_days().max(0),
         None => 0,
     }
 }
 
-fn age_seconds(ts: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> i64 {
+pub(crate) fn age_seconds(ts: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> i64 {
     match ts {
         Some(t) => (Utc::now() - t.0).num_seconds().max(0),
         None => 0,

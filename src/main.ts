@@ -3,7 +3,7 @@ import { ANSI_BASE16, xterm256ToHex } from "./ansi";
 import { api } from "./api";
 import { closeExec, isExecEnded, isExecOpen, openExec, syncExecFontMetrics } from "./exec";
 import { MONO_TEXT_CLASSES } from "./typography";
-import { formatAgeDetailed, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
+import { formatAgeDetailed, formatBytes, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
 import type {
   AiAuthState,
   AiProvider,
@@ -17,6 +17,9 @@ import type {
   GitOpsResult,
   HpaInfo,
   KedaResult,
+  SecretDetail,
+  SecretInfo,
+  SecretValue,
   KedaScaledObjectInfo,
   HelmReleaseDetail,
   MetricsBackendInfo,
@@ -564,6 +567,30 @@ interface HpaDetailState {
   eventsLoading: boolean;
 }
 
+/** A revealed key's lifecycle. Held only while the panel is open; closing it drops every value. */
+type SecretReveal = { status: "loading" } | { status: "shown"; value: SecretValue } | { status: "error"; error: string };
+
+/**
+ * The Secret panel. Carries no values of its own: `detail` is key names,
+ * sizes and redacted YAML, and a value exists here only once someone reveals
+ * that one key.
+ */
+interface SecretDetailState {
+  ctx: string;
+  namespace: string;
+  name: string;
+  /** From the row, so the header is right before the detail call returns. */
+  secretType: string;
+  view: "keys" | "yaml";
+  detail: SecretDetail | null;
+  detailError: string | null;
+  showManagedFields: boolean;
+  yamlSearch: string;
+  yamlSearchIndex: number;
+  /** Keyed by the Secret's key name. */
+  revealed: Record<string, SecretReveal>;
+}
+
 interface KedaDetailState extends MetricsViewState {
   ctx: string;
   namespace: string;
@@ -696,6 +723,7 @@ interface AppState {
   nap: Map<string, NapResult>;
   /** Plain list, not a `*Result`: `autoscaling/v2` is never absent. */
   hpa: Map<string, HpaInfo[]>;
+  secrets: Map<string, SecretInfo[]>;
   keda: Map<string, KedaResult>;
   gitops: Map<string, GitOpsResult>;
   helm: Map<string, HelmReleaseInfo[]>;
@@ -787,6 +815,7 @@ interface AppState {
   yamlEdit: YamlEditState | null;
   napDetail: NapDetailState | null;
   hpaDetail: HpaDetailState | null;
+  secretDetail: SecretDetailState | null;
   kedaDetail: KedaDetailState | null;
   helmDetail: HelmDetailState | null;
 }
@@ -813,6 +842,7 @@ const state: AppState = {
   eventsWarningsOnly: true,
   nap: new Map(),
   hpa: new Map(),
+  secrets: new Map(),
   keda: new Map(),
   gitops: new Map(),
   helm: new Map(),
@@ -861,6 +891,7 @@ const state: AppState = {
   yamlEdit: null,
   napDetail: null,
   hpaDetail: null,
+  secretDetail: null,
   kedaDetail: null,
   helmDetail: null,
 };
@@ -882,6 +913,7 @@ let gitOpsDetailToken = 0;
 let napDetailToken = 0;
 /** Same idea as `podDetailToken`, for the KEDA scaled object detail panel. */
 let hpaDetailToken = 0;
+let secretDetailToken = 0;
 let kedaDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
 let helmDetailToken = 0;
@@ -1659,6 +1691,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "keda", label: "KEDA" },
   { id: "gitops", label: "GitOps" },
   { id: "helm", label: "Helm" },
+  { id: "secrets", label: "Secrets" },
   { id: "cost", label: "Cost" },
 ];
 
@@ -1855,6 +1888,9 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
     case "helm":
       state.helm.set(ctx, await api.getHelmReleases(ctx));
       break;
+    case "secrets":
+      state.secrets.set(ctx, await api.getSecrets(ctx));
+      break;
     case "cost":
       break;
   }
@@ -1886,6 +1922,8 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
       return state.gitops.has(ctx);
     case "helm":
       return state.helm.has(ctx);
+    case "secrets":
+      return state.secrets.has(ctx);
     case "cost":
       return true;
   }
@@ -2355,6 +2393,7 @@ function openNodeDetail(ctx: string, name: string) {
   closeHelmDetail();
   closeNapDetail();
   closeKedaDetail();
+  closeSecretDetail();
     closeHpaDetail();
   const token = ++nodeDetailToken;
   state.nodeDetail = {
@@ -2494,6 +2533,7 @@ function openHelmDetail(ctx: string, namespace: string, name: string, revision: 
   closeGitOpsDetail();
   closeNapDetail();
   closeKedaDetail();
+  closeSecretDetail();
     closeHpaDetail();
   const token = ++helmDetailToken;
   state.helmDetail = {
@@ -2593,6 +2633,7 @@ function openGitOpsDetail(ctx: string, namespace: string, name: string) {
   closeHelmDetail();
   closeNapDetail();
   closeKedaDetail();
+  closeSecretDetail();
     closeHpaDetail();
   const token = ++gitOpsDetailToken;
   state.gitOpsDetail = {
@@ -2749,6 +2790,7 @@ function openNapDetail(ctx: string, name: string) {
   closeGitOpsDetail();
   closeHelmDetail();
   closeKedaDetail();
+  closeSecretDetail();
     closeHpaDetail();
   const token = ++napDetailToken;
   state.napDetail = {
@@ -3350,6 +3392,11 @@ function syncYamlHighlight(ta: HTMLTextAreaElement) {
  * disabled while editing for the same reason.
  */
 function startYamlEdit(ctx: string, kind: string, namespace: string, name: string, yaml: string) {
+  if (kind === "Secret") {
+    // Only ever shown redacted, so what the editor would hold is placeholders.
+    showCopyToast("Secrets can't be edited here — their values are redacted");
+    return;
+  }
   const apiVersion = yaml.match(/^apiVersion:\s*(\S+)/m)?.[1];
   if (!apiVersion) {
     // Every manifest the backend serialises carries one, so this means the
@@ -3600,6 +3647,7 @@ function openHpaDetail(ctx: string, namespace: string, name: string) {
   closeHelmDetail();
   closeNapDetail();
   closeKedaDetail();
+  closeSecretDetail();
   const token = ++hpaDetailToken;
   state.hpaDetail = {
     ctx,
@@ -3695,6 +3743,131 @@ function moveHpaSearch(_view: string, delta: number) {
   render();
 }
 
+// ---------------------------------------------------------------------------
+// Secret detail panel (Keys / YAML)
+// ---------------------------------------------------------------------------
+//
+// No Events tab: Kubernetes emits almost none for a Secret, and the events
+// helper lists the whole cluster's events to filter them, so the tab would
+// cost that call to show an empty list. No Diagnose either — it would send the
+// Secret to an AI provider.
+
+function openSecretDetail(ctx: string, namespace: string, name: string, secretType: string) {
+  closePodDetail();
+  closeNodeDetail();
+  closeWorkloadDetail();
+  closeGitOpsDetail();
+  closeHelmDetail();
+  closeNapDetail();
+  closeKedaDetail();
+  closeHpaDetail();
+  const token = ++secretDetailToken;
+  state.secretDetail = {
+    ctx,
+    namespace,
+    name,
+    secretType,
+    view: "keys",
+    detail: null,
+    detailError: null,
+    showManagedFields: false,
+    yamlSearch: "",
+    yamlSearchIndex: 0,
+    revealed: {},
+  };
+  render();
+
+  api
+    .getSecretDetail(ctx, namespace, name)
+    .then((detail) => {
+      if (token !== secretDetailToken || !state.secretDetail) return;
+      state.secretDetail.detail = detail;
+      render();
+    })
+    .catch((e) => {
+      if (token !== secretDetailToken || !state.secretDetail) return;
+      state.secretDetail.detailError = String(e);
+      render();
+    });
+}
+
+/** Drops the panel's state — and with it every revealed value. */
+function closeSecretDetail() {
+  secretDetailToken += 1;
+  state.secretDetail = null;
+  render();
+}
+
+function setSecretDetailView(view: SecretDetailState["view"]) {
+  if (!state.secretDetail) return;
+  state.secretDetail.view = view;
+  render();
+}
+
+function toggleSecretManagedFields() {
+  if (!state.secretDetail) return;
+  state.secretDetail.showManagedFields = !state.secretDetail.showManagedFields;
+  render();
+}
+
+function currentSecretYamlText(sd: SecretDetailState): string {
+  if (!sd.detail) return "";
+  return sd.showManagedFields ? sd.detail.manifest.yaml_full : sd.detail.manifest.yaml_without_managed_fields;
+}
+
+function setSecretSearch(_view: string, query: string) {
+  if (!state.secretDetail) return;
+  state.secretDetail.yamlSearch = query;
+  state.secretDetail.yamlSearchIndex = 0;
+  pendingSearchScroll = true;
+  render();
+}
+
+function moveSecretSearch(_view: string, delta: number) {
+  const sd = state.secretDetail;
+  if (!sd || !sd.yamlSearch) return;
+  const count = countSearchMatches(currentSecretYamlText(sd), sd.yamlSearch);
+  if (count === 0) return;
+  sd.yamlSearchIndex = (((sd.yamlSearchIndex + delta) % count) + count) % count;
+  pendingSearchScroll = true;
+  render();
+}
+
+/** Fetches one key's value, fresh — the only way a value reaches the page. */
+async function revealSecretKey(key: string) {
+  const sd = state.secretDetail;
+  if (!sd) return;
+  const token = secretDetailToken;
+  sd.revealed[key] = { status: "loading" };
+  render();
+  try {
+    const value = await api.getSecretValue(sd.ctx, sd.namespace, sd.name, key);
+    // Hidden again, or the panel closed, while the request was in flight: do
+    // not bring the value back.
+    if (token !== secretDetailToken || state.secretDetail?.revealed[key]?.status !== "loading") return;
+    state.secretDetail.revealed[key] = { status: "shown", value };
+  } catch (e) {
+    if (token !== secretDetailToken || state.secretDetail?.revealed[key]?.status !== "loading") return;
+    state.secretDetail.revealed[key] = { status: "error", error: String(e) };
+  }
+  render();
+}
+
+function hideSecretKey(key: string) {
+  if (!state.secretDetail) return;
+  delete state.secretDetail.revealed[key];
+  render();
+}
+
+/** Plain text on purpose: the rich-text copy path would put the value into an HTML flavour too. */
+async function copySecretKey(key: string) {
+  const r = state.secretDetail?.revealed[key];
+  if (!r || r.status !== "shown") return;
+  const binary = r.value.text === null;
+  const ok = await copyPlainTextToClipboard(r.value.text ?? r.value.base64 ?? "");
+  showCopyToast(ok ? `Copied ${key}${binary ? " (as base64)" : ""}` : "Copy failed");
+}
+
 function openKedaDetail(ctx: string, namespace: string, kind: string, name: string) {
   closePodDetail();
   closeNodeDetail();
@@ -3703,6 +3876,7 @@ function openKedaDetail(ctx: string, namespace: string, kind: string, name: stri
   closeHelmDetail();
   closeNapDetail();
     closeHpaDetail();
+    closeSecretDetail();
   const token = ++kedaDetailToken;
   // The row already carries the resolved target — KEDA defaults an omitted
   // `scaleTargetRef.kind` to Deployment and the backend applies that on the
@@ -3859,6 +4033,7 @@ function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: 
   closeHelmDetail();
   closeNapDetail();
   closeKedaDetail();
+  closeSecretDetail();
   stopWorkloadLogFollow();
     closeHpaDetail();
   const token = ++workloadDetailToken;
@@ -4257,6 +4432,7 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
   closeHelmDetail();
   closeNapDetail();
   closeKedaDetail();
+  closeSecretDetail();
   stopPodLogFollow();
     closeHpaDetail();
   const token = ++podDetailToken;
@@ -4662,6 +4838,15 @@ function setMetricsRange(minutes: number) {
   toggleHpaManagedFields,
   setHpaSearch,
   moveHpaSearch,
+  openSecretDetail,
+  closeSecretDetail,
+  setSecretDetailView,
+  toggleSecretManagedFields,
+  setSecretSearch,
+  moveSecretSearch,
+  revealSecretKey,
+  hideSecretKey,
+  copySecretKey,
   openKedaDetail,
   closeKedaDetail,
   setKedaDetailView,
@@ -4874,6 +5059,7 @@ function render(carried?: PreRenderState) {
     ${renderWorkloadDetailPanel()}
     ${renderNapDetailPanel()}
     ${renderHpaDetailPanel()}
+    ${renderSecretDetailPanel()}
     ${renderKedaDetailPanel()}
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
@@ -6022,6 +6208,8 @@ function renderTabContentBody(): string {
       return renderGitOps();
     case "helm":
       return renderHelm();
+    case "secrets":
+      return renderSecrets();
     case "cost":
       return renderCost();
   }
@@ -7808,7 +7996,7 @@ function highlightSearchMatches(html: string, query: string, currentIndex: numbe
  * to be unique within that panel for the `data-filter-key` focus-restore tag.
  */
 function renderSearchBox(
-  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa",
+  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret",
   view: string,
   query: string,
   matchCount: number,
@@ -7862,11 +8050,17 @@ function renderYamlPane(o: {
   editableYaml: string;
   showManagedFields: boolean;
   toggleHandler: string;
-  searchKind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa";
+  searchKind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret";
   search: string;
   searchIndex: number;
   scrollId: string;
   target: { ctx: string; kind: string; namespace: string; name: string };
+  /**
+   * No Edit button. For a Secret, whose YAML is shown with its values
+   * redacted: saving that text would overwrite every value with its
+   * placeholder. `startYamlEdit` and the backend both refuse it as well.
+   */
+  readOnly?: boolean;
 }): string {
   if (o.error) return `<div class="text-sm text-status-critical">${esc(o.error)}</div>`;
   if (!o.loaded) return `<div class="text-sm text-ink-muted">Loading…</div>`;
@@ -7923,11 +8117,15 @@ function renderYamlPane(o: {
           </label>
           ${renderCopyButton(o.scrollId)}
           ${yamlWrapButton()}
-          ${writeActionButton(
-            "Edit",
-            `Edit this ${o.target.kind.toLowerCase()}'s YAML`,
-            `window.__app.startYamlEdit(${jsArg(o.target.ctx)},${jsArg(o.target.kind)},${jsArg(o.target.namespace)},${jsArg(o.target.name)},${jsArg(o.editableYaml)})`,
-          )}
+          ${
+            o.readOnly
+              ? ""
+              : writeActionButton(
+                  "Edit",
+                  `Edit this ${o.target.kind.toLowerCase()}'s YAML`,
+                  `window.__app.startYamlEdit(${jsArg(o.target.ctx)},${jsArg(o.target.kind)},${jsArg(o.target.namespace)},${jsArg(o.target.name)},${jsArg(o.editableYaml)})`,
+                )
+          }
         </div>
         ${renderSearchBox(o.searchKind, "yaml", o.search, matchCount, o.searchIndex)}
       </div>
@@ -9005,6 +9203,128 @@ function renderHpaDetailPanel(): string {
     </div>`;
 }
 
+/**
+ * Past this many characters a revealed value is shown truncated. A Helm
+ * release Secret's one key can run to megabytes, and all of it would go into
+ * the DOM on every render. Copy still copies the whole value.
+ */
+const SECRET_REVEAL_DISPLAY_CHARS = 20_000;
+
+const SECRET_ACTION_BUTTON =
+  "rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary";
+
+function renderSecretKeysView(sd: SecretDetailState): string {
+  if (sd.detailError) return `<div class="text-sm text-status-critical">${esc(sd.detailError)}</div>`;
+  if (!sd.detail) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  if (sd.detail.keys.length === 0) return `<div class="text-sm text-ink-muted">This Secret has no keys.</div>`;
+
+  const cards = sd.detail.keys.map((k) => {
+    const r = sd.revealed[k.name];
+    const arg = jsArg(k.name);
+    let value: string;
+    let actions: string;
+    if (!r) {
+      value = `<span class="select-none tracking-widest text-ink-muted">••••••••</span>`;
+      actions = `<button type="button" title="Show this value — it will be visible on screen" onclick="window.__app.revealSecretKey(${arg})" class="${SECRET_ACTION_BUTTON}">Reveal</button>`;
+    } else if (r.status === "loading") {
+      value = `<span class="text-xs text-ink-muted">Fetching…</span>`;
+      actions = `<button type="button" onclick="window.__app.hideSecretKey(${arg})" class="${SECRET_ACTION_BUTTON}">Cancel</button>`;
+    } else if (r.status === "error") {
+      value = `<span class="text-xs text-status-critical">${esc(r.error)}</span>`;
+      actions = `<button type="button" onclick="window.__app.revealSecretKey(${arg})" class="${SECRET_ACTION_BUTTON}">Retry</button>`;
+    } else {
+      const text = r.value.text;
+      const truncated = text !== null && text.length > SECRET_REVEAL_DISPLAY_CHARS;
+      value =
+        text === null
+          ? `<span class="text-xs text-ink-muted">Binary value, ${formatBytes(r.value.bytes)} — not shown as text. Copy copies it as base64.</span>`
+          : `<pre data-scroll-id="secret-value:${esc(sd.ctx)}:${esc(sd.namespace)}:${esc(sd.name)}:${esc(k.name)}" class="max-h-48 select-text overflow-auto whitespace-pre-wrap break-all rounded border border-gridline bg-surface-1 p-2 text-xs text-ink-primary">${esc(truncated ? text.slice(0, SECRET_REVEAL_DISPLAY_CHARS) : text)}</pre>${
+              truncated
+                ? `<div class="mt-1 text-xs text-ink-muted">Showing the first ${SECRET_REVEAL_DISPLAY_CHARS.toLocaleString()} of ${text.length.toLocaleString()} characters. Copy copies all of it.</div>`
+                : ""
+            }`;
+      actions = `
+        <button type="button" onclick="window.__app.copySecretKey(${arg})" class="${SECRET_ACTION_BUTTON}">Copy</button>
+        <button type="button" onclick="window.__app.hideSecretKey(${arg})" class="${SECRET_ACTION_BUTTON}">Hide</button>`;
+    }
+    return `
+      <div class="rounded-md border border-gridline bg-surface-2 p-3">
+        <div class="flex items-center justify-between gap-2">
+          <div class="min-w-0">
+            <span class="break-all font-mono text-xs text-ink-primary">${esc(k.name)}</span>
+            <span class="ml-2 text-xs text-ink-muted">${formatBytes(k.bytes)}</span>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">${actions}</div>
+        </div>
+        <div class="mt-2">${value}</div>
+      </div>`;
+  });
+
+  return `
+    <div class="flex flex-col gap-2">
+      <div class="text-xs text-ink-muted">Values stay hidden until you reveal one, and are fetched only then. Closing this panel forgets every revealed value.</div>
+      ${cards.join("")}
+    </div>`;
+}
+
+function renderSecretDetailPanel(): string {
+  const sd = state.secretDetail;
+  if (!sd) return "";
+
+  const tabs: { id: SecretDetailState["view"]; label: string }[] = [
+    { id: "keys", label: "Keys" },
+    { id: "yaml", label: "YAML" },
+  ];
+
+  const body =
+    sd.view === "keys"
+      ? renderSecretKeysView(sd)
+      : renderYamlPane({
+          error: sd.detailError,
+          loaded: !!sd.detail,
+          yaml: currentSecretYamlText(sd),
+          editableYaml: "",
+          showManagedFields: sd.showManagedFields,
+          toggleHandler: "toggleSecretManagedFields",
+          searchKind: "Secret",
+          search: sd.yamlSearch,
+          searchIndex: sd.yamlSearchIndex,
+          scrollId: `secret-yaml:${esc(sd.ctx)}:${esc(sd.namespace)}:${esc(sd.name)}`,
+          target: { ctx: sd.ctx, kind: "Secret", namespace: sd.namespace, name: sd.name },
+          readOnly: true,
+        });
+
+  // No write-mode toggle in the header: nothing in this panel writes.
+  return `
+    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeSecretDetail()">
+      ${slideOverShell()}
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">${esc(sd.name)}</div>
+            <div class="truncate text-xs text-ink-muted">Secret · ${esc(sd.secretType)} · ${esc(sd.namespace)} · ${esc(sd.ctx)}</div>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <button type="button" onclick="window.__app.closeSecretDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
+        </div>
+        <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
+          ${tabs
+            .map(
+              (t) => `
+            <button
+              type="button"
+              onclick="window.__app.setSecretDetailView(${jsArg(t.id)})"
+              data-detail-tab ${sd.view === t.id ? "data-detail-tab-active" : ""}
+              class="rounded-md px-3 py-1.5 text-xs font-medium ${sd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
+            >${t.label}</button>`,
+            )
+            .join("")}
+        </div>
+        <div ${detailBodyAttrs(`secret:${sd.ctx}:${sd.namespace}:${sd.name}:${sd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+      </div>
+    </div>`;
+}
+
 function renderKedaDetailPanel(): string {
   const kd = state.kedaDetail;
   if (!kd) return "";
@@ -9658,6 +9978,102 @@ function renderHpa(): string {
     </div>`;
 }
 
+/**
+ * The Secrets tab: name, type, key count and age — never a value. See
+ * `secrets.rs` for how the values are kept out of the list.
+ *
+ * No status column: a Secret has no health to report.
+ */
+function renderSecrets(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+
+  type SecretRow = { ctx: string; s: SecretInfo };
+  const allRows: SecretRow[] = ctxs.flatMap((ctx) => (state.secrets.get(ctx) ?? []).map((s) => ({ ctx, s })));
+  if (allRows.length === 0 && !state.tabLoading) {
+    // A 403 is the common case on this tab — the usual read-only roles exclude
+    // Secrets — and the error banner above already says so. "No secrets found"
+    // under it would state the opposite as fact.
+    if (state.tabErrorsByContext.size > 0) return "";
+    return `<div class="text-sm text-ink-muted">No secrets found.</div>`;
+  }
+  const keyOf = (r: SecretRow) => `${r.ctx}:${r.s.namespace}:${r.s.name}`;
+
+  const columns: ColumnDef<SecretRow>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: SecretRow) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.s.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.s.name, filter: "string" },
+    { key: "type", label: "Type", value: (r) => r.s.secret_type, filter: "enum" },
+    {
+      key: "keys",
+      label: "Keys",
+      // -1 rather than 0 for a Helm release Secret, whose keys were not read:
+      // sorted and filtered as "unknown", never as "empty".
+      value: (r) => r.s.keys?.length ?? -1,
+      filter: "number",
+      copyText: (r) => (r.s.keys ? String(r.s.keys.length) : "—"),
+    },
+    {
+      key: "age",
+      label: "Age",
+      value: (r) => r.s.age_days,
+      filter: "number",
+      copyText: (r) => formatAgeDetailed(r.s.age_days, r.s.age_seconds),
+      sortValue: (r) => r.s.age_seconds,
+    },
+  ];
+  const filtered = applyFilters("secrets", allRows, columns);
+  const sorted = sortRows("secrets", filtered, columns);
+  recordTableSnapshot("secrets", columns, sorted, keyOf);
+  const paged = pageSlice("secrets", sorted);
+
+  return `
+    ${filterSummary("secrets", allRows.length, filtered.length)}
+    ${selectionToolbar("secrets")}
+    <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:secrets">
+      <table class="data-table">
+        ${renderColGroup("secrets", columns, [32])}
+        <thead>
+          <tr>${selectAllCheckboxHeader("secrets", sorted, keyOf)}${sortableHeaderRow("secrets", columns)}</tr>
+          <tr class="filter-row"><th></th>${filterRowCells("secrets", columns, allRows)}</tr>
+        </thead>
+        <tbody>
+          ${paged
+            .map((row) => {
+              const { ctx, s: sec } = row;
+              const keys = sec.keys
+                ? `<td class="tabular" title="${esc(sec.keys.map((k) => k.name).join(", "))}">${sec.keys.length}</td>`
+                : `<td class="tabular text-ink-muted" title="Not read — Helm keeps a full copy of each release revision here, so these are listed without their contents. The Helm tab shows the releases.">—</td>`;
+              return `
+            <tr>
+              ${rowCheckboxCell("secrets", keyOf(row))}
+              ${
+                multi
+                  ? `<td class="text-ink-muted"><button type="button" title="Filter by this cluster" onclick="window.__app.setEnumFilter('secrets','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
+                  : ""
+              }
+              <td><button type="button" title="Filter by this namespace" onclick="window.__app.setEnumFilter('secrets','namespace',[${jsArg(sec.namespace)}])" class="hover:text-series-blue hover:underline">${esc(sec.namespace)}</button></td>
+              <td>
+                <button
+                  type="button"
+                  title="View secret details (keys, YAML)"
+                  data-row-open onclick="window.__app.openSecretDetail(${jsArg(ctx)},${jsArg(sec.namespace)},${jsArg(sec.name)},${jsArg(sec.secret_type)})"
+                  class="text-ink-primary hover:text-series-blue hover:underline"
+                >${esc(sec.name)}</button>${sec.immutable ? ' <span class="text-ink-muted" title="Immutable — its data cannot be changed, only deleted and recreated">(immutable)</span>' : ""}
+              </td>
+              <td><button type="button" title="Filter by this type" onclick="window.__app.setEnumFilter('secrets','type',[${jsArg(sec.secret_type)}])" class="hover:text-series-blue hover:underline">${esc(sec.secret_type)}</button></td>
+              ${keys}
+              <td class="tabular">${formatAgeDetailed(sec.age_days, sec.age_seconds)}</td>
+            </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+      ${sorted.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching secrets.</div>' : ""}
+    </div>
+    ${renderPagination("secrets", sorted.length)}`;
+}
+
 function renderKeda(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
@@ -10197,6 +10613,7 @@ const DETAIL_PANEL_CLOSERS: { isOpen: () => boolean; close: () => void }[] = [
   { isOpen: () => !!state.helmDetail, close: closeHelmDetail },
   { isOpen: () => !!state.napDetail, close: closeNapDetail },
   { isOpen: () => !!state.kedaDetail, close: closeKedaDetail },
+  { isOpen: () => !!state.secretDetail, close: closeSecretDetail },
 ];
 
 function isAnyDetailPanelOpen(): boolean {
