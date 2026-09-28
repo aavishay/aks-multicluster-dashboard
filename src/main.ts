@@ -621,6 +621,13 @@ interface ExternalSecretDetailState {
   events: EventInfo[] | null;
   eventsError: string | null;
   eventsLoading: boolean;
+  /**
+   * Narrows the Keys view. Matched against the Secret key, the remote key and
+   * the property alike — unlike the Secret panel's filter, which sees names
+   * only: an ExternalSecret holds references, never values, so every column
+   * here is safe to search.
+   */
+  keySearch: string;
 }
 
 interface KedaDetailState extends MetricsViewState {
@@ -4006,6 +4013,7 @@ function openExternalSecretDetail(ctx: string, namespace: string, name: string) 
     events: null,
     eventsError: null,
     eventsLoading: false,
+    keySearch: "",
   };
   render();
 
@@ -4035,6 +4043,12 @@ function setExternalSecretDetailView(view: ExternalSecretDetailState["view"]) {
   ed.view = view;
   render();
   if (view === "events" && !ed.events && !ed.eventsLoading) void fetchExternalSecretEvents();
+}
+
+function setExternalSecretKeySearch(query: string) {
+  if (!state.externalSecretDetail) return;
+  state.externalSecretDetail.keySearch = query;
+  render();
 }
 
 function toggleExternalSecretManagedFields() {
@@ -5073,6 +5087,7 @@ function setMetricsRange(minutes: number) {
   closeExternalSecretDetail,
   setExternalSecretDetailView,
   toggleExternalSecretManagedFields,
+  setExternalSecretKeySearch,
   setExternalSecretSearch,
   moveExternalSecretSearch,
   openKedaDetail,
@@ -9604,12 +9619,19 @@ function renderSecretDetailPanel(): string {
 function renderExternalSecretKeysView(ed: ExternalSecretDetailState): string {
   if (ed.detailError) return `<div class="text-sm text-status-critical">${esc(ed.detailError)}</div>`;
   if (!ed.detail) return `<div class="text-sm text-ink-muted">Loading…</div>`;
-  const { mappings, data_from } = ed.detail;
-  if (mappings.length === 0 && data_from.length === 0) {
+  const { mappings: allMappings, data_from: allDataFrom } = ed.detail;
+  if (allMappings.length === 0 && allDataFrom.length === 0) {
     return `<div class="text-sm text-ink-muted">This ExternalSecret maps no keys.</div>`;
   }
+  const query = ed.keySearch.trim().toLowerCase();
+  const hit = (...fields: string[]) => !query || fields.some((f) => f.toLowerCase().includes(query));
+  const mappings = allMappings.filter((m) => hit(m.secret_key, m.remote_key, m.property));
+  const data_from = allDataFrom.filter((d) => hit(d));
+  const mark = (text: string) => highlightSearchMatches(esc(text), query, -1);
   // Only when some entry pins one: a column that is empty on every row is noise.
-  const withVersion = mappings.some((m) => m.version);
+  // Decided over every mapping, not the filtered ones, so the columns do not
+  // come and go as the reader types.
+  const withVersion = allMappings.some((m) => m.version);
   const table = mappings.length
     ? `
       <table class="data-table">
@@ -9619,9 +9641,9 @@ function renderExternalSecretKeysView(ed: ExternalSecretDetailState): string {
             .map(
               (m) => `
             <tr>
-              <td class="font-mono text-ink-primary" title="${esc(m.secret_key)}">${esc(m.secret_key)}</td>
-              <td class="font-mono" title="${esc(m.remote_key)}">${esc(m.remote_key)}</td>
-              <td class="font-mono" title="${esc(m.property)}">${esc(m.property) || '<span class="text-ink-muted">—</span>'}</td>
+              <td class="font-mono text-ink-primary" title="${esc(m.secret_key)}">${mark(m.secret_key)}</td>
+              <td class="font-mono" title="${esc(m.remote_key)}">${mark(m.remote_key)}</td>
+              <td class="font-mono" title="${esc(m.property)}">${m.property ? mark(m.property) : '<span class="text-ink-muted">—</span>'}</td>
               ${withVersion ? `<td class="font-mono">${esc(m.version) || '<span class="text-ink-muted">latest</span>'}</td>` : ""}
             </tr>`,
             )
@@ -9633,14 +9655,34 @@ function renderExternalSecretKeysView(ed: ExternalSecretDetailState): string {
     ? `
       <div>
         <div class="mb-1 text-xs font-medium text-ink-secondary">dataFrom <span class="font-normal text-ink-muted">— each adds any number of keys, known only once synced</span></div>
-        <ul class="flex flex-col gap-1">${data_from.map((d) => `<li class="rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary">${esc(d)}</li>`).join("")}</ul>
+        <ul class="flex flex-col gap-1">${data_from.map((d) => `<li class="rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary">${mark(d)}</li>`).join("")}</ul>
       </div>`
     : "";
+  // Same markup as the Secret panel's key filter: `data-detail-search` for
+  // Cmd+F and for Escape stepping out of it before closing the panel,
+  // `data-filter-key` so focus and caret survive each keystroke's re-render.
+  const total = allMappings.length;
+  const search = `
+    <div class="flex items-center gap-2">
+      <input
+        type="text"
+        placeholder="Filter keys…"
+        value="${esc(ed.keySearch)}"
+        data-detail-search
+        data-filter-key="externalsecret-key-search"
+        oninput="window.__app.setExternalSecretKeySearch(this.value)"
+        class="w-48 rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none focus:border-series-blue"
+      />
+      <span class="w-16 whitespace-nowrap text-right tabular text-xs text-ink-muted">${query ? `${mappings.length} of ${total}` : `${total} key${total === 1 ? "" : "s"}`}</span>
+    </div>`;
+  const nothing = mappings.length === 0 && data_from.length === 0;
   return `
     <div class="flex flex-col gap-3">
-      <div class="text-xs text-ink-muted">Where each key of the Secret comes from. References only — the values live in the store.</div>
-      ${table}
-      ${from}
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="min-w-0 text-xs text-ink-muted">Where each key of the Secret comes from. References only — the values live in the store.</div>
+        ${search}
+      </div>
+      ${nothing ? `<div class="text-sm text-ink-muted">Nothing matches “${esc(ed.keySearch.trim())}”.</div>` : `${table}${from}`}
     </div>`;
 }
 
