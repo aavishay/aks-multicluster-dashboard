@@ -84,15 +84,23 @@ Take the `.dmg`, or the `.app.zip` if you would rather not mount a disk image.
 Every release from 0.7.2 onward also carries an `x86_64.AppImage` for Linux —
 `chmod +x` it and run it.
 
-### Optional: Claude features
+### Optional: AI diagnosis
 
-Explaining cryptic Helm/ArgoCD errors uses the Anthropic API. Click the ✦
-button in the top bar and paste an API key (from
-[console.anthropic.com](https://console.anthropic.com) → API keys). It's stored
-in your operating system's credential store — Keychain on macOS, the D-Bus
-secret service on Linux — never in the app or in a file it owns.
+Any node, workload, pod, Argo CD application or Helm release can be diagnosed
+by an AI model: open it and click **Diagnose** in its panel, or press `⌘D` on
+a focused row. The app gathers the status, events and manifest behind it —
+plus recent logs for a pod — and shows you exactly what will be sent, with a
+summary of what was redacted. Nothing leaves the machine until you confirm.
 
-An exported `ANTHROPIC_API_KEY` takes precedence if you'd rather not store one.
+It works with Claude, Gemini, or a local Ollama. Click the AI button in the
+top bar to choose one and, for Claude or Gemini, paste an API key (from
+[console.anthropic.com](https://console.anthropic.com) or
+[aistudio.google.com](https://aistudio.google.com)). The key is stored in your
+operating system's credential store — Keychain on macOS, the D-Bus secret
+service on Linux — never in the app or in a file it owns.
+
+An exported `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` takes precedence if you'd
+rather not store one.
 
 ### Prerequisites
 

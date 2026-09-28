@@ -10,28 +10,6 @@ use crate::ai;
 use crate::models::{ClaudeDiagnosisPayload, PodInfo};
 use crate::{k8s, redact};
 
-/// Generous for an explanation that should run a few paragraphs, while staying
-/// far from the point where a truncated answer is likely. Streaming means the
-/// large ceiling costs nothing in timeout risk.
-const EXPLAIN_MAX_TOKENS: u32 = 16_000;
-
-/// The whole request is one short string in, prose out — `medium` keeps it
-/// quick without the terseness `low` brings to a diagnostic explanation.
-/// Raise to `high` if explanations start missing root causes.
-const EXPLAIN_EFFORT: &str = "medium";
-
-const EXPLAIN_SYSTEM: &str = "\
-You explain Kubernetes, Helm, and ArgoCD error messages to an experienced SRE.
-
-Given one error message, respond with:
-1. What the error actually means, in plain language.
-2. The most likely cause, and why.
-3. Concrete next steps — the specific file, field, or command to check.
-
-Be direct and concise; assume fluency with kubectl and Helm. Do not restate the \
-error back. If the message is too ambiguous to diagnose confidently, say what \
-additional information would settle it rather than guessing.";
-
 // ---------------------------------------------------------------------------
 // Pod diagnosis
 // ---------------------------------------------------------------------------
@@ -41,8 +19,9 @@ additional information would settle it rather than guessing.";
 const DIAGNOSE_LOG_LINES: usize = 200;
 /// Fetched before trimming, so `tail_lines` has a real tail to choose from.
 const DIAGNOSE_LOG_FETCH_LINES: i64 = 400;
-/// Diagnosis reasons over several documents at once, so it gets more headroom
-/// than the one-string explain path.
+/// Diagnosis reasons over several documents at once — status, events,
+/// manifest and logs — so it gets generous headroom. Streaming means the large
+/// ceiling costs nothing in timeout risk.
 const DIAGNOSE_MAX_TOKENS: u32 = 32_000;
 /// Root-causing a crashloop is the intelligence-sensitive case in this app;
 /// terser settings produce plausible-but-shallow answers here.
@@ -1140,16 +1119,6 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
-}
-
-/// Streams an explanation of a single error message, emitting text deltas on
-/// `on_token` as they arrive.
-///
-/// Only the error string leaves the machine — no logs, manifests, or cluster
-/// identifiers — which is what makes this the lowest-exposure Claude feature
-/// in the app.
-pub async fn explain_error(error_text: &str, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
-    ai::stream(error_text, EXPLAIN_SYSTEM, EXPLAIN_MAX_TOKENS, EXPLAIN_EFFORT, on_token).await
 }
 
 #[cfg(test)]

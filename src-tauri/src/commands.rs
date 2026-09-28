@@ -612,14 +612,6 @@ pub async fn ai_diagnose(
 }
 
 #[tauri::command]
-pub async fn ai_explain_error(error_text: String, on_token: tauri::ipc::Channel<String>) -> Result<(), String> {
-    // Not wrapped in `with_retry`/`with_deadline`: those are keyed to a cluster
-    // context, and a streaming call already surfaces progress incrementally, so
-    // a stall is visible rather than silent.
-    claude::explain_error(&error_text, on_token).await
-}
-
-#[tauri::command]
 pub fn kubeconfig_path() -> Option<String> {
     kubeconfig::kubeconfig_path().map(|p| p.display().to_string())
 }

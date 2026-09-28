@@ -198,12 +198,6 @@ export const api = {
     channel.onmessage = onToken;
     return invoke<void>("ai_diagnose", { prompt, kind, onToken: channel });
   },
-  /** Streams an explanation of one error string; `onToken` fires per text delta. */
-  aiExplainError: (errorText: string, onToken: (chunk: string) => void) => {
-    const channel = new Channel<string>();
-    channel.onmessage = onToken;
-    return invoke<void>("ai_explain_error", { errorText, onToken: channel });
-  },
   getNapNodePools: (contextName: string) => invoke<NapResult>("get_nap_node_pools", { contextName }),
   getNapNodePoolManifest: (contextName: string, name: string) =>
     invoke<NapNodePoolManifest>("get_nap_node_pool_manifest", { contextName, name }),
