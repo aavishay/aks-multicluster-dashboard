@@ -587,6 +587,12 @@ interface SecretDetailState {
   showManagedFields: boolean;
   yamlSearch: string;
   yamlSearchIndex: number;
+  /**
+   * Narrows the Keys view by key *name*. Never matched against values: they
+   * are not on the page until revealed, and a filter that found them would
+   * be a way to probe a value without revealing it.
+   */
+  keySearch: string;
   /** Keyed by the Secret's key name. */
   revealed: Record<string, SecretReveal>;
 }
@@ -3773,6 +3779,7 @@ function openSecretDetail(ctx: string, namespace: string, name: string, secretTy
     showManagedFields: false,
     yamlSearch: "",
     yamlSearchIndex: 0,
+    keySearch: "",
     revealed: {},
   };
   render();
@@ -3830,6 +3837,12 @@ function moveSecretSearch(_view: string, delta: number) {
   if (count === 0) return;
   sd.yamlSearchIndex = (((sd.yamlSearchIndex + delta) % count) + count) % count;
   pendingSearchScroll = true;
+  render();
+}
+
+function setSecretKeySearch(query: string) {
+  if (!state.secretDetail) return;
+  state.secretDetail.keySearch = query;
   render();
 }
 
@@ -4844,6 +4857,7 @@ function setMetricsRange(minutes: number) {
   toggleSecretManagedFields,
   setSecretSearch,
   moveSecretSearch,
+  setSecretKeySearch,
   revealSecretKey,
   hideSecretKey,
   copySecretKey,
@@ -9218,7 +9232,11 @@ function renderSecretKeysView(sd: SecretDetailState): string {
   if (!sd.detail) return `<div class="text-sm text-ink-muted">Loading…</div>`;
   if (sd.detail.keys.length === 0) return `<div class="text-sm text-ink-muted">This Secret has no keys.</div>`;
 
-  const cards = sd.detail.keys.map((k) => {
+  const query = sd.keySearch.trim().toLowerCase();
+  const shown = query ? sd.detail.keys.filter((k) => k.name.toLowerCase().includes(query)) : sd.detail.keys;
+  const total = sd.detail.keys.length;
+
+  const cards = shown.map((k) => {
     const r = sd.revealed[k.name];
     const arg = jsArg(k.name);
     let value: string;
@@ -9251,7 +9269,7 @@ function renderSecretKeysView(sd: SecretDetailState): string {
       <div class="rounded-md border border-gridline bg-surface-2 p-3">
         <div class="flex items-center justify-between gap-2">
           <div class="min-w-0">
-            <span class="break-all font-mono text-xs text-ink-primary">${esc(k.name)}</span>
+            <span class="break-all font-mono text-xs text-ink-primary">${highlightSearchMatches(esc(k.name), query, -1)}</span>
             <span class="ml-2 text-xs text-ink-muted">${formatBytes(k.bytes)}</span>
           </div>
           <div class="flex shrink-0 items-center gap-2">${actions}</div>
@@ -9260,10 +9278,30 @@ function renderSecretKeysView(sd: SecretDetailState): string {
       </div>`;
   });
 
+  // `data-detail-search` puts it under Cmd+F like every other panel's search
+  // box; `data-filter-key` keeps focus and caret across the re-render each
+  // keystroke causes.
+  const search = `
+    <div class="flex items-center gap-2">
+      <input
+        type="text"
+        placeholder="Filter keys…"
+        value="${esc(sd.keySearch)}"
+        data-detail-search
+        data-filter-key="secret-key-search"
+        oninput="window.__app.setSecretKeySearch(this.value)"
+        class="w-48 rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none focus:border-series-blue"
+      />
+      <span class="w-16 whitespace-nowrap text-right tabular text-xs text-ink-muted">${query ? `${shown.length} of ${total}` : `${total} key${total === 1 ? "" : "s"}`}</span>
+    </div>`;
+
   return `
     <div class="flex flex-col gap-2">
-      <div class="text-xs text-ink-muted">Values stay hidden until you reveal one, and are fetched only then. Closing this panel forgets every revealed value.</div>
-      ${cards.join("")}
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="min-w-0 text-xs text-ink-muted">Values stay hidden until you reveal one, and are fetched only then. Closing this panel forgets every revealed value.</div>
+        ${search}
+      </div>
+      ${shown.length ? cards.join("") : `<div class="text-sm text-ink-muted">No keys match “${esc(sd.keySearch.trim())}”.</div>`}
     </div>`;
 }
 
