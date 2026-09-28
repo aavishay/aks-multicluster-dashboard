@@ -11459,8 +11459,8 @@ function stepTab(delta: number) {
  * out of a filter you had just narrowed threw the filter away — the opposite of
  * what the key is for at that moment.
  *
- * An allowlist of two places rather than "any field with a filter key", and
- * deliberately so: the cluster palette's query, the YAML editor and the
+ * An allowlist rather than "any field with a filter key" — table filters, the
+ * cluster filter, and a detail panel's search box — and deliberately so: the cluster palette's query, the YAML editor and the
  * confirmation dialog's number all carry `data-filter-key` as well, and Escape
  * there belongs to the thing the field sits in, not to the field. A denylist
  * would quietly capture the next one of those to be added.
@@ -11477,10 +11477,13 @@ function blurFocusedFilterField(target: EventTarget | null): boolean {
   // which has exactly the same complaint: Escape in it used to clear the tab's
   // filters, which are not even the filter being typed in.
   const isTableFilter = target.closest('[data-scroll-id^="table:"]') !== null;
-  // And the Secret panel's key filter, which is a filter in the same sense:
-  // stepping out of it leaves the Keys view's arrows free to pick a key, where
-  // escaping straight past it would close the panel under the reader.
-  if (!isTableFilter && key !== "cluster-filter" && key !== "secret-key-search") return false;
+  // And a detail panel's search box — the YAML and logs search in every panel,
+  // and the Secret panel's key filter — all marked `data-detail-search` for
+  // Cmd+F. Escaping straight past one closed the panel under the reader, with
+  // the query and anything revealed in it; stepping out first leaves the
+  // arrows free to scroll the panel, or to pick a key in a Secret's Keys view.
+  const isPanelSearch = target.hasAttribute("data-detail-search");
+  if (!isTableFilter && !isPanelSearch && key !== "cluster-filter") return false;
   target.blur();
   return true;
 }
