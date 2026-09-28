@@ -5184,6 +5184,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       ["↑ ↓", "Move the row cursor"],
       ["Enter", "Open the focused row's details"],
+      [withMod("X"), "Same as clicking the focused row's name"],
       [withMod("D"), "Diagnose the focused row with Claude"],
       ["Space", "Select or deselect the focused row"],
       ["⇧↑ ⇧↓", "Extend the selection"],
@@ -6315,7 +6316,7 @@ function renderNodes(): string {
                   <button
                     type="button"
                     title="View pods on this node"
-                    onclick="window.__app.viewPodsForNode(${jsArg(ctx)},${jsArg(n.name)})"
+                    data-row-name onclick="window.__app.viewPodsForNode(${jsArg(ctx)},${jsArg(n.name)})"
                     class="text-ink-primary hover:text-series-blue hover:underline"
                   >${esc(n.name)}</button>${n.unschedulable ? ' <span class="text-status-warning">(cordoned)</span>' : ""}
                 </span>
@@ -6461,7 +6462,7 @@ function renderWorkloads(): string {
                   <button
                     type="button"
                     title="View pods for this workload"
-                    onclick="window.__app.viewPodsForWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})"
+                    data-row-name onclick="window.__app.viewPodsForWorkload(${jsArg(ctx)},${jsArg(w.kind)},${jsArg(w.namespace)},${jsArg(w.name)})"
                     class="text-ink-primary hover:text-series-blue hover:underline"
                   >${esc(w.name)}</button>
                 </span>
@@ -9688,7 +9689,7 @@ function renderNap(): string {
                   <button
                     type="button"
                     title="View nodes provisioned by this pool"
-                    onclick="window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(p.name)})"
+                    data-row-name onclick="window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(p.name)})"
                     class="text-ink-primary hover:text-series-blue hover:underline"
                   >${esc(p.name)}</button>
                 </span>
@@ -10972,6 +10973,29 @@ function activateFocusedRow(): boolean {
 }
 
 /**
+ * Cmd+X: clicks the focused row's name — the same thing a left-click on the
+ * object does, which is not always what Enter does.
+ *
+ * On Nodes, Workloads and NAP the name is a drill-down, marked
+ * `data-row-name`: a workload's name jumps to its pods, a node's to the pods
+ * scheduled on it, a node pool's to the nodes it provisioned. The detail panel
+ * is the separate ⓘ glyph beside it, which is Enter's. On Pods, GitOps and
+ * Helm the name IS the panel opener, and on HPA and KEDA the name is plain
+ * text — in both cases this falls back to `data-row-open`, so the key still
+ * does something rather than nothing.
+ *
+ * Clicked rather than called, for the reason `activateFocusedRow` gives: the
+ * button carries the arguments, so the key cannot disagree with the click.
+ */
+function activateFocusedRowName(): boolean {
+  const row = focusedRowElement();
+  const target = row?.querySelector<HTMLElement>("[data-row-name]") ?? row?.querySelector<HTMLElement>("[data-row-open]");
+  if (!target) return false;
+  target.click();
+  return true;
+}
+
+/**
  * Cmd/Ctrl+D: clicks whichever Diagnose button is in play.
  *
  * Clicked rather than called directly, for the same reason as
@@ -11398,6 +11422,22 @@ document.addEventListener("keydown", (e) => {
     if (diagnoseFromKeyboard() === "signed-out") {
       showCopyToast("Sign in to Claude first — see the AI button in the top bar");
     }
+    return;
+  }
+
+  // Cmd+X does what left-clicking the focused row's name does — see
+  // `activateFocusedRowName` for why that is not simply Enter again.
+  //
+  // Unlike Cmd+B, Cmd+D and Cmd+K it IS gated on isEditableTarget, and left
+  // unclaimed there rather than swallowed: Cmd+X is Cut, and in a filter box
+  // Cut is what it has to stay. Outside an editable field Cut has nothing to
+  // act on — a table cell cannot be cut from — so claiming it costs nothing.
+  //
+  // Gated on isAnyOverlayOpen, the same as Enter, so it cannot open a row
+  // that is hidden behind a panel or a dialog.
+  if (e.key === "x" || e.key === "X") {
+    if (isEditableTarget(e.target) || isAnyOverlayOpen()) return;
+    if (activateFocusedRowName()) e.preventDefault();
     return;
   }
 
