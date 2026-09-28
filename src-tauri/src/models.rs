@@ -70,8 +70,8 @@ pub struct PodInfo {
     pub cpu_usage_millicores: Option<i64>,
     pub memory_usage_ki: Option<i64>,
     pub status_reason: Option<String>,
-    /// The container that is failing, so a row-level Diagnose can target it
-    /// rather than the pod's first container. `None` for a pod-level failure
+    /// The container that is failing, so a diagnosis targets it rather than
+    /// the pod's first container. `None` for a pod-level failure
     /// such as `Evicted`, which belongs to no container.
     pub failure_container: Option<String>,
     /// The failing container's reason and message.
@@ -129,7 +129,7 @@ pub struct WorkloadInfo {
     pub images: Vec<String>,
     /// `helm.sh/chart` label, e.g. "apisix-2.14.0", when Helm installed it.
     pub chart: Option<String>,
-    /// The most informative failing condition, for the Explain affordance.
+    /// The most informative failing condition, shown as the status tooltip.
     ///
     /// Controllers mostly report `MinimumReplicasUnavailable: Deployment does
     /// not have minimum availability`, which restates the ready count and

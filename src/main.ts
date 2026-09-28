@@ -635,21 +635,9 @@ interface HelmDetailState {
   searchIndex: number;
 }
 
-/** The "explain this error" panel: one error in, streamed prose out. */
-interface ClaudeExplainState {
-  /** The error text sent to Claude — shown verbatim so it's clear what left the machine. */
-  errorText: string;
-  /** Short label for the panel header, e.g. "apisix (Helm release)". */
-  subject: string;
-  /** Accumulated text deltas. */
-  answer: string;
-  streaming: boolean;
-  error: string | null;
-}
-
 /**
- * Pod diagnosis. Unlike explain-error this sends logs, so it is a two-step
- * flow: assemble + preview the redacted payload, then send only on an explicit
+ * A diagnosis. It sends logs, manifests and events, so it is a two-step flow:
+ * assemble + preview the redacted payload, then send only on an explicit
  * confirmation.
  */
 interface ClaudeDiagnoseState {
@@ -725,7 +713,6 @@ interface AppState {
   metricsBackendTesting: boolean;
   claudeAuth: AiAuthState | null;
   claudePanelOpen: boolean;
-  claudeExplain: ClaudeExplainState | null;
   claudeDiagnose: ClaudeDiagnoseState | null;
   sortState: Partial<Record<TabId, SortSpec>>;
   filterState: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
@@ -840,7 +827,6 @@ const state: AppState = {
   metricsBackendTesting: false,
   claudeAuth: null,
   claudePanelOpen: false,
-  claudeExplain: null,
   claudeDiagnose: null,
   detailPanelWidth: getInitialDetailWidth(),
   sortState: {},
@@ -899,9 +885,7 @@ let hpaDetailToken = 0;
 let kedaDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
 let helmDetailToken = 0;
-/** Bumped per explain request, so a stale stream can't append to a newer one. */
-let claudeExplainToken = 0;
-/** Same guard for the diagnosis stream. */
+/** Bumped per diagnosis request, so a stale stream can't append to a newer one. */
 let claudeDiagnoseToken = 0;
 /** rAF-batches streamed token appends, same as the log-follow path. */
 let claudeRenderScheduled = false;
@@ -4704,8 +4688,6 @@ function setMetricsRange(minutes: number) {
   setAiModel,
   setAiBaseUrl,
   clearClaudeApiKey,
-  explainError,
-  closeClaudeExplain,
   diagnosePod,
   diagnoseWorkload,
   diagnoseGitOpsApp,
@@ -4715,7 +4697,6 @@ function setMetricsRange(minutes: number) {
   closeClaudeDiagnose,
   toggleDiagnosePayload,
   copyDiagnosis,
-  copyExplanation,
   openMetricsBackendEditor,
   closeMetricsBackendEditor,
   setMetricsBackendField,
@@ -4898,7 +4879,6 @@ function render(carried?: PreRenderState) {
     ${renderHelmDetailPanel()}
     ${renderMetricsBackendEditor()}
     ${renderClaudePanel()}
-    ${renderClaudeExplainPanel()}
     ${renderClaudeDiagnosePanel()}
     ${renderClusterPalette()}
     ${renderConfirmDialog()}
@@ -5358,14 +5338,13 @@ function uiScaleButton(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The "Diagnose" affordance, on a failing table row and in a detail panel's
- * header.
+ * The "Diagnose" affordance, in a detail panel's header.
  *
- * Diagnose rather than Explain because Explain sends only the error string,
- * and on a row that is one line of status text — enough for the model to
- * restate what `ImagePullBackOff` means and no more. Diagnose sends the
- * status, events, manifest and logs behind that row, which is the difference
- * between naming the failure and explaining it.
+ * It replaced an Explain button that sent only the error string — one line of
+ * status text, enough for the model to restate what `ImagePullBackOff` means
+ * and no more. Diagnose sends the status, events, manifest and logs behind the
+ * object, which is the difference between naming the failure and explaining
+ * it.
  *
  * `onclick` is passed in rather than built here: a pod and a workload reach
  * different entry points, and the two need different arguments.
@@ -5397,24 +5376,6 @@ function claudeDiagnoseButton(onclick: string, what: string): string {
       onclick="${onclick}"
       class="shrink-0 rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
     >Diagnose</button>`;
-}
-
-/** Small "Explain" affordance, rendered only where an error string exists. */
-function claudeExplainButton(subject: string, errorText: string): string {
-  if (!errorText.trim()) return "";
-  const signedIn = state.claudeAuth?.signed_in === true;
-  const title = signedIn
-    ? "Explain this error with Claude (sends only this message)"
-    : "Sign in to Claude first — see the AI button in the top bar";
-  return `
-    <button
-      type="button"
-      title="${esc(title)}"
-      ${signedIn ? "" : "disabled"}
-      onclick="window.__app.explainError(${jsArg(subject)}, this.dataset.err)"
-      data-err="${esc(errorText)}"
-      class="shrink-0 rounded border border-gridline px-1.5 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
-    >Explain</button>`;
 }
 
 /** Two inputs feeding a node — a model, rather than the sparkle that reads as one vendor's mark. */
@@ -5799,63 +5760,6 @@ function renderMarkdown(source: string, target: MarkdownTarget = "panel"): strin
   if (code) out.push(codeBlock(code));
   flush();
   return out.join("");
-}
-
-function renderClaudeExplainPanel(): string {
-  const ex = state.claudeExplain;
-  if (!ex) return "";
-  const scrollId = "claude-explain";
-
-  // The error does not replace the answer when tokens arrived before it, for
-  // the same reason as the diagnosis panel: a stream that failed halfway has
-  // still produced half an explanation, and discarding it takes the Copy
-  // button with it.
-  const body = ex.error && !ex.answer
-    ? `<div class="text-sm text-status-critical">${esc(ex.error)}</div>`
-    : ex.answer
-      ? `${ex.error ? `<div class="mb-2 text-sm text-status-critical">${esc(ex.error)}</div>` : ""}<div class="text-sm leading-relaxed text-ink-secondary">${renderMarkdown(ex.answer)}</div>`
-      : `<div class="text-sm text-ink-muted">Thinking…</div>`;
-
-  return `
-    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeClaudeExplain()">
-      ${slideOverShell()}
-        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
-          <div class="min-w-0">
-            <div class="truncate text-sm font-medium text-ink-primary">Explain error</div>
-            <div class="truncate text-xs text-ink-muted">${esc(ex.subject)}</div>
-          </div>
-          <button type="button" onclick="window.__app.closeClaudeExplain()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
-        </div>
-
-        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4" data-detail-body data-scroll-id="${scrollId}">
-          <div>
-            <div class="mb-1 text-xs font-medium text-ink-secondary">Sent to Claude</div>
-            <pre class="max-h-32 overflow-auto whitespace-pre-wrap rounded-md border border-gridline bg-surface-2 p-2 text-xs text-ink-secondary">${esc(ex.errorText)}</pre>
-          </div>
-          <div class="border-t border-gridline pt-3">
-            <div class="mb-1 flex items-center justify-between gap-2 text-xs font-medium text-ink-secondary">
-              <div class="flex items-center gap-2">
-                Explanation
-                ${ex.streaming ? '<span class="text-ink-muted">streaming…</span>' : ""}${
-                  ex.error && ex.answer ? '<span class="text-status-warning">incomplete</span>' : ""
-                }
-              </div>
-              ${
-                ex.answer
-                  ? `<button
-                      type="button"
-                      title="Copy the explanation — pastes with formatting into Teams, Outlook or a ticket"
-                      onclick="window.__app.copyExplanation()"
-                      class="rounded px-2 py-1 text-xs font-normal text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
-                    >Copy</button>`
-                  : ""
-              }
-            </div>
-            ${body}
-          </div>
-        </div>
-      </div>
-    </div>`;
 }
 
 function renderClaudeDiagnosePanel(): string {
@@ -6367,20 +6271,14 @@ function renderWorkloads(): string {
   const rows = state.unhealthyOnly.workloads ? allRows.filter((r) => !r.w.healthy) : allRows;
   const keyOf = (r: WorkloadRow) => `${r.ctx}:${r.w.namespace}:${r.w.kind}:${r.w.name}`;
 
-  // The status cell keys off `healthy`, not `failure_message`, which is the
-  // opposite of the Pods table one row-renderer down. (Until the row-level
-  // Diagnose button moved into the detail panel this governed that button
-  // too; it still governs the dot and the unhealthy-only filter.)
+  // The status dot and the unhealthy-only filter key off `healthy`, not
+  // `failure_message`; the message is only the dot's tooltip.
   //
   // A workload's `healthy` is `desired == ready` and is computed for every
   // kind, whereas `failure_message` comes from `status.conditions` — and
   // measured against a real fleet, 0 of 30 StatefulSets and DaemonSets carry
-  // any conditions at all. Gating on the message hid the button from two of
-  // the three kinds entirely.
-  //
-  // Pods are the other way round for an equally concrete reason: `podHealthy`
-  // is phase-based, and a crashlooping pod sits in phase Running, so it reads
-  // as healthy. There `failure_message` is the trustworthy signal.
+  // any conditions at all. Keying on the message would hide failures on two
+  // of the three kinds entirely.
   const columns: ColumnDef<WorkloadRow>[] = [
     ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: WorkloadRow) => r.ctx, filter: "enum" as const }] : []),
     { key: "kind", label: "Kind", value: (r) => r.w.kind, filter: "enum" },
@@ -6989,7 +6887,7 @@ function chartLegendLabel(color: string, label: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Claude: auth + explain-error
+// Claude: auth + diagnosis
 // ---------------------------------------------------------------------------
 
 function toggleClaudePanel() {
@@ -7146,8 +7044,6 @@ async function copyClaudeAnswer(opts: {
   heading: string;
   /** One line under the heading — where the subject lives. */
   subtitle?: string;
-  /** Verbatim context the answer is about, rendered as a code block. */
-  context?: string;
   answer: string;
   error: string | null;
   incompleteLabel: string;
@@ -7159,16 +7055,12 @@ async function copyClaudeAnswer(opts: {
   if (opts.subtitle) lines.push(opts.subtitle);
   if (incomplete) lines.push(incomplete);
   lines.push("");
-  if (opts.context) lines.push("```", opts.context, "```", "");
   lines.push(opts.answer);
 
   const html =
     `<h2 style="${CLIPBOARD_HEADING_STYLE}font-size:1.3em;">${esc(opts.heading)}</h2>` +
     (opts.subtitle ? `<p style="margin:0 0 12px;${CLIPBOARD_TEXT_COLOR}"><em>${esc(opts.subtitle)}</em></p>` : "") +
     (incomplete ? `<p style="margin:0 0 12px;color:#b45309;"><strong>${esc(incomplete)}</strong></p>` : "") +
-    (opts.context
-      ? `<pre style="${CLIPBOARD_CODE_STYLE}padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-word;margin:0 0 12px;">${esc(opts.context)}</pre>`
-      : "") +
     renderMarkdown(opts.answer, "clipboard");
 
   const ok = await copyRichTextToClipboard(lines.join("\n"), html);
@@ -7229,26 +7121,6 @@ async function copyDiagnosis() {
   });
 }
 
-/**
- * The explained error goes in the copy as well as the explanation.
- *
- * An explanation on its own is close to useless to a reader in a channel:
- * they cannot tell what was explained, and the error is usually the thing
- * someone needs to recognise before the explanation means anything.
- */
-async function copyExplanation() {
-  const ex = state.claudeExplain;
-  if (!ex || !ex.answer) return;
-  await copyClaudeAnswer({
-    heading: `Explanation — ${ex.subject}`,
-    context: ex.errorText,
-    answer: ex.answer,
-    error: ex.error,
-    incompleteLabel: "Incomplete — the explanation stopped early",
-    toast: "Explanation copied to clipboard",
-  });
-}
-
 function toggleDiagnosePayload() {
   if (!state.claudeDiagnose) return;
   state.claudeDiagnose.showPayload = !state.claudeDiagnose.showPayload;
@@ -7287,7 +7159,6 @@ async function startDiagnosis(
   build: () => Promise<ClaudeDiagnosisPayload>,
 ) {
   const token = ++claudeDiagnoseToken;
-  closeClaudeExplain();
   state.claudeDiagnose = {
     ctx,
     kind,
@@ -7344,47 +7215,6 @@ async function confirmDiagnose() {
     if (token !== claudeDiagnoseToken || !state.claudeDiagnose) return;
     state.claudeDiagnose.streaming = false;
     state.claudeDiagnose.error = String(e);
-  }
-  render();
-}
-
-function closeClaudeExplain() {
-  claudeExplainToken += 1;
-  state.claudeExplain = null;
-  render();
-}
-
-/**
- * Opens the explain panel for one error string. Only this string is sent —
- * no logs, manifests or cluster identifiers — which is what keeps this the
- * lowest-exposure Claude feature in the app.
- */
-async function explainError(subject: string, errorText: string) {
-  if (!errorText.trim()) return;
-  const token = ++claudeExplainToken;
-  state.claudeExplain = { errorText, subject, answer: "", streaming: true, error: null };
-  render();
-
-  try {
-    await api.aiExplainError(errorText, (chunk) => {
-      if (token !== claudeExplainToken || !state.claudeExplain) return;
-      state.claudeExplain.answer += chunk;
-      // Coalesce bursts of deltas into one render per frame — a full re-render
-      // per token would thrash, same reasoning as the log-follow path.
-      if (!claudeRenderScheduled) {
-        claudeRenderScheduled = true;
-        requestAnimationFrame(() => {
-          claudeRenderScheduled = false;
-          render();
-        });
-      }
-    });
-    if (token !== claudeExplainToken || !state.claudeExplain) return;
-    state.claudeExplain.streaming = false;
-  } catch (e) {
-    if (token !== claudeExplainToken || !state.claudeExplain) return;
-    state.claudeExplain.streaming = false;
-    state.claudeExplain.error = String(e);
   }
   render();
 }
@@ -10199,12 +10029,7 @@ function renderHelm(): string {
               <td class="tabular">${esc(r.app_version) || "—"}</td>
               <td class="tabular" title="${r.revision_count} revision${r.revision_count === 1 ? "" : "s"} retained">${r.revision}</td>
               <td class="tabular">${formatAgeDetailed(r.age_days, r.age_seconds)}</td>
-              <td class="max-w-xs" title="${esc(r.description)}">
-                <span class="inline-flex items-center gap-1.5">
-                  <span class="min-w-0 truncate">${esc(r.description) || "—"}</span>
-                  ${helmReleaseHealthy(r) ? "" : claudeExplainButton(`${r.name} (Helm release)`, r.description)}
-                </span>
-              </td>
+              <td class="max-w-xs truncate" title="${esc(r.description)}">${esc(r.description) || "—"}</td>
             </tr>`;
             })
             .join("")}
@@ -10423,7 +10248,7 @@ function consumesPlainNavKeys(target: EventTarget | null): boolean {
  * True while something is layered over the tab content that fully *takes* a
  * plain arrow key — everything in the return below, currently the shortcuts
  * list, a confirmation dialog, the cluster palette, Claude's
- * panel/explain/diagnose views, the metrics-backend editor and an open enum
+ * panel and diagnosis view, the metrics-backend editor and an open enum
  * dropdown. Read the expression rather than trusting this sentence; a list in
  * prose falls behind the code it describes, which this one has done twice.
  *
@@ -10459,22 +10284,22 @@ function isBlockingOverlayOpen(): boolean {
 }
 
 /**
- * Claude's explain and diagnose views — the slide-over ones.
+ * Claude's diagnosis view — the slide-over one.
  *
- * Split out of `isNonPanelOverlayOpen` because they are the one overlay family
- * that *has* somewhere to put a navigation key: each renders a slide-over
- * whose body is an `overflow-auto` scroll container. Lumping them in with the
- * dialogs meant PageUp/PageDown, Home/End and the arrows were all dropped by
- * the first guard, so a diagnosis five thousand pixels tall could not be
- * scrolled by keyboard at all — and because Diagnose is only reachable from an
+ * Split out of `isNonPanelOverlayOpen` because it is the one overlay that
+ * *has* somewhere to put a navigation key: it renders a slide-over whose body
+ * is an `overflow-auto` scroll container. Lumping it in with the dialogs meant
+ * PageUp/PageDown, Home/End and the arrows were all dropped by the first
+ * guard, so a diagnosis five thousand pixels tall could not be scrolled by
+ * keyboard at all — and because Diagnose was then reachable only from an
  * unhealthy row, it looked like the keys broke whenever the table had red
  * rows in it.
  *
- * Still modal, so they consume the key either way: nothing should page the
+ * Still modal, so it consumes the key either way: nothing should page the
  * table behind an open panel.
  */
 function isClaudeOverlayOpen(): boolean {
-  return !!state.claudeExplain || !!state.claudeDiagnose;
+  return !!state.claudeDiagnose;
 }
 
 /** True while anything at all covers the tab content, detail panels included — the broad guard for keys that no overlay should let through. */
@@ -11242,7 +11067,6 @@ document.addEventListener("keydown", (e) => {
     // Escape reaching past it would close the panel and take the draft with it.
     else if (state.yamlEdit) cancelYamlEdit();
     else if (state.clusterPalette) closeClusterPalette();
-    else if (state.claudeExplain) closeClaudeExplain();
     else if (state.claudeDiagnose) closeClaudeDiagnose();
     else if (state.claudePanelOpen) toggleClaudePanel();
     else if (state.metricsBackendEditor) closeMetricsBackendEditor();

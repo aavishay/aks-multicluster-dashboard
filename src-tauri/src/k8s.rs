@@ -530,17 +530,16 @@ fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_ow
 /// Waiting reasons that mean "still starting", not "broken".
 ///
 /// A pod is briefly in both on every normal rollout and neither carries a
-/// message. Offering to explain `ContainerCreating` would spend a round trip
-/// to be told a container is being created.
+/// message. Reporting `ContainerCreating` as a failure would flag every pod
+/// on every rollout for a container that is simply being created.
 const TRANSIENT_WAITING_REASONS: [&str; 2] = ["ContainerCreating", "PodInitializing"];
 
 /// The failing container and the message describing it, or `None` for a pod
 /// with nothing wrong.
 ///
-/// The container is returned so a row-level Diagnose can target the one that
-/// is actually broken rather than whichever the pod lists first — on a pod
-/// with a healthy sidecar those differ, and the sidecar's logs explain
-/// nothing.
+/// The container is returned so a diagnosis targets the one that is actually
+/// broken rather than whichever the pod lists first — on a pod with a healthy
+/// sidecar those differ, and the sidecar's logs explain nothing.
 ///
 /// Reads the container states rather than `pod.status.reason`: that field is
 /// only set for pod-level failures such as `Evicted`, and was unset on all
@@ -595,8 +594,8 @@ fn pod_failure(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<(Option
 ///
 /// A clean exit is not a failure even though the container is not ready: a
 /// finished CronJob pod sits at `Completed (exit 0)` indefinitely, and on one
-/// real cluster those were half the not-ready pods. Offering to explain a job
-/// that worked is worse than offering nothing.
+/// real cluster those were half the not-ready pods. Flagging a job that
+/// worked as failed is worse than flagging nothing.
 fn container_state_message(state: &k8s_openapi::api::core::v1::ContainerState) -> Option<String> {
     if let Some(w) = &state.waiting {
         let reason = w.reason.clone().unwrap_or_default();
@@ -4498,7 +4497,7 @@ mod tests {
         assert_eq!(parse_memory_ki("16K"), 15);
     }
 
-    // -- failure messages for the Explain affordance --------------------------
+    // -- pod failure detection ------------------------------------------------
 
     fn cs(name: &str, ready: bool, state: k8s_openapi::api::core::v1::ContainerState) -> k8s_openapi::api::core::v1::ContainerStatus {
         k8s_openapi::api::core::v1::ContainerStatus { name: name.into(), ready, state: Some(state), ..Default::default() }
@@ -4549,7 +4548,7 @@ mod tests {
         // The container-level exclusion skips the exit-0 container, and the
         // pod-level fallback then has to not undo it: a CronJob pod reporting
         // `Succeeded` / `Completed` must yield nothing, or the most common
-        // Explain button in the app would offer to explain a job that worked.
+        // not-ready pod in the fleet would be reported as a failure.
         let st = status_with_phase("Succeeded", "Completed", vec![cs("cronjob", false, terminated_state("Completed", 0))]);
         assert_eq!(pod_failure(&st), None);
     }
@@ -4628,8 +4627,8 @@ mod tests {
 
     #[test]
     fn the_container_returned_is_the_failing_one_not_the_first() {
-        // A row-level Diagnose targets this container, so returning the wrong
-        // one sends a healthy sidecar's logs to explain a broken app.
+        // A diagnosis targets this container, so returning the wrong one
+        // sends a healthy sidecar's logs to explain a broken app.
         let st = status_of(vec![
             cs("istio-proxy", true, waiting_state("ImagePullBackOff", "ignore me")),
             cs("app", false, waiting_state("CrashLoopBackOff", "back-off restarting")),

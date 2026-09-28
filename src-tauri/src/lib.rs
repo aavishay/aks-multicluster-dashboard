@@ -162,7 +162,6 @@ pub fn run() {
             commands::ai_build_helm_diagnosis,
             commands::ai_build_node_diagnosis,
             commands::ai_diagnose,
-            commands::ai_explain_error,
             commands::kubeconfig_path,
             commands::get_write_enabled,
             commands::set_write_enabled,
