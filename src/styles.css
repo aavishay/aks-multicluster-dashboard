@@ -120,6 +120,12 @@ body,
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+/* The tab bar scrolls sideways when the tabs outgrow the window. A full
+   10px scrollbar under a row of text reads as a broken layout, so this one
+   is kept thin — present, so a mouse without a wheel can still reach it. */
+.tab-bar::-webkit-scrollbar {
+  height: 4px;
+}
 
 .tabular {
   font-variant-numeric: tabular-nums;

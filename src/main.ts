@@ -950,6 +950,8 @@ let napDetailToken = 0;
 /** Same idea as `podDetailToken`, for the KEDA scaled object detail panel. */
 let hpaDetailToken = 0;
 let secretDetailToken = 0;
+/** The tab the last render showed, so `render` can scroll a newly active tab into view once. */
+let lastRenderedActiveTab: TabId | null = null;
 let externalSecretDetailToken = 0;
 let kedaDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
@@ -2124,7 +2126,11 @@ async function prefetchOtherTabsInBackground() {
   const ctxs = selectedContextsList();
   if (ctxs.length === 0) return;
 
-  const otherTabs = TABS.map((t) => t.id).filter((id) => id !== "cost" && id !== state.activeTab);
+  // Never Secrets: its list downloads every Secret, values included, and only
+  // drops them in Rust — something to do when the reader opens the tab, not on
+  // every refresh of every cluster behind their back. It is also a guaranteed
+  // 403 wherever the reader holds only the usual read-only role.
+  const otherTabs = TABS.map((t) => t.id).filter((id) => id !== "cost" && id !== "secrets" && id !== state.activeTab);
 
   for (const tab of otherTabs) {
     for (const ctx of ctxs) {
@@ -5317,6 +5323,15 @@ function render(carried?: PreRenderState) {
   });
   restoreSelectionSnapshot(app, selectionSnapshot);
 
+  // After the scroll restore, which would otherwise put the bar back where it
+  // was: a tab reached by the keyboard, a drill-down or Back can be off the
+  // visible end of it. Only on a change, so reading along the bar is never
+  // yanked back to the active tab.
+  if (state.activeTab !== lastRenderedActiveTab) {
+    lastRenderedActiveTab = state.activeTab;
+    app.querySelector<HTMLElement>("[data-tab-active]")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
   // After the scroll restore above, so the layer is aligned to the position
   // the textarea actually ended up at rather than the one it was rebuilt with.
   const yamlEditor = app.querySelector<HTMLTextAreaElement>('[data-filter-key="yaml-editor"]');
@@ -6319,14 +6334,24 @@ function renderTopbar(): string {
     </header>`;
 }
 
+/**
+ * The tab bar scrolls sideways rather than wrapping or clipping. At 125% UI
+ * scale on an ordinary window there are more tabs than width: without this
+ * the bar ran off its right edge with no way to reach the rest, and a
+ * two-word label ("Resource Usage") broke onto two lines to make room.
+ *
+ * `data-scroll-id` keeps its offset across renders, and `render` brings the
+ * active tab into view whenever it changes — see `lastRenderedActiveTab`.
+ */
 function renderTabs(): string {
   return `
-    <nav class="flex gap-1 border-b border-gridline bg-surface-1 px-5">
+    <nav data-scroll-id="tab-bar" class="tab-bar flex gap-1 overflow-x-auto border-b border-gridline bg-surface-1 px-5">
       ${TABS.map(
         (t) => `
         <button
           onclick="window.__app.selectTab(${jsArg(t.id)})"
-          class="border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
+          ${state.activeTab === t.id ? "data-tab-active" : ""}
+          class="shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
             state.activeTab === t.id
               ? "border-series-blue text-ink-primary"
               : "border-transparent text-ink-muted hover:text-ink-secondary"
