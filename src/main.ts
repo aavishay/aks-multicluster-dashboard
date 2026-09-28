@@ -593,6 +593,12 @@ interface SecretDetailState {
    * be a way to probe a value without revealing it.
    */
   keySearch: string;
+  /**
+   * The Keys view's cursor, moved by Up/Down and acted on by Enter. Held as the
+   * key's *name* rather than an index, so narrowing the filter cannot silently
+   * move it onto a different key.
+   */
+  keyCursor: string | null;
   /** Keyed by the Secret's key name. */
   revealed: Record<string, SecretReveal>;
 }
@@ -3780,6 +3786,7 @@ function openSecretDetail(ctx: string, namespace: string, name: string, secretTy
     yamlSearch: "",
     yamlSearchIndex: 0,
     keySearch: "",
+    keyCursor: null,
     revealed: {},
   };
   render();
@@ -3844,6 +3851,45 @@ function setSecretKeySearch(query: string) {
   if (!state.secretDetail) return;
   state.secretDetail.keySearch = query;
   render();
+}
+
+/** The keys the Keys view is currently showing, in order — the filter applied. */
+function visibleSecretKeys(sd: SecretDetailState): string[] {
+  const query = sd.keySearch.trim().toLowerCase();
+  return (sd.detail?.keys ?? []).map((k) => k.name).filter((n) => !query || n.toLowerCase().includes(query));
+}
+
+/**
+ * Up/Down in the Keys view. Returns false when there is nothing to move to, so
+ * the key falls through to scrolling the panel.
+ *
+ * A first press lands on the near end — Down on the first key, Up on the last
+ * — the same convention as the table's row cursor. So does a cursor whose key
+ * the filter has since hidden: stepping from a position the reader can no
+ * longer see would land somewhere arbitrary.
+ */
+function moveSecretKeyCursor(delta: 1 | -1): boolean {
+  const sd = state.secretDetail;
+  if (!sd) return false;
+  const keys = visibleSecretKeys(sd);
+  if (keys.length === 0) return false;
+  const at = sd.keyCursor === null ? -1 : keys.indexOf(sd.keyCursor);
+  const next = at === -1 ? (delta > 0 ? 0 : keys.length - 1) : Math.min(keys.length - 1, Math.max(0, at + delta));
+  sd.keyCursor = keys[next];
+  render();
+  document.querySelector<HTMLElement>("[data-secret-key-focused]")?.scrollIntoView({ block: "nearest" });
+  return true;
+}
+
+/** Enter in the Keys view: reveals the key under the cursor, or hides it if it is showing. */
+function toggleSecretKeyAtCursor(): boolean {
+  const sd = state.secretDetail;
+  if (!sd || sd.keyCursor === null || !visibleSecretKeys(sd).includes(sd.keyCursor)) return false;
+  const r = sd.revealed[sd.keyCursor];
+  if (r?.status === "loading") return true;
+  if (r?.status === "shown") hideSecretKey(sd.keyCursor);
+  else void revealSecretKey(sd.keyCursor);
+  return true;
 }
 
 /** Fetches one key's value, fresh — the only way a value reaches the page. */
@@ -5391,7 +5437,8 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     title: "Detail panels",
     items: [
       ["← →", "Switch between the panel's tabs"],
-      ["↑ ↓", "Scroll the panel"],
+      ["↑ ↓", "Scroll the panel — or, in a Secret's Keys, pick a key"],
+      ["Enter", "Reveal or hide the picked Secret key"],
       [withMod("D"), "Diagnose what the panel is showing"],
     ],
   },
@@ -9265,8 +9312,9 @@ function renderSecretKeysView(sd: SecretDetailState): string {
         <button type="button" onclick="window.__app.copySecretKey(${arg})" class="${SECRET_ACTION_BUTTON}">Copy</button>
         <button type="button" onclick="window.__app.hideSecretKey(${arg})" class="${SECRET_ACTION_BUTTON}">Hide</button>`;
     }
+    const focused = sd.keyCursor === k.name;
     return `
-      <div class="rounded-md border border-gridline bg-surface-2 p-3">
+      <div ${focused ? "data-secret-key-focused" : ""} class="rounded-md border ${focused ? "border-series-blue" : "border-gridline"} bg-surface-2 p-3">
         <div class="flex items-center justify-between gap-2">
           <div class="min-w-0">
             <span class="break-all font-mono text-xs text-ink-primary">${highlightSearchMatches(esc(k.name), query, -1)}</span>
@@ -9298,7 +9346,7 @@ function renderSecretKeysView(sd: SecretDetailState): string {
   return `
     <div class="flex flex-col gap-2">
       <div class="flex flex-wrap items-center justify-between gap-2">
-        <div class="min-w-0 text-xs text-ink-muted">Values stay hidden until you reveal one, and are fetched only then. Closing this panel forgets every revealed value.</div>
+        <div class="min-w-0 text-xs text-ink-muted">Values stay hidden until you reveal one, and are fetched only then. Closing this panel forgets every revealed value. ↑ ↓ pick a key, Enter reveals or hides it.</div>
         ${search}
       </div>
       ${shown.length ? cards.join("") : `<div class="text-sm text-ink-muted">No keys match “${esc(sd.keySearch.trim())}”.</div>`}
@@ -11429,7 +11477,10 @@ function blurFocusedFilterField(target: EventTarget | null): boolean {
   // which has exactly the same complaint: Escape in it used to clear the tab's
   // filters, which are not even the filter being typed in.
   const isTableFilter = target.closest('[data-scroll-id^="table:"]') !== null;
-  if (!isTableFilter && key !== "cluster-filter") return false;
+  // And the Secret panel's key filter, which is a filter in the same sense:
+  // stepping out of it leaves the Keys view's arrows free to pick a key, where
+  // escaping straight past it would close the panel under the reader.
+  if (!isTableFilter && key !== "cluster-filter" && key !== "secret-key-search") return false;
   target.blur();
   return true;
 }
@@ -11610,6 +11661,12 @@ document.addEventListener("keydown", (e) => {
       if (scrollDetailPanel("line", delta)) e.preventDefault();
       return;
     }
+    // The Secret panel's Keys view has a cursor of its own; anywhere else a
+    // panel's arrows scroll it.
+    if (state.secretDetail?.view === "keys" && moveSecretKeyCursor(delta)) {
+      e.preventDefault();
+      return;
+    }
     // With a panel open these scroll its content instead of moving the row
     // cursor hidden behind it — see `detailPanelScroller` for why the browser
     // won't do this on its own.
@@ -11665,6 +11722,14 @@ document.addEventListener("keydown", (e) => {
   // Enter opens the cursor's row; Space selects it. Guarded one step wider
   // than the navigation keys, since a focused button or link already handles
   // both of these itself.
+  // Enter on the Secret panel's key cursor reveals or hides that key. Ahead of
+  // the row branch below, whose overlay guard would otherwise swallow it: the
+  // panel is the overlay here, and the cursor is inside it.
+  if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && state.secretDetail?.view === "keys") {
+    if (consumesActivationKeys(e.target) || isNonPanelOverlayOpen()) return;
+    if (toggleSecretKeyAtCursor()) e.preventDefault();
+    return;
+  }
   if ((e.key === "Enter" || e.key === " ") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
     if (consumesActivationKeys(e.target) || isAnyOverlayOpen()) return;
     if (e.key === "Enter" ? activateFocusedRow() : toggleFocusedRowSelection()) e.preventDefault();
