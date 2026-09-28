@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::{ai, claude, helm, k8s, kubeconfig, metrics_backend, mutate, retry};
+use crate::{ai, claude, external_secrets, helm, k8s, kubeconfig, metrics_backend, mutate, retry, secrets};
 use std::future::Future;
 use std::time::Duration;
 
@@ -415,6 +415,39 @@ pub async fn get_nap_node_pools(context_name: String) -> Result<NapResult, Strin
 
 /// Every HorizontalPodAutoscaler in the cluster. No `installed` flag to carry,
 /// unlike the KEDA and NAP reads below: `autoscaling/v2` ships with Kubernetes.
+#[tauri::command]
+pub async fn get_secrets(context_name: String) -> Result<Vec<SecretInfo>, String> {
+    with_retry(&context_name, || secrets::get_secrets(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_secret_detail(context_name: String, namespace: String, name: String) -> Result<SecretDetail, String> {
+    with_retry(&context_name, || secrets::get_secret_detail(&context_name, &namespace, &name)).await
+}
+
+/// The one command that returns a Secret value — a single key, on an explicit
+/// Reveal. Retried like the rest: it is a read, and a transient failure here is
+/// no more meaningful than anywhere else.
+#[tauri::command]
+pub async fn get_secret_value(context_name: String, namespace: String, name: String, key: String) -> Result<SecretValue, String> {
+    with_retry(&context_name, || secrets::get_secret_value(&context_name, &namespace, &name, &key)).await
+}
+
+#[tauri::command]
+pub async fn get_external_secrets(context_name: String) -> Result<ExternalSecretsResult, String> {
+    with_retry(&context_name, || external_secrets::get_external_secrets(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_external_secret_detail(context_name: String, namespace: String, name: String) -> Result<ExternalSecretDetail, String> {
+    with_retry(&context_name, || external_secrets::get_external_secret_detail(&context_name, &namespace, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_external_secret_events(context_name: String, namespace: String, name: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || external_secrets::get_external_secret_events(&context_name, &namespace, &name)).await
+}
+
 #[tauri::command]
 pub async fn get_hpas(context_name: String) -> Result<Vec<HpaInfo>, String> {
     with_retry(&context_name, || k8s::get_hpas(&context_name)).await

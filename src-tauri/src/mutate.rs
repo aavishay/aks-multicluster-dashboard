@@ -304,6 +304,8 @@ pub async fn apply_manifest(
         ));
     }
 
+    refuse_redacted_kind(&gvk)?;
+
     let client = client_for_context(context_name).await?;
     // Asked rather than guessed: the plural is not derivable from the kind for
     // every resource, and this has to work for CRDs the app has never seen.
@@ -348,10 +350,32 @@ fn describe_apply_error(kind: &str, e: kube::Error) -> String {
     format!("Failed to save the {kind}: {e}")
 }
 
+/// Kinds this app only ever shows redacted, and so must never write back.
+///
+/// The Secret panel's YAML has every value replaced by its size. The editor
+/// does not offer to edit it, but this is the line that holds if that ever
+/// changes: saving that text would overwrite every value in the Secret with
+/// its placeholder, and there is no undo.
+fn refuse_redacted_kind(gvk: &GroupVersionKind) -> Result<(), String> {
+    if gvk.group.is_empty() && gvk.kind == "Secret" {
+        return Err("Secrets can't be edited here. This app only shows them with their values redacted, so saving would overwrite every value. Use kubectl.".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+
+    #[test]
+    fn a_secret_is_never_written_back() {
+        assert!(refuse_redacted_kind(&GroupVersionKind::gvk("", "v1", "Secret")).is_err());
+        // Only the core Secret: a CRD that happens to be called Secret is not
+        // what this panel shows, and is not redacted.
+        assert!(refuse_redacted_kind(&GroupVersionKind::gvk("example.io", "v1", "Secret")).is_ok());
+        assert!(refuse_redacted_kind(&GroupVersionKind::gvk("", "v1", "ConfigMap")).is_ok());
+    }
 
     fn pod_with(owner: Option<&str>, phase: Option<&str>, mirror: bool) -> Pod {
         let mut pod = Pod::default();

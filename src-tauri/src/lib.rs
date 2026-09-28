@@ -2,6 +2,7 @@ mod ai;
 mod claude;
 mod commands;
 mod exec;
+mod external_secrets;
 mod helm;
 mod k8s;
 mod kubeconfig;
@@ -10,6 +11,7 @@ mod models;
 mod mutate;
 mod redact;
 mod retry;
+mod secrets;
 
 /// A macOS app launched via Finder/Dock/Launchpad is spawned by launchd with
 /// a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) rather than the user's
@@ -136,6 +138,12 @@ pub fn run() {
             commands::get_workload_metrics_over_time,
             commands::get_helm_releases,
             commands::get_helm_release_detail,
+            commands::get_secrets,
+            commands::get_secret_detail,
+            commands::get_secret_value,
+            commands::get_external_secrets,
+            commands::get_external_secret_detail,
+            commands::get_external_secret_events,
             commands::get_nap_node_pools,
             commands::get_hpas,
             commands::get_hpa_manifest,

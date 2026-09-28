@@ -287,6 +287,80 @@ export interface HelmReleaseInfo {
   age_seconds: number;
 }
 
+/** An External Secrets Operator `ExternalSecret`. Mirrors `ExternalSecretInfo` in models.rs. */
+export interface ExternalSecretInfo {
+  namespace: string;
+  name: string;
+  store_kind: string;
+  store_name: string;
+  /** The Secret it writes — `spec.target.name`, defaulting to its own name. */
+  target_name: string;
+  target_type: string;
+  /** As written, e.g. "1h". Empty means ESO's default. */
+  refresh_interval: string;
+  data_count: number;
+  data_from_count: number;
+  ready: boolean;
+  /** From the Ready condition. Empty when there is no condition yet. */
+  reason: string;
+  message: string;
+  last_refresh: string | null;
+  age_days: number;
+  age_seconds: number;
+}
+
+/** `installed: false` means no served version of the CRD answered — ESO is not on this cluster. */
+export interface ExternalSecretsResult {
+  installed: boolean;
+  error: string | null;
+  external_secrets: ExternalSecretInfo[];
+}
+
+export interface ExternalSecretMapping {
+  secret_key: string;
+  remote_key: string;
+  property: string;
+  version: string;
+}
+
+export interface ExternalSecretDetail {
+  mappings: ExternalSecretMapping[];
+  /** `spec.dataFrom`, one readable line per entry. */
+  data_from: string[];
+  manifest: ObjectManifest;
+}
+
+/** One key of a Secret — its name and decoded size, never its value. Mirrors `SecretKeyInfo` in models.rs. */
+export interface SecretKeyInfo {
+  name: string;
+  bytes: number;
+}
+
+/** One Secret as the Secrets tab lists it. Mirrors `SecretInfo` in models.rs. */
+export interface SecretInfo {
+  namespace: string;
+  name: string;
+  secret_type: string;
+  /** Null for a Helm release Secret, which is listed metadata-only: unknown, not empty. */
+  keys: SecretKeyInfo[] | null;
+  immutable: boolean;
+  age_days: number;
+  age_seconds: number;
+}
+
+/** What the Secret panel loads: the key list and the redacted YAML. */
+export interface SecretDetail {
+  keys: SecretKeyInfo[];
+  manifest: ObjectManifest;
+}
+
+/** One revealed value. Exactly one of `text` and `base64` is set. */
+export interface SecretValue {
+  bytes: number;
+  text: string | null;
+  base64: string | null;
+}
+
 export interface HelmReleaseDetail {
   values_yaml: string;
   default_values_yaml: string;
@@ -317,7 +391,7 @@ export interface ClaudeDiagnosisPayload {
   approx_tokens: number;
 }
 
-export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "nap" | "hpa" | "keda" | "gitops" | "helm" | "cost";
+export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "nap" | "hpa" | "keda" | "gitops" | "helm" | "secrets" | "externalsecrets" | "cost";
 
 /** Azure Node Auto Provisioning (managed Karpenter). `installed: false` means the CRDs aren't registered, i.e. NAP is off for this cluster. */
 export interface NapResult {
