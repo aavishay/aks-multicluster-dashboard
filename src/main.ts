@@ -602,8 +602,14 @@ interface SecretDetailState {
    * move it onto a different key.
    */
   keyCursor: string | null;
-  /** Keyed by the Secret's key name. */
-  revealed: Record<string, SecretReveal>;
+  /**
+   * Keyed by the Secret's key name. A `Map`, not an object: `toString`,
+   * `constructor` and `__proto__` are all valid Secret key names, and on a
+   * plain object the first two resolve to inherited properties before anything
+   * is revealed — which read as "shown" and crashed the render on `r.value` —
+   * while assigning the third does not create an entry at all.
+   */
+  revealed: Map<string, SecretReveal>;
 }
 
 interface ExternalSecretDetailState {
@@ -3837,7 +3843,7 @@ function openSecretDetail(ctx: string, namespace: string, name: string, secretTy
     yamlSearchIndex: 0,
     keySearch: "",
     keyCursor: null,
-    revealed: {},
+    revealed: new Map(),
   };
   render();
 
@@ -3935,7 +3941,7 @@ function moveSecretKeyCursor(delta: 1 | -1): boolean {
 function toggleSecretKeyAtCursor(): boolean {
   const sd = state.secretDetail;
   if (!sd || sd.keyCursor === null || !visibleSecretKeys(sd).includes(sd.keyCursor)) return false;
-  const r = sd.revealed[sd.keyCursor];
+  const r = sd.revealed.get(sd.keyCursor);
   if (r?.status === "loading") return true;
   if (r?.status === "shown") hideSecretKey(sd.keyCursor);
   else void revealSecretKey(sd.keyCursor);
@@ -3947,30 +3953,36 @@ async function revealSecretKey(key: string) {
   const sd = state.secretDetail;
   if (!sd) return;
   const token = secretDetailToken;
-  sd.revealed[key] = { status: "loading" };
+  // This request's own entry. A response is applied only while this exact
+  // object is still the key's state — "still loading" is not enough, since
+  // Cancel then Reveal again leaves the key loading under a *newer* request,
+  // which a late answer from this one must not overwrite with a stale value
+  // or an error.
+  const pending: SecretReveal = { status: "loading" };
+  sd.revealed.set(key, pending);
   render();
   try {
     const value = await api.getSecretValue(sd.ctx, sd.namespace, sd.name, key);
-    // Hidden again, or the panel closed, while the request was in flight: do
-    // not bring the value back.
-    if (token !== secretDetailToken || state.secretDetail?.revealed[key]?.status !== "loading") return;
-    state.secretDetail.revealed[key] = { status: "shown", value };
+    // Hidden again, superseded, or the panel closed while in flight: do not
+    // bring the value back.
+    if (token !== secretDetailToken || state.secretDetail?.revealed.get(key) !== pending) return;
+    state.secretDetail.revealed.set(key, { status: "shown", value });
   } catch (e) {
-    if (token !== secretDetailToken || state.secretDetail?.revealed[key]?.status !== "loading") return;
-    state.secretDetail.revealed[key] = { status: "error", error: String(e) };
+    if (token !== secretDetailToken || state.secretDetail?.revealed.get(key) !== pending) return;
+    state.secretDetail.revealed.set(key, { status: "error", error: String(e) });
   }
   render();
 }
 
 function hideSecretKey(key: string) {
   if (!state.secretDetail) return;
-  delete state.secretDetail.revealed[key];
+  state.secretDetail.revealed.delete(key);
   render();
 }
 
 /** Plain text on purpose: the rich-text copy path would put the value into an HTML flavour too. */
 async function copySecretKey(key: string) {
-  const r = state.secretDetail?.revealed[key];
+  const r = state.secretDetail?.revealed.get(key);
   if (!r || r.status !== "shown") return;
   const binary = r.value.text === null;
   const ok = await copyPlainTextToClipboard(r.value.text ?? r.value.base64 ?? "");
@@ -9489,7 +9501,7 @@ function renderSecretKeysView(sd: SecretDetailState): string {
   const total = sd.detail.keys.length;
 
   const cards = shown.map((k) => {
-    const r = sd.revealed[k.name];
+    const r = sd.revealed.get(k.name);
     const arg = jsArg(k.name);
     let value: string;
     let actions: string;
