@@ -1194,17 +1194,13 @@ function columnWidth<T>(tab: TabId, col: ColumnDef<T>): number {
  * `leadingWidths` covers any unlabeled columns before `columns` (e.g. the
  * status-dot column).
  *
- * The GitOps and Helm tables pass a wider status column than the rest
- * because theirs also holds the Diagnose button for a failing row. Measured
- * rather than guessed: the dot, the gap and the button stop overflowing at
- * 112px including the cell's padding, and below that the fixed table layout
- * ellipsises the button. 116 leaves a little slack.
- *
- * Nodes, Workloads and Pods used to be in that list and are now back to the
- * dot-only 36px. Their row button made a failing row ~2px taller than a
- * healthy one, and `settleAutoPageSize` derives the whole page size from the
- * first rendered row — so the page size flipped between pages and its
- * re-anchor threw the reader back to page 1. See that function for the rest.
+ * Every status column is the dot-only 36px. Five tables used to pass 116,
+ * measured to fit the dot, the gap and a row-level Diagnose button, until
+ * that button moved into the detail panels: it made a failing row ~2px taller
+ * than a healthy one, and `settleAutoPageSize` derives the whole page size
+ * from the first rendered row — so the page size flipped between pages and
+ * its re-anchor threw the reader back to page 1. See that function for the
+ * rest.
  */
 function renderColGroup<T>(tab: TabId, columns: ColumnDef<T>[], leadingWidths: number[] = []): string {
   const leading = leadingWidths.map((w) => `<col style="width:${w}px">`).join("");
@@ -5380,14 +5376,14 @@ function uiScaleButton(): string {
  * nothing to find, so Cmd+D fell through to the row cursor behind the panel
  * and resolved against a row the reader could not see.
  *
- * The `"row"` size is now GitOps and Helm only. Nodes, Workloads and Pods
- * render it in their detail panel instead — a row-height difference of a
- * couple of pixels was enough to break table paging, and the panel button is
- * a superset of the row one anyway, since it is not gated on the object
- * being unhealthy. Cmd+D still reaches those three rows; they carry the
- * diagnosis in data attributes rather than a button. See `diagnoseFocusedRow`.
+ * Panel-only. The tables used to render a smaller variant on failing rows;
+ * none does now. It made a failing row a couple of pixels taller than a
+ * healthy one, which was enough to break table paging — see
+ * `settleAutoPageSize` — and the panel button is a superset anyway, since it
+ * is not gated on the object being unhealthy. Cmd+D still reaches the rows,
+ * which carry the diagnosis in data attributes. See `diagnoseFocusedRow`.
  */
-function claudeDiagnoseButton(onclick: string, what: string, size: "row" | "panel" = "row"): string {
+function claudeDiagnoseButton(onclick: string, what: string): string {
   const signedIn = state.claudeAuth?.signed_in === true;
   const title = signedIn
     ? `Diagnose this ${what} with Claude — you'll review exactly what is sent first`
@@ -5399,7 +5395,7 @@ function claudeDiagnoseButton(onclick: string, what: string, size: "row" | "pane
       ${signedIn ? "" : "disabled"}
       data-diagnose
       onclick="${onclick}"
-      class="shrink-0 rounded border border-gridline ${size === "row" ? "px-1.5 py-0.5" : "px-2 py-1"} text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
+      class="shrink-0 rounded border border-gridline px-2 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary disabled:cursor-not-allowed disabled:opacity-40"
     >Diagnose</button>`;
 }
 
@@ -8379,7 +8375,6 @@ function renderPodDetailPanel(): string {
               // own pick wins, which is the point of the picker.
               `window.__app.diagnosePod(${jsArg(pd.ctx)},${jsArg(pd.namespace)},${jsArg(pd.name)},${jsArg(pd.activeContainer || pd.failureContainer)})`,
               "pod",
-              "panel",
             )}
             ${writeActionButton(
               "Shell",
@@ -8543,7 +8538,7 @@ function renderNodeDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(nd.ctx)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
-            ${claudeDiagnoseButton(`window.__app.diagnoseNode(${jsArg(nd.ctx)},${jsArg(nd.name)})`, "node", "panel")}
+            ${claudeDiagnoseButton(`window.__app.diagnoseNode(${jsArg(nd.ctx)},${jsArg(nd.name)})`, "node")}
             ${(() => {
               // The state the button would move the node *to*, not the one it
               // is in: offer the direction it isn't already in. Unknown (the
@@ -8944,7 +8939,6 @@ function renderWorkloadDetailPanel(): string {
             ${claudeDiagnoseButton(
               `window.__app.diagnoseWorkload(${jsArg(wd.ctx)},${jsArg(wd.kind)},${jsArg(wd.namespace)},${jsArg(wd.name)})`,
               wd.kind.toLowerCase(),
-              "panel",
             )}
             ${writeActionButton(
               "Restart",
@@ -9440,7 +9434,6 @@ function renderGitOpsDetailPanel(): string {
             ${claudeDiagnoseButton(
               `window.__app.diagnoseGitOpsApp(${jsArg(gd.ctx)},${jsArg(gd.namespace)},${jsArg(gd.name)})`,
               "application",
-              "panel",
             )}
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeGitOpsDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
@@ -10020,7 +10013,7 @@ function renderGitOps(): string {
     ${selectionToolbar("gitops")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:gitops">
       <table class="data-table">
-        ${renderColGroup("gitops", columns, [32, 116])}
+        ${renderColGroup("gitops", columns, [32, 36])}
         <thead>
           <tr>${selectAllCheckboxHeader("gitops", sorted, keyOf)}<th></th>${sortableHeaderRow("gitops", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("gitops", columns, rows)}</tr>
@@ -10030,9 +10023,9 @@ function renderGitOps(): string {
             .map((row) => {
               const { ctx, a } = row;
               return `
-            <tr>
+            <tr data-diagnose-what="application" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(a.namespace)}" data-diagnose-name="${esc(a.name)}">
               ${rowCheckboxCell("gitops", keyOf(row))}
-              <td title="${esc(gitOpsAppHealthy(a) ? "" : `${a.sync_status} · ${a.health_status}`)}"><span class="inline-flex items-center gap-1.5">${statusDot(gitOpsAppHealthy(a))}${!gitOpsAppHealthy(a) ? claudeDiagnoseButton(`window.__app.diagnoseGitOpsApp(${jsArg(ctx)},${jsArg(a.namespace)},${jsArg(a.name)})`, "application") : ""}</span></td>
+              <td title="${esc(gitOpsAppHealthy(a) ? "" : `${a.sync_status} · ${a.health_status}`)}">${statusDot(gitOpsAppHealthy(a))}</td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter GitOps apps by this cluster" onclick="window.__app.setEnumFilter('gitops','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -10173,7 +10166,7 @@ function renderHelm(): string {
     ${selectionToolbar("helm")}
     <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:helm">
       <table class="data-table">
-        ${renderColGroup("helm", columns, [32, 116])}
+        ${renderColGroup("helm", columns, [32, 36])}
         <thead>
           <tr>${selectAllCheckboxHeader("helm", sorted, keyOf)}<th></th>${sortableHeaderRow("helm", columns)}</tr>
           <tr class="filter-row"><th></th><th></th>${filterRowCells("helm", columns, rows)}</tr>
@@ -10183,9 +10176,9 @@ function renderHelm(): string {
             .map((row) => {
               const { ctx, r } = row;
               return `
-            <tr>
+            <tr data-diagnose-what="release" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(r.namespace)}" data-diagnose-name="${esc(r.name)}">
               ${rowCheckboxCell("helm", keyOf(row))}
-              <td title="${esc(helmReleaseConcern(r) ?? "")}"><span class="inline-flex items-center gap-1.5">${statusDot(helmReleaseHealthy(r))}${helmReleaseConcern(r) ? claudeDiagnoseButton(`window.__app.diagnoseHelmRelease(${jsArg(ctx)},${jsArg(r.namespace)},${jsArg(r.name)})`, "release") : ""}</span></td>
+              <td title="${esc(helmReleaseConcern(r) ?? "")}">${statusDot(helmReleaseHealthy(r))}</td>
               ${
                 multi
                   ? `<td class="text-ink-muted"><button type="button" title="Filter releases by this cluster" onclick="window.__app.setEnumFilter('helm','cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`
@@ -10296,6 +10289,7 @@ function renderHelmDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(hd.ctx)} · ${esc(hd.namespace)} · revision ${hd.revision}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${claudeDiagnoseButton(`window.__app.diagnoseHelmRelease(${jsArg(hd.ctx)},${jsArg(hd.namespace)},${jsArg(hd.name)})`, "release")}
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeHelmDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
@@ -10996,31 +10990,17 @@ function activateFocusedRowName(): boolean {
 }
 
 /**
- * Cmd/Ctrl+D: clicks whichever Diagnose button is in play.
+ * The diagnosis the focused table row stands for, for Cmd+D.
  *
- * Clicked rather than called directly, for the same reason as
- * `activateFocusedRow`: the button already carries the right arguments — which
- * container a pod row diagnoses, which kind a workload row is — and the
- * shortcut cannot then disagree with what clicking does. It also inherits the
- * signed-out gating for free, since a disabled button ignores a click.
- *
- * An open detail panel wins over the row cursor because it covers the table:
- * diagnosing a row you cannot see, while a panel for something else is in
- * front of you, would be the wrong subject.
- */
-/**
- * Cmd+D on a focused Nodes, Workloads or Pods row.
- *
- * Those three tables no longer render a Diagnose button — one made a failing
+ * No table renders a row-level Diagnose button any more. One made a failing
  * row taller than a healthy one, and `settleAutoPageSize` sizes the page from
- * the first row's height, so paging broke. The row carries what a diagnosis
- * needs in data attributes instead. Attributes cost no height, so the
- * shortcut survives without the affordance coming back.
+ * the first row's height, so paging broke. Each diagnosable row carries its
+ * target in data attributes instead; attributes cost no height, so the
+ * shortcut survives without the button coming back.
  *
- * Unconditional, unlike the button it stands in for: that appeared only on an
- * unhealthy row, whereas the detail panel offers Diagnose for any of the
- * three. The shortcut should agree with the panel it now proxies for rather
- * than with the button that is gone.
+ * Unconditional, unlike the buttons it stands in for: those appeared only on
+ * an unhealthy row, whereas the detail panel offers Diagnose for any row. The
+ * shortcut agrees with the panel rather than with a button that is gone.
  */
 function diagnoseFocusedRow(): boolean {
   const d = focusedRowElement()?.dataset;
@@ -11037,25 +11017,44 @@ function diagnoseFocusedRow(): boolean {
     case "workload":
       diagnoseWorkload(ctx, d.diagnoseKind ?? "", ns, name);
       return true;
+    case "application":
+      diagnoseGitOpsApp(ctx, ns, name);
+      return true;
+    case "release":
+      diagnoseHelmRelease(ctx, ns, name);
+      return true;
     default:
       return false;
   }
 }
 
+/**
+ * Cmd/Ctrl+D: diagnoses what is in focus — the open detail panel's subject if
+ * there is one, else the focused row.
+ *
+ * The panel case clicks the panel's own Diagnose button rather than calling
+ * anything directly: the button already carries the right arguments — which
+ * container a pod diagnoses, which kind a workload is — so the shortcut
+ * cannot disagree with the click, and it inherits the signed-out gating for
+ * free, since a disabled button ignores a click.
+ *
+ * An open detail panel always wins over the row cursor, including one with
+ * nothing to diagnose (NAP, HPA, KEDA): it covers the table, and diagnosing a
+ * row you cannot see, while a panel for something else is in front of you,
+ * would be the wrong subject.
+ */
 function diagnoseFromKeyboard(): "done" | "signed-out" | "nothing" {
   const inPanel = document.querySelector<HTMLButtonElement>("[data-detail-panel] [data-diagnose]");
-  const inRow = focusedRowElement()?.querySelector<HTMLButtonElement>("[data-diagnose]") ?? null;
-  const button = inPanel ?? inRow;
-  if (button) {
+  if (inPanel) {
     // Say why nothing happened rather than swallowing the keypress: a disabled
     // button gives no feedback to someone who never reached for the mouse.
-    if (button.disabled) return "signed-out";
-    button.click();
+    if (inPanel.disabled) return "signed-out";
+    inPanel.click();
     return "done";
   }
-  // No button anywhere, so this is one of the three tables that carry the
-  // diagnosis on the row itself. Signed out answers the same as a disabled
-  // button would, for the same reason — the keypress must not vanish.
+  if (isAnyDetailPanelOpen()) return "nothing";
+  // Signed out answers the same as a disabled button would, for the same
+  // reason — the keypress must not vanish.
   if (!focusedRowElement()?.dataset.diagnoseWhat) return "nothing";
   if (state.claudeAuth?.signed_in !== true) return "signed-out";
   return diagnoseFocusedRow() ? "done" : "nothing";
@@ -11402,8 +11401,8 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  // Cmd+D diagnoses what is in focus — an open pod or workload panel, or the
-  // focused row on Pods and Workloads.
+  // Cmd+D diagnoses what is in focus — an open detail panel's subject, or the
+  // focused row. See `diagnoseFromKeyboard`.
   //
   // Gated on isNonPanelOverlayOpen so it cannot fire while the diagnosis it
   // just opened is on screen: `claudeDiagnose` is one of that predicate's
