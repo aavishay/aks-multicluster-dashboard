@@ -6412,7 +6412,14 @@ function renderPods(): string {
   type PodRow = { ctx: string; p: PodInfo };
   const allRows: PodRow[] = ctxs.flatMap((ctx) => (state.pods.get(ctx) || []).map((p) => ({ ctx, p })));
   if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No pods found.</div>`;
-  const podHealthy = (r: PodRow) => r.p.phase === "Running" || r.p.phase === "Succeeded";
+  // Phase alone is not enough: a crashlooping pod sits in phase Running, so a
+  // phase-only check painted it green and hid it from the unhealthy-only
+  // filter and the unhealthy-first sort. `failure_message` is the backend's
+  // own verdict on the containers — a not-ready container whose state or last
+  // state is a failure — and already excludes the two things that must not
+  // count: the transient `ContainerCreating` / `PodInitializing` of a normal
+  // rollout, and a clean exit such as a finished CronJob.
+  const podHealthy = (r: PodRow) => (r.p.phase === "Running" || r.p.phase === "Succeeded") && !r.p.failure_message;
   const rows = state.unhealthyOnly.pods ? allRows.filter((r) => !podHealthy(r)) : allRows;
   const keyOf = (r: PodRow) => `${r.ctx}:${r.p.namespace}:${r.p.name}`;
 
