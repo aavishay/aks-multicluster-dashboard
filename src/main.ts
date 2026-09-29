@@ -6646,13 +6646,23 @@ function renderClaudeDiagnosePanel(): string {
     </div>`;
 }
 
-/** A top-bar button that opens one of the palettes, drawn like the search box it opens. */
+/**
+ * A top-bar button that opens one of the palettes, drawn like the search box
+ * it opens.
+ *
+ * The name is set outright with aria-label: once the container query hides the
+ * label, the text left inside is just the shortcut, and `title` does not
+ * override text content — a screen reader would announce "⌘K" and nothing
+ * about what it does.
+ */
 function paletteButton(label: string, what: string, key: string, onclick: string): string {
   return `
     <button
       type="button"
       onclick="${onclick}"
       title="${esc(what)} (${withMod(key)})"
+      aria-label="${esc(what)}"
+      aria-keyshortcuts="${IS_MAC ? "Meta" : "Control"}+${key}"
       class="flex shrink-0 items-center gap-1.5 rounded-md border border-gridline bg-surface-2 px-2.5 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
     >
       <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
