@@ -747,6 +747,8 @@ interface AppState {
   reconnecting: Set<string>;
   /** Cmd+K cluster quick-switcher; null when closed. Toggling a cluster doesn't close it, so several can be picked in one go. */
   clusterPalette: { query: string; highlightedIndex: number } | null;
+  /** The ⌘T tab switcher. */
+  tabPalette: { query: string; highlightedIndex: number } | null;
   activeTab: TabId;
   overviews: Map<string, ClusterOverview>;
   nodes: Map<string, NodeInfo[]>;
@@ -879,6 +881,7 @@ const state: AppState = {
   selectedContexts: new Set(),
   reconnecting: new Set(),
   clusterPalette: null,
+  tabPalette: null,
   activeTab: "overview",
   overviews: new Map(),
   nodes: new Map(),
@@ -988,6 +991,8 @@ let podsStreamRenderScheduled = false;
 let pendingSearchScroll = false;
 /** Same idea as `pendingSearchScroll`, for the cluster palette's arrow-key navigation scrolling its highlighted row into view. */
 let pendingClusterPaletteScroll = false;
+let pendingTabPaletteScroll = false;
+let tabPaletteHoverRenderScheduled = false;
 /** Set when the row cursor moves, so the post-render pass scrolls it into view — but only then, never on an ordinary auto-refresh re-render. */
 let pendingRowFocusScroll = false;
 /**
@@ -2245,6 +2250,241 @@ function clearClusterSelection() {
   loadTabData();
 }
 
+// ---------------------------------------------------------------------------
+// Tab switcher (⌘T)
+// ---------------------------------------------------------------------------
+//
+// Its own palette rather than a section of ⌘K's: that one is a checklist —
+// Enter toggles a cluster and it stays open to pick several — while this goes
+// to a tab and closes. In one list Enter would mean two different things
+// depending on which row it landed on.
+
+/**
+ * A line saying what each tab holds, and the words someone might type for it
+ * that its label does not contain. A Record over every TabId, so adding a tab
+ * without an entry here fails to compile rather than leaving it unfindable.
+ */
+const TAB_PALETTE_INFO: Record<TabId, { hint: string; aliases: string[] }> = {
+  overview: { hint: "Per-cluster health at a glance", aliases: ["health", "summary", "home", "clusters"] },
+  nodes: { hint: "Capacity, readiness, cordon and drain", aliases: ["vm", "machines", "cordon", "drain"] },
+  workloads: { hint: "Deployments, StatefulSets and DaemonSets", aliases: ["deploy", "deployment", "statefulset", "daemonset", "replicas"] },
+  pods: { hint: "Restarts, logs and shells", aliases: ["logs", "containers", "crashloop", "exec", "shell"] },
+  resources: { hint: "CPU and memory against allocatable", aliases: ["cpu", "memory", "usage", "capacity"] },
+  metrics: { hint: "Prometheus graphs over time", aliases: ["prometheus", "graphs", "victoriametrics", "grafana"] },
+  events: { hint: "Recent cluster events", aliases: ["warnings", "errors"] },
+  nap: { hint: "Karpenter node pools", aliases: ["karpenter", "nodepool", "autoprovision", "provisioning"] },
+  hpa: { hint: "Horizontal pod autoscalers", aliases: ["autoscaler", "autoscaling", "scaling"] },
+  keda: { hint: "Event-driven autoscaling", aliases: ["scaledobject", "scaledjob"] },
+  gitops: { hint: "Argo CD applications", aliases: ["argo", "argocd", "sync", "applications"] },
+  helm: { hint: "Releases and their revisions", aliases: ["chart", "release"] },
+  secrets: { hint: "Keys and sizes, values masked", aliases: ["secret", "credentials", "password"] },
+  externalsecrets: { hint: "External Secrets Operator syncs", aliases: ["eso", "external", "vault", "keyvault"] },
+  cost: { hint: "Billing — not wired up yet", aliases: ["billing", "spend"] },
+};
+
+type TabPaletteEntry = { id: TabId; label: string; hint: string; via: string | null };
+
+/**
+ * The tabs matching the switcher's query, best first. With no query, every
+ * tab in bar order, so the list is the same every time it opens.
+ *
+ * A match on the label beats one on an alias, and a prefix beats a substring:
+ * label prefix, then a word in the label, then an alias prefix, then any
+ * substring. `via` names the alias that matched, so a row reached by "argo"
+ * can say why GitOps is there.
+ */
+function tabPaletteMatches(query: string): TabPaletteEntry[] {
+  const q = query.trim().toLowerCase();
+  return TABS.map((t, order) => {
+    const label = t.label.toLowerCase();
+    // Words split on camel case too, so "se" finds ExternalSecrets and "ops" GitOps.
+    const words = t.label.split(/\s+|(?<=[a-z])(?=[A-Z])/).map((w) => w.toLowerCase());
+    const { hint, aliases } = TAB_PALETTE_INFO[t.id];
+    let score = 0;
+    let via: string | null = null;
+    if (!q) score = 1;
+    else if (label.startsWith(q)) score = 5;
+    else if (words.some((w) => w.startsWith(q))) score = 4;
+    else if (aliases.some((a) => a.startsWith(q))) {
+      score = 3;
+      via = aliases.find((a) => a.startsWith(q)) ?? null;
+    } else if (label.includes(q)) score = 2;
+    else if (aliases.some((a) => a.includes(q))) {
+      score = 1;
+      via = aliases.find((a) => a.includes(q)) ?? null;
+    }
+    return { id: t.id, label: t.label, hint, via, score, order };
+  })
+    .filter((e) => e.score > 0)
+    .sort((a, b) => b.score - a.score || a.order - b.order)
+    .map(({ id, label, hint, via }) => ({ id, label, hint, via }));
+}
+
+/**
+ * How many things on a tab need attention, from data already loaded — the
+ * switcher never fetches. Each count is exactly what that tab's own
+ * unhealthy-only filter lists, through the same predicate.
+ *
+ * `loaded` is how many of the selected clusters that tab has answered for.
+ * Fewer than all makes the number a floor, which the badge's tooltip says
+ * rather than passing a partial count off as the whole.
+ *
+ * Pods is the one tab where an entry in its map does not mean an answer: a
+ * first load streams in page by page and writes each page as it lands, so a
+ * cluster only counts once `podsLoadedComplete` says every page arrived.
+ */
+function tabProblemCount(tab: TabId): { count: number; loaded: number; total: number; label: string; tone: "critical" | "warning" } | null {
+  const ctxs = selectedContextsList();
+  const across = <T>(map: Map<string, T>, bad: (v: T) => number, complete: (ctx: string) => boolean = () => true) => {
+    let count = 0;
+    let loaded = 0;
+    for (const ctx of ctxs) {
+      const v = map.get(ctx);
+      if (v === undefined || !complete(ctx)) continue;
+      loaded += 1;
+      count += bad(v);
+    }
+    return { count, loaded };
+  };
+  const n = <T>(items: T[] | undefined, isBad: (i: T) => boolean) => (items ?? []).filter(isBad).length;
+  let r: { count: number; loaded: number };
+  let label: string;
+  let tone: "critical" | "warning" = "critical";
+  switch (tab) {
+    case "overview":
+      r = across(state.overviews, (o) => (!o.reachable || o.nodes_ready !== o.node_count ? 1 : 0));
+      label = "not healthy";
+      break;
+    case "nodes":
+      r = across(state.nodes, (list) => n(list, (x) => !x.ready));
+      label = "not ready";
+      break;
+    case "workloads":
+      r = across(state.workloads, (list) => n(list, (x) => !x.healthy));
+      label = "unhealthy";
+      break;
+    case "pods":
+      r = across(
+        state.pods,
+        (list) => n(list, (x) => !podIsHealthy(x)),
+        (ctx) => state.podsLoadedComplete.has(ctx),
+      );
+      label = "unhealthy";
+      break;
+    case "events":
+      r = across(state.events, (list) => n(list, (x) => x.event_type === "Warning"));
+      label = "warning";
+      tone = "warning";
+      break;
+    case "nap":
+      r = across(state.nap, (res) => n(res.node_pools, (x) => !x.ready));
+      label = "not ready";
+      break;
+    case "hpa":
+      r = across(state.hpa, (list) => n(list, (x) => !hpaIsHealthy(x)));
+      label = "not scaling";
+      break;
+    case "keda":
+      r = across(state.keda, (res) => n(res.scaled_objects, (x) => !x.ready));
+      label = "not ready";
+      break;
+    case "gitops":
+      r = across(state.gitops, (res) => n(res.apps, (x) => !gitOpsAppHealthy(x)));
+      label = "out of sync or degraded";
+      break;
+    case "helm":
+      r = across(state.helm, (list) => n(list, (x) => !helmReleaseHealthy(x)));
+      label = "not deployed";
+      break;
+    case "externalsecrets":
+      r = across(state.externalSecrets, (res) => n(res.external_secrets, (x) => !x.ready));
+      label = "not synced";
+      break;
+    // No notion of health to count.
+    case "resources":
+    case "metrics":
+    case "secrets":
+    case "cost":
+      return null;
+  }
+  if (r.count === 0) return null;
+  return { ...r, total: ctxs.length, label: tab === "events" && r.count !== 1 ? "warnings" : label, tone };
+}
+
+function openTabPalette() {
+  // Not over a dialog, a diagnosis or the shortcuts list: jumping tabs behind
+  // one of those would strand it over a view it no longer belongs to. The
+  // cluster palette alone doesn't count — the two are alternatives, so ⌘T
+  // from inside ⌘K swaps one for the other. It is set aside for the check
+  // rather than skipping it: ⌘K opens unguarded, so it can itself be sitting
+  // under one of those overlays, and a swap there would slip a tab palette in
+  // behind it.
+  const clusterPalette = state.clusterPalette;
+  state.clusterPalette = null;
+  const blocked = isNonPanelOverlayOpen();
+  state.clusterPalette = clusterPalette;
+  if (blocked) return;
+  state.clusterPalette = null;
+  state.tabPalette = { query: "", highlightedIndex: 0 };
+  render();
+}
+
+function closeTabPalette() {
+  state.tabPalette = null;
+  render();
+}
+
+function setTabPaletteQuery(query: string) {
+  if (!state.tabPalette) return;
+  state.tabPalette.query = query;
+  state.tabPalette.highlightedIndex = 0;
+  render();
+}
+
+function moveTabPaletteHighlight(delta: number) {
+  const palette = state.tabPalette;
+  if (!palette) return;
+  const count = tabPaletteMatches(palette.query).length;
+  if (count === 0) return;
+  palette.highlightedIndex = Math.max(0, Math.min(count - 1, palette.highlightedIndex + delta));
+  pendingTabPaletteScroll = true;
+  render();
+}
+
+/**
+ * Mouse hover moves the one highlight. On `mousemove`, batched to a frame —
+ * both for the reasons given at `setClusterPaletteHighlight`.
+ */
+function setTabPaletteHighlight(index: number) {
+  const palette = state.tabPalette;
+  if (!palette || palette.highlightedIndex === index) return;
+  palette.highlightedIndex = index;
+  if (tabPaletteHoverRenderScheduled) return;
+  tabPaletteHoverRenderScheduled = true;
+  requestAnimationFrame(() => {
+    tabPaletteHoverRenderScheduled = false;
+    render();
+  });
+}
+
+/**
+ * Goes to a tab and closes the switcher. An open detail panel is closed too:
+ * it belongs to the tab being left, and would otherwise sit over the new one.
+ */
+function goToTabFromPalette(tab: TabId) {
+  state.tabPalette = null;
+  closeOpenDetailPanel();
+  if (state.activeTab === tab) render();
+  else selectTab(tab);
+}
+
+function chooseTabPaletteHighlighted() {
+  const palette = state.tabPalette;
+  if (!palette) return;
+  const entry = tabPaletteMatches(palette.query)[palette.highlightedIndex];
+  if (entry) goToTabFromPalette(entry.id);
+}
+
 /** Clusters matching the palette's current query — shared by the render and the keyboard-nav bounds so they can't disagree on what's "visible". */
 function clusterPaletteVisible(): ClusterEntry[] {
   const query = state.clusterPalette?.query.trim().toLowerCase();
@@ -2253,6 +2493,8 @@ function clusterPaletteVisible(): ClusterEntry[] {
 }
 
 function openClusterPalette() {
+  // The two palettes are alternatives: ⌘K from inside ⌘T swaps one for the other.
+  state.tabPalette = null;
   state.clusterPalette = { query: "", highlightedIndex: 0 };
   render();
 }
@@ -5007,6 +5249,13 @@ function setMetricsRange(minutes: number) {
   setClusterPaletteQuery,
   moveClusterPaletteHighlight,
   setClusterPaletteHighlight,
+  openTabPalette,
+  closeTabPalette,
+  setTabPaletteQuery,
+  moveTabPaletteHighlight,
+  setTabPaletteHighlight,
+  chooseTabPaletteHighlighted,
+  goToTabFromPalette,
   toggleClusterPaletteHighlighted,
   selectTab,
   viewPodsForWorkload,
@@ -5323,6 +5572,7 @@ function render(carried?: PreRenderState) {
     ${renderClaudePanel()}
     ${renderClaudeDiagnosePanel()}
     ${renderClusterPalette()}
+    ${renderTabPalette()}
     ${renderConfirmDialog()}
     ${renderShortcutsPanel()}
   `;
@@ -5417,6 +5667,10 @@ function render(carried?: PreRenderState) {
     pendingClusterPaletteScroll = false;
     app.querySelector<HTMLElement>("[data-cluster-palette-current]")?.scrollIntoView({ block: "nearest" });
   }
+  if (pendingTabPaletteScroll) {
+    pendingTabPaletteScroll = false;
+    app.querySelector<HTMLElement>("[data-tab-palette-current]")?.scrollIntoView({ block: "nearest" });
+  }
 
   // The row cursor is marked here rather than inside each table's row
   // template: one insertion point instead of ten, and it survives the
@@ -5464,6 +5718,11 @@ function render(carried?: PreRenderState) {
   // over on every render after that.
   if (state.clusterPalette) {
     const query = app.querySelector<HTMLInputElement>('[data-filter-key="cluster-palette-query"]');
+    if (query && document.activeElement !== query) query.focus({ preventScroll: true });
+  }
+  // Same reason, for the tab switcher.
+  if (state.tabPalette) {
+    const query = app.querySelector<HTMLInputElement>('[data-filter-key="tab-palette-query"]');
     if (query && document.activeElement !== query) query.focus({ preventScroll: true });
   }
 }
@@ -5650,6 +5909,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
   {
     title: "Everywhere",
     items: [
+      [withMod("T"), "Go to a tab"],
       [withMod("F"), "Search — the panel's box, or this table's filter"],
       ["?", "This list"],
       ["Esc", "Back out a layer: the field, then what's open, then filters, then write mode"],
@@ -5689,6 +5949,74 @@ function renderShortcutsPanel(): string {
         </div>
         <div class="grid gap-x-8 gap-y-5 overflow-auto p-4 sm:grid-cols-2">
           ${SHORTCUT_GROUPS.map(group).join("")}
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderTabPalette(): string {
+  const palette = state.tabPalette;
+  if (!palette) return "";
+  const entries = tabPaletteMatches(palette.query);
+  const q = palette.query.trim().toLowerCase();
+
+  const rows = entries
+    .map((e, i) => {
+      const highlighted = i === palette.highlightedIndex;
+      const problems = tabProblemCount(e.id);
+      const badge = problems
+        ? `<span
+            title="${esc(
+              problems.loaded < problems.total
+                ? `Counted across ${problems.loaded} of ${problems.total} selected clusters — the rest have no data for this tab yet`
+                : `Across ${problems.total === 1 ? "the selected cluster" : `all ${problems.total} selected clusters`}`,
+            )}"
+            class="shrink-0 rounded px-1.5 py-0.5 text-xs ${problems.tone === "critical" ? "bg-status-critical/15 text-status-critical" : "bg-status-warning/15 text-status-warning"}"
+          >${problems.count}${problems.loaded < problems.total ? "+" : ""} ${esc(problems.label)}</span>`
+        : "";
+      return `
+        <div
+          ${highlighted ? "data-tab-palette-current" : ""}
+          onclick="window.__app.goToTabFromPalette(${jsArg(e.id)})"
+          onmousemove="window.__app.setTabPaletteHighlight(${i})"
+          class="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 ${highlighted ? "bg-surface-3" : ""}"
+        >
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-sm text-ink-primary">${highlightSearchMatches(esc(e.label), q, -1)}</div>
+            <div class="truncate text-xs text-ink-muted">${esc(e.hint)}</div>
+          </div>
+          ${e.via ? `<span class="shrink-0 text-xs text-ink-muted">matches “${esc(e.via)}”</span>` : ""}
+          ${badge}
+          ${state.activeTab === e.id ? '<span class="shrink-0 text-xs text-ink-muted">current</span>' : ""}
+        </div>`;
+    })
+    .join("");
+
+  return `
+    <div class="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-6 pt-[12vh]" onclick="window.__app.closeTabPalette()">
+      <div class="flex max-h-[70vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-gridline bg-surface-1 shadow-2xl" onclick="event.stopPropagation()">
+        <div class="border-b border-gridline p-2">
+          <input
+            type="text"
+            autofocus
+            placeholder="Go to tab…"
+            value="${esc(palette.query)}"
+            data-filter-key="tab-palette-query"
+            oninput="window.__app.setTabPaletteQuery(this.value)"
+            onkeydown="
+              if (event.key === 'ArrowDown') { event.preventDefault(); window.__app.moveTabPaletteHighlight(1); }
+              else if (event.key === 'ArrowUp') { event.preventDefault(); window.__app.moveTabPaletteHighlight(-1); }
+              else if (event.key === 'Enter') { event.preventDefault(); window.__app.chooseTabPaletteHighlighted(); }
+            "
+            class="w-full rounded-md border-none bg-transparent px-2 py-1.5 text-sm text-ink-primary outline-none"
+          />
+        </div>
+        <div class="flex items-center justify-between border-b border-gridline px-3 py-1.5 text-xs text-ink-muted">
+          <span>${q ? `${entries.length} of ${TABS.length} tabs` : `${TABS.length} tabs`}</span>
+          <span>↑↓ move · ↵ open · esc ${q ? "clear" : "close"}</span>
+        </div>
+        <div class="flex-1 overflow-auto p-1.5" data-scroll-id="tab-palette:${encodeURIComponent(palette.query)}">
+          ${rows || `<div class="p-3 text-center text-xs text-ink-muted">No tab matches “${esc(palette.query.trim())}”.</div>`}
         </div>
       </div>
     </div>`;
@@ -6331,9 +6659,24 @@ function renderTopbar(): string {
   const title =
     ctxs.length === 0 ? "Select a cluster" : ctxs.length === 1 ? ctxs[0] : `${ctxs.length} clusters selected`;
 
+  // The "Go to…" button drops its label below the width at which the whole bar
+  // fits on one line, keeping the icon and the shortcut. A container query, in
+  // rem, so that point moves with the UI scale and not with the window alone.
   return `
-    <header class="flex items-center justify-between border-b border-gridline bg-surface-1 px-5 py-3">
-      <div class="text-sm font-medium text-ink-primary" title="${esc(ctxs.join(", "))}">${esc(title)}</div>
+    <header class="@container flex items-center justify-between border-b border-gridline bg-surface-1 px-5 py-3">
+      <div class="flex items-center gap-3">
+        <div class="text-sm font-medium text-ink-primary" title="${esc(ctxs.join(", "))}">${esc(title)}</div>
+        <button
+          type="button"
+          onclick="window.__app.openTabPalette()"
+          title="Go to a tab (${withMod("T")})"
+          class="flex shrink-0 items-center gap-1.5 rounded-md border border-gridline bg-surface-2 px-2.5 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+        >
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+          <span class="@max-4xl:hidden">Go to…</span>
+          <span class="text-ink-muted">${withMod("T")}</span>
+        </button>
+      </div>
       <div class="flex items-center gap-3 text-xs text-ink-muted">
         <span class="tabular">${state.lastUpdated ? `Updated ${relativeTime(state.lastUpdated.toISOString())}` : ""}</span>
         <select
@@ -6872,20 +7215,34 @@ function ownerLabel(p: PodInfo): string {
   return p.owner_kind && p.owner_name ? `${p.owner_kind}/${p.owner_name}` : "";
 }
 
+/**
+ * Phase alone is not enough: a crashlooping pod sits in phase Running, so a
+ * phase-only check painted it green and hid it from the unhealthy-only
+ * filter and the unhealthy-first sort. `failure_message` is the backend's
+ * own verdict on the containers — a not-ready container whose state or last
+ * state is a failure — and already excludes the two things that must not
+ * count: the transient `ContainerCreating` / `PodInitializing` of a normal
+ * rollout, and a clean exit such as a finished CronJob.
+ *
+ * Shared with the tab switcher's problem count, so the number it shows is
+ * exactly what the Pods tab's unhealthy-only filter would list.
+ */
+function podIsHealthy(p: PodInfo): boolean {
+  return (p.phase === "Running" || p.phase === "Succeeded") && !p.failure_message;
+}
+
+/** Shared with the tab switcher's problem count, for the same reason as `podIsHealthy`. */
+function hpaIsHealthy(h: HpaInfo): boolean {
+  return h.able_to_scale && h.scaling_active;
+}
+
 function renderPods(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
   type PodRow = { ctx: string; p: PodInfo };
   const allRows: PodRow[] = ctxs.flatMap((ctx) => (state.pods.get(ctx) || []).map((p) => ({ ctx, p })));
   if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No pods found.</div>`;
-  // Phase alone is not enough: a crashlooping pod sits in phase Running, so a
-  // phase-only check painted it green and hid it from the unhealthy-only
-  // filter and the unhealthy-first sort. `failure_message` is the backend's
-  // own verdict on the containers — a not-ready container whose state or last
-  // state is a failure — and already excludes the two things that must not
-  // count: the transient `ContainerCreating` / `PodInitializing` of a normal
-  // rollout, and a clean exit such as a finished CronJob.
-  const podHealthy = (r: PodRow) => (r.p.phase === "Running" || r.p.phase === "Succeeded") && !r.p.failure_message;
+  const podHealthy = (r: PodRow) => podIsHealthy(r.p);
   const rows = state.unhealthyOnly.pods ? allRows.filter((r) => !podHealthy(r)) : allRows;
   const keyOf = (r: PodRow) => `${r.ctx}:${r.p.namespace}:${r.p.name}`;
 
@@ -10339,7 +10696,7 @@ function renderHpa(): string {
 
   type HpaRow = { ctx: string; h: HpaInfo };
   const allRows: HpaRow[] = ctxs.flatMap((ctx) => (state.hpa.get(ctx) ?? []).map((h) => ({ ctx, h })));
-  const healthy = (h: HpaInfo) => h.able_to_scale && h.scaling_active;
+  const healthy = hpaIsHealthy;
 
   if (allRows.length === 0 && !state.tabLoading) {
     return `<div class="text-sm text-ink-muted">No horizontal pod autoscalers found.</div>`;
@@ -11287,6 +11644,7 @@ function isBlockingOverlayOpen(): boolean {
     // `detailPanelScroller` fall through to whatever detail panel happened to
     // be open underneath — scrolling a panel hidden behind it.
     state.claudePanelOpen ||
+    !!state.tabPalette ||
     !!state.metricsBackendEditor ||
     state.openEnumFilter !== null
   );
@@ -12082,6 +12440,13 @@ document.addEventListener("keydown", (e) => {
     // Escape reaching past it would close the panel and take the draft with it.
     else if (state.yamlEdit) cancelYamlEdit();
     else if (state.clusterPalette) closeClusterPalette();
+    // A query is cleared first, then the switcher closes. Trimmed, as
+    // everywhere else in the switcher: a query of spaces matches as empty and
+    // its hint already says Esc closes.
+    else if (state.tabPalette) {
+      if (state.tabPalette.query.trim()) setTabPaletteQuery("");
+      else closeTabPalette();
+    }
     else if (state.claudeDiagnose) closeClaudeDiagnose();
     else if (state.claudePanelOpen) toggleClaudePanel();
     else if (state.metricsBackendEditor) closeMetricsBackendEditor();
@@ -12299,6 +12664,17 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "k" || e.key === "K") {
     e.preventDefault();
     openClusterPalette();
+    return;
+  }
+
+  // Cmd+T opens the tab switcher, and closes it again. Not gated on
+  // isEditableTarget, for the same reason as Cmd+K: no competing meaning in a
+  // plain text input. Unclaimed anywhere else in the app, and absent from
+  // Tauri's default macOS menu, so nothing intercepts it before the page.
+  if (e.key === "t" || e.key === "T") {
+    e.preventDefault();
+    if (state.tabPalette) closeTabPalette();
+    else openTabPalette();
     return;
   }
 
