@@ -2328,15 +2328,19 @@ function tabPaletteMatches(query: string): TabPaletteEntry[] {
  * `loaded` is how many of the selected clusters that tab has answered for.
  * Fewer than all makes the number a floor, which the badge's tooltip says
  * rather than passing a partial count off as the whole.
+ *
+ * Pods is the one tab where an entry in its map does not mean an answer: a
+ * first load streams in page by page and writes each page as it lands, so a
+ * cluster only counts once `podsLoadedComplete` says every page arrived.
  */
 function tabProblemCount(tab: TabId): { count: number; loaded: number; total: number; label: string; tone: "critical" | "warning" } | null {
   const ctxs = selectedContextsList();
-  const across = <T>(map: Map<string, T>, bad: (v: T) => number) => {
+  const across = <T>(map: Map<string, T>, bad: (v: T) => number, complete: (ctx: string) => boolean = () => true) => {
     let count = 0;
     let loaded = 0;
     for (const ctx of ctxs) {
       const v = map.get(ctx);
-      if (v === undefined) continue;
+      if (v === undefined || !complete(ctx)) continue;
       loaded += 1;
       count += bad(v);
     }
@@ -2360,7 +2364,11 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
       label = "unhealthy";
       break;
     case "pods":
-      r = across(state.pods, (list) => n(list, (x) => !podIsHealthy(x)));
+      r = across(
+        state.pods,
+        (list) => n(list, (x) => !podIsHealthy(x)),
+        (ctx) => state.podsLoadedComplete.has(ctx),
+      );
       label = "unhealthy";
       break;
     case "events":
@@ -2406,10 +2414,17 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
 function openTabPalette() {
   // Not over a dialog, a diagnosis or the shortcuts list: jumping tabs behind
   // one of those would strand it over a view it no longer belongs to. The
-  // cluster palette is the exception — the two are alternatives, so ⌘T from
-  // inside ⌘K swaps one for the other.
-  if (state.clusterPalette) state.clusterPalette = null;
-  else if (isNonPanelOverlayOpen()) return;
+  // cluster palette alone doesn't count — the two are alternatives, so ⌘T
+  // from inside ⌘K swaps one for the other. It is set aside for the check
+  // rather than skipping it: ⌘K opens unguarded, so it can itself be sitting
+  // under one of those overlays, and a swap there would slip a tab palette in
+  // behind it.
+  const clusterPalette = state.clusterPalette;
+  state.clusterPalette = null;
+  const blocked = isNonPanelOverlayOpen();
+  state.clusterPalette = clusterPalette;
+  if (blocked) return;
+  state.clusterPalette = null;
   state.tabPalette = { query: "", highlightedIndex: 0 };
   render();
 }
@@ -12425,9 +12440,11 @@ document.addEventListener("keydown", (e) => {
     // Escape reaching past it would close the panel and take the draft with it.
     else if (state.yamlEdit) cancelYamlEdit();
     else if (state.clusterPalette) closeClusterPalette();
-    // A query is cleared first, then the switcher closes.
+    // A query is cleared first, then the switcher closes. Trimmed, as
+    // everywhere else in the switcher: a query of spaces matches as empty and
+    // its hint already says Esc closes.
     else if (state.tabPalette) {
-      if (state.tabPalette.query) setTabPaletteQuery("");
+      if (state.tabPalette.query.trim()) setTabPaletteQuery("");
       else closeTabPalette();
     }
     else if (state.claudeDiagnose) closeClaudeDiagnose();
