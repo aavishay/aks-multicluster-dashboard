@@ -746,7 +746,12 @@ interface AppState {
   /** Contexts currently retrying a failed connection via the sidebar's Reconnect button. */
   reconnecting: Set<string>;
   /** Cmd+K cluster quick-switcher; null when closed. Toggling a cluster doesn't close it, so several can be picked in one go. */
-  clusterPalette: { query: string; highlightedIndex: number } | null;
+  clusterPalette: {
+    query: string;
+    highlightedIndex: number;
+    /** The selection as it stood when the palette opened, listed first — see `clusterPaletteVisible`. */
+    selectedAtOpen: Set<string>;
+  } | null;
   /** The ⌘T tab switcher. */
   tabPalette: { query: string; highlightedIndex: number } | null;
   activeTab: TabId;
@@ -2485,17 +2490,31 @@ function chooseTabPaletteHighlighted() {
   if (entry) goToTabFromPalette(entry.id);
 }
 
-/** Clusters matching the palette's current query — shared by the render and the keyboard-nav bounds so they can't disagree on what's "visible". */
+/**
+ * Clusters matching the palette's current query — shared by the render and the keyboard-nav bounds so they can't disagree on what's "visible".
+ *
+ * The selected clusters come first, so what you are looking at is at the top
+ * rather than scattered through a list of sixteen. First by the selection as
+ * it stood when the palette opened, not as it stands now: the palette stays
+ * open while you toggle, and re-sorting live would move the row you just
+ * pressed Enter on out from under the highlight, leaving a different cluster
+ * under it for the next press.
+ */
 function clusterPaletteVisible(): ClusterEntry[] {
-  const query = state.clusterPalette?.query.trim().toLowerCase();
-  if (!query) return state.clusters;
-  return state.clusters.filter((c) => c.context_name.toLowerCase().includes(query) || c.cluster_name.toLowerCase().includes(query));
+  const palette = state.clusterPalette;
+  const query = palette?.query.trim().toLowerCase();
+  const matches = query
+    ? state.clusters.filter((c) => c.context_name.toLowerCase().includes(query) || c.cluster_name.toLowerCase().includes(query))
+    : state.clusters;
+  const first = palette?.selectedAtOpen;
+  if (!first || first.size === 0) return matches;
+  return [...matches.filter((c) => first.has(c.context_name)), ...matches.filter((c) => !first.has(c.context_name))];
 }
 
 function openClusterPalette() {
   // The two palettes are alternatives: ⌘K from inside ⌘T swaps one for the other.
   state.tabPalette = null;
-  state.clusterPalette = { query: "", highlightedIndex: 0 };
+  state.clusterPalette = { query: "", highlightedIndex: 0, selectedAtOpen: new Set(state.selectedContexts) };
   render();
 }
 
@@ -6666,7 +6685,7 @@ function paletteButton(label: string, what: string, key: string, onclick: string
       class="flex shrink-0 items-center gap-1.5 rounded-md border border-gridline bg-surface-2 px-2.5 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
     >
       <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
-      <span class="@max-6xl:hidden">${esc(label)}</span>
+      <span class="@max-[66rem]:hidden">${esc(label)}</span>
       <span class="text-ink-muted">${withMod(key)}</span>
     </button>`;
 }
