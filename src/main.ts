@@ -6062,7 +6062,7 @@ function renderClusterPalette(): string {
           <input
             type="text"
             autofocus
-            placeholder="Jump to cluster…"
+            placeholder="Go to cluster…"
             value="${esc(palette.query)}"
             data-filter-key="cluster-palette-query"
             oninput="window.__app.setClusterPaletteQuery(this.value)"
