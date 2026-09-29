@@ -6646,6 +6646,21 @@ function renderClaudeDiagnosePanel(): string {
     </div>`;
 }
 
+/** A top-bar button that opens one of the palettes, drawn like the search box it opens. */
+function paletteButton(label: string, what: string, key: string, onclick: string): string {
+  return `
+    <button
+      type="button"
+      onclick="${onclick}"
+      title="${esc(what)} (${withMod(key)})"
+      class="flex shrink-0 items-center gap-1.5 rounded-md border border-gridline bg-surface-2 px-2.5 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
+    >
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+      <span class="@max-6xl:hidden">${esc(label)}</span>
+      <span class="text-ink-muted">${withMod(key)}</span>
+    </button>`;
+}
+
 function renderTopbar(): string {
   const refreshOptions = [
     [0, "Off"],
@@ -6659,23 +6674,16 @@ function renderTopbar(): string {
   const title =
     ctxs.length === 0 ? "Select a cluster" : ctxs.length === 1 ? ctxs[0] : `${ctxs.length} clusters selected`;
 
-  // The "Go to…" button drops its label below the width at which the whole bar
-  // fits on one line, keeping the icon and the shortcut. A container query, in
-  // rem, so that point moves with the UI scale and not with the window alone.
+  // The two "Go to" buttons drop their labels below the width at which the
+  // whole bar fits on one line, keeping the icon and the shortcut. A container
+  // query, in rem, so that point moves with the UI scale and not with the
+  // window alone.
   return `
     <header class="@container flex items-center justify-between border-b border-gridline bg-surface-1 px-5 py-3">
       <div class="flex items-center gap-3">
         <div class="text-sm font-medium text-ink-primary" title="${esc(ctxs.join(", "))}">${esc(title)}</div>
-        <button
-          type="button"
-          onclick="window.__app.openTabPalette()"
-          title="Go to a tab (${withMod("T")})"
-          class="flex shrink-0 items-center gap-1.5 rounded-md border border-gridline bg-surface-2 px-2.5 py-1 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary"
-        >
-          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
-          <span class="@max-4xl:hidden">Go to…</span>
-          <span class="text-ink-muted">${withMod("T")}</span>
-        </button>
+        ${paletteButton("Go to cluster…", "Go to a cluster", "K", "window.__app.openClusterPalette()")}
+        ${paletteButton("Go to tab…", "Go to a tab", "T", "window.__app.openTabPalette()")}
       </div>
       <div class="flex items-center gap-3 text-xs text-ink-muted">
         <span class="tabular">${state.lastUpdated ? `Updated ${relativeTime(state.lastUpdated.toISOString())}` : ""}</span>
