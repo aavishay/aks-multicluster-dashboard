@@ -1,0 +1,105 @@
+name: Verify the Windows Scoop install
+
+# The Windows counterpart of verify-linux-cask.yml, and for the same reason: no
+# one here runs Windows, so this is the only place the published install path
+# is ever exercised. It installs from the *published* bucket, the way a
+# stranger would, and fails if any step of that path is broken.
+#
+# Manual, and run after updating the bucket, since it tests whatever the
+# bucket currently serves.
+#
+# Unlike the Linux check, no pull_request trigger: it landed before the first
+# release with a Windows installer, when the bucket served nothing, so a run on
+# its own PR could only have failed. Now that it is on the default branch it
+# can be dispatched; add the trigger back when changing it.
+on:
+  workflow_dispatch:
+    inputs:
+      expect_version:
+        description: "Version the bucket should install (blank to accept whatever it serves)"
+        required: false
+        type: string
+        default: ""
+
+# No checkout: the bucket comes from GitHub over https like any user's would.
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Install Scoop
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # -RunAsAdmin because the runner is an administrator, which Scoop's
+          # installer otherwise refuses. A user's own install needs neither.
+          Invoke-Expression "& {$(Invoke-RestMethod https://get.scoop.sh)} -RunAsAdmin"
+          "$env:USERPROFILE\scoop\shims" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Add the bucket
+        run: |
+          $ErrorActionPreference = 'Stop'
+          scoop --version
+          scoop bucket add aks-fleet-dashboard https://github.com/aavishay/scoop-aks-fleet-dashboard
+          scoop info aks-fleet-dashboard
+
+      - name: Install
+        run: |
+          $ErrorActionPreference = 'Stop'
+          scoop install aks-fleet-dashboard
+          if ($LASTEXITCODE -ne 0) { throw "scoop install exited $LASTEXITCODE" }
+
+      - name: Installed version matches the bucket, and the expected one if given
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installed = (scoop list aks-fleet-dashboard | Where-Object Name -eq 'aks-fleet-dashboard').Version
+          $manifest = (scoop cat aks-fleet-dashboard | ConvertFrom-Json).version
+          "installed=$installed bucket=$manifest"
+          if ("$installed" -ne "$manifest") { throw "installed $installed but the bucket offers $manifest" }
+          $want = '${{ github.event.inputs.expect_version }}'
+          if ($want -and "$installed" -ne $want) { throw "expected $want, bucket installed $installed — has the bucket been pushed?" }
+
+      - name: The app is where Scoop puts it, with its Start menu shortcut
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$env:USERPROFILE\scoop\apps\aks-fleet-dashboard\current\k8s-view.exe"
+          if (-not (Test-Path $exe)) {
+            Get-ChildItem "$env:USERPROFILE\scoop\apps\aks-fleet-dashboard\current" | Format-Table
+            throw "not installed at $exe"
+          }
+          $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Scoop Apps\AKS Fleet Dashboard.lnk"
+          if (-not (Test-Path $lnk)) { throw "no Start menu shortcut at $lnk" }
+          # The pieces of the installer that are not the app: Scoop unpacks the
+          # installer rather than running it, so these must have been removed.
+          foreach ($junk in 'uninstall.exe', '$PLUGINSDIR') {
+            if (Test-Path "$env:USERPROFILE\scoop\apps\aks-fleet-dashboard\current\$junk") { throw "$junk was left in the install" }
+          }
+
+      # The same smoke test the build runs on the unpacked installer, here on
+      # the copy Scoop actually installed.
+      - name: The installed app starts and stays running
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = Start-Process -FilePath "$env:USERPROFILE\scoop\apps\aks-fleet-dashboard\current\k8s-view.exe" -PassThru
+          Start-Sleep -Seconds 15
+          $app.Refresh()
+          if ($app.HasExited) { throw "the app exited within 15s, with code $($app.ExitCode)" }
+          "still running after 15s (pid $($app.Id))"
+          Stop-Process -Id $app.Id -Force
+
+      - name: scoop update declines on an up-to-date install
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = scoop update aks-fleet-dashboard 6>&1 2>&1 | Out-String
+          $out
+          if ($out -notmatch 'latest version') { throw "unexpected update output" }
+
+      - name: Uninstall cleanly
+        run: |
+          $ErrorActionPreference = 'Stop'
+          scoop uninstall aks-fleet-dashboard
+          if (Test-Path "$env:USERPROFILE\scoop\apps\aks-fleet-dashboard") { throw "the app survived uninstall" }

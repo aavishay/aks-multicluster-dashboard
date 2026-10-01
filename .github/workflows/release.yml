@@ -130,6 +130,17 @@ jobs:
 
             Universal binary — runs natively on both Apple Silicon and Intel.
 
+            ## Windows
+
+            ```powershell
+            scoop bucket add aks-fleet-dashboard https://github.com/aavishay/scoop-aks-fleet-dashboard
+            scoop install aks-fleet-dashboard
+            ```
+
+            Or run the `x64-setup.exe` directly. It is not code-signed, so
+            SmartScreen may warn "Windows protected your PC" on first run:
+            choose **More info → Run anyway**.
+
       - name: Retry attaching the macOS assets
         if: steps.publish_macos.outcome == 'failure'
         uses: softprops/action-gh-release@v2
@@ -254,3 +265,66 @@ jobs:
             *AppImage*) ;;
             *) echo "::error::the release has no AppImage asset"; exit 1 ;;
           esac
+
+  # Windows x64, built by the same workflow pull requests run, exactly as the
+  # Linux build is: no write access there, only an artifact.
+  windows:
+    uses: ./.github/workflows/windows-nsis.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+
+  # The Linux publish job's shape, for the same reasons: serialised behind the
+  # macOS job, which creates the release, and holding the only write access in
+  # a job that runs nothing but a download and an upload.
+  windows-publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-nsis
+          path: dist-release
+
+      # Two attempts, as for Linux: by now the release is public with its other
+      # platforms, and one failed upload would leave it advertising a Windows
+      # install with no installer behind it.
+      - uses: softprops/action-gh-release@v2
+        id: publish
+        continue-on-error: true
+        # No body and no generate_release_notes: the macOS job owns those.
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist-release/*
+
+      - name: Retry attaching the Windows assets
+        if: steps.publish.outcome == 'failure'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist-release/*
+
+      # The backstop the other two publish jobs have: a success from the action
+      # is not the same fact as the asset being attached under its name. By
+      # name, with `grep -Fx`, for the reason the macOS check gives.
+      - name: Confirm the Windows assets are actually on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.publish.outcome }}" = "failure" ]; then
+            echo "::warning::attaching the Windows assets failed once and was retried"
+          fi
+          VERSION="${TAG#v}"
+          NAMES=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          echo "$NAMES"
+          MISSING=0
+          for want in "AKS-Fleet-Dashboard-${VERSION}-x64-setup.exe" "SHA256SUMS-windows.txt"; do
+            if ! printf '%s\n' "$NAMES" | grep -Fxq -- "$want"; then
+              echo "::error::the release is missing $want"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 0 ]

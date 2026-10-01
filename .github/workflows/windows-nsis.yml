@@ -1,0 +1,183 @@
+name: Windows installer
+
+# The Windows counterpart of linux-appimage.yml, built the same way for the
+# same reason: one definition, two callers. Pull requests build it as a
+# portability check, and the release workflow calls it with a tag to publish
+# the asset, so the release cannot drift from what PRs actually test.
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag, used only to name the asset. Omitted for a build-only check."
+        required: false
+        type: string
+        default: ""
+
+# Read-only, on every trigger, as in the Linux workflow: this only produces an
+# artifact, and attaching it to a release is release.yml's job.
+permissions:
+  contents: read
+
+jobs:
+  nsis:
+    runs-on: windows-latest
+    defaults:
+      run:
+        # Git Bash, which every Windows runner has, so the steps read like the
+        # macOS and Linux ones. PowerShell only where Windows itself is the
+        # subject: reading a PE header, starting a GUI process.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # The only thing that proves the Rust compiles for Windows at all: the
+      # keyring's Credential Manager backend, the cfg(unix) code compiled out,
+      # and the Windows-only KUBECONFIG test that cannot run anywhere else.
+      - name: Test
+        run: |
+          npx tsc --noEmit
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build the installer
+        # NSIS only: a per-user install that needs no admin rights, and the
+        # format the Scoop manifest unpacks. `targets: "all"` would add an MSI,
+        # which nothing consumes.
+        #
+        # Retried for the reason the AppImage build is: bundling fetches NSIS
+        # and its plugins from GitHub at the very end, and a flaky download
+        # there should not cost a release its Windows half. The compile is
+        # cached by the first attempt, so a retry only re-runs the bundling.
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if npm run tauri build -- --bundles nsis; then
+              [ "$attempt" -gt 1 ] && echo "::warning::NSIS bundling succeeded on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::NSIS bundling failed on attempt $attempt, retrying"
+              sleep $((attempt * 20))
+            fi
+          done
+          echo "::error::NSIS bundling failed three times"
+          exit 1
+
+      - name: Name the artifact and checksum it
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -n "$TAG" ]; then
+            VERSION="${TAG#v}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          mkdir -p dist-release
+
+          BUILT=$(find src-tauri/target/release/bundle/nsis -maxdepth 1 -name '*-setup.exe' -print -quit)
+          [ -n "$BUILT" ] || { echo "::error::no NSIS installer was produced"; exit 1; }
+          ASSET="AKS-Fleet-Dashboard-${VERSION}-x64-setup.exe"
+          cp "$BUILT" "dist-release/$ASSET"
+
+          cd dist-release
+          # Its own file, as the Linux one is: two jobs uploading the same name
+          # would have the second overwrite the first.
+          sha256sum "$ASSET" | tee SHA256SUMS-windows.txt
+          {
+            echo "### Windows x64 checksum for the Scoop manifest"
+            echo '```'
+            cat SHA256SUMS-windows.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # What the Scoop manifest relies on: that the installer unpacks with 7-Zip
+      # into a runnable app, the way Scoop installs it, without running the
+      # installer at all. The listing goes to the summary because the manifest
+      # names the executable inside, and this is where that name is confirmed.
+      - name: Unpack the installer the way Scoop does
+        run: |
+          set -euo pipefail
+          EXE=$(find dist-release -name '*-setup.exe' -print -quit)
+          7z x -y -ounpacked "$EXE" > /dev/null
+          {
+            echo "### Installer contents (what Scoop installs)"
+            echo '```'
+            (cd unpacked && find . -maxdepth 2 | sort)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Named after the Rust package, as the macOS binary inside the .app
+          # is; the Start menu shortcut is what carries the product name.
+          [ -f "unpacked/k8s-view.exe" ] \
+            || { echo "::error::the installer holds no 'k8s-view.exe'"; find unpacked -maxdepth 2; exit 1; }
+
+      # The app inside, not the installer: an NSIS installer is a 32-bit x86
+      # stub whatever it carries, so checking the setup.exe reports 0x014C on a
+      # perfectly good x64 build. That is exactly what the first version of
+      # this step did.
+      - name: Verify the app is an x64 Windows executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bytes = [System.IO.File]::ReadAllBytes("unpacked\k8s-view.exe")
+          # e_lfanew at 0x3C points at the PE signature; the machine field
+          # follows it. 0x8664 is x86-64.
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $sig = [System.Text.Encoding]::ASCII.GetString($bytes, $pe, 4)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          "signature=$($sig.Trim([char]0)) machine=0x{0:X4}" -f $machine
+          if ($sig -ne "PE`0`0" -or $machine -ne 0x8664) { throw "not an x64 PE executable" }
+
+      # Not proof the app works against a cluster: there is no kubeconfig here.
+      # It is proof the unpacked app starts and stays up, which is where a
+      # missing WebView2, a bad bundle or a panic at startup would show. With no
+      # kubeconfig the app renders its "add a cluster" state and waits, so a
+      # process still alive after a quarter of a minute has got that far.
+      - name: The unpacked app starts and stays running
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = Start-Process -FilePath "unpacked\k8s-view.exe" -PassThru
+          Start-Sleep -Seconds 15
+          $app.Refresh()
+          if ($app.HasExited) { throw "the app exited within 15s, with code $($app.ExitCode)" }
+          "still running after 15s (pid $($app.Id))"
+          Stop-Process -Id $app.Id -Force
+
+      # Two attempts, for the reason the Linux upload has them: a 403 on
+      # finalising the artifact once left a release without its Linux asset.
+      - uses: actions/upload-artifact@v4
+        id: upload
+        continue-on-error: true
+        with:
+          name: windows-nsis
+          path: dist-release/*
+          if-no-files-found: error
+
+      - name: Retry the upload
+        if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis
+          path: dist-release/*
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Say so if the upload needed a retry
+        if: steps.upload.outcome == 'failure'
+        run: echo "::warning::the artifact upload failed once and succeeded on retry"
