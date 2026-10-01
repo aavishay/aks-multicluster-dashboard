@@ -6781,7 +6781,7 @@ function renderEmptyState(): string {
       <div class="text-sm">No AKS clusters found in your kubeconfig.</div>
       <div class="max-w-md text-xs">
         Run <code class="rounded bg-surface-2 px-1 py-0.5">az login --use-device-code</code> and
-        <code class="rounded bg-surface-2 px-1 py-0.5">az aks get-credentials --resource-group &lt;rg&gt; --name &lt;cluster&gt; --merge</code>
+        <code class="rounded bg-surface-2 px-1 py-0.5">az aks get-credentials --resource-group &lt;rg&gt; --name &lt;cluster&gt;</code>
         for each cluster, then reopen this app. See README.md for details.
       </div>
     </div>`;

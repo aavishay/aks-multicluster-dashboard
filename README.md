@@ -16,6 +16,9 @@ need to embed any Azure credentials or auth flows of its own.
 
 ## Install
 
+On macOS and Linux, through Homebrew (below). On Windows, through Scoop — see
+[Windows (x64)](#windows-x64) for the steps.
+
 ```bash
 brew trust --tap aavishay/aks-fleet-dashboard
 brew tap aavishay/aks-fleet-dashboard
@@ -79,30 +82,79 @@ the first thing to try, and please open an issue.
 ### Windows (x64)
 
 Through [Scoop](https://scoop.sh), which plays the part Homebrew does on the
-other two platforms:
+other two platforms. Everything below runs in PowerShell, as your own user —
+none of it needs an administrator prompt.
+
+**1. Install Scoop**, if you don't have it yet, and `git`, which Scoop needs
+to add a bucket:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+scoop install git
+```
+
+**2. Install the app:**
 
 ```powershell
 scoop bucket add aks-fleet-dashboard https://github.com/aavishay/scoop-aks-fleet-dashboard
 scoop install aks-fleet-dashboard
 ```
 
-and `scoop update aks-fleet-dashboard` to upgrade. It lands in the Start menu
-as **AKS Fleet Dashboard**. Three things differ from macOS:
+**3. Install the Azure CLI, `kubectl` and Azure's `kubelogin`**, which AKS
+sign-in runs through:
+
+```powershell
+scoop install azure-cli kubectl azure-kubelogin
+```
+
+Take `azure-kubelogin`, not `kubelogin`: in Scoop that name belongs to an
+unrelated OIDC plugin in the Extras bucket, and AKS sign-in fails with it.
+If you'd rather not take `kubectl` and `kubelogin` from Scoop, install just
+`azure-cli` here and then run `az aks install-cli`, which downloads those two —
+it needs `az` already installed, so it cannot replace it.
+
+**4. Add your clusters to kubeconfig:**
+
+```powershell
+az login
+az aks get-credentials --resource-group <resource-group> --name <cluster-name>
+```
+
+Repeat the second line for every cluster you want in the dashboard. Each run
+adds a context to `%USERPROFILE%\.kube\config` — merging into it is the
+command's default, and there is no `--merge` flag; check them with
+`kubectl config get-contexts`. The app reads that file, or the first one in
+`KUBECONFIG` if you set it.
+
+**5. Sign in once from the terminal**, so `kubelogin` has a token before the
+app asks for one. Its sign-in prompt goes to a terminal, which the app does not
+have:
+
+```powershell
+kubectl get nodes --context <cluster-name>
+```
+
+**6. Open the app** from the Start menu: **AKS Fleet Dashboard**. If a cluster
+later shows "unreachable" because the token expired, run the same `kubectl`
+command again and reopen the app.
+
+To upgrade to the latest release:
+
+```powershell
+scoop update aks-fleet-dashboard
+```
+
+What differs from macOS:
 
 - **Ctrl replaces Cmd**, as on Linux. Press `?` in the app for the list.
-- **AKS sign-in needs Azure's `kubelogin` on your PATH**, the same as
-  `kubectl` does on Windows: `scoop install azure-kubelogin`, or
-  `az aks install-cli`. Not `scoop install kubelogin`, which is an unrelated
-  OIDC plugin of the same name from Scoop's Extras bucket. The app reads
-  `%USERPROFILE%\.kube\config`, or the first file in `KUBECONFIG`.
 - **It renders in WebView2**, the Edge engine Windows 11 and an up-to-date
   Windows 10 already carry. If the window comes up blank, install the
   [WebView2 runtime](https://developer.microsoft.com/microsoft-edge/webview2/).
-
-The installer is not code-signed, so running the `x64-setup.exe` by hand may
-bring up SmartScreen's "Windows protected your PC": choose **More info → Run
-anyway**. Scoop unpacks the installer rather than running it, so it should not
-bring that prompt up.
+- **The installer is not code-signed.** Scoop unpacks it rather than running
+  it, so installing through Scoop should not prompt. Running the
+  `x64-setup.exe` from the release by hand may bring up SmartScreen's
+  "Windows protected your PC": choose **More info → Run anyway**.
 
 ### Without Homebrew
 
@@ -138,7 +190,7 @@ A working `kubectl` context per cluster — the app reads your existing
 `~/.kube/config` and never stores credentials of its own:
 
 ```bash
-az aks get-credentials --resource-group <rg> --name <cluster> --merge
+az aks get-credentials --resource-group <rg> --name <cluster>
 ```
 
 ## Why this is source you build, not a binary we hand you
@@ -171,12 +223,12 @@ az login --use-device-code
 # repeat for every cluster you want in the dashboard:
 az aks get-credentials \
   --resource-group <resource-group> \
-  --name <cluster-name> \
-  --merge
+  --name <cluster-name>
 ```
 
-Each `--merge` appends a context to `~/.kube/config` rather than overwriting
-it, so all your clusters end up side by side — that's the list the app's
+Each run merges a context into `~/.kube/config` rather than overwriting it —
+that is the command's default, and there is no `--merge` flag — so all your
+clusters end up side by side — that's the list the app's
 sidebar reads. Verify with `kubectl config get-contexts` before opening the
 app.
 
