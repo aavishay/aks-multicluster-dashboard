@@ -1,7 +1,7 @@
 //! Helpers for discovering kubeconfig contexts and building a `kube::Client`
 //! for a chosen context. AKS clusters get here the normal way: the user runs
-//! `az aks get-credentials --resource-group <rg> --name <cluster> --merge`
-//! for each cluster (see README.md), which appends a context to
+//! `az aks get-credentials --resource-group <rg> --name <cluster>` for each
+//! cluster (see README.md), which merges a context into
 //! `~/.kube/config`. We never talk to the Azure control plane directly; we
 //! just read whatever kubeconfig contexts are already on disk, exactly like
 //! kubectl/Lens/Headlamp do.
@@ -63,7 +63,7 @@ pub fn list_contexts() -> Result<Vec<ClusterEntry>, String> {
     let path = kubeconfig_path().ok_or_else(|| "Could not determine home directory to locate ~/.kube/config".to_string())?;
     if !path.exists() {
         return Err(format!(
-            "No kubeconfig found at {}. Run `az aks get-credentials --merge` for each AKS cluster first (see README).",
+            "No kubeconfig found at {}. Run `az aks get-credentials --resource-group <rg> --name <cluster>` for each AKS cluster first (see README).",
             path.display()
         ));
     }
@@ -215,7 +215,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// A kubeconfig shaped like what `az aks get-credentials --merge` actually
+    /// A kubeconfig shaped like what `az aks get-credentials` actually
     /// produces: two AKS clusters (Azure AD / kubelogin exec auth, azmk8s.io
     /// server hostnames) plus one unrelated local cluster, to make sure AKS
     /// detection and sorting work against realistic input rather than a

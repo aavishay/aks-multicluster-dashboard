@@ -110,18 +110,20 @@ scoop install azure-cli kubectl azure-kubelogin
 
 Take `azure-kubelogin`, not `kubelogin`: in Scoop that name belongs to an
 unrelated OIDC plugin in the Extras bucket, and AKS sign-in fails with it.
-`az aks install-cli` is the alternative if you'd rather not use Scoop for
-these.
+If you'd rather not take `kubectl` and `kubelogin` from Scoop, install just
+`azure-cli` here and then run `az aks install-cli`, which downloads those two —
+it needs `az` already installed, so it cannot replace it.
 
 **4. Add your clusters to kubeconfig:**
 
 ```powershell
 az login
-az aks get-credentials --resource-group <resource-group> --name <cluster-name> --merge
+az aks get-credentials --resource-group <resource-group> --name <cluster-name>
 ```
 
-Repeat the second line for every cluster you want in the dashboard. Each
-`--merge` adds a context to `%USERPROFILE%\.kube\config`; check them with
+Repeat the second line for every cluster you want in the dashboard. Each run
+adds a context to `%USERPROFILE%\.kube\config` — merging into it is the
+command's default, and there is no `--merge` flag; check them with
 `kubectl config get-contexts`. The app reads that file, or the first one in
 `KUBECONFIG` if you set it.
 
@@ -188,7 +190,7 @@ A working `kubectl` context per cluster — the app reads your existing
 `~/.kube/config` and never stores credentials of its own:
 
 ```bash
-az aks get-credentials --resource-group <rg> --name <cluster> --merge
+az aks get-credentials --resource-group <rg> --name <cluster>
 ```
 
 ## Why this is source you build, not a binary we hand you
@@ -221,12 +223,12 @@ az login --use-device-code
 # repeat for every cluster you want in the dashboard:
 az aks get-credentials \
   --resource-group <resource-group> \
-  --name <cluster-name> \
-  --merge
+  --name <cluster-name>
 ```
 
-Each `--merge` appends a context to `~/.kube/config` rather than overwriting
-it, so all your clusters end up side by side — that's the list the app's
+Each run merges a context into `~/.kube/config` rather than overwriting it —
+that is the command's default, and there is no `--merge` flag — so all your
+clusters end up side by side — that's the list the app's
 sidebar reads. Verify with `kubectl config get-contexts` before opening the
 app.
 
