@@ -33,14 +33,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = SLOW_CLUSTER_TIMEOUT;
 const WRITE_TIMEOUT: Duration = SLOW_CLUSTER_TIMEOUT;
 
-/// Resolve the kubeconfig path: respects `KUBECONFIG` env var (first entry if
-/// multiple are colon-separated) and otherwise falls back to `~/.kube/config`.
+/// Resolve the kubeconfig path: respects `KUBECONFIG` env var (its first
+/// non-empty entry, when it lists several) and otherwise falls back to
+/// `~/.kube/config`.
+///
+/// Split with `std::env::split_paths`, not on `':'`. The list separator is the
+/// platform's, the same one PATH uses: `:` on macOS and Linux, `;` on Windows.
+/// Splitting on `':'` there cut every path at its drive letter, so
+/// `C:\Users\me\.kube\config` resolved to a file named `C`.
 pub fn kubeconfig_path() -> Option<PathBuf> {
-    if let Ok(val) = std::env::var("KUBECONFIG") {
-        if let Some(first) = val.split(':').next() {
-            if !first.is_empty() {
-                return Some(PathBuf::from(first));
-            }
+    if let Some(val) = std::env::var_os("KUBECONFIG") {
+        if let Some(first) = std::env::split_paths(&val).find(|p| !p.as_os_str().is_empty()) {
+            return Some(first);
         }
     }
     dirs::home_dir().map(|h| h.join(".kube").join("config"))
@@ -319,6 +323,49 @@ users:
             assert_eq!(prod.namespace, Some("default".to_string()));
             assert!(prod.server.contains("azmk8s.io"));
         });
+    }
+
+    /// Runs `f` with `KUBECONFIG` set to `value`, restoring it afterwards.
+    fn with_kubeconfig_env<T>(value: &std::ffi::OsStr, f: impl FnOnce() -> T) -> T {
+        let _guard = super::KUBECONFIG_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("KUBECONFIG");
+        std::env::set_var("KUBECONFIG", value);
+        let out = f();
+        match previous {
+            Some(v) => std::env::set_var("KUBECONFIG", v),
+            None => std::env::remove_var("KUBECONFIG"),
+        }
+        out
+    }
+
+    #[test]
+    fn kubeconfig_path_takes_the_first_entry_of_a_list() {
+        // Joined with the platform's own separator, so this checks the real
+        // thing on each OS rather than one hard-coded spelling of it.
+        let first = std::env::temp_dir().join("first-kubeconfig");
+        let second = std::env::temp_dir().join("second-kubeconfig");
+        let list = std::env::join_paths([&first, &second]).unwrap();
+        assert_eq!(with_kubeconfig_env(&list, kubeconfig_path), Some(first));
+    }
+
+    #[test]
+    fn kubeconfig_path_skips_empty_entries() {
+        let only = std::env::temp_dir().join("only-kubeconfig");
+        let mut list = std::ffi::OsString::from(if cfg!(windows) { ";" } else { ":" });
+        list.push(only.as_os_str());
+        assert_eq!(with_kubeconfig_env(&list, kubeconfig_path), Some(only));
+    }
+
+    /// The bug this guards: splitting on `':'` cut a Windows path at its drive
+    /// letter. Only meaningful where `;` is the separator, so Windows CI runs it.
+    #[cfg(windows)]
+    #[test]
+    fn kubeconfig_path_keeps_a_windows_drive_letter() {
+        let list = std::ffi::OsStr::new(r"C:\Users\me\.kube\config;D:\other\config");
+        assert_eq!(
+            with_kubeconfig_env(list, kubeconfig_path),
+            Some(PathBuf::from(r"C:\Users\me\.kube\config"))
+        );
     }
 
     #[test]
