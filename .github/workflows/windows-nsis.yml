@@ -106,20 +106,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify the installer is an x64 Windows executable
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $exe = Get-ChildItem dist-release -Filter '*-setup.exe' | Select-Object -First 1
-          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
-          # e_lfanew at 0x3C points at the PE signature; the machine field
-          # follows it. 0x8664 is x86-64.
-          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
-          $sig = [System.Text.Encoding]::ASCII.GetString($bytes, $pe, 4)
-          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
-          "signature=$($sig.Trim([char]0)) machine=0x{0:X4}" -f $machine
-          if ($sig -ne "PE`0`0" -or $machine -ne 0x8664) { throw "not an x64 PE executable" }
-
       # What the Scoop manifest relies on: that the installer unpacks with 7-Zip
       # into a runnable app, the way Scoop installs it, without running the
       # installer at all. The listing goes to the summary because the manifest
@@ -137,6 +123,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           [ -f "unpacked/AKS Fleet Dashboard.exe" ] \
             || { echo "::error::the installer holds no 'AKS Fleet Dashboard.exe'"; find unpacked -maxdepth 2; exit 1; }
+
+      # The app inside, not the installer: an NSIS installer is a 32-bit x86
+      # stub whatever it carries, so checking the setup.exe reports 0x014C on a
+      # perfectly good x64 build. That is exactly what the first version of
+      # this step did.
+      - name: Verify the app is an x64 Windows executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bytes = [System.IO.File]::ReadAllBytes("unpacked\AKS Fleet Dashboard.exe")
+          # e_lfanew at 0x3C points at the PE signature; the machine field
+          # follows it. 0x8664 is x86-64.
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $sig = [System.Text.Encoding]::ASCII.GetString($bytes, $pe, 4)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          "signature=$($sig.Trim([char]0)) machine=0x{0:X4}" -f $machine
+          if ($sig -ne "PE`0`0" -or $machine -ne 0x8664) { throw "not an x64 PE executable" }
 
       # Not proof the app works against a cluster: there is no kubeconfig here.
       # It is proof the unpacked app starts and stays up, which is where a

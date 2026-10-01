@@ -76,13 +76,40 @@ has not been confirmed on real hardware, and neither has first launch. If it
 fails to start, installing your distribution's `webkit2gtk-4.1` runtime is
 the first thing to try, and please open an issue.
 
+### Windows (x64)
+
+Through [Scoop](https://scoop.sh), which plays the part Homebrew does on the
+other two platforms:
+
+```powershell
+scoop bucket add aks-fleet-dashboard https://github.com/aavishay/scoop-aks-fleet-dashboard
+scoop install aks-fleet-dashboard
+```
+
+and `scoop update aks-fleet-dashboard` to upgrade. It lands in the Start menu
+as **AKS Fleet Dashboard**. Three things differ from macOS:
+
+- **Ctrl replaces Cmd**, as on Linux. Press `?` in the app for the list.
+- **AKS sign-in needs `kubelogin` on your PATH**, the same as `kubectl` does
+  on Windows: `scoop install kubelogin`, or `az aks install-cli`. The app reads
+  `%USERPROFILE%\.kube\config`, or the first file in `KUBECONFIG`.
+- **It renders in WebView2**, the Edge engine Windows 11 and an up-to-date
+  Windows 10 already carry. If the window comes up blank, install the
+  [WebView2 runtime](https://developer.microsoft.com/microsoft-edge/webview2/).
+
+The installer is not code-signed, so running the `x64-setup.exe` by hand may
+bring up SmartScreen's "Windows protected your PC": choose **More info → Run
+anyway**. Scoop unpacks the installer rather than running it, so it should not
+bring that prompt up.
+
 ### Without Homebrew
 
 Releases carry the artifacts directly:
 [Releases](https://github.com/aavishay/aks-multicluster-dashboard/releases).
 Take the `.dmg`, or the `.app.zip` if you would rather not mount a disk image.
 Every release from 0.7.2 onward also carries an `x86_64.AppImage` for Linux —
-`chmod +x` it and run it.
+`chmod +x` it and run it — and from 0.7.40 an `x64-setup.exe` for Windows,
+which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
@@ -97,7 +124,8 @@ top bar to choose one and, for Claude or Gemini, paste an API key (from
 [console.anthropic.com](https://console.anthropic.com) or
 [aistudio.google.com](https://aistudio.google.com)). The key is stored in your
 operating system's credential store — Keychain on macOS, the D-Bus secret
-service on Linux — never in the app or in a file it owns.
+service on Linux, Credential Manager on Windows — never in the app or in a file
+it owns.
 
 An exported `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` takes precedence if you'd
 rather not store one.
