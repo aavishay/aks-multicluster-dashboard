@@ -121,8 +121,10 @@ jobs:
             (cd unpacked && find . -maxdepth 2 | sort)
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          [ -f "unpacked/AKS Fleet Dashboard.exe" ] \
-            || { echo "::error::the installer holds no 'AKS Fleet Dashboard.exe'"; find unpacked -maxdepth 2; exit 1; }
+          # Named after the Rust package, as the macOS binary inside the .app
+          # is; the Start menu shortcut is what carries the product name.
+          [ -f "unpacked/k8s-view.exe" ] \
+            || { echo "::error::the installer holds no 'k8s-view.exe'"; find unpacked -maxdepth 2; exit 1; }
 
       # The app inside, not the installer: an NSIS installer is a 32-bit x86
       # stub whatever it carries, so checking the setup.exe reports 0x014C on a
@@ -132,7 +134,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $bytes = [System.IO.File]::ReadAllBytes("unpacked\AKS Fleet Dashboard.exe")
+          $bytes = [System.IO.File]::ReadAllBytes("unpacked\k8s-view.exe")
           # e_lfanew at 0x3C points at the PE signature; the machine field
           # follows it. 0x8664 is x86-64.
           $pe = [BitConverter]::ToInt32($bytes, 0x3C)
@@ -150,7 +152,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $app = Start-Process -FilePath "unpacked\AKS Fleet Dashboard.exe" -PassThru
+          $app = Start-Process -FilePath "unpacked\k8s-view.exe" -PassThru
           Start-Sleep -Seconds 15
           $app.Refresh()
           if ($app.HasExited) { throw "the app exited within 15s, with code $($app.ExitCode)" }
