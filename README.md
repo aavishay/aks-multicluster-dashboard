@@ -90,8 +90,10 @@ and `scoop update aks-fleet-dashboard` to upgrade. It lands in the Start menu
 as **AKS Fleet Dashboard**. Three things differ from macOS:
 
 - **Ctrl replaces Cmd**, as on Linux. Press `?` in the app for the list.
-- **AKS sign-in needs `kubelogin` on your PATH**, the same as `kubectl` does
-  on Windows: `scoop install kubelogin`, or `az aks install-cli`. The app reads
+- **AKS sign-in needs Azure's `kubelogin` on your PATH**, the same as
+  `kubectl` does on Windows: `scoop install azure-kubelogin`, or
+  `az aks install-cli`. Not `scoop install kubelogin`, which is an unrelated
+  OIDC plugin of the same name from Scoop's Extras bucket. The app reads
   `%USERPROFILE%\.kube\config`, or the first file in `KUBECONFIG`.
 - **It renders in WebView2**, the Edge engine Windows 11 and an up-to-date
   Windows 10 already carry. If the window comes up blank, install the
