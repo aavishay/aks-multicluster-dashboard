@@ -770,11 +770,13 @@ interface AppState {
    */
   podsLoadedComplete: Set<string>;
   /**
-   * Clusters whose first Pods load is still streaming in, with when it began.
-   * Their rows in `state.pods` are only the pages that have arrived so far —
-   * see `podsStillArrivingNote`.
+   * Every first Pods load still streaming in, per cluster, each with when it
+   * began. While a cluster has one, its rows in `state.pods` may be only the
+   * pages that have arrived so far — see `podsStillArrivingNote`. A set and not
+   * one slot because attempts overlap: with one slot, a newer attempt failing
+   * cleared it while an older one was still streaming partial pages.
    */
-  podsFirstLoadInFlight: Map<string, { startedAt: number }>;
+  podsFirstLoadInFlight: Map<string, Set<{ startedAt: number }>>;
   workloads: Map<string, WorkloadInfo[]>;
   events: Map<string, EventInfo[]>;
   eventsWarningsOnly: boolean;
@@ -1038,9 +1040,31 @@ function startLoadingTicker() {
   loadingTicker = window.setInterval(() => {
     if (!state.tabLoading) {
       stopLoadingTicker();
-    } else if (!hasAnyDataForTab() || (state.activeTab === "pods" && state.podsFirstLoadInFlight.size > 0)) {
-      // The second case keeps the Pods header's "still loading … (Ns)" count
-      // moving while a first load streams in over rows already on screen.
+    } else if (!hasAnyDataForTab()) {
+      render();
+    }
+  }, 1000);
+}
+
+/**
+ * Keeps the Pods header's "still loading … (Ns)" count moving while a first
+ * load streams in over rows already on screen. Its own timer rather than the
+ * loading ticker's: that one runs only while `loadTabData` holds `tabLoading`,
+ * and a reconnect starts a load outside it, which left the seconds frozen.
+ * Stops itself once no first load is in flight.
+ */
+let podsArrivingTicker: number | undefined;
+function startPodsArrivingTicker() {
+  if (podsArrivingTicker !== undefined) return;
+  podsArrivingTicker = window.setInterval(() => {
+    if (state.podsFirstLoadInFlight.size === 0) {
+      window.clearInterval(podsArrivingTicker);
+      podsArrivingTicker = undefined;
+      // One last render on the way out: a load that a newer pass superseded
+      // commits its rows without rendering (the loader renders for the current
+      // pass only), which left the note frozen over a list already complete.
+      if (state.activeTab === "pods") render();
+    } else if (state.activeTab === "pods") {
       render();
     }
   }, 1000);
@@ -1891,7 +1915,12 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       // slower overlapping attempt finishing later cannot clear the mark of a
       // newer one still running.
       const inFlight = { startedAt: Date.now() };
-      if (isFirstLoad) state.podsFirstLoadInFlight.set(ctx, inFlight);
+      if (isFirstLoad) {
+        const attempts = state.podsFirstLoadInFlight.get(ctx) ?? new Set();
+        attempts.add(inFlight);
+        state.podsFirstLoadInFlight.set(ctx, attempts);
+        startPodsArrivingTicker();
+      }
       try {
         pods = await api.streamPods(ctx, undefined, (page) => {
           // The preview exists only to get rows on screen during a first
@@ -1933,7 +1962,10 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
         if (isFirstLoad && state.pods.get(ctx) === preview) state.pods.delete(ctx);
         throw e;
       } finally {
-        if (state.podsFirstLoadInFlight.get(ctx) === inFlight) state.podsFirstLoadInFlight.delete(ctx);
+        // Only this attempt: any other still running keeps the cluster marked.
+        const attempts = state.podsFirstLoadInFlight.get(ctx);
+        attempts?.delete(inFlight);
+        if (attempts?.size === 0) state.podsFirstLoadInFlight.delete(ctx);
       }
       // Committed unconditionally, first load or refresh: the preview written
       // during streaming is by definition missing at least the final page.
@@ -7307,7 +7339,7 @@ function podsStillArrivingNote(ctxs: string[]): string {
     (ctx) => state.podsFirstLoadInFlight.has(ctx) && state.pods.has(ctx) && !state.podsLoadedComplete.has(ctx),
   );
   if (arriving.length === 0) return "";
-  const startedAt = Math.min(...arriving.map((ctx) => state.podsFirstLoadInFlight.get(ctx)!.startedAt));
+  const startedAt = Math.min(...arriving.flatMap((ctx) => [...state.podsFirstLoadInFlight.get(ctx)!].map((a) => a.startedAt)));
   const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
   const soFar = arriving.reduce((n, ctx) => n + (state.pods.get(ctx)?.length ?? 0), 0);
   const who = arriving.length === 1 ? esc(arriving[0]) : `${arriving.length} clusters`;
