@@ -15,7 +15,7 @@
 //! metadata-only for that reason, and listing them in full here would
 //! re-download all of it on every refresh.
 
-use crate::k8s::{age_days, age_seconds};
+use crate::k8s::{age_days, age_seconds, created_at};
 use crate::kubeconfig::client_for_context;
 use crate::models::{ObjectManifest, SecretDetail, SecretInfo, SecretKeyInfo, SecretValue};
 use base64::Engine;
@@ -49,6 +49,7 @@ fn secret_to_info(s: &Secret) -> SecretInfo {
         immutable: s.immutable.unwrap_or(false),
         age_days: age_days(s.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(s.metadata.creation_timestamp.clone()),
+        created_at: created_at(&s.metadata.creation_timestamp),
     }
 }
 
@@ -63,6 +64,7 @@ fn helm_meta_to_info(m: &PartialObjectMeta<Secret>) -> SecretInfo {
         immutable: false,
         age_days: age_days(m.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(m.metadata.creation_timestamp.clone()),
+        created_at: created_at(&m.metadata.creation_timestamp),
     }
 }
 

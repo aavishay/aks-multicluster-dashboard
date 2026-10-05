@@ -1136,6 +1136,7 @@ mod tests {
             restarts,
             age_days: 1,
             age_seconds: 86_400,
+            created_at: None,
             owner_kind: Some("Deployment".into()),
             owner_name: Some("api".into()),
             cpu_usage_millicores: None,
