@@ -769,6 +769,14 @@ interface AppState {
    * as if it were the whole cluster.
    */
   podsLoadedComplete: Set<string>;
+  /**
+   * Every first Pods load still streaming in, per cluster, each with when it
+   * began. While a cluster has one, its rows in `state.pods` may be only the
+   * pages that have arrived so far — see `podsStillArrivingNote`. A set and not
+   * one slot because attempts overlap: with one slot, a newer attempt failing
+   * cleared it while an older one was still streaming partial pages.
+   */
+  podsFirstLoadInFlight: Map<string, Set<{ startedAt: number }>>;
   workloads: Map<string, WorkloadInfo[]>;
   events: Map<string, EventInfo[]>;
   eventsWarningsOnly: boolean;
@@ -892,6 +900,7 @@ const state: AppState = {
   nodes: new Map(),
   pods: new Map(),
   podsLoadedComplete: new Set(),
+  podsFirstLoadInFlight: new Map(),
   workloads: new Map(),
   events: new Map(),
   eventsWarningsOnly: true,
@@ -1032,6 +1041,30 @@ function startLoadingTicker() {
     if (!state.tabLoading) {
       stopLoadingTicker();
     } else if (!hasAnyDataForTab()) {
+      render();
+    }
+  }, 1000);
+}
+
+/**
+ * Keeps the Pods header's "still loading … (Ns)" count moving while a first
+ * load streams in over rows already on screen. Its own timer rather than the
+ * loading ticker's: that one runs only while `loadTabData` holds `tabLoading`,
+ * and a reconnect starts a load outside it, which left the seconds frozen.
+ * Stops itself once no first load is in flight.
+ */
+let podsArrivingTicker: number | undefined;
+function startPodsArrivingTicker() {
+  if (podsArrivingTicker !== undefined) return;
+  podsArrivingTicker = window.setInterval(() => {
+    if (state.podsFirstLoadInFlight.size === 0) {
+      window.clearInterval(podsArrivingTicker);
+      podsArrivingTicker = undefined;
+      // One last render on the way out: a load that a newer pass superseded
+      // commits its rows without rendering (the loader renders for the current
+      // pass only), which left the note frozen over a list already complete.
+      if (state.activeTab === "pods") render();
+    } else if (state.activeTab === "pods") {
       render();
     }
   }, 1000);
@@ -1877,6 +1910,17 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       // would deterministically drop the last one.
       const preview: PodInfo[] = [];
       let pods: PodInfo[] = [];
+      // Marks the cluster as mid-stream for the Pods header, so the first page
+      // on screen is not read as the whole cluster. An object of its own, so a
+      // slower overlapping attempt finishing later cannot clear the mark of a
+      // newer one still running.
+      const inFlight = { startedAt: Date.now() };
+      if (isFirstLoad) {
+        const attempts = state.podsFirstLoadInFlight.get(ctx) ?? new Set();
+        attempts.add(inFlight);
+        state.podsFirstLoadInFlight.set(ctx, attempts);
+        startPodsArrivingTicker();
+      }
       try {
         pods = await api.streamPods(ctx, undefined, (page) => {
           // The preview exists only to get rows on screen during a first
@@ -1917,6 +1961,11 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
         // written over this attempt's own progress.
         if (isFirstLoad && state.pods.get(ctx) === preview) state.pods.delete(ctx);
         throw e;
+      } finally {
+        // Only this attempt: any other still running keeps the cluster marked.
+        const attempts = state.podsFirstLoadInFlight.get(ctx);
+        attempts?.delete(inFlight);
+        if (attempts?.size === 0) state.podsFirstLoadInFlight.delete(ctx);
       }
       // Committed unconditionally, first load or refresh: the preview written
       // during streaming is by definition missing at least the final page.
@@ -7273,6 +7322,30 @@ function hpaIsHealthy(h: HpaInfo): boolean {
   return h.able_to_scale && h.scaling_active;
 }
 
+/**
+ * Says so when the Pods table is showing only part of a cluster.
+ *
+ * A first load streams in page by page, 500 pods to a page, and the table
+ * shows each page as it lands. Once there is any data the loading screen
+ * gives way to the table, so nothing else marks the rows as partial: on a
+ * slow connection the first page sat on screen as "1–16 of 500" for as long as
+ * the second took, reading as a cluster of exactly 500 pods.
+ */
+function podsStillArrivingNote(ctxs: string[]): string {
+  // Not `podsLoadedComplete`: overlapping attempts are normal here, and once
+  // any one of them finishes the table holds the whole cluster, even while a
+  // slower one is still streaming.
+  const arriving = ctxs.filter(
+    (ctx) => state.podsFirstLoadInFlight.has(ctx) && state.pods.has(ctx) && !state.podsLoadedComplete.has(ctx),
+  );
+  if (arriving.length === 0) return "";
+  const startedAt = Math.min(...arriving.flatMap((ctx) => [...state.podsFirstLoadInFlight.get(ctx)!].map((a) => a.startedAt)));
+  const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const soFar = arriving.reduce((n, ctx) => n + (state.pods.get(ctx)?.length ?? 0), 0);
+  const who = arriving.length === 1 ? esc(arriving[0]) : `${arriving.length} clusters`;
+  return `<span class="text-status-warning" title="The first load streams in 500 pods at a time; the table fills in as each page arrives.">Still loading pods from ${who} — ${soFar} so far (${elapsed}s)</span>`;
+}
+
 function renderPods(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
@@ -7325,7 +7398,10 @@ function renderPods(): string {
 
   return `
     <div class="mb-2 flex items-center justify-between">
-      <div class="text-xs text-ink-muted">${state.unhealthyOnly.pods ? `${rows.length} of ${allRows.length} unhealthy` : ""}</div>
+      <div class="flex items-center gap-3 text-xs text-ink-muted">
+        ${podsStillArrivingNote(ctxs)}
+        <span>${state.unhealthyOnly.pods ? `${rows.length} of ${allRows.length} unhealthy` : ""}</span>
+      </div>
       ${unhealthyOnlyToggle("pods")}
     </div>
     ${filterSummary("pods", rows.length, filtered.length)}
