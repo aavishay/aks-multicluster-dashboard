@@ -5,7 +5,7 @@
 //! and a property. So unlike `secrets.rs` there is nothing to redact, and its
 //! YAML and its mappings are shown as they are.
 
-use crate::k8s::{age_days, age_seconds, event_to_info, json_str, list_events_sorted, object_manifest};
+use crate::k8s::{age_days, age_seconds, created_at, event_to_info, json_str, list_events_sorted, object_manifest};
 use crate::kubeconfig::client_for_context;
 use crate::models::{EventInfo, ExternalSecretDetail, ExternalSecretInfo, ExternalSecretMapping, ExternalSecretsResult};
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams};
@@ -76,6 +76,7 @@ fn to_info(obj: &DynamicObject) -> ExternalSecretInfo {
         last_refresh: Some(json_str(status, "refreshTime")).filter(|t| !t.is_empty()).map(str::to_string),
         age_days: age_days(obj.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(obj.metadata.creation_timestamp.clone()),
+        created_at: created_at(&obj.metadata.creation_timestamp),
         name,
     }
 }

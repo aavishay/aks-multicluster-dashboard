@@ -158,6 +158,14 @@ pub(crate) fn age_seconds(ts: Option<k8s_openapi::apimachinery::pkg::apis::meta:
     }
 }
 
+/// The timestamp `age_days`/`age_seconds` count from, as RFC 3339 in UTC to the
+/// second. Sent alongside the age rather than worked out from it: the age is
+/// measured when the list is built, so subtracting it from the frontend's clock
+/// later would be off by however long ago that was.
+pub(crate) fn created_at(ts: &Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> Option<String> {
+    ts.as_ref().map(|t| t.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
 /// The object's managing controller (kind, name), if it has one — e.g. a Pod's
 /// managing controller is usually the ReplicaSet that created it, not the
 /// Deployment that created the ReplicaSet.
@@ -453,6 +461,7 @@ pub async fn get_nodes(context_name: &str) -> Result<Vec<NodeInfo>, String> {
                 conditions,
                 age_days: age_days(n.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(n.metadata.creation_timestamp.clone()),
+                created_at: created_at(&n.metadata.creation_timestamp),
                 unschedulable: n.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false),
             }
         })
@@ -517,6 +526,7 @@ fn build_pod_info(p: Pod, metrics: &HashMap<(String, String), (i64, i64)>, rs_ow
         restarts,
         age_days: age_days(p.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(p.metadata.creation_timestamp.clone()),
+        created_at: created_at(&p.metadata.creation_timestamp),
         owner_kind,
         owner_name,
         cpu_usage_millicores: if has_metrics { Some(cpu) } else { None },
@@ -1265,6 +1275,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 healthy: workload_healthy(ready, desired),
                 age_days: age_days(d.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(d.metadata.creation_timestamp.clone()),
+                created_at: created_at(&d.metadata.creation_timestamp),
                 version: v.version,
                 version_from_label: v.version_from_label,
                 images: v.images,
@@ -1299,6 +1310,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 healthy: workload_healthy(ready, desired),
                 age_days: age_days(s.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(s.metadata.creation_timestamp.clone()),
+                created_at: created_at(&s.metadata.creation_timestamp),
                 version: v.version,
                 version_from_label: v.version_from_label,
                 images: v.images,
@@ -1332,6 +1344,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 healthy: workload_healthy(ready, desired),
                 age_days: age_days(d.metadata.creation_timestamp.clone()),
                 age_seconds: age_seconds(d.metadata.creation_timestamp.clone()),
+                created_at: created_at(&d.metadata.creation_timestamp),
                 version: v.version,
                 version_from_label: v.version_from_label,
                 images: v.images,
@@ -1462,6 +1475,7 @@ pub async fn get_workload_revisions(
                         current: false,
                         age_days: age_days(rs.metadata.creation_timestamp.clone()),
                         age_seconds: age_seconds(rs.metadata.creation_timestamp.clone()),
+                        created_at: created_at(&rs.metadata.creation_timestamp),
                     }
                 })
                 .collect()
@@ -1489,6 +1503,7 @@ pub async fn get_workload_revisions(
                     current: false,
                     age_days: age_days(cr.metadata.creation_timestamp.clone()),
                     age_seconds: age_seconds(cr.metadata.creation_timestamp.clone()),
+                    created_at: created_at(&cr.metadata.creation_timestamp),
                 })
                 .collect()
         }
@@ -1852,6 +1867,7 @@ fn dynamic_object_to_gitops_app(obj: DynamicObject) -> GitOpsAppInfo {
         last_synced_at,
         age_days: age_days(obj.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(obj.metadata.creation_timestamp.clone()),
+        created_at: created_at(&obj.metadata.creation_timestamp),
         name,
     }
 }
@@ -1986,6 +2002,7 @@ fn dynamic_object_to_nap_node_pool(obj: DynamicObject) -> NapNodePoolInfo {
         capacity_types,
         age_days: age_days(obj.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(obj.metadata.creation_timestamp.clone()),
+        created_at: created_at(&obj.metadata.creation_timestamp),
     }
 }
 
@@ -2300,6 +2317,7 @@ fn hpa_to_info(hpa: HorizontalPodAutoscaler) -> HpaInfo {
         last_scale_at: status.last_scale_time.map(|t| t.0.to_rfc3339()),
         age_days: age_days(hpa.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(hpa.metadata.creation_timestamp.clone()),
+        created_at: created_at(&hpa.metadata.creation_timestamp),
     }
 }
 
@@ -2387,6 +2405,7 @@ fn dynamic_object_to_keda(obj: DynamicObject, kind: &str) -> KedaScaledObjectInf
         paused,
         age_days: age_days(obj.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(obj.metadata.creation_timestamp.clone()),
+        created_at: created_at(&obj.metadata.creation_timestamp),
     }
 }
 
@@ -3150,6 +3169,14 @@ pub async fn get_gitops_diff_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn created_at_is_utc_to_the_second() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        let t = chrono::DateTime::parse_from_rfc3339("2026-04-29T19:37:04.6162361+03:00").unwrap().with_timezone(&Utc);
+        assert_eq!(created_at(&Some(Time(t))), Some("2026-04-29T16:37:04Z".to_string()));
+        assert_eq!(created_at(&None), None);
+    }
 
     #[test]
     fn pod_counts_split_into_running_and_not_ready() {

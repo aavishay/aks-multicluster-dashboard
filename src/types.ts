@@ -42,6 +42,8 @@ export interface NodeInfo {
   conditions: string[];
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
   unschedulable: boolean;
 }
 
@@ -54,6 +56,8 @@ export interface PodInfo {
   restarts: number;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
   owner_kind: string | null;
   owner_name: string | null;
   cpu_usage_millicores: number | null;
@@ -93,6 +97,8 @@ export interface WorkloadInfo {
   healthy: boolean;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
   version: string;
   version_from_label: boolean;
   images: string[];
@@ -111,6 +117,8 @@ export interface WorkloadRevisionInfo {
   current: boolean;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
 }
 
 export interface EventInfo {
@@ -178,6 +186,8 @@ export interface GitOpsAppInfo {
   last_synced_at: string | null;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
 }
 
 export interface GitOpsResult {
@@ -225,6 +235,8 @@ export interface HpaInfo {
   last_scale_at: string | null;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
 }
 
 export type GitOpsAppManifest = ObjectManifest;
@@ -307,6 +319,8 @@ export interface ExternalSecretInfo {
   last_refresh: string | null;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
 }
 
 /** `installed: false` means no served version of the CRD answered — ESO is not on this cluster. */
@@ -346,6 +360,8 @@ export interface SecretInfo {
   immutable: boolean;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
 }
 
 /** What the Secret panel loads: the key list and the redacted YAML. */
@@ -418,6 +434,8 @@ export interface NapNodePoolInfo {
   capacity_types: string;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
 }
 
 /** KEDA autoscalers. Same `installed` semantics as `NapResult`. */
@@ -442,4 +460,6 @@ export interface KedaScaledObjectInfo {
   paused: boolean;
   age_days: number;
   age_seconds: number;
+  /** When it was created, RFC 3339 UTC — what the age is counted from. */
+  created_at: string | null;
 }

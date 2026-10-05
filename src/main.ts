@@ -3,7 +3,7 @@ import { ANSI_BASE16, xterm256ToHex } from "./ansi";
 import { api } from "./api";
 import { closeExec, isExecEnded, isExecOpen, openExec, syncExecFontMetrics } from "./exec";
 import { MONO_TEXT_CLASSES } from "./typography";
-import { formatAgeDetailed, formatBytes, formatKi, formatMillicores, formatPct, relativeTime } from "./format";
+import { formatAgeDetailed, formatBytes, formatKi, formatMillicores, formatPct, relativeTime, timeTitle } from "./format";
 import type {
   AiAuthState,
   AiProvider,
@@ -6715,7 +6715,7 @@ function renderTopbar(): string {
         ${paletteButton("Go to tab…", "Go to a tab", "T", "window.__app.openTabPalette()")}
       </div>
       <div class="flex items-center gap-3 text-xs text-ink-muted">
-        <span class="tabular">${state.lastUpdated ? `Updated ${relativeTime(state.lastUpdated.toISOString())}` : ""}</span>
+        <span class="tabular" title="${esc(state.lastUpdated ? timeTitle("Updated", state.lastUpdated.toISOString()) : "")}">${state.lastUpdated ? `Updated ${relativeTime(state.lastUpdated.toISOString())}` : ""}</span>
         <select
           class="rounded-md border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-secondary outline-none"
           onchange="window.__app.setAutoRefresh(Number(this.value))"
@@ -7096,7 +7096,7 @@ function renderNodes(): string {
                 }
               </td>
               <td>${esc(n.kubelet_version)}</td>
-              <td class="tabular">${formatAgeDetailed(n.age_days, n.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", n.created_at))}">${formatAgeDetailed(n.age_days, n.age_seconds)}</td>
             </tr>`;
               },
             )
@@ -7225,7 +7225,7 @@ function renderWorkloads(): string {
               <td class="tabular">${w.ready}</td>
               <td class="tabular">${w.updated}</td>
               <td class="tabular">${w.available}</td>
-              <td class="tabular">${formatAgeDetailed(w.age_days, w.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", w.created_at))}">${formatAgeDetailed(w.age_days, w.age_seconds)}</td>
             </tr>`;
               },
             )
@@ -7399,7 +7399,7 @@ function renderPods(): string {
                     : "—"
                 }
               </td>
-              <td class="tabular">${formatAgeDetailed(p.age_days, p.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", p.created_at))}">${formatAgeDetailed(p.age_days, p.age_seconds)}</td>
             </tr>`;
             })
             .join("")}
@@ -9206,7 +9206,7 @@ function renderEventsList(scrollId: string, events: EventInfo[] | null, error: s
               <td title="${esc(e.reason)}">${esc(e.reason)}</td>
               <td class="whitespace-normal break-words">${esc(e.message)}</td>
               <td class="tabular">${e.count}</td>
-              <td class="tabular">${esc(relativeTime(e.last_seen))}</td>
+              <td class="tabular" title="${esc(timeTitle("Last seen", e.last_seen))}">${esc(relativeTime(e.last_seen))}</td>
             </tr>`,
             )
             .join("")}
@@ -9495,7 +9495,7 @@ function renderWorkloadRevisionsView(wd: WorkloadDetailState): string {
             <td class="max-w-xs truncate" title="${esc(r.images.join(", "))}">${
               r.images.length > 0 ? esc(r.images.map(shortImageRef).join(", ")) : "\u2014"
             }</td>
-            <td class="tabular">${formatAgeDetailed(r.age_days, r.age_seconds)}</td>
+            <td class="tabular" title="${esc(timeTitle("Created", r.created_at))}">${formatAgeDetailed(r.age_days, r.age_seconds)}</td>
           </tr>`,
             )
             .join("")}
@@ -10102,7 +10102,7 @@ function renderExternalSecretStatusStrip(ed: ExternalSecretDetailState): string 
       <div class="flex flex-wrap items-center gap-2">
         ${statusDot(e.ready)}
         <span class="font-medium text-ink-primary">${esc(status)}</span>
-        <span class="text-ink-muted" title="${esc(e.last_refresh ?? "")}">${e.last_refresh ? `last sync ${relativeTime(e.last_refresh)}` : "never synced"}</span>
+        <span class="text-ink-muted" title="${esc(timeTitle("Last synced", e.last_refresh))}">${e.last_refresh ? `last sync ${relativeTime(e.last_refresh)}` : "never synced"}</span>
       </div>
       ${!e.ready && e.message ? `<div class="mt-1 break-words text-status-critical">${esc(e.message)}</div>` : ""}
       <div class="mt-1 text-ink-muted">
@@ -10544,7 +10544,7 @@ function renderEvents(): string {
               <td>${esc(e.reason)}</td>
               <td class="max-w-md truncate" title="${esc(e.message)}">${esc(e.message)}</td>
               <td class="tabular">${e.count}</td>
-              <td class="tabular">${relativeTime(e.last_seen)}</td>
+              <td class="tabular" title="${esc(timeTitle("Last seen", e.last_seen))}">${relativeTime(e.last_seen)}</td>
             </tr>`;
               },
             )
@@ -10701,7 +10701,7 @@ function renderNap(): string {
               <td class="tabular">${formatMillicores(p.cpu_used_millicores)} / ${formatMillicores(p.cpu_limit_millicores)}</td>
               <td class="tabular">${formatKi(p.memory_used_ki)} / ${formatKi(p.memory_limit_ki)}</td>
               <td class="tabular">${p.weight}</td>
-              <td class="tabular">${formatAgeDetailed(p.age_days, p.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", p.created_at))}">${formatAgeDetailed(p.age_days, p.age_seconds)}</td>
             </tr>`;
             })
             .join("")}
@@ -10819,7 +10819,7 @@ function renderHpa(): string {
               <td class="tabular">${h.min_replicas}</td>
               <td class="tabular ${atCeiling ? "text-status-warning" : ""}" ${atCeiling ? 'title="At its ceiling — it cannot scale up further"' : ""}>${h.max_replicas}</td>
               <td class="tabular" ${h.current_replicas !== h.desired_replicas ? `title="Scaling toward ${h.desired_replicas}"` : ""}>${h.current_replicas}${h.current_replicas !== h.desired_replicas ? ` <span class="text-ink-muted">&rarr; ${h.desired_replicas}</span>` : ""}</td>
-              <td class="tabular">${formatAgeDetailed(h.age_days, h.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", h.created_at))}">${formatAgeDetailed(h.age_days, h.age_seconds)}</td>
             </tr>`;
             })
             .join("")}
@@ -10914,7 +10914,7 @@ function renderSecrets(): string {
               </td>
               <td><button type="button" title="Filter by this type" onclick="window.__app.setEnumFilter('secrets','type',[${jsArg(sec.secret_type)}])" class="hover:text-series-blue hover:underline">${esc(sec.secret_type)}</button></td>
               ${keys}
-              <td class="tabular">${formatAgeDetailed(sec.age_days, sec.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", sec.created_at))}">${formatAgeDetailed(sec.age_days, sec.age_seconds)}</td>
             </tr>`;
             })
             .join("")}
@@ -11040,8 +11040,8 @@ function renderExternalSecrets(): string {
               <td><button type="button" title="Open the Secret this writes" onclick="window.__app.openSecretDetail(${jsArg(ctx)},${jsArg(e.namespace)},${jsArg(e.target_name)},${jsArg(e.target_type)})" class="hover:text-series-blue hover:underline">${esc(e.target_name)}</button></td>
               <td class="tabular">${e.data_count}${e.data_from_count ? ` <span class="text-ink-muted" title="${e.data_from_count} dataFrom entr${e.data_from_count === 1 ? "y" : "ies"}, each adding any number of keys">+ ${e.data_from_count} dataFrom</span>` : ""}</td>
               <td class="tabular" ${e.refresh_interval ? "" : 'title="ESO\'s default interval"'}>${esc(e.refresh_interval) || '<span class="text-ink-muted">default</span>'}</td>
-              <td class="tabular" title="${esc(e.last_refresh ?? "Never synced")}">${e.last_refresh ? relativeTime(e.last_refresh) : '<span class="text-ink-muted">never</span>'}</td>
-              <td class="tabular">${formatAgeDetailed(e.age_days, e.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Last synced", e.last_refresh) || "Never synced")}">${e.last_refresh ? relativeTime(e.last_refresh) : '<span class="text-ink-muted">never</span>'}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", e.created_at))}">${formatAgeDetailed(e.age_days, e.age_seconds)}</td>
             </tr>`;
             })
             .join("")}
@@ -11153,7 +11153,7 @@ function renderKeda(): string {
               <td class="tabular">${so.min_replicas}</td>
               <td class="tabular">${so.max_replicas}</td>
               <td><span class="${so.active ? "text-status-good" : "text-ink-muted"}">${so.active ? "Active" : "Idle"}</span></td>
-              <td class="tabular">${formatAgeDetailed(so.age_days, so.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", so.created_at))}">${formatAgeDetailed(so.age_days, so.age_seconds)}</td>
             </tr>`;
             })
             .join("")}
@@ -11272,14 +11272,14 @@ function renderGitOps(): string {
                 >${esc(a.name)}</button>
               </td>
               <td>${esc(a.destination_namespace)}</td>
-              <td class="${a.sync_status === "Synced" ? "" : "text-status-warning"}" title="${esc(a.last_synced_at ?? "")}">
+              <td class="${a.sync_status === "Synced" ? "" : "text-status-warning"}" title="${esc(timeTitle("Last synced", a.last_synced_at))}">
                 ${esc(a.sync_status)}${a.last_synced_at ? ` <span class="tabular text-ink-muted">· ${relativeTime(a.last_synced_at)}</span>` : ""}
               </td>
               <td class="${a.health_status === "Healthy" ? "" : a.health_status === "Degraded" ? "text-status-critical" : "text-status-warning"}">${esc(a.health_status)}</td>
               <td class="max-w-xs truncate" title="${esc(a.repo_url)}">${esc(a.repo_url)}</td>
               <td class="max-w-xs truncate" title="${esc(a.path)}">${esc(a.path) || "—"}</td>
               <td class="tabular">${esc(a.revision) || "—"}</td>
-              <td class="tabular">${formatAgeDetailed(a.age_days, a.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Created", a.created_at))}">${formatAgeDetailed(a.age_days, a.age_seconds)}</td>
             </tr>`;
             })
             .join("")}
@@ -11429,7 +11429,7 @@ function renderHelm(): string {
               <td class="tabular">${esc(r.chart_version) || "—"}</td>
               <td class="tabular">${esc(r.app_version) || "—"}</td>
               <td class="tabular" title="${r.revision_count} revision${r.revision_count === 1 ? "" : "s"} retained">${r.revision}</td>
-              <td class="tabular">${formatAgeDetailed(r.age_days, r.age_seconds)}</td>
+              <td class="tabular" title="${esc(timeTitle("Last deployed", r.last_deployed))}">${formatAgeDetailed(r.age_days, r.age_seconds)}</td>
               <td class="max-w-xs truncate" title="${esc(r.description)}">${esc(r.description) || "—"}</td>
             </tr>`;
             })

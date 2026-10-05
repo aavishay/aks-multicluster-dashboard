@@ -52,3 +52,25 @@ export function relativeTime(iso: string | null): string {
   if (diffHr < 24) return `${diffHr}h ago`;
   return `${Math.round(diffHr / 24)}d ago`;
 }
+
+/**
+ * The exact moment behind a relative figure ("3h", "2m ago"), for a cell's
+ * tooltip: local time with its zone, then the same instant in UTC on a second
+ * line — the one to compare against logs and the API server. Empty for a
+ * missing or unparseable timestamp, which leaves the cell without a tooltip
+ * rather than showing "Invalid Date".
+ */
+export function exactTime(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const local = d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "long" });
+  const utc = `${d.toISOString().slice(0, 19).replace("T", " ")} UTC`;
+  return `${local}\n${utc}`;
+}
+
+/** `exactTime` with what the moment was, e.g. "Created …" for an Age column. */
+export function timeTitle(what: string, iso: string | null | undefined): string {
+  const at = exactTime(iso);
+  return at ? `${what} ${at}` : "";
+}

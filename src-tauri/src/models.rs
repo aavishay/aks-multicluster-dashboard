@@ -50,6 +50,10 @@ pub struct NodeInfo {
     pub conditions: Vec<String>,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
     pub unschedulable: bool,
 }
 
@@ -63,6 +67,10 @@ pub struct PodInfo {
     pub restarts: i32,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
     /// The workload kind that owns this pod (e.g. "Deployment", "StatefulSet",
     /// "DaemonSet", "Job"), resolved through its ReplicaSet if it has one.
     pub owner_kind: Option<String>,
@@ -118,6 +126,10 @@ pub struct WorkloadInfo {
     pub healthy: bool,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
     /// What version is running: the `app.kubernetes.io/version` label where
     /// set, otherwise the first container's image tag.
     pub version: String,
@@ -160,6 +172,10 @@ pub struct WorkloadRevisionInfo {
     pub current: bool,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -265,6 +281,10 @@ pub struct GitOpsAppInfo {
     pub last_synced_at: Option<String>,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
 }
 
 /// `installed: false` means no `applications.argoproj.io` CRD was found in
@@ -408,6 +428,10 @@ pub struct ExternalSecretInfo {
     pub last_refresh: Option<String>,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
 }
 
 /// `installed: false` means no served version of the CRD answered — ESO is not
@@ -460,6 +484,10 @@ pub struct SecretInfo {
     pub immutable: bool,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
 }
 
 /// What the Secret detail panel loads: the key list and the redacted YAML.
@@ -515,6 +543,10 @@ pub struct NapNodePoolInfo {
     pub capacity_types: String,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
 }
 
 /// One `HorizontalPodAutoscaler`.
@@ -562,6 +594,10 @@ pub struct HpaInfo {
     pub last_scale_at: Option<String>,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
 }
 
 /// KEDA autoscalers. Same `installed` reasoning as `NapResult`.
@@ -596,6 +632,10 @@ pub struct KedaScaledObjectInfo {
     pub paused: bool,
     pub age_days: i64,
     pub age_seconds: i64,
+    /// When the object was created, RFC 3339 in UTC: what the age above is
+    /// counted from, for the frontend's exact-time tooltip. `None` when the
+    /// API server sent no `creationTimestamp`.
+    pub created_at: Option<String>,
 }
 
 pub type GitOpsAppManifest = ObjectManifest;
