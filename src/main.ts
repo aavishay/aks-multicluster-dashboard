@@ -745,14 +745,14 @@ interface AppState {
   selectedContexts: Set<string>;
   /** Contexts currently retrying a failed connection via the sidebar's Reconnect button. */
   reconnecting: Set<string>;
-  /** Cmd+K cluster quick-switcher; null when closed. Toggling a cluster doesn't close it, so several can be picked in one go. */
+  /** Cmd+S cluster quick-switcher; null when closed. Toggling a cluster doesn't close it, so several can be picked in one go. */
   clusterPalette: {
     query: string;
     highlightedIndex: number;
     /** The selection as it stood when the palette opened, listed first — see `clusterPaletteVisible`. */
     selectedAtOpen: Set<string>;
   } | null;
-  /** The ⌘T tab switcher. */
+  /** The ⌘K tab switcher. */
   tabPalette: { query: string; highlightedIndex: number } | null;
   activeTab: TabId;
   overviews: Map<string, ClusterOverview>;
@@ -2305,10 +2305,10 @@ function clearClusterSelection() {
 }
 
 // ---------------------------------------------------------------------------
-// Tab switcher (⌘T)
+// Tab switcher (⌘K)
 // ---------------------------------------------------------------------------
 //
-// Its own palette rather than a section of ⌘K's: that one is a checklist —
+// Its own palette rather than a section of ⌘S's: that one is a checklist —
 // Enter toggles a cluster and it stays open to pick several — while this goes
 // to a tab and closes. In one list Enter would mean two different things
 // depending on which row it landed on.
@@ -2468,9 +2468,9 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
 function openTabPalette() {
   // Not over a dialog, a diagnosis or the shortcuts list: jumping tabs behind
   // one of those would strand it over a view it no longer belongs to. The
-  // cluster palette alone doesn't count — the two are alternatives, so ⌘T
-  // from inside ⌘K swaps one for the other. It is set aside for the check
-  // rather than skipping it: ⌘K opens unguarded, so it can itself be sitting
+  // cluster palette alone doesn't count — the two are alternatives, so ⌘K
+  // from inside ⌘S swaps one for the other. It is set aside for the check
+  // rather than skipping it: ⌘S opens unguarded, so it can itself be sitting
   // under one of those overlays, and a swap there would slip a tab palette in
   // behind it.
   const clusterPalette = state.clusterPalette;
@@ -2561,7 +2561,7 @@ function clusterPaletteVisible(): ClusterEntry[] {
 }
 
 function openClusterPalette() {
-  // The two palettes are alternatives: ⌘K from inside ⌘T swaps one for the other.
+  // The two palettes are alternatives: ⌘S from inside ⌘K swaps one for the other.
   state.tabPalette = null;
   state.clusterPalette = { query: "", highlightedIndex: 0, selectedAtOpen: new Set(state.selectedContexts) };
   render();
@@ -5961,7 +5961,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
       ["↑ ↓ PgUp PgDn Home End", "Scroll a tab with no table, like Metrics or Cost"],
       [`${withMod("←")} ${withMod("→")}`, "Back and forward through views"],
       [withMod("B"), "Show or hide the cluster list"],
-      [withMod("K"), "Switch cluster"],
+      [withMod("S"), "Switch cluster"],
       [withMod("R"), "Refresh now"],
     ],
   },
@@ -5977,7 +5977,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
   {
     title: "Everywhere",
     items: [
-      [withMod("T"), "Go to a tab"],
+      [withMod("K"), "Go to a tab"],
       [withMod("F"), "Search — the panel's box, or this table's filter"],
       ["?", "This list"],
       ["Esc", "Back out a layer: the field, then what's open, then filters, then write mode"],
@@ -6720,7 +6720,7 @@ function renderClaudeDiagnosePanel(): string {
  *
  * The name is set outright with aria-label: once the container query hides the
  * label, the text left inside is just the shortcut, and `title` does not
- * override text content — a screen reader would announce "⌘K" and nothing
+ * override text content — a screen reader would announce "⌘S" and nothing
  * about what it does.
  */
 function paletteButton(label: string, what: string, key: string, onclick: string): string {
@@ -6760,8 +6760,8 @@ function renderTopbar(): string {
     <header class="@container flex items-center justify-between border-b border-gridline bg-surface-1 px-5 py-3">
       <div class="flex items-center gap-3">
         <div class="text-sm font-medium text-ink-primary" title="${esc(ctxs.join(", "))}">${esc(title)}</div>
-        ${paletteButton("Go to cluster…", "Go to a cluster", "K", "window.__app.openClusterPalette()")}
-        ${paletteButton("Go to tab…", "Go to a tab", "T", "window.__app.openTabPalette()")}
+        ${paletteButton("Go to cluster…", "Go to a cluster", "S", "window.__app.openClusterPalette()")}
+        ${paletteButton("Go to tab…", "Go to a tab", "K", "window.__app.openTabPalette()")}
       </div>
       <div class="flex items-center gap-3 text-xs text-ink-muted">
         <span class="tabular" title="${esc(state.lastUpdated ? timeTitle("Updated", state.lastUpdated.toISOString()) : "")}">${state.lastUpdated ? `Updated ${relativeTime(state.lastUpdated.toISOString())}` : ""}</span>
@@ -12721,7 +12721,7 @@ document.addEventListener("keydown", (e) => {
   // binding every editor and chat app uses for its sidebar, so it is the first
   // thing anyone tries.
   //
-  // Not gated on isEditableTarget, for the same reason as Cmd+K below: Cmd+B
+  // Not gated on isEditableTarget, for the same reason as Cmd+S below: Cmd+B
   // means bold in a rich text editor, and this app has none, so there is
   // nothing in a plain input for it to collide with. Overlays don't gate it
   // either — same reasoning as Cmd+R: collapsing the sidebar behind a panel is
@@ -12739,7 +12739,7 @@ document.addEventListener("keydown", (e) => {
   // just opened is on screen: `claudeDiagnose` is one of that predicate's
   // members, which makes a second press a no-op rather than a re-request.
   //
-  // Not gated on isEditableTarget, for the same reason as Cmd+K below — there
+  // Not gated on isEditableTarget, for the same reason as Cmd+S below — there
   // is no competing meaning for it inside a plain text input, and this app has
   // no rich text editor where Cmd+D would mean something else.
   if (e.key === "d" || e.key === "D") {
@@ -12758,7 +12758,7 @@ document.addEventListener("keydown", (e) => {
   // Cmd+X does what left-clicking the focused row's name does — see
   // `activateFocusedRowName` for why that is not simply Enter again.
   //
-  // Unlike Cmd+B, Cmd+D and Cmd+K it IS gated on isEditableTarget, and left
+  // Unlike Cmd+B, Cmd+D and Cmd+S it IS gated on isEditableTarget, and left
   // unclaimed there rather than swallowed: Cmd+X is Cut, and in a filter box
   // Cut is what it has to stay. Outside an editable field Cut has nothing to
   // act on — a table cell cannot be cut from — so claiming it costs nothing.
@@ -12771,20 +12771,22 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  // Not gated on isEditableTarget: unlike Cmd+Left's native cursor-movement
-  // conflict, Cmd+K has no competing meaning inside a plain text input, so it
-  // should open the switcher no matter where focus currently is.
-  if (e.key === "k" || e.key === "K") {
+  // Cmd+S opens the cluster switcher. Not gated on isEditableTarget: unlike
+  // Cmd+Left's native cursor-movement conflict, Cmd+S has no competing meaning
+  // inside a plain text input, so it should open the switcher no matter where
+  // focus currently is. preventDefault matters more here than for most keys:
+  // Ctrl+S is "save page" to a browser engine, and must not reach the WebView.
+  if (e.key === "s" || e.key === "S") {
     e.preventDefault();
     openClusterPalette();
     return;
   }
 
-  // Cmd+T opens the tab switcher, and closes it again. Not gated on
-  // isEditableTarget, for the same reason as Cmd+K: no competing meaning in a
-  // plain text input. Unclaimed anywhere else in the app, and absent from
-  // Tauri's default macOS menu, so nothing intercepts it before the page.
-  if (e.key === "t" || e.key === "T") {
+  // Cmd+K opens the tab switcher, and closes it again. Not gated on
+  // isEditableTarget, for the same reason as Cmd+S: no competing meaning in a
+  // plain text input. Absent from Tauri's default macOS menu, so nothing
+  // intercepts it before the page.
+  if (e.key === "k" || e.key === "K") {
     e.preventDefault();
     if (state.tabPalette) closeTabPalette();
     else openTabPalette();
@@ -12792,7 +12794,7 @@ document.addEventListener("keydown", (e) => {
   }
 
   // Cmd+F focuses an open detail panel's search box. Not gated on
-  // isEditableTarget, for the same reason as Cmd+K above: there's no
+  // isEditableTarget, for the same reason as Cmd+S above: there's no
   // competing meaning inside a text field, and re-pressing it to reselect
   // the current query is useful rather than surprising.
   //
