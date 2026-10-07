@@ -14,6 +14,8 @@ import type {
   ServiceInfo,
   ConfigMapEntry,
   ContainerDetail,
+  HpaManifest,
+  HpaMetricRow,
   PodConditionInfo,
   PodReference,
   ConfigMapInfo,
@@ -570,8 +572,8 @@ interface HpaDetailState {
   ctx: string;
   namespace: string;
   name: string;
-  view: "yaml" | "events";
-  manifest: ObjectManifest | null;
+  view: "overview" | "yaml" | "events";
+  manifest: HpaManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
   yamlSearch: string;
@@ -4155,7 +4157,8 @@ function openHpaDetail(ctx: string, namespace: string, name: string) {
     ctx,
     namespace,
     name,
-    view: "yaml",
+    // Opens on whether it is scaling and why not, rather than on raw YAML.
+    view: "overview",
     manifest: null,
     manifestError: null,
     showManagedFields: false,
@@ -10200,9 +10203,9 @@ function renderTemplateContainerCard(c: ContainerDetail, init: boolean): string 
     </div>`;
 }
 
-/** One of the replica counts across the top of a Workload's Overview. */
-function replicaTile(label: string, value: number, of: number): string {
-  const tone = value < of ? "text-status-warning" : "text-ink-primary";
+/** One of the replica counts across the top of an Overview; amber when short of `of`, or when `warn` says so. */
+function replicaTile(label: string, value: number, of: number, warn = value < of): string {
+  const tone = warn ? "text-status-warning" : "text-ink-primary";
   return `
     <div class="rounded-md border border-gridline bg-surface-1 px-3 py-2">
       <div class="text-xs text-ink-muted">${esc(label)}</div>
@@ -10580,17 +10583,126 @@ function renderHpaYamlView(hd: HpaDetailState): string {
   });
 }
 
+/**
+ * Whether a reading is past its target, for the amber mark. Only when both
+ * sides are utilization percentages — a raw quantity's units are the metric's
+ * own, and comparing them as plain numbers would mislead.
+ */
+function hpaReadingOverTarget(m: HpaMetricRow): boolean {
+  const pct = (v: string) => (/^\d+%$/.test(v) ? Number(v.slice(0, -1)) : null);
+  const current = pct(m.current);
+  const target = pct(m.target);
+  return current !== null && target !== null && current > target;
+}
+
+/**
+ * The HPA panel's Overview: whether it is scaling and if not why, each metric
+ * against its target, how it scales up and down, and what it scales.
+ */
+function renderHpaOverviewView(hd: HpaDetailState): string {
+  if (hd.manifestError) return `<div class="text-sm text-status-critical">${esc(hd.manifestError)}</div>`;
+  if (!hd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const d = hd.manifest.detail;
+  const { ctx, namespace, name } = hd;
+  const row = state.hpa.get(ctx)?.find((h) => h.namespace === namespace && h.name === name);
+
+  const condition = (type: string) => d.conditions.find((c) => c.condition_type === type);
+  const active = condition("ScalingActive");
+  const able = condition("AbleToScale");
+  const limited = condition("ScalingLimited");
+  const failing = [active, able].find((c) => c && c.status !== "True");
+  const banners = [
+    ...(failing
+      ? [`<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">Not scaling · ${esc([failing.reason, failing.message].filter(Boolean).join(": "))}</div>`]
+      : []),
+    // Held at max is worth a look — it wants more than it may have; held at
+    // min is the normal resting state and gets no banner.
+    ...(limited?.status === "True" && row && row.current_replicas >= row.max_replicas
+      ? [`<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">Held at its maximum of ${row.max_replicas}${limited.message ? ` · ${esc(limited.message)}` : ""}</div>`]
+      : []),
+  ];
+  const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
+
+  const tiles = row
+    ? `<div class="mb-3 grid grid-cols-4 gap-2">
+        ${replicaTile("Min", row.min_replicas, row.min_replicas)}
+        ${replicaTile("Current", row.current_replicas, row.current_replicas, row.current_replicas >= row.max_replicas)}
+        ${replicaTile("Desired", row.desired_replicas, row.desired_replicas)}
+        ${replicaTile("Max", row.max_replicas, row.max_replicas)}
+      </div>`
+    : "";
+
+  const workloadKinds = new Set(["Deployment", "StatefulSet", "DaemonSet"]);
+  const target = row
+    ? workloadKinds.has(row.target_kind)
+      ? `<button type="button" onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(row.target_kind)},${jsArg(namespace)},${jsArg(row.target_name)})" class="text-series-blue hover:underline">${esc(row.target_kind)}/${esc(row.target_name)}</button>`
+      : `${esc(row.target_kind)}/${esc(row.target_name)}`
+    : "—";
+  const facts = [
+    overviewRow("Scales", target),
+    ...(d.owner_kind
+      ? [
+          overviewRow(
+            "Managed by",
+            d.owner_kind === "ScaledObject"
+              ? `<button type="button" onclick="window.__app.openKedaDetail(${jsArg(ctx)},${jsArg(namespace)},'ScaledObject',${jsArg(d.owner_name)})" class="text-series-blue hover:underline">KEDA ScaledObject ${esc(d.owner_name)}</button> <span class="text-xs text-ink-muted">edit that, not this</span>`
+              : `${esc(d.owner_kind)}/${esc(d.owner_name)}`,
+          ),
+        ]
+      : []),
+    overviewRow(
+      "Last scaled",
+      row?.last_scale_at ? `<span title="${esc(timeTitle("Scaled", row.last_scale_at))}">${relativeTime(row.last_scale_at)}</span>` : '<span class="text-ink-muted">never</span>',
+    ),
+  ].join("");
+
+  const metrics = overviewSection(
+    "Metrics",
+    d.metrics.length === 0
+      ? `<div class="text-xs text-ink-muted">No metrics — it scales on nothing.</div>`
+      : `<table class="w-full text-left text-sm">
+          <thead class="text-xs text-ink-muted"><tr><th class="py-1 pr-3 font-normal">Metric</th><th class="py-1 pr-3 font-normal">Current</th><th class="py-1 font-normal">Target</th></tr></thead>
+          <tbody>${d.metrics
+            .map((m) => {
+              const unknown = m.current === "<unknown>";
+              return `
+            <tr class="border-t border-gridline/60">
+              <td class="py-1.5 pr-3"><span class="font-mono text-xs">${esc(m.name)}</span> <span class="text-xs text-ink-muted">${esc(m.kind)}</span></td>
+              <td class="py-1.5 pr-3 tabular ${unknown ? "text-status-critical" : hpaReadingOverTarget(m) ? "text-status-warning" : ""}">${unknown ? "unknown — no reading" : esc(m.current)}</td>
+              <td class="py-1.5 tabular">${esc(m.target)}</td>
+            </tr>`;
+            })
+            .join("")}</tbody>
+        </table>`,
+  );
+
+  const behavior = overviewSection(
+    d.behavior_is_default ? "Behavior (Kubernetes defaults)" : "Behavior",
+    `<div class="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1 text-sm">
+      <span class="text-ink-muted">Scale up</span><div>${d.scale_up.map((l) => `<div>${esc(l)}</div>`).join("")}</div>
+      <span class="text-ink-muted">Scale down</span><div>${d.scale_down.map((l) => `<div>${esc(l)}</div>`).join("")}</div>
+    </div>`,
+  );
+
+  // ScalingLimited=True means it is held at a bound — not a fault on its own.
+  const isHealthy = (c: PodConditionInfo) => (c.condition_type === "ScalingLimited" ? true : c.status === "True");
+  return `${banner}${tiles}<div>${facts}</div>${metrics}${behavior}${renderConditionsSection(d.conditions, isHealthy)}`;
+}
+
 function renderHpaDetailPanel(): string {
   const hd = state.hpaDetail;
   if (!hd) return "";
 
   const tabs: { id: HpaDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "yaml", label: "YAML" },
     { id: "events", label: "Events" },
   ];
 
   const body =
-    hd.view === "yaml"
+    hd.view === "overview"
+      ? renderHpaOverviewView(hd)
+      : hd.view === "yaml"
       ? renderHpaYamlView(hd)
       : renderEventsList(`hpa-events:${hd.ctx}:${hd.namespace}:${hd.name}`, hd.events, hd.eventsError);
 

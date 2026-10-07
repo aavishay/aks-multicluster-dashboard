@@ -733,3 +733,32 @@ export interface ConfigMapEntry {
   binary: boolean;
   bytes: number;
 }
+
+/** An HPA's YAML and what its panel's Overview shows. Mirrors `HpaManifest` in models.rs. */
+export interface HpaManifest {
+  yaml_full: string;
+  yaml_without_managed_fields: string;
+  detail: HpaDetail;
+}
+
+/** One declared metric beside its reading. Mirrors `HpaMetricRow` in models.rs. */
+export interface HpaMetricRow {
+  /** `Resource`, `ContainerResource`, `Pods`, `Object` or `External`. */
+  kind: string;
+  name: string;
+  target: string;
+  /** Same form as `target`, or `<unknown>` with no reading. */
+  current: string;
+}
+
+/** Mirrors `HpaDetail` in models.rs. */
+export interface HpaDetail {
+  metrics: HpaMetricRow[];
+  scale_up: string[];
+  scale_down: string[];
+  behavior_is_default: boolean;
+  conditions: PodConditionInfo[];
+  /** A KEDA ScaledObject, when KEDA created this HPA. */
+  owner_kind: string;
+  owner_name: string;
+}

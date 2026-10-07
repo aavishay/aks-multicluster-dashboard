@@ -37,6 +37,7 @@ import type {
   DrainReport,
   NapNodePoolManifest,
   ObjectManifest,
+  HpaManifest,
   NamespaceInfo,
   ServiceInfo,
   IngressInfo,
@@ -249,7 +250,7 @@ export const api = {
     invoke<EventInfo[]>("get_external_secret_events", { contextName, namespace, name }),
   getHpas: (contextName: string) => invoke<HpaInfo[]>("get_hpas", { contextName }),
   getHpaManifest: (contextName: string, namespace: string, name: string) =>
-    invoke<ObjectManifest>("get_hpa_manifest", { contextName, namespace, name }),
+    invoke<HpaManifest>("get_hpa_manifest", { contextName, namespace, name }),
   getHpaEvents: (contextName: string, namespace: string, name: string) =>
     invoke<EventInfo[]>("get_hpa_events", { contextName, namespace, name }),
   getGitOpsApps: (contextName: string) => invoke<GitOpsResult>("get_gitops_apps", { contextName }),

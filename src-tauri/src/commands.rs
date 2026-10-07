@@ -454,7 +454,7 @@ pub async fn get_hpas(context_name: String) -> Result<Vec<HpaInfo>, String> {
 }
 
 #[tauri::command]
-pub async fn get_hpa_manifest(context_name: String, namespace: String, name: String) -> Result<ObjectManifest, String> {
+pub async fn get_hpa_manifest(context_name: String, namespace: String, name: String) -> Result<HpaManifest, String> {
     with_retry(&context_name, || k8s::get_hpa_manifest(&context_name, &namespace, &name)).await
 }
 
