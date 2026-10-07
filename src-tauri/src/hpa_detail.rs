@@ -47,6 +47,14 @@ pub(crate) fn hpa_detail(hpa: &HorizontalPodAutoscaler) -> HpaDetail {
     );
     let owner = hpa.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true));
     HpaDetail {
+        target_kind: spec.map(|s| s.scale_target_ref.kind.clone()).unwrap_or_default(),
+        target_name: spec.map(|s| s.scale_target_ref.name.clone()).unwrap_or_default(),
+        // The API server defaults an unset minReplicas to 1, as hpa_to_info says.
+        min_replicas: spec.and_then(|s| s.min_replicas).unwrap_or(1) as i64,
+        max_replicas: spec.map(|s| s.max_replicas).unwrap_or_default() as i64,
+        current_replicas: status.and_then(|s| s.current_replicas).unwrap_or(0) as i64,
+        desired_replicas: status.map(|s| s.desired_replicas).unwrap_or_default() as i64,
+        last_scale_at: status.and_then(|s| created_at(&s.last_scale_time)),
         metrics: hpa_metric_rows(
             spec.and_then(|s| s.metrics.as_deref()).unwrap_or_default(),
             status.and_then(|s| s.current_metrics.as_deref()).unwrap_or_default(),
@@ -139,6 +147,7 @@ mod tests {
         assert_eq!((d.metrics[0].name.as_str(), d.metrics[0].current.as_str(), d.metrics[0].target.as_str()), ("cpu", "41%", "70%"));
         assert_eq!(d.metrics[1].current, "<unknown>");
         assert_eq!((d.owner_kind.as_str(), d.owner_name.as_str()), ("ScaledObject", "api"));
+        assert_eq!((d.target_kind.as_str(), d.target_name.as_str(), d.min_replicas, d.max_replicas), ("Deployment", "api", 1, 10));
     }
 
     #[test]

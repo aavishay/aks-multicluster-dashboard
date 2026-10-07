@@ -1063,6 +1063,17 @@ pub struct HpaMetricRow {
 /// What an HPA's YAML buries. Mirrors `HpaDetail` in types.ts.
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 pub struct HpaDetail {
+    /// The replica bounds and counts, target and last scale, from the same
+    /// object as the metrics and conditions below. Not from the table's row,
+    /// which refreshes on its own clock: mixing the two could pair one
+    /// revision's replica count with another's ScalingLimited message.
+    pub target_kind: String,
+    pub target_name: String,
+    pub min_replicas: i64,
+    pub max_replicas: i64,
+    pub current_replicas: i64,
+    pub desired_replicas: i64,
+    pub last_scale_at: Option<String>,
     pub metrics: Vec<HpaMetricRow>,
     /// How it scales up and down, one line per rule — or Kubernetes' defaults,
     /// said as such, when `behavior` is not set.

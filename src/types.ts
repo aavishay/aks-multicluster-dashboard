@@ -753,6 +753,14 @@ export interface HpaMetricRow {
 
 /** Mirrors `HpaDetail` in models.rs. */
 export interface HpaDetail {
+  /** From the same object as the metrics and conditions — never the table's separately-refreshed row. */
+  target_kind: string;
+  target_name: string;
+  min_replicas: number;
+  max_replicas: number;
+  current_replicas: number;
+  desired_replicas: number;
+  last_scale_at: string | null;
   metrics: HpaMetricRow[];
   scale_up: string[];
   scale_down: string[];

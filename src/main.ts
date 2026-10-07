@@ -9417,19 +9417,25 @@ function podsNotLoadedNote(ctx: string): string {
   return `<div class="text-xs text-ink-muted">${why}</div>`;
 }
 
+function conditionTone(healthy: boolean | null): string {
+  return healthy === null ? "text-ink-secondary" : healthy ? "text-status-good" : "text-status-critical";
+}
+
 /** A titled block of an Overview, below its facts. */
 function overviewSection(title: string, body: string): string {
   return `<div class="mt-4 text-xs font-medium uppercase tracking-wide text-ink-muted">${esc(title)}</div><div class="mt-2 flex flex-col gap-2">${body}</div>`;
 }
 
 /**
- * Conditions as the Overviews show them, healthy in green and the rest in red.
- * Healthy usually means True; `isHealthy` overrides that for a node, where
- * MemoryPressure=True is the bad case.
+ * Conditions as the Overviews show them: healthy in green, unhealthy in red,
+ * and neutral in the ordinary text colour. Healthy usually means True;
+ * `isHealthy` overrides that — for a node, MemoryPressure=True is the bad
+ * case — and returns null for a state that is neither, such as an HPA's
+ * ScalingLimited=True, which is a bound being reached rather than a fault.
  */
 function renderConditionsSection(
   conditions: PodConditionInfo[],
-  isHealthy: (c: PodConditionInfo) => boolean = (c) => c.status === "True",
+  isHealthy: (c: PodConditionInfo) => boolean | null = (c) => c.status === "True",
 ): string {
   if (conditions.length === 0) return "";
   return overviewSection(
@@ -9440,7 +9446,7 @@ function renderConditionsSection(
           (c) => `
         <tr class="border-t border-gridline/60 first:border-t-0">
           <td class="py-1.5 pr-3">${esc(c.condition_type)}</td>
-          <td class="py-1.5 pr-3 ${isHealthy(c) ? "text-status-good" : "text-status-critical"}">${esc(c.status)}</td>
+          <td class="py-1.5 pr-3 ${conditionTone(isHealthy(c))}">${esc(c.status)}</td>
           <td class="py-1.5 text-xs text-ink-secondary" title="${esc(timeTitle("Changed", c.last_transition))}">${esc([c.reason, c.message].filter(Boolean).join(": "))}</td>
         </tr>`,
         )
@@ -10602,9 +10608,11 @@ function hpaReadingOverTarget(m: HpaMetricRow): boolean {
 function renderHpaOverviewView(hd: HpaDetailState): string {
   if (hd.manifestError) return `<div class="text-sm text-status-critical">${esc(hd.manifestError)}</div>`;
   if (!hd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  // Everything from the one fetched object. The table's row refreshes on its
+  // own clock, and mixing it in could pair one revision's replica count with
+  // another's condition message.
   const d = hd.manifest.detail;
-  const { ctx, namespace, name } = hd;
-  const row = state.hpa.get(ctx)?.find((h) => h.namespace === namespace && h.name === name);
+  const { ctx, namespace } = hd;
 
   const condition = (type: string) => d.conditions.find((c) => c.condition_type === type);
   const active = condition("ScalingActive");
@@ -10617,27 +10625,23 @@ function renderHpaOverviewView(hd: HpaDetailState): string {
       : []),
     // Held at max is worth a look — it wants more than it may have; held at
     // min is the normal resting state and gets no banner.
-    ...(limited?.status === "True" && row && row.current_replicas >= row.max_replicas
-      ? [`<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">Held at its maximum of ${row.max_replicas}${limited.message ? ` · ${esc(limited.message)}` : ""}</div>`]
+    ...(limited?.status === "True" && d.current_replicas >= d.max_replicas
+      ? [`<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">Held at its maximum of ${d.max_replicas}${limited.message ? ` · ${esc(limited.message)}` : ""}</div>`]
       : []),
   ];
   const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
 
-  const tiles = row
-    ? `<div class="mb-3 grid grid-cols-4 gap-2">
-        ${replicaTile("Min", row.min_replicas, row.min_replicas)}
-        ${replicaTile("Current", row.current_replicas, row.current_replicas, row.current_replicas >= row.max_replicas)}
-        ${replicaTile("Desired", row.desired_replicas, row.desired_replicas)}
-        ${replicaTile("Max", row.max_replicas, row.max_replicas)}
-      </div>`
-    : "";
+  const tiles = `<div class="mb-3 grid grid-cols-4 gap-2">
+        ${replicaTile("Min", d.min_replicas, d.min_replicas)}
+        ${replicaTile("Current", d.current_replicas, d.current_replicas, d.current_replicas >= d.max_replicas)}
+        ${replicaTile("Desired", d.desired_replicas, d.desired_replicas)}
+        ${replicaTile("Max", d.max_replicas, d.max_replicas)}
+      </div>`;
 
   const workloadKinds = new Set(["Deployment", "StatefulSet", "DaemonSet"]);
-  const target = row
-    ? workloadKinds.has(row.target_kind)
-      ? `<button type="button" onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(row.target_kind)},${jsArg(namespace)},${jsArg(row.target_name)})" class="text-series-blue hover:underline">${esc(row.target_kind)}/${esc(row.target_name)}</button>`
-      : `${esc(row.target_kind)}/${esc(row.target_name)}`
-    : "—";
+  const target = workloadKinds.has(d.target_kind)
+    ? `<button type="button" onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(d.target_kind)},${jsArg(namespace)},${jsArg(d.target_name)})" class="text-series-blue hover:underline">${esc(d.target_kind)}/${esc(d.target_name)}</button>`
+    : `${esc(d.target_kind)}/${esc(d.target_name)}`;
   const facts = [
     overviewRow("Scales", target),
     ...(d.owner_kind
@@ -10652,7 +10656,7 @@ function renderHpaOverviewView(hd: HpaDetailState): string {
       : []),
     overviewRow(
       "Last scaled",
-      row?.last_scale_at ? `<span title="${esc(timeTitle("Scaled", row.last_scale_at))}">${relativeTime(row.last_scale_at)}</span>` : '<span class="text-ink-muted">never</span>',
+      d.last_scale_at ? `<span title="${esc(timeTitle("Scaled", d.last_scale_at))}">${relativeTime(d.last_scale_at)}</span>` : '<span class="text-ink-muted">never</span>',
     ),
   ].join("");
 
@@ -10684,8 +10688,10 @@ function renderHpaOverviewView(hd: HpaDetailState): string {
     </div>`,
   );
 
-  // ScalingLimited=True means it is held at a bound — not a fault on its own.
-  const isHealthy = (c: PodConditionInfo) => (c.condition_type === "ScalingLimited" ? true : c.status === "True");
+  // ScalingLimited=True is a bound being reached, not a fault: neutral. False
+  // is the plain healthy case; Unknown is no verdict either way: neutral.
+  const isHealthy = (c: PodConditionInfo): boolean | null =>
+    c.condition_type === "ScalingLimited" ? (c.status === "False" ? true : null) : c.status === "True";
   return `${banner}${tiles}<div>${facts}</div>${metrics}${behavior}${renderConditionsSection(d.conditions, isHealthy)}`;
 }
 
