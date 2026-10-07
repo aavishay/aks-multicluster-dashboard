@@ -862,7 +862,7 @@ async fn fetch_workload_yaml<K>(
     name: &str,
     api_version: &str,
     kind: &str,
-) -> Result<(String, String, Vec<String>), String>
+) -> Result<(String, String, Vec<String>, K), String>
 where
     K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope, DynamicType = ()>
         + HasPodTemplateContainers
@@ -880,7 +880,7 @@ where
     stripped.meta_mut().managed_fields = None;
     let yaml_without_managed_fields = k8s_object_to_yaml(&stripped, api_version, kind)?;
 
-    Ok((yaml_full, yaml_without_managed_fields, containers))
+    Ok((yaml_full, yaml_without_managed_fields, containers, obj))
 }
 
 pub async fn get_workload_manifest(
@@ -890,16 +890,28 @@ pub async fn get_workload_manifest(
     name: &str,
 ) -> Result<WorkloadManifest, String> {
     let client = client_for_context(context_name).await?;
-    let (yaml_full, yaml_without_managed_fields, containers) = match kind {
-        "Deployment" => fetch_workload_yaml::<Deployment>(client, namespace, name, "apps/v1", "Deployment").await?,
-        "StatefulSet" => fetch_workload_yaml::<StatefulSet>(client, namespace, name, "apps/v1", "StatefulSet").await?,
-        "DaemonSet" => fetch_workload_yaml::<DaemonSet>(client, namespace, name, "apps/v1", "DaemonSet").await?,
+    // The typed object comes back too, for the Overview's detail: each kind
+    // keeps its strategy and revision in its own fields.
+    let (yaml_full, yaml_without_managed_fields, containers, detail) = match kind {
+        "Deployment" => {
+            let (f, s, c, o) = fetch_workload_yaml::<Deployment>(client, namespace, name, "apps/v1", "Deployment").await?;
+            (f, s, c, crate::workload_detail::deployment_detail(&o))
+        }
+        "StatefulSet" => {
+            let (f, s, c, o) = fetch_workload_yaml::<StatefulSet>(client, namespace, name, "apps/v1", "StatefulSet").await?;
+            (f, s, c, crate::workload_detail::statefulset_detail(&o))
+        }
+        "DaemonSet" => {
+            let (f, s, c, o) = fetch_workload_yaml::<DaemonSet>(client, namespace, name, "apps/v1", "DaemonSet").await?;
+            (f, s, c, crate::workload_detail::daemonset_detail(&o))
+        }
         other => return Err(format!("Unsupported workload kind '{other}'")),
     };
     Ok(WorkloadManifest {
         yaml_full,
         yaml_without_managed_fields,
         containers,
+        detail,
     })
 }
 
@@ -927,6 +939,7 @@ pub async fn get_pod_manifest(context_name: &str, namespace: &str, pod_name: &st
         containers,
         yaml_full,
         yaml_without_managed_fields,
+        detail: crate::pod_detail::pod_detail(&pod),
     })
 }
 

@@ -73,6 +73,68 @@ export interface PodManifest {
   containers: string[];
   yaml_full: string;
   yaml_without_managed_fields: string;
+  /** What the panel's Overview shows, from the same fetch. */
+  detail: PodDetail;
+}
+
+/** Mirrors `PodDetail` in models.rs. */
+export interface PodDetail {
+  phase: string;
+  /** Set for a pod-level failure such as Evicted or UnexpectedAdmissionError. */
+  reason: string;
+  message: string;
+  node: string;
+  pod_ip: string;
+  host_ip: string;
+  qos_class: string;
+  service_account: string;
+  priority_class: string;
+  restart_policy: string;
+  start_time: string | null;
+  /** As the API records it — usually a ReplicaSet. */
+  controller_kind: string;
+  controller_name: string;
+  init_containers: ContainerDetail[];
+  containers: ContainerDetail[];
+  conditions: PodConditionInfo[];
+  references: PodReference[];
+}
+
+/** Mirrors `ContainerDetail` in models.rs. */
+export interface ContainerDetail {
+  name: string;
+  image: string;
+  ready: boolean;
+  restart_count: number;
+  /** `running`, `waiting`, `terminated`, or empty. */
+  state: string;
+  state_reason: string;
+  state_message: string;
+  state_since: string | null;
+  exit_code: number | null;
+  last_reason: string;
+  last_exit_code: number | null;
+  last_finished: string | null;
+  last_message: string;
+  cpu_request: string;
+  cpu_limit: string;
+  memory_request: string;
+  memory_limit: string;
+  ports: string[];
+}
+
+export interface PodConditionInfo {
+  condition_type: string;
+  status: string;
+  reason: string;
+  message: string;
+  last_transition: string | null;
+}
+
+export interface PodReference {
+  kind: "ConfigMap" | "Secret" | "PersistentVolumeClaim";
+  name: string;
+  via: string[];
 }
 
 export interface NodeManifest {
@@ -84,6 +146,32 @@ export interface WorkloadManifest {
   yaml_full: string;
   yaml_without_managed_fields: string;
   containers: string[];
+  /** What the panel's Overview shows, from the same fetch. */
+  detail: WorkloadDetail;
+}
+
+/** Mirrors `WorkloadDetail` in models.rs. */
+export interface WorkloadDetail {
+  strategy: string;
+  selector: string[];
+  /** The pod template's labels, `key=value` — what a Service selects on. */
+  template_labels: string[];
+  revision: string;
+  /** Set only while a StatefulSet rollout is underway. */
+  update_revision: string;
+  generation: number;
+  observed_generation: number;
+  paused: boolean;
+  service_name: string;
+  pod_management_policy: string;
+  volume_claim_templates: string[];
+  node_selector: string[];
+  misscheduled: number;
+  conditions: PodConditionInfo[];
+  /** Spec only — a template has no status. */
+  init_containers: ContainerDetail[];
+  containers: ContainerDetail[];
+  references: PodReference[];
 }
 
 export interface WorkloadInfo {
@@ -407,7 +495,28 @@ export interface ClaudeDiagnosisPayload {
   approx_tokens: number;
 }
 
-export type TabId = "overview" | "nodes" | "workloads" | "pods" | "resources" | "metrics" | "events" | "nap" | "hpa" | "keda" | "gitops" | "helm" | "secrets" | "externalsecrets" | "cost";
+export type TabId =
+  | "overview"
+  | "nodes"
+  | "namespaces"
+  | "workloads"
+  | "pods"
+  | "services"
+  | "ingresses"
+  | "pvcs"
+  | "pvs"
+  | "resources"
+  | "metrics"
+  | "events"
+  | "nap"
+  | "hpa"
+  | "keda"
+  | "gitops"
+  | "helm"
+  | "configmaps"
+  | "secrets"
+  | "externalsecrets"
+  | "cost";
 
 /** Azure Node Auto Provisioning (managed Karpenter). `installed: false` means the CRDs aren't registered, i.e. NAP is off for this cluster. */
 export interface NapResult {
@@ -462,4 +571,132 @@ export interface KedaScaledObjectInfo {
   age_seconds: number;
   /** When it was created, RFC 3339 UTC — what the age is counted from. */
   created_at: string | null;
+}
+
+/** A Namespace. Mirrors `NamespaceInfo` in models.rs. */
+export interface NamespaceInfo {
+  name: string;
+  /** `Active`, or `Terminating` while its contents are deleted. */
+  status: string;
+  /** `key=value`, sorted. */
+  labels: string[];
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/** A Service. Mirrors `ServiceInfo` in models.rs. */
+export interface ServiceInfo {
+  namespace: string;
+  name: string;
+  service_type: string;
+  /** `None` for a headless Service. */
+  cluster_ip: string;
+  /** LoadBalancer addresses, externalIPs, or an ExternalName's target. */
+  external: string[];
+  /** kubectl's shape: `80/TCP`, `80:30080/TCP`. */
+  ports: string[];
+  selector: string[];
+  /** A LoadBalancer with no address yet. */
+  pending_load_balancer: boolean;
+  /** Ready endpoints behind it; null when there is nothing to count or slices could not be listed. */
+  endpoints_ready: number | null;
+  endpoints_total: number | null;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+export interface IngressRuleInfo {
+  /** `*` for a host-less rule. */
+  host: string;
+  path: string;
+  /** `service:port`, or `Kind/name` for a resource backend. */
+  backend: string;
+}
+
+/** An Ingress. Mirrors `IngressInfo` in models.rs. */
+export interface IngressInfo {
+  namespace: string;
+  name: string;
+  class: string;
+  hosts: string[];
+  /** What the controller published; empty until one has picked it up. */
+  address: string[];
+  tls: boolean;
+  rules: IngressRuleInfo[];
+  default_backend: string | null;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/** A PersistentVolumeClaim. Mirrors `PvcInfo` in models.rs. */
+export interface PvcInfo {
+  namespace: string;
+  name: string;
+  /** `Bound`, `Pending` or `Lost`. */
+  status: string;
+  volume: string;
+  /** Provided by the bound volume; empty until bound. */
+  capacity: string;
+  requested: string;
+  /** RWO, ROX, RWX, RWOP. */
+  access_modes: string[];
+  storage_class: string;
+  volume_mode: string;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/** A PersistentVolume. Mirrors `PvInfo` in models.rs. */
+export interface PvInfo {
+  name: string;
+  capacity: string;
+  access_modes: string[];
+  reclaim_policy: string;
+  /** `Available`, `Bound`, `Released`, `Failed` or `Pending`. */
+  status: string;
+  claim_namespace: string;
+  claim_name: string;
+  storage_class: string;
+  /** CSI driver, or the in-tree volume type. */
+  source: string;
+  reason: string;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/** The kinds behind the shared resource detail panel. */
+export type ResourceKind = "Namespace" | "Service" | "Ingress" | "PersistentVolumeClaim" | "PersistentVolume" | "ConfigMap";
+
+/** One key of a ConfigMap, without its value. Mirrors `ConfigMapKeyInfo` in models.rs. */
+export interface ConfigMapKeyInfo {
+  name: string;
+  bytes: number;
+  /** From `binaryData`: no text to show. */
+  binary: boolean;
+}
+
+/** A ConfigMap with its keys and sizes, not its values. Mirrors `ConfigMapInfo` in models.rs. */
+export interface ConfigMapInfo {
+  namespace: string;
+  name: string;
+  keys: ConfigMapKeyInfo[];
+  total_bytes: number;
+  immutable: boolean;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/** One key with its value, for the panel's Data view. Mirrors `ConfigMapEntry` in models.rs. */
+export interface ConfigMapEntry {
+  key: string;
+  /** Empty for a binary key. */
+  value: string;
+  binary: boolean;
+  bytes: number;
 }

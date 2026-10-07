@@ -3,9 +3,20 @@ import { ANSI_BASE16, xterm256ToHex } from "./ansi";
 import { api } from "./api";
 import { closeExec, isExecEnded, isExecOpen, openExec, syncExecFontMetrics } from "./exec";
 import { MONO_TEXT_CLASSES } from "./typography";
-import { formatAgeDetailed, formatBytes, formatKi, formatMillicores, formatPct, relativeTime, timeTitle } from "./format";
+import { exactTime, formatAgeDetailed, formatBytes, formatKi, formatMillicores, formatPct, relativeTime, timeTitle } from "./format";
 import type {
   AiAuthState,
+  IngressInfo,
+  NamespaceInfo,
+  PvcInfo,
+  PvInfo,
+  ResourceKind,
+  ServiceInfo,
+  ConfigMapEntry,
+  ContainerDetail,
+  PodConditionInfo,
+  PodReference,
+  ConfigMapInfo,
   AiProvider,
   ClaudeDiagnosisPayload,
   ClusterEntry,
@@ -415,7 +426,7 @@ interface PodDetailState extends MetricsViewState {
   ctx: string;
   namespace: string;
   name: string;
-  view: "yaml" | "logs" | "events" | "graph";
+  view: "overview" | "yaml" | "logs" | "events" | "graph";
   containers: string[];
   activeContainer: string;
   /**
@@ -472,7 +483,7 @@ interface WorkloadDetailState extends MetricsViewState {
   kind: string;
   namespace: string;
   name: string;
-  view: "yaml" | "logs" | "events" | "graph" | "revisions";
+  view: "overview" | "yaml" | "logs" | "events" | "graph" | "revisions";
   manifest: WorkloadManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
@@ -636,6 +647,35 @@ interface ExternalSecretDetailState {
   keySearch: string;
 }
 
+/**
+ * The detail panel shared by the Namespaces, Services, Ingress, PVC and PV
+ * tabs. One state and one renderer for all five rather than five copies: they
+ * differ only in what the Overview lists, which reads the row already loaded
+ * for the table, so only the YAML and events are fetched.
+ */
+interface ResourceDetailState {
+  ctx: string;
+  kind: ResourceKind;
+  /** Empty for the cluster-scoped kinds, Namespace and PersistentVolume. */
+  namespace: string;
+  name: string;
+  /** `data` is the ConfigMap's alone. */
+  view: "overview" | "data" | "yaml" | "events";
+  /** A ConfigMap's values, fetched when its Data view first opens. */
+  data: ConfigMapEntry[] | null;
+  dataError: string | null;
+  dataLoading: boolean;
+  dataSearch: string;
+  manifest: ObjectManifest | null;
+  manifestError: string | null;
+  showManagedFields: boolean;
+  yamlSearch: string;
+  yamlSearchIndex: number;
+  events: EventInfo[] | null;
+  eventsError: string | null;
+  eventsLoading: boolean;
+}
+
 interface KedaDetailState extends MetricsViewState {
   ctx: string;
   namespace: string;
@@ -785,6 +825,12 @@ interface AppState {
   hpa: Map<string, HpaInfo[]>;
   secrets: Map<string, SecretInfo[]>;
   externalSecrets: Map<string, ExternalSecretsResult>;
+  namespaces: Map<string, NamespaceInfo[]>;
+  services: Map<string, ServiceInfo[]>;
+  ingresses: Map<string, IngressInfo[]>;
+  pvcs: Map<string, PvcInfo[]>;
+  pvs: Map<string, PvInfo[]>;
+  configmaps: Map<string, ConfigMapInfo[]>;
   keda: Map<string, KedaResult>;
   gitops: Map<string, GitOpsResult>;
   helm: Map<string, HelmReleaseInfo[]>;
@@ -878,6 +924,8 @@ interface AppState {
   hpaDetail: HpaDetailState | null;
   secretDetail: SecretDetailState | null;
   externalSecretDetail: ExternalSecretDetailState | null;
+  /** The one panel the Namespaces, Services, Ingress, PVC and PV tabs share. */
+  resourceDetail: ResourceDetailState | null;
   kedaDetail: KedaDetailState | null;
   helmDetail: HelmDetailState | null;
 }
@@ -908,6 +956,12 @@ const state: AppState = {
   hpa: new Map(),
   secrets: new Map(),
   externalSecrets: new Map(),
+  namespaces: new Map(),
+  services: new Map(),
+  ingresses: new Map(),
+  pvcs: new Map(),
+  pvs: new Map(),
+  configmaps: new Map(),
   keda: new Map(),
   gitops: new Map(),
   helm: new Map(),
@@ -958,6 +1012,7 @@ const state: AppState = {
   hpaDetail: null,
   secretDetail: null,
   externalSecretDetail: null,
+  resourceDetail: null,
   kedaDetail: null,
   helmDetail: null,
 };
@@ -984,6 +1039,7 @@ let secretDetailToken = 0;
 let lastRenderedActiveTab: TabId | null = null;
 let externalSecretDetailToken = 0;
 let kedaDetailToken = 0;
+let resourceDetailToken = 0;
 /** Same idea as `podDetailToken`, for the Helm release detail panel. */
 let helmDetailToken = 0;
 /** Bumped per diagnosis request, so a stale stream can't append to a newer one. */
@@ -1776,8 +1832,13 @@ function filterSummary(tab: TabId, totalCount: number, filteredCount: number): s
 const TABS: { id: TabId; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "nodes", label: "Nodes" },
+  { id: "namespaces", label: "Namespaces" },
   { id: "workloads", label: "Workloads" },
   { id: "pods", label: "Pods" },
+  { id: "services", label: "Services" },
+  { id: "ingresses", label: "Ingress" },
+  { id: "pvcs", label: "PVC" },
+  { id: "pvs", label: "PV" },
   { id: "resources", label: "Resource Usage" },
   { id: "metrics", label: "Metrics" },
   { id: "events", label: "Events" },
@@ -1786,6 +1847,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "keda", label: "KEDA" },
   { id: "gitops", label: "GitOps" },
   { id: "helm", label: "Helm" },
+  { id: "configmaps", label: "ConfigMaps" },
   { id: "secrets", label: "Secrets" },
   { id: "externalsecrets", label: "ExternalSecrets" },
   { id: "cost", label: "Cost" },
@@ -2006,6 +2068,24 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
     case "externalsecrets":
       state.externalSecrets.set(ctx, await api.getExternalSecrets(ctx));
       break;
+    case "namespaces":
+      state.namespaces.set(ctx, await api.getNamespaces(ctx));
+      break;
+    case "services":
+      state.services.set(ctx, await api.getServices(ctx));
+      break;
+    case "ingresses":
+      state.ingresses.set(ctx, await api.getIngresses(ctx));
+      break;
+    case "pvcs":
+      state.pvcs.set(ctx, await api.getPvcs(ctx));
+      break;
+    case "pvs":
+      state.pvs.set(ctx, await api.getPvs(ctx));
+      break;
+    case "configmaps":
+      state.configmaps.set(ctx, await api.getConfigMaps(ctx));
+      break;
     case "cost":
       break;
   }
@@ -2041,6 +2121,18 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
       return state.secrets.has(ctx);
     case "externalsecrets":
       return state.externalSecrets.has(ctx);
+    case "namespaces":
+      return state.namespaces.has(ctx);
+    case "services":
+      return state.services.has(ctx);
+    case "ingresses":
+      return state.ingresses.has(ctx);
+    case "pvcs":
+      return state.pvcs.has(ctx);
+    case "pvs":
+      return state.pvs.has(ctx);
+    case "configmaps":
+      return state.configmaps.has(ctx);
     case "cost":
       return true;
   }
@@ -2321,6 +2413,12 @@ function clearClusterSelection() {
 const TAB_PALETTE_INFO: Record<TabId, { hint: string; aliases: string[] }> = {
   overview: { hint: "Per-cluster health at a glance", aliases: ["health", "summary", "home", "clusters"] },
   nodes: { hint: "Capacity, readiness, cordon and drain", aliases: ["vm", "machines", "cordon", "drain"] },
+  namespaces: { hint: "Namespaces and their status", aliases: ["ns", "project", "tenant"] },
+  services: { hint: "Types, ports and ready endpoints", aliases: ["svc", "endpoints", "loadbalancer", "clusterip", "nodeport"] },
+  ingresses: { hint: "Hosts, paths and addresses", aliases: ["ingresses", "routes", "hosts", "tls", "nginx"] },
+  pvcs: { hint: "Persistent volume claims", aliases: ["persistentvolumeclaim", "claims", "storage", "disk"] },
+  pvs: { hint: "Persistent volumes", aliases: ["persistentvolume", "volumes", "storage", "disk", "reclaim"] },
+  configmaps: { hint: "Keys, sizes and values", aliases: ["cm", "config", "configuration", "settings", "env"] },
   workloads: { hint: "Deployments, StatefulSets and DaemonSets", aliases: ["deploy", "deployment", "statefulset", "daemonset", "replicas"] },
   pods: { hint: "Restarts, logs and shells", aliases: ["logs", "containers", "crashloop", "exec", "shell"] },
   resources: { hint: "CPU and memory against allocatable", aliases: ["cpu", "memory", "usage", "capacity"] },
@@ -2454,9 +2552,30 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
       r = across(state.externalSecrets, (res) => n(res.external_secrets, (x) => !x.ready));
       label = "not synced";
       break;
+    case "namespaces":
+      r = across(state.namespaces, (list) => n(list, (x) => !namespaceIsHealthy(x)));
+      label = "terminating";
+      break;
+    case "services":
+      r = across(state.services, (list) => n(list, (x) => !serviceIsHealthy(x)));
+      label = "unhealthy";
+      break;
+    case "ingresses":
+      r = across(state.ingresses, (list) => n(list, (x) => !ingressIsHealthy(x)));
+      label = "without an address";
+      break;
+    case "pvcs":
+      r = across(state.pvcs, (list) => n(list, (x) => !pvcIsHealthy(x)));
+      label = "not bound";
+      break;
+    case "pvs":
+      r = across(state.pvs, (list) => n(list, (x) => !pvIsHealthy(x)));
+      label = "failed or pending";
+      break;
     // No notion of health to count.
     case "resources":
     case "metrics":
+    case "configmaps":
     case "secrets":
     case "cost":
       return null;
@@ -2759,6 +2878,7 @@ function viewNodesForNodePool(ctx: string, poolName: string) {
 // ---------------------------------------------------------------------------
 
 function openNodeDetail(ctx: string, name: string) {
+  closeResourceDetail();
   closePodDetail();
   closeWorkloadDetail();
   closeGitOpsDetail();
@@ -2900,6 +3020,7 @@ function moveNodeSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openHelmDetail(ctx: string, namespace: string, name: string, revision: number) {
+  closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -3001,6 +3122,7 @@ function moveHelmSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openGitOpsDetail(ctx: string, namespace: string, name: string) {
+  closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -3159,6 +3281,7 @@ function moveGitOpsSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openNapDetail(ctx: string, name: string) {
+  closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -4016,6 +4139,7 @@ function kedaTargetIsGraphable(targetKind: string, targetName: string): boolean 
 // a third view here would duplicate one of the two.
 
 function openHpaDetail(ctx: string, namespace: string, name: string) {
+  closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -4130,6 +4254,7 @@ function moveHpaSearch(_view: string, delta: number) {
 // Secret to an AI provider.
 
 function openSecretDetail(ctx: string, namespace: string, name: string, secretType: string) {
+  closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -4310,6 +4435,7 @@ async function copySecretKey(key: string) {
 // has been failing, which the Ready condition alone cannot.
 
 function openExternalSecretDetail(ctx: string, namespace: string, name: string) {
+  closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -4423,6 +4549,7 @@ function moveExternalSecretSearch(_view: string, delta: number) {
 }
 
 function openKedaDetail(ctx: string, namespace: string, kind: string, name: string) {
+  closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -4582,6 +4709,7 @@ function moveKedaSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: string) {
+  closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
   closeGitOpsDetail();
@@ -4598,7 +4726,8 @@ function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: 
     kind,
     namespace,
     name,
-    view: "yaml",
+    // Opens on how it is doing and what it runs, rather than on raw YAML.
+    view: "overview",
     manifest: null,
     manifestError: null,
     showManagedFields: false,
@@ -4982,6 +5111,7 @@ function manualRefresh() {
 // ---------------------------------------------------------------------------
 
 function openPodDetail(ctx: string, namespace: string, name: string) {
+  closeResourceDetail();
   closeNodeDetail();
   closeWorkloadDetail();
   closeGitOpsDetail();
@@ -4997,7 +5127,8 @@ function openPodDetail(ctx: string, namespace: string, name: string) {
     ctx,
     namespace,
     name,
-    view: "yaml",
+    // Opens on what is wrong and where, rather than on raw YAML.
+    view: "overview",
     containers: [],
     activeContainer: "",
     failureContainer: podRowFor(ctx, namespace, name)?.failure_container ?? "",
@@ -5139,6 +5270,13 @@ function movePodSearch(view: "yaml" | "logs", delta: number) {
   else pd.logSearchIndex = next;
   pendingSearchScroll = true;
   render();
+}
+
+/** A container card's "Logs": picks that container and switches to the Logs view. */
+function showPodContainerLogs(container: string) {
+  if (!state.podDetail) return;
+  setPodDetailContainer(container);
+  setPodDetailView("logs");
 }
 
 function setPodDetailContainer(container: string) {
@@ -5413,6 +5551,15 @@ function setMetricsRange(minutes: number) {
   hideSecretKey,
   copySecretKey,
   openExternalSecretDetail,
+  openResourceDetail,
+  showPodContainerLogs,
+  closeResourceDetail,
+  setResourceDetailView,
+  toggleResourceManagedFields,
+  setResourceSearch,
+  moveResourceSearch,
+  setConfigMapDataSearch,
+  copyConfigMapValue,
   closeExternalSecretDetail,
   setExternalSecretDetailView,
   toggleExternalSecretManagedFields,
@@ -5633,6 +5780,7 @@ function render(carried?: PreRenderState) {
     ${renderHpaDetailPanel()}
     ${renderSecretDetailPanel()}
     ${renderExternalSecretDetailPanel()}
+    ${renderResourceDetailPanel()}
     ${renderKedaDetailPanel()}
     ${renderGitOpsDetailPanel()}
     ${renderHelmDetailPanel()}
@@ -6917,6 +7065,18 @@ function renderTabContentBody(): string {
       return renderSecrets();
     case "externalsecrets":
       return renderExternalSecrets();
+    case "namespaces":
+      return renderNamespaces();
+    case "services":
+      return renderServices();
+    case "ingresses":
+      return renderIngresses();
+    case "pvcs":
+      return renderPvcs();
+    case "pvs":
+      return renderPvs();
+    case "configmaps":
+      return renderConfigMaps();
     case "cost":
       return renderCost();
   }
@@ -8737,6 +8897,13 @@ function highlightSearchMatches(html: string, query: string, currentIndex: numbe
 // ---------------------------------------------------------------------------
 
 /**
+ * Every detail panel with a searchable YAML tab. The search box calls
+ * `set<Kind>Search` / `move<Kind>Search` by this name, so a new panel adds
+ * itself here once rather than to each place that lists them.
+ */
+type SearchKind = "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret" | "ExternalSecret" | "Resource";
+
+/**
  * Search box shared by every YAML/Logs-style view (pod YAML, pod Logs, node
  * YAML): a query input plus a match counter and prev/next buttons. `kind`
  * selects which detail panel's search/move functions it wires up to
@@ -8744,7 +8911,7 @@ function highlightSearchMatches(html: string, query: string, currentIndex: numbe
  * to be unique within that panel for the `data-filter-key` focus-restore tag.
  */
 function renderSearchBox(
-  kind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret" | "ExternalSecret",
+  kind: SearchKind,
   view: string,
   query: string,
   matchCount: number,
@@ -8798,7 +8965,7 @@ function renderYamlPane(o: {
   editableYaml: string;
   showManagedFields: boolean;
   toggleHandler: string;
-  searchKind: "Pod" | "Node" | "Workload" | "GitOps" | "Helm" | "Nap" | "Keda" | "Hpa" | "Secret" | "ExternalSecret";
+  searchKind: SearchKind;
   search: string;
   searchIndex: number;
   scrollId: string;
@@ -9109,38 +9276,230 @@ function detailBodyAttrs(scrollId: string): string {
   return `data-detail-body data-scroll-id="detail-body:${esc(scrollId)}"`;
 }
 
+/** The states that mean "this container is in trouble", as opposed to merely starting. */
+const BAD_CONTAINER_REASONS = new Set([
+  "CrashLoopBackOff",
+  "ImagePullBackOff",
+  "ErrImagePull",
+  "InvalidImageName",
+  "CreateContainerConfigError",
+  "CreateContainerError",
+  "RunContainerError",
+  "OOMKilled",
+  "Error",
+  "ContainerCannotRun",
+  "DeadlineExceeded",
+]);
+
+function containerStateBadge(c: ContainerDetail): string {
+  const label = c.state_reason || c.state || "unknown";
+  const tone =
+    c.state === "running"
+      ? c.ready
+        ? "bg-status-good/15 text-status-good"
+        : "bg-status-warning/15 text-status-warning"
+      : BAD_CONTAINER_REASONS.has(c.state_reason) || (c.state === "terminated" && c.exit_code !== 0)
+        ? "bg-status-critical/15 text-status-critical"
+        : c.state === "terminated"
+          ? "bg-surface-3 text-ink-secondary"
+          : "bg-status-warning/15 text-status-warning";
+  const shown = c.state === "running" && !c.ready ? "running · not ready" : label;
+  return `<span class="rounded px-1.5 py-0.5 text-xs ${tone}">${esc(shown)}</span>`;
+}
+
+/** "request / limit", or a dash for each side that is not set. */
+function requestLimit(request: string, limit: string): string {
+  if (!request && !limit) return '<span class="text-ink-muted">not set</span>';
+  return `<span class="tabular">${esc(request || "—")}</span> <span class="text-ink-muted">/</span> <span class="tabular">${esc(limit || "—")}</span>`;
+}
+
+function renderContainerCard(c: ContainerDetail, init: boolean): string {
+  const since = c.state_since ? ` <span class="text-ink-muted" title="${esc(timeTitle(c.state === "running" ? "Started" : "Finished", c.state_since))}">· ${relativeTime(c.state_since)}</span>` : "";
+  const exit = c.state === "terminated" && c.exit_code !== null ? ` <span class="text-ink-muted">exit ${c.exit_code}</span>` : "";
+  const last = c.last_reason
+    ? `<div class="mt-1.5 text-xs">
+        <span class="text-ink-muted">Last exit:</span>
+        <span class="${BAD_CONTAINER_REASONS.has(c.last_reason) ? "text-status-critical" : "text-ink-secondary"}">${esc(c.last_reason)}${c.last_exit_code !== null ? ` (${c.last_exit_code})` : ""}</span>
+        ${c.last_finished ? `<span class="text-ink-muted" title="${esc(timeTitle("Finished", c.last_finished))}">· ${relativeTime(c.last_finished)}</span>` : ""}
+        ${c.last_message ? `<div class="mt-1 whitespace-pre-wrap break-words font-mono text-[11px] text-ink-secondary">${esc(c.last_message)}</div>` : ""}
+      </div>`
+    : "";
+  return `
+    <div class="rounded-md border border-gridline bg-surface-1 p-3">
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex min-w-0 items-center gap-2">
+          <span class="truncate font-mono text-sm text-ink-primary">${esc(c.name)}</span>
+          ${init ? '<span class="text-xs text-ink-muted">init</span>' : ""}
+          ${containerStateBadge(c)}
+        </div>
+        <div class="flex shrink-0 items-center gap-3 text-xs">
+          <span class="${c.restart_count > 0 ? "text-status-warning" : "text-ink-muted"}">${c.restart_count} restart${c.restart_count === 1 ? "" : "s"}</span>
+          <button type="button" onclick="window.__app.showPodContainerLogs(${jsArg(c.name)})" class="text-series-blue hover:underline">Logs</button>
+        </div>
+      </div>
+      ${c.state_reason || since || exit ? `<div class="mt-1 text-xs text-ink-secondary">${esc(c.state)}${exit}${since}</div>` : ""}
+      ${c.state_message ? `<div class="mt-1 whitespace-pre-wrap break-words font-mono text-[11px] text-ink-secondary">${esc(c.state_message)}</div>` : ""}
+      ${last}
+      <div class="mt-2 grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1 text-xs">
+        <span class="text-ink-muted">Image</span><span class="break-all font-mono text-[11px] text-ink-primary">${esc(c.image) || "—"}</span>
+        <span class="text-ink-muted">CPU</span><span>${requestLimit(c.cpu_request, c.cpu_limit)}</span>
+        <span class="text-ink-muted">Memory</span><span>${requestLimit(c.memory_request, c.memory_limit)}</span>
+        ${c.ports.length ? `<span class="text-ink-muted">Ports</span><span>${overviewChips(c.ports)}</span>` : ""}
+      </div>
+    </div>`;
+}
+
+/**
+ * The Pod panel's Overview: what is wrong and where, before the raw YAML.
+ * Read from `detail`, which arrives with the manifest, plus the row the table
+ * already holds — so it needs no request of its own.
+ */
+function renderPodOverviewView(pd: PodDetailState): string {
+  if (pd.manifestError) return `<div class="text-sm text-status-critical">${esc(pd.manifestError)}</div>`;
+  if (!pd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const d = pd.manifest.detail;
+  const row = podRowFor(pd.ctx, pd.namespace, pd.name);
+  const { ctx, namespace } = pd;
+
+  // A pod-level failure first. Some — UnexpectedAdmissionError, Evicted —
+  // leave no conditions and no container status at all, so this line is the
+  // only explanation there is.
+  const failure = d.reason || d.message
+    ? `${d.phase}${d.reason ? ` · ${d.reason}` : ""}${d.message ? `: ${d.message}` : ""}`
+    : row?.failure_message ?? "";
+  const banner = failure
+    ? `<div class="mb-3 whitespace-pre-wrap break-words rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(failure)}</div>`
+    : "";
+
+  const workloadKinds = new Set(["Deployment", "StatefulSet", "DaemonSet"]);
+  const ownerKind = row?.owner_kind ?? d.controller_kind;
+  const ownerName = row?.owner_name ?? d.controller_name;
+  const owner = ownerKind
+    ? workloadKinds.has(ownerKind)
+      ? `<button type="button" onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(ownerKind)},${jsArg(namespace)},${jsArg(ownerName)})" class="text-series-blue hover:underline">${esc(ownerKind)}/${esc(ownerName)}</button>`
+      : `${esc(ownerKind)}/${esc(ownerName)}`
+    : '<span class="text-ink-muted">none</span>';
+
+  const facts = [
+    overviewRow("Phase", esc(d.phase) || "—"),
+    overviewRow(
+      "Node",
+      d.node
+        ? `<button type="button" onclick="window.__app.openNodeDetail(${jsArg(ctx)},${jsArg(d.node)})" class="text-series-blue hover:underline">${esc(d.node)}</button>`
+        : '<span class="text-status-warning">not scheduled</span>',
+    ),
+    overviewRow("Owner", owner),
+    overviewRow("Pod IP", `<span class="tabular">${esc(d.pod_ip) || "—"}</span>${d.host_ip ? ` <span class="text-xs text-ink-muted">on host ${esc(d.host_ip)}</span>` : ""}`),
+    overviewRow("QoS class", esc(d.qos_class) || "—"),
+    overviewRow("Service account", esc(d.service_account) || "—"),
+    ...(d.priority_class ? [overviewRow("Priority class", esc(d.priority_class))] : []),
+    overviewRow("Restart policy", esc(d.restart_policy) || "—"),
+    overviewRow("Started", d.start_time ? esc(exactTime(d.start_time).replace("\n", " · ")) : "—"),
+  ].join("");
+
+  const containers = overviewSection("Containers", d.containers.map((c) => renderContainerCard(c, false)).join(""));
+  const inits = d.init_containers.length
+    ? overviewSection("Init containers", d.init_containers.map((c) => renderContainerCard(c, true)).join(""))
+    : "";
+
+  return `${banner}<div>${facts}</div>${inits}${containers}${renderConditionsSection(d.conditions)}${renderUsesSection(ctx, namespace, d.references)}`;
+}
+
+/** A titled block of an Overview, below its facts. */
+function overviewSection(title: string, body: string): string {
+  return `<div class="mt-4 text-xs font-medium uppercase tracking-wide text-ink-muted">${esc(title)}</div><div class="mt-2 flex flex-col gap-2">${body}</div>`;
+}
+
+/** Conditions as the Pod and Workload Overviews show them: anything not True in red. */
+function renderConditionsSection(conditions: PodConditionInfo[]): string {
+  if (conditions.length === 0) return "";
+  return overviewSection(
+    "Conditions",
+    `<table class="w-full text-left text-sm">
+      <tbody>${conditions
+        .map(
+          (c) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3">${esc(c.condition_type)}</td>
+          <td class="py-1.5 pr-3 ${c.status === "True" ? "text-status-good" : "text-status-critical"}">${esc(c.status)}</td>
+          <td class="py-1.5 text-xs text-ink-secondary" title="${esc(timeTitle("Changed", c.last_transition))}">${esc([c.reason, c.message].filter(Boolean).join(": "))}</td>
+        </tr>`,
+        )
+        .join("")}</tbody>
+    </table>`,
+  );
+}
+
+/**
+ * Every ConfigMap, Secret and PVC a pod (or a workload's pod template) reads,
+ * each a link to its panel, with how it is used. `extra` adds rows that are
+ * not references as such — a StatefulSet's claim templates.
+ */
+function renderUsesSection(ctx: string, namespace: string, refs: PodReference[], extra: string[] = []): string {
+  if (refs.length === 0 && extra.length === 0) return "";
+  const secretType = (name: string) => state.secrets.get(ctx)?.find((s) => s.namespace === namespace && s.name === name)?.secret_type ?? "";
+  const refLink = (r: PodReference) =>
+    r.kind === "Secret"
+      ? `<button type="button" onclick="window.__app.openSecretDetail(${jsArg(ctx)},${jsArg(namespace)},${jsArg(r.name)},${jsArg(secretType(r.name))})" class="text-series-blue hover:underline">${esc(r.name)}</button>`
+      : `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},${jsArg(r.kind)},${jsArg(namespace)},${jsArg(r.name)})" class="text-series-blue hover:underline">${esc(r.name)}</button>`;
+  const kindLabel: Record<PodReference["kind"], string> = { ConfigMap: "ConfigMap", Secret: "Secret", PersistentVolumeClaim: "PVC" };
+  return overviewSection(
+    "Uses",
+    `<table class="w-full text-left text-sm">
+      <tbody>${refs
+        .map(
+          (r) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="w-20 py-1.5 pr-3 text-xs text-ink-muted">${kindLabel[r.kind]}</td>
+          <td class="py-1.5 pr-3">${refLink(r)}</td>
+          <td class="py-1.5 text-right text-xs text-ink-muted">${esc(r.via.join(", "))}</td>
+        </tr>`,
+        )
+        .join("")}${extra.join("")}</tbody>
+    </table>`,
+  );
+}
+
 function renderPodDetailPanel(): string {
   const pd = state.podDetail;
   if (!pd) return "";
 
   const tabs: { id: PodDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "yaml", label: "YAML" },
     { id: "logs", label: "Logs" },
     { id: "events", label: "Events" },
     { id: "graph", label: "Graph" },
   ];
 
+  // An init container picked from the Overview's "Logs" is not among the
+  // manifest's `containers`; listed here too, or the picker would show the
+  // first app container while the logs beneath it are the init container's.
+  const pickable =
+    pd.activeContainer && !pd.containers.includes(pd.activeContainer) ? [...pd.containers, pd.activeContainer] : pd.containers;
   const containerSelector =
-    pd.containers.length > 1
+    pickable.length > 1
       ? `
       <select
         class="rounded-md border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-secondary outline-none"
         onchange="window.__app.setPodDetailContainer(this.value)"
       >
-        ${pd.containers
+        ${pickable
           .map((c) => `<option value="${esc(c)}" ${c === pd.activeContainer ? "selected" : ""}>${esc(c)}</option>`)
           .join("")}
       </select>`
       : "";
 
   const body =
-    pd.view === "yaml"
-      ? renderPodYamlView(pd)
-      : pd.view === "logs"
-        ? renderPodLogsView(pd)
-        : pd.view === "events"
-          ? renderPodEventsView(pd)
-          : renderPodGraphView(pd);
+    pd.view === "overview"
+      ? renderPodOverviewView(pd)
+      : pd.view === "yaml"
+        ? renderPodYamlView(pd)
+        : pd.view === "logs"
+          ? renderPodLogsView(pd)
+          : pd.view === "events"
+            ? renderPodEventsView(pd)
+            : renderPodGraphView(pd);
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closePodDetail()">
@@ -9662,11 +10021,161 @@ function renderWorkloadLogsView(wd: WorkloadDetailState): string {
     </div>`;
 }
 
+/** A pod template's container: what every pod will run, with no status to show. */
+function renderTemplateContainerCard(c: ContainerDetail, init: boolean): string {
+  return `
+    <div class="rounded-md border border-gridline bg-surface-1 p-3">
+      <div class="flex items-center gap-2">
+        <span class="truncate font-mono text-sm text-ink-primary">${esc(c.name)}</span>
+        ${init ? '<span class="text-xs text-ink-muted">init</span>' : ""}
+      </div>
+      <div class="mt-2 grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1 text-xs">
+        <span class="text-ink-muted">Image</span><span class="break-all font-mono text-[11px] text-ink-primary">${esc(c.image) || "—"}</span>
+        <span class="text-ink-muted">CPU</span><span>${requestLimit(c.cpu_request, c.cpu_limit)}</span>
+        <span class="text-ink-muted">Memory</span><span>${requestLimit(c.memory_request, c.memory_limit)}</span>
+        ${c.ports.length ? `<span class="text-ink-muted">Ports</span><span>${overviewChips(c.ports)}</span>` : ""}
+      </div>
+    </div>`;
+}
+
+/** One of the replica counts across the top of a Workload's Overview. */
+function replicaTile(label: string, value: number, of: number): string {
+  const tone = value < of ? "text-status-warning" : "text-ink-primary";
+  return `
+    <div class="rounded-md border border-gridline bg-surface-1 px-3 py-2">
+      <div class="text-xs text-ink-muted">${esc(label)}</div>
+      <div class="mt-0.5 text-lg font-semibold tabular ${tone}">${value}</div>
+    </div>`;
+}
+
+/**
+ * The Workload panel's Overview: whether it is rolled out and healthy, how it
+ * rolls out, what scales it, which pods and Services are its, and what its
+ * pods are built from. Pods, Services and autoscalers are matched against
+ * what those tabs already loaded — nothing is fetched for this view.
+ */
+function renderWorkloadOverviewView(wd: WorkloadDetailState): string {
+  if (wd.manifestError) return `<div class="text-sm text-status-critical">${esc(wd.manifestError)}</div>`;
+  if (!wd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const d = wd.manifest.detail;
+  const { ctx, kind, namespace, name } = wd;
+  const row = state.workloads.get(ctx)?.find((w) => w.kind === kind && w.namespace === namespace && w.name === name);
+
+  const progressing = d.conditions.find((c) => c.condition_type === "Progressing" && c.status === "False");
+  const failure = row?.failure_message || (progressing ? [progressing.reason, progressing.message].filter(Boolean).join(": ") : "");
+  const banner = failure
+    ? `<div class="mb-3 whitespace-pre-wrap break-words rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(failure)}</div>`
+    : "";
+
+  const tiles = row
+    ? `<div class="mb-3 grid grid-cols-4 gap-2">
+        ${replicaTile("Desired", row.desired, row.desired)}
+        ${replicaTile("Ready", row.ready, row.desired)}
+        ${replicaTile("Updated", row.updated, row.desired)}
+        ${replicaTile("Available", row.available, row.desired)}
+      </div>`
+    : "";
+
+  // Behind means the controller has not yet acted on the latest spec change —
+  // the replica counts above describe the previous one.
+  const behind = d.observed_generation < d.generation;
+  const revision = d.revision
+    ? `<span class="font-mono text-xs">${esc(d.revision)}</span>${d.update_revision ? ` <span class="text-status-warning">→ ${esc(d.update_revision)} rolling out</span>` : ""}`
+    : "—";
+
+  const hpas = (state.hpa.get(ctx) ?? []).filter((h) => h.namespace === namespace && h.target_kind === kind && h.target_name === name);
+  const kedas = (state.keda.get(ctx)?.scaled_objects ?? []).filter((k) => k.namespace === namespace && k.target_kind === kind && k.target_name === name);
+  const scaledBy = [
+    ...hpas.map((h) => `<button type="button" onclick="window.__app.openHpaDetail(${jsArg(ctx)},${jsArg(namespace)},${jsArg(h.name)})" class="text-series-blue hover:underline">HPA ${esc(h.name)}</button>`),
+    ...kedas.map((k) => `<button type="button" onclick="window.__app.openKedaDetail(${jsArg(ctx)},${jsArg(namespace)},${jsArg(k.kind)},${jsArg(k.name)})" class="text-series-blue hover:underline">${esc(k.kind)} ${esc(k.name)}</button>`),
+  ];
+
+  const facts = [
+    overviewRow("Strategy", esc(d.strategy) || "—"),
+    ...(d.paused ? [overviewRow("Paused", '<span class="text-status-warning">yes — rollouts are held until it is resumed</span>')] : []),
+    overviewRow("Revision", revision),
+    ...(behind ? [overviewRow("Generation", `<span class="text-status-warning">${d.observed_generation} of ${d.generation} observed — the controller has not caught up with the latest change</span>`)] : []),
+    overviewRow("Selector", overviewChips(d.selector)),
+    ...(d.service_name
+      ? [overviewRow("Service", `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Service',${jsArg(namespace)},${jsArg(d.service_name)})" class="text-series-blue hover:underline">${esc(d.service_name)}</button> <span class="text-xs text-ink-muted">headless, for stable pod names</span>`)]
+      : []),
+    ...(kind === "StatefulSet" ? [overviewRow("Pod management", esc(d.pod_management_policy))] : []),
+    ...(d.node_selector.length ? [overviewRow("Node selector", overviewChips(d.node_selector))] : []),
+    ...(d.misscheduled > 0 ? [overviewRow("Misscheduled", `<span class="text-status-warning">${d.misscheduled} pod${d.misscheduled === 1 ? "" : "s"} running where it should not</span>`)] : []),
+    ...(kind !== "DaemonSet" ? [overviewRow("Scaled by", scaledBy.length ? scaledBy.join(" · ") : '<span class="text-ink-muted">nothing — replicas are set by hand</span>')] : []),
+    overviewRow("Created", row?.created_at ? esc(exactTime(row.created_at).replace("\n", " · ")) : "—"),
+  ].join("");
+
+  // Its pods, from the Pods tab's list: the row's owner is already resolved
+  // from ReplicaSet to Deployment, so this matches on the workload itself.
+  const podList = state.pods.get(ctx);
+  const ownPods = (podList ?? []).filter((p) => p.namespace === namespace && p.owner_kind === kind && p.owner_name === name);
+  const POD_CAP = 50;
+  const pods = !podList
+    ? overviewSection("Pods", `<div class="text-xs text-ink-muted">This cluster's pods have not been loaded yet — open the Pods tab once.</div>`)
+    : overviewSection(
+        `Pods (${ownPods.length})`,
+        ownPods.length === 0
+          ? `<div class="text-xs text-ink-muted">None.</div>`
+          : `<table class="w-full text-left text-sm">
+              <tbody>${ownPods
+                .slice(0, POD_CAP)
+                .map(
+                  (p) => `
+                <tr class="border-t border-gridline/60 first:border-t-0">
+                  <td class="w-5 py-1.5" title="${esc(p.failure_message || p.phase)}">${statusDot(podIsHealthy(p))}</td>
+                  <td class="py-1.5 pr-3"><button type="button" onclick="window.__app.openPodDetail(${jsArg(ctx)},${jsArg(p.namespace)},${jsArg(p.name)})" class="text-series-blue hover:underline">${esc(p.name)}</button></td>
+                  <td class="py-1.5 pr-3 tabular text-xs">${esc(p.ready)}</td>
+                  <td class="py-1.5 pr-3 tabular text-xs ${p.restarts > 0 ? "text-status-warning" : "text-ink-muted"}">${p.restarts} restart${p.restarts === 1 ? "" : "s"}</td>
+                  <td class="truncate py-1.5 text-xs text-ink-muted">${esc(p.node ?? "")}</td>
+                </tr>`,
+                )
+                .join("")}</tbody>
+            </table>${ownPods.length > POD_CAP ? `<div class="text-xs text-ink-muted">and ${ownPods.length - POD_CAP} more — filter the Pods tab by owner to see them all.</div>` : ""}`,
+      );
+
+  // A Service is this workload's when its whole selector is among the pod
+  // template's labels — exactly how the Service picks pods.
+  const labels = new Set(d.template_labels);
+  const services = (state.services.get(ctx) ?? []).filter(
+    (svc) => svc.namespace === namespace && svc.selector.length > 0 && svc.selector.every((kv) => labels.has(kv)),
+  );
+  const servicesSection = services.length
+    ? overviewSection(
+        "Services",
+        `<div class="flex flex-wrap gap-x-3 gap-y-1 text-sm">${services
+          .map(
+            (svc) =>
+              `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Service',${jsArg(namespace)},${jsArg(svc.name)})" class="text-series-blue hover:underline">${esc(svc.name)}</button> <span class="text-xs text-ink-muted">${esc(svc.service_type)} · ${serviceEndpointsText(svc)}</span>`,
+          )
+          .join("")}</div>`,
+      )
+    : "";
+
+  const template = overviewSection(
+    "Pod template",
+    [...d.init_containers.map((c) => renderTemplateContainerCard(c, true)), ...d.containers.map((c) => renderTemplateContainerCard(c, false))].join(""),
+  );
+
+  // Each claim template yields one PVC per pod, named <template>-<pod>.
+  const claimRows = d.volume_claim_templates.map(
+    (t) => `
+    <tr class="border-t border-gridline/60 first:border-t-0">
+      <td class="w-20 py-1.5 pr-3 text-xs text-ink-muted">PVC</td>
+      <td class="py-1.5 pr-3 font-mono text-xs">${esc(t)}-${esc(name)}-<span class="text-ink-muted">N</span></td>
+      <td class="py-1.5 text-right text-xs text-ink-muted">claim template, one per pod</td>
+    </tr>`,
+  );
+
+  return `${banner}${tiles}<div>${facts}</div>${pods}${servicesSection}${renderConditionsSection(d.conditions)}${template}${renderUsesSection(ctx, namespace, d.references, claimRows)}`;
+}
+
 function renderWorkloadDetailPanel(): string {
   const wd = state.workloadDetail;
   if (!wd) return "";
 
   const tabs: { id: WorkloadDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "yaml", label: "YAML" },
     { id: "logs", label: "Logs" },
     { id: "events", label: "Events" },
@@ -9700,15 +10209,17 @@ function renderWorkloadDetailPanel(): string {
       : "";
 
   const body =
-    wd.view === "yaml"
-      ? renderWorkloadYamlView(wd)
-      : wd.view === "logs"
-        ? renderWorkloadLogsView(wd)
-        : wd.view === "events"
-          ? renderWorkloadEventsView(wd)
-          : wd.view === "revisions"
-            ? renderWorkloadRevisionsView(wd)
-            : renderWorkloadGraphView(wd);
+    wd.view === "overview"
+      ? renderWorkloadOverviewView(wd)
+      : wd.view === "yaml"
+        ? renderWorkloadYamlView(wd)
+        : wd.view === "logs"
+          ? renderWorkloadLogsView(wd)
+          : wd.view === "events"
+            ? renderWorkloadEventsView(wd)
+            : wd.view === "revisions"
+              ? renderWorkloadRevisionsView(wd)
+              : renderWorkloadGraphView(wd);
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeWorkloadDetail()">
@@ -11128,6 +11639,811 @@ function renderExternalSecrets(): string {
     ${renderPagination("externalsecrets", sorted.length)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Namespaces, Services, Ingress, PVC and PV tabs
+// ---------------------------------------------------------------------------
+//
+// Each health check below is shared by its tab's unhealthy-only filter, its
+// status dot and the tab switcher's problem count, so the three cannot drift.
+
+/** A namespace stuck Terminating is the usual reason to come looking. */
+function namespaceIsHealthy(n: NamespaceInfo): boolean {
+  return n.status === "Active";
+}
+
+/**
+ * A LoadBalancer still waiting for an address, or a Service whose selector
+ * matches no ready pod — traffic sent to it goes nowhere. An unknown endpoint
+ * count (no selector, or EndpointSlices not readable) is not counted against it.
+ */
+function serviceIsHealthy(s: ServiceInfo): boolean {
+  return !s.pending_load_balancer && s.endpoints_ready !== 0;
+}
+
+/** No address yet: no controller has picked it up, or its class matches none. */
+function ingressIsHealthy(i: IngressInfo): boolean {
+  return i.address.length > 0;
+}
+
+function pvcIsHealthy(c: PvcInfo): boolean {
+  return c.status === "Bound";
+}
+
+/** Released is a claim gone and its data kept — expected under Retain, so not a fault. */
+function pvIsHealthy(v: PvInfo): boolean {
+  return v.status !== "Failed" && v.status !== "Pending";
+}
+
+/**
+ * A Kubernetes quantity in bytes, for sorting capacities: "10Gi" must sort
+ * below "1Ti", which as text it does not. Unparseable sorts first.
+ */
+function quantityBytes(q: string): number {
+  const m = /^([0-9.]+)\s*([KMGTPE]i?|k)?$/.exec(q.trim());
+  if (!m) return -1;
+  const n = Number(m[1]);
+  const unit = m[2] ?? "";
+  const pow = { "": 0, k: 1, K: 1, M: 2, G: 3, T: 4, P: 5, E: 6 }[unit.replace("i", "")] ?? 0;
+  return n * (unit.endsWith("i") ? 1024 : 1000) ** pow;
+}
+
+/** The Cluster cell shared by the five tables: a link that filters to that cluster. */
+function resourceClusterCell(tab: TabId, ctx: string): string {
+  return `<td class="text-ink-muted"><button type="button" title="Filter by this cluster" onclick="window.__app.setEnumFilter(${jsArg(tab)},'cluster',[${jsArg(ctx)}])" class="hover:text-series-blue hover:underline">${esc(ctx)}</button></td>`;
+}
+
+function resourceNamespaceCell(tab: TabId, ns: string): string {
+  return `<td><button type="button" title="Filter by this namespace" onclick="window.__app.setEnumFilter(${jsArg(tab)},'namespace',[${jsArg(ns)}])" class="hover:text-series-blue hover:underline">${esc(ns)}</button></td>`;
+}
+
+/** The Name cell: opens the shared detail panel, and is what Enter and a click activate. */
+function resourceNameCell(ctx: string, kind: ResourceKind, namespace: string, name: string): string {
+  return `
+    <td>
+      <button
+        type="button"
+        title="View details (overview, YAML, events)"
+        data-row-open onclick="window.__app.openResourceDetail(${jsArg(ctx)},${jsArg(kind)},${jsArg(namespace)},${jsArg(name)})"
+        class="text-ink-primary hover:text-series-blue hover:underline"
+      >${esc(name)}</button>
+    </td>`;
+}
+
+function resourceAgeCell(r: { age_days: number; age_seconds: number; created_at: string | null }): string {
+  return `<td class="tabular" title="${esc(timeTitle("Created", r.created_at))}">${formatAgeDetailed(r.age_days, r.age_seconds)}</td>`;
+}
+
+function resourceAgeColumn<T>(get: (row: T) => { age_days: number; age_seconds: number }): ColumnDef<T> {
+  return {
+    key: "age",
+    label: "Age",
+    value: (r) => get(r).age_days,
+    filter: "number",
+    copyText: (r) => formatAgeDetailed(get(r).age_days, get(r).age_seconds),
+    sortValue: (r) => get(r).age_seconds,
+  };
+}
+
+/**
+ * The scaffolding every one of the five tables shares — the unhealthy-only
+ * line, filter summary, selection toolbar, header rows, empty state and
+ * pagination — around the rows each tab renders itself.
+ */
+function resourceTable<T>(o: {
+  tab: TabId;
+  noun: string;
+  allRows: T[];
+  rows: T[];
+  columns: ColumnDef<T>[];
+  keyOf: (row: T) => string;
+  /**
+   * The status column and the unhealthy-only line, for kinds that have a
+   * health. Left out for ConfigMaps, which have none — each row then has no
+   * status cell either.
+   */
+  health?: { healthy: (row: T) => boolean; unhealthyLabel: string; statusText: (row: T) => string };
+  renderRow: (row: T) => string;
+}): string {
+  const { tab, health } = o;
+  const filtered = applyFilters(tab, o.rows, o.columns);
+  const sorted = sortRows(tab, filtered, o.columns, health ? (r) => !health.healthy(r) : undefined);
+  recordTableSnapshot(tab, o.columns, sorted, o.keyOf, health ? { header: "Status", text: health.statusText } : undefined);
+  const paged = pageSlice(tab, sorted);
+  return `
+    ${
+      health
+        ? `<div class="mb-2 flex items-center justify-between">
+      <div class="text-xs text-ink-muted">${state.unhealthyOnly[tab] ? `${o.rows.length} of ${o.allRows.length} ${esc(health.unhealthyLabel)}` : ""}</div>
+      ${unhealthyOnlyToggle(tab)}
+    </div>`
+        : ""
+    }
+    ${filterSummary(tab, o.rows.length, filtered.length)}
+    ${selectionToolbar(tab)}
+    <div class="overflow-auto rounded-lg border border-gridline" data-scroll-id="table:${tab}">
+      <table class="data-table">
+        ${renderColGroup(tab, o.columns, health ? [32, 36] : [32])}
+        <thead>
+          <tr>${selectAllCheckboxHeader(tab, sorted, o.keyOf)}${health ? "<th></th>" : ""}${sortableHeaderRow(tab, o.columns)}</tr>
+          <tr class="filter-row"><th></th>${health ? "<th></th>" : ""}${filterRowCells(tab, o.columns, o.rows)}</tr>
+        </thead>
+        <tbody>${paged.map(o.renderRow).join("")}</tbody>
+      </table>
+      ${sorted.length === 0 && !state.tabLoading ? `<div class="p-4 text-sm text-ink-muted">No matching ${esc(o.noun)}.</div>` : ""}
+    </div>
+    ${renderPagination(tab, sorted.length)}`;
+}
+
+function renderNamespaces(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; n: NamespaceInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.namespaces.get(ctx) ?? []).map((n) => ({ ctx, n })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No namespaces found.</div>`;
+  const rows = state.unhealthyOnly.namespaces ? allRows.filter((r) => !namespaceIsHealthy(r.n)) : allRows;
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "name", label: "Name", value: (r) => r.n.name, filter: "string" },
+    { key: "status", label: "Status", value: (r) => r.n.status, filter: "enum" },
+    { key: "labels", label: "Labels", value: (r) => r.n.labels.join(", "), filter: "string" },
+    resourceAgeColumn((r) => r.n),
+  ];
+  return resourceTable({
+    tab: "namespaces",
+    noun: "namespaces",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.n.name}`,
+    health: { healthy: (r) => namespaceIsHealthy(r.n), unhealthyLabel: "terminating", statusText: (r) => r.n.status },
+    renderRow: ({ ctx, n }) => `
+      <tr>
+        ${rowCheckboxCell("namespaces", `${ctx}:${n.name}`)}
+        <td title="${esc(n.status)}">${statusDot(namespaceIsHealthy(n))}</td>
+        ${multi ? resourceClusterCell("namespaces", ctx) : ""}
+        ${resourceNameCell(ctx, "Namespace", "", n.name)}
+        <td class="${namespaceIsHealthy(n) ? "" : "text-status-critical"}">${esc(n.status)}</td>
+        <td class="truncate text-ink-secondary" title="${esc(n.labels.join("\n"))}">${esc(n.labels.join(", "))}</td>
+        ${resourceAgeCell(n)}
+      </tr>`,
+  });
+}
+
+function serviceEndpointsText(s: ServiceInfo): string {
+  return s.endpoints_ready === null ? "—" : `${s.endpoints_ready}/${s.endpoints_total ?? s.endpoints_ready}`;
+}
+
+function serviceStatus(s: ServiceInfo): string {
+  if (s.pending_load_balancer) return "LoadBalancer address pending";
+  if (s.endpoints_ready === 0) return s.endpoints_total ? "No ready endpoints" : "Selector matches no pods";
+  return "Healthy";
+}
+
+function renderServices(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; s: ServiceInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.services.get(ctx) ?? []).map((s) => ({ ctx, s })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No services found.</div>`;
+  const rows = state.unhealthyOnly.services ? allRows.filter((r) => !serviceIsHealthy(r.s)) : allRows;
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.s.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.s.name, filter: "string" },
+    { key: "type", label: "Type", value: (r) => r.s.service_type, filter: "enum" },
+    { key: "clusterIp", label: "Cluster IP", value: (r) => r.s.cluster_ip, filter: "string" },
+    { key: "external", label: "External", value: (r) => r.s.external.join(", "), filter: "string" },
+    { key: "ports", label: "Ports", value: (r) => r.s.ports.join(", "), filter: "string" },
+    {
+      key: "endpoints",
+      label: "Endpoints",
+      value: (r) => r.s.endpoints_ready ?? -1,
+      filter: "number",
+      copyText: (r) => serviceEndpointsText(r.s),
+    },
+    { key: "selector", label: "Selector", value: (r) => r.s.selector.join(", "), filter: "string" },
+    resourceAgeColumn((r) => r.s),
+  ];
+  return resourceTable({
+    tab: "services",
+    noun: "services",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.s.namespace}:${r.s.name}`,
+    health: { healthy: (r) => serviceIsHealthy(r.s), unhealthyLabel: "unhealthy", statusText: (r) => serviceStatus(r.s) },
+    renderRow: ({ ctx, s }) => `
+      <tr>
+        ${rowCheckboxCell("services", `${ctx}:${s.namespace}:${s.name}`)}
+        <td title="${esc(serviceStatus(s))}">${statusDot(serviceIsHealthy(s))}</td>
+        ${multi ? resourceClusterCell("services", ctx) : ""}
+        ${resourceNamespaceCell("services", s.namespace)}
+        ${resourceNameCell(ctx, "Service", s.namespace, s.name)}
+        <td>${esc(s.service_type)}</td>
+        <td class="tabular text-ink-secondary">${esc(s.cluster_ip) || "—"}</td>
+        <td class="truncate tabular ${s.pending_load_balancer ? "text-status-warning" : ""}" title="${esc(s.external.join("\n"))}">${s.pending_load_balancer ? "pending" : esc(s.external.join(", ")) || '<span class="text-ink-muted">—</span>'}</td>
+        <td class="truncate tabular" title="${esc(s.ports.join("\n"))}">${esc(s.ports.join(", ")) || '<span class="text-ink-muted">—</span>'}</td>
+        <td class="tabular ${s.endpoints_ready === 0 ? "text-status-critical" : ""}" title="${esc(s.endpoints_ready === null ? "Nothing to count: no selector, an ExternalName, or EndpointSlices not readable" : "Ready / total endpoints")}">${serviceEndpointsText(s)}</td>
+        <td class="truncate text-ink-secondary" title="${esc(s.selector.join("\n"))}">${esc(s.selector.join(", ")) || '<span class="text-ink-muted">—</span>'}</td>
+        ${resourceAgeCell(s)}
+      </tr>`,
+  });
+}
+
+function renderIngresses(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; i: IngressInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.ingresses.get(ctx) ?? []).map((i) => ({ ctx, i })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No ingresses found.</div>`;
+  const rows = state.unhealthyOnly.ingresses ? allRows.filter((r) => !ingressIsHealthy(r.i)) : allRows;
+  const backends = (i: IngressInfo) => [...new Set(i.rules.map((r) => r.backend).concat(i.default_backend ?? []))];
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.i.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.i.name, filter: "string" },
+    { key: "class", label: "Class", value: (r) => r.i.class || "default", filter: "enum" },
+    { key: "hosts", label: "Hosts", value: (r) => r.i.hosts.join(", "), filter: "string" },
+    { key: "address", label: "Address", value: (r) => r.i.address.join(", "), filter: "string" },
+    { key: "tls", label: "TLS", value: (r) => (r.i.tls ? "yes" : "no"), filter: "enum" },
+    { key: "backends", label: "Backends", value: (r) => backends(r.i).join(", "), filter: "string" },
+    resourceAgeColumn((r) => r.i),
+  ];
+  return resourceTable({
+    tab: "ingresses",
+    noun: "ingresses",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.i.namespace}:${r.i.name}`,
+    health: { healthy: (r) => ingressIsHealthy(r.i), unhealthyLabel: "without an address", statusText: (r) => (ingressIsHealthy(r.i) ? "Healthy" : "No address") },
+    renderRow: ({ ctx, i }) => `
+      <tr>
+        ${rowCheckboxCell("ingresses", `${ctx}:${i.namespace}:${i.name}`)}
+        <td title="${ingressIsHealthy(i) ? "Has an address" : "No address: no controller has picked it up"}">${statusDot(ingressIsHealthy(i))}</td>
+        ${multi ? resourceClusterCell("ingresses", ctx) : ""}
+        ${resourceNamespaceCell("ingresses", i.namespace)}
+        ${resourceNameCell(ctx, "Ingress", i.namespace, i.name)}
+        <td>${esc(i.class) || '<span class="text-ink-muted">default</span>'}</td>
+        <td class="truncate" title="${esc(i.hosts.join("\n"))}">${esc(i.hosts.join(", ")) || '<span class="text-ink-muted">—</span>'}</td>
+        <td class="truncate tabular ${ingressIsHealthy(i) ? "" : "text-status-critical"}" title="${esc(i.address.join("\n"))}">${esc(i.address.join(", ")) || "none"}</td>
+        <td>${i.tls ? "yes" : '<span class="text-ink-muted">no</span>'}</td>
+        <td class="truncate text-ink-secondary" title="${esc(backends(i).join("\n"))}">${esc(backends(i).join(", "))}</td>
+        ${resourceAgeCell(i)}
+      </tr>`,
+  });
+}
+
+function renderPvcs(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; c: PvcInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.pvcs.get(ctx) ?? []).map((c) => ({ ctx, c })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No persistent volume claims found.</div>`;
+  const rows = state.unhealthyOnly.pvcs ? allRows.filter((r) => !pvcIsHealthy(r.c)) : allRows;
+  const size = (c: PvcInfo) => c.capacity || c.requested;
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.c.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.c.name, filter: "string" },
+    { key: "status", label: "Status", value: (r) => r.c.status, filter: "enum" },
+    { key: "volume", label: "Volume", value: (r) => r.c.volume, filter: "string" },
+    { key: "capacity", label: "Capacity", value: (r) => size(r.c), filter: "string", sortValue: (r) => quantityBytes(size(r.c)) },
+    { key: "access", label: "Access", value: (r) => r.c.access_modes.join(","), filter: "enum" },
+    { key: "storageClass", label: "Storage class", value: (r) => r.c.storage_class, filter: "enum" },
+    resourceAgeColumn((r) => r.c),
+  ];
+  return resourceTable({
+    tab: "pvcs",
+    noun: "claims",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.c.namespace}:${r.c.name}`,
+    health: { healthy: (r) => pvcIsHealthy(r.c), unhealthyLabel: "not bound", statusText: (r) => r.c.status },
+    renderRow: ({ ctx, c }) => `
+      <tr>
+        ${rowCheckboxCell("pvcs", `${ctx}:${c.namespace}:${c.name}`)}
+        <td title="${esc(c.status)}">${statusDot(pvcIsHealthy(c))}</td>
+        ${multi ? resourceClusterCell("pvcs", ctx) : ""}
+        ${resourceNamespaceCell("pvcs", c.namespace)}
+        ${resourceNameCell(ctx, "PersistentVolumeClaim", c.namespace, c.name)}
+        <td class="${pvcIsHealthy(c) ? "" : "text-status-critical"}">${esc(c.status)}</td>
+        <td class="truncate">${
+          c.volume
+            ? `<button type="button" title="Open the PersistentVolume" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'PersistentVolume','',${jsArg(c.volume)})" class="hover:text-series-blue hover:underline">${esc(c.volume)}</button>`
+            : '<span class="text-ink-muted">—</span>'
+        }</td>
+        <td class="tabular" ${c.capacity ? "" : 'title="Requested — not bound yet"'}>${c.capacity ? esc(c.capacity) : `<span class="text-ink-muted">${esc(c.requested) || "—"}</span>`}</td>
+        <td>${esc(c.access_modes.join(","))}</td>
+        <td>${esc(c.storage_class) || '<span class="text-ink-muted">—</span>'}</td>
+        ${resourceAgeCell(c)}
+      </tr>`,
+  });
+}
+
+function renderPvs(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; v: PvInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.pvs.get(ctx) ?? []).map((v) => ({ ctx, v })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No persistent volumes found.</div>`;
+  const rows = state.unhealthyOnly.pvs ? allRows.filter((r) => !pvIsHealthy(r.v)) : allRows;
+  const claim = (v: PvInfo) => (v.claim_name ? `${v.claim_namespace}/${v.claim_name}` : "");
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "name", label: "Name", value: (r) => r.v.name, filter: "string" },
+    { key: "status", label: "Status", value: (r) => r.v.status, filter: "enum" },
+    { key: "claim", label: "Claim", value: (r) => claim(r.v), filter: "string" },
+    { key: "capacity", label: "Capacity", value: (r) => r.v.capacity, filter: "string", sortValue: (r) => quantityBytes(r.v.capacity) },
+    { key: "access", label: "Access", value: (r) => r.v.access_modes.join(","), filter: "enum" },
+    { key: "reclaim", label: "Reclaim", value: (r) => r.v.reclaim_policy, filter: "enum" },
+    { key: "storageClass", label: "Storage class", value: (r) => r.v.storage_class, filter: "enum" },
+    { key: "source", label: "Source", value: (r) => r.v.source, filter: "enum" },
+    resourceAgeColumn((r) => r.v),
+  ];
+  return resourceTable({
+    tab: "pvs",
+    noun: "volumes",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.v.name}`,
+    health: { healthy: (r) => pvIsHealthy(r.v), unhealthyLabel: "failed or pending", statusText: (r) => r.v.status },
+    renderRow: ({ ctx, v }) => `
+      <tr>
+        ${rowCheckboxCell("pvs", `${ctx}:${v.name}`)}
+        <td title="${esc(v.reason ? `${v.status}: ${v.reason}` : v.status)}">${statusDot(pvIsHealthy(v))}</td>
+        ${multi ? resourceClusterCell("pvs", ctx) : ""}
+        ${resourceNameCell(ctx, "PersistentVolume", "", v.name)}
+        <td class="${pvIsHealthy(v) ? (v.status === "Released" ? "text-status-warning" : "") : "text-status-critical"}">${esc(v.status)}</td>
+        <td class="truncate">${
+          v.claim_name
+            ? `<button type="button" title="Open the claim" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'PersistentVolumeClaim',${jsArg(v.claim_namespace)},${jsArg(v.claim_name)})" class="hover:text-series-blue hover:underline"><span class="text-ink-muted">${esc(v.claim_namespace)}/</span>${esc(v.claim_name)}</button>`
+            : '<span class="text-ink-muted">—</span>'
+        }</td>
+        <td class="tabular">${esc(v.capacity) || "—"}</td>
+        <td>${esc(v.access_modes.join(","))}</td>
+        <td>${esc(v.reclaim_policy)}</td>
+        <td>${esc(v.storage_class) || '<span class="text-ink-muted">—</span>'}</td>
+        <td class="truncate text-ink-secondary">${esc(v.source) || "—"}</td>
+        ${resourceAgeCell(v)}
+      </tr>`,
+  });
+}
+
+function renderConfigMaps(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; c: ConfigMapInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.configmaps.get(ctx) ?? []).map((c) => ({ ctx, c })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No ConfigMaps found.</div>`;
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.c.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.c.name, filter: "string" },
+    {
+      // Filters on the key names, so "which ConfigMap has application.yaml"
+      // is one filter; sorts by how many there are.
+      key: "keys",
+      label: "Keys",
+      value: (r) => r.c.keys.map((k) => k.name).join(", "),
+      filter: "string",
+      sortValue: (r) => r.c.keys.length,
+    },
+    {
+      key: "size",
+      label: "Size",
+      value: (r) => r.c.total_bytes,
+      filter: "number",
+      copyText: (r) => formatBytes(r.c.total_bytes),
+    },
+    { key: "immutable", label: "Immutable", value: (r) => (r.c.immutable ? "yes" : "no"), filter: "enum" },
+    resourceAgeColumn((r) => r.c),
+  ];
+  return resourceTable({
+    tab: "configmaps",
+    noun: "ConfigMaps",
+    allRows,
+    rows: allRows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.c.namespace}:${r.c.name}`,
+    renderRow: ({ ctx, c }) => {
+      const names = c.keys.map((k) => k.name);
+      return `
+      <tr>
+        ${rowCheckboxCell("configmaps", `${ctx}:${c.namespace}:${c.name}`)}
+        ${multi ? resourceClusterCell("configmaps", ctx) : ""}
+        ${resourceNamespaceCell("configmaps", c.namespace)}
+        ${resourceNameCell(ctx, "ConfigMap", c.namespace, c.name)}
+        <td class="truncate" title="${esc(names.join("\n"))}"><span class="tabular">${names.length}</span>${names.length ? ` <span class="text-ink-muted">· ${esc(names.join(", "))}</span>` : ""}</td>
+        <td class="tabular">${formatBytes(c.total_bytes)}</td>
+        <td>${c.immutable ? "yes" : '<span class="text-ink-muted">no</span>'}</td>
+        ${resourceAgeCell(c)}
+      </tr>`;
+    },
+  });
+}
+
+/**
+ * A ConfigMap's values, one card per key, with a filter on key names and
+ * values both. Not masked as Secrets are — a ConfigMap holds configuration,
+ * not credentials — but fetched only when this view opens, never with the table.
+ */
+function renderConfigMapDataView(rd: ResourceDetailState): string {
+  if (rd.dataError) return `<div class="text-sm text-status-critical">${esc(rd.dataError)}</div>`;
+  if (!rd.data) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const total = rd.data.length;
+  if (total === 0) return `<div class="text-sm text-ink-muted">This ConfigMap has no keys.</div>`;
+  const q = rd.dataSearch.trim().toLowerCase();
+  const shown = rd.data
+    .map((e, index) => ({ e, index }))
+    .filter(({ e }) => !q || e.key.toLowerCase().includes(q) || (!e.binary && e.value.toLowerCase().includes(q)));
+  const cards = shown.map(
+    ({ e, index }) => `
+      <div class="rounded-md border border-gridline bg-surface-1 p-3">
+        <div class="flex items-center justify-between gap-2">
+          <div class="min-w-0 truncate">
+            <span class="font-mono text-sm text-ink-primary">${highlightSearchMatches(esc(e.key), q, -1)}</span>
+            <span class="ml-2 text-xs text-ink-muted">${formatBytes(e.bytes)}${e.binary ? " · binary" : ""}</span>
+          </div>
+          ${
+            e.binary
+              ? ""
+              : `<button type="button" onclick="window.__app.copyConfigMapValue(${index})" class="shrink-0 rounded border border-gridline px-2 py-0.5 text-xs text-ink-secondary hover:bg-surface-3 hover:text-ink-primary">Copy</button>`
+          }
+        </div>
+        ${
+          e.binary
+            ? `<div class="mt-2 text-xs text-ink-muted">Binary data isn't shown.</div>`
+            : `<pre class="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-2 p-2 font-mono text-xs text-ink-primary">${e.value ? highlightSearchMatches(esc(e.value), q, -1) : '<span class="text-ink-muted">(empty)</span>'}</pre>`
+        }
+      </div>`,
+  );
+  // The Secret panel's key filter markup: `data-detail-search` puts it under
+  // Cmd+F and Escape's step-out; `data-filter-key` keeps focus across renders.
+  return `
+    <div class="flex flex-col gap-2">
+      <div class="flex items-center justify-end gap-2">
+        <input
+          type="text"
+          placeholder="Filter keys and values…"
+          value="${esc(rd.dataSearch)}"
+          data-detail-search
+          data-filter-key="configmap-data-search"
+          oninput="window.__app.setConfigMapDataSearch(this.value)"
+          class="w-56 rounded border border-gridline bg-surface-2 px-2 py-1 text-xs text-ink-primary outline-none focus:border-series-blue"
+        />
+        <span class="w-16 whitespace-nowrap text-right tabular text-xs text-ink-muted">${q ? `${shown.length} of ${total}` : `${total} key${total === 1 ? "" : "s"}`}</span>
+      </div>
+      ${shown.length ? cards.join("") : `<div class="text-sm text-ink-muted">No keys match “${esc(rd.dataSearch.trim())}”.</div>`}
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// The detail panel those six tabs share (Overview / YAML / Events, and Data for a ConfigMap)
+// ---------------------------------------------------------------------------
+
+function openResourceDetail(ctx: string, kind: ResourceKind, namespace: string, name: string) {
+  // Every other panel, through the registry rather than by name.
+  for (const p of DETAIL_PANEL_CLOSERS) if (p.isOpen() && p.close !== closeResourceDetail) p.close();
+  const token = ++resourceDetailToken;
+  state.resourceDetail = {
+    ctx,
+    kind,
+    namespace,
+    name,
+    view: "overview",
+    data: null,
+    dataError: null,
+    dataLoading: false,
+    dataSearch: "",
+    manifest: null,
+    manifestError: null,
+    showManagedFields: false,
+    yamlSearch: "",
+    yamlSearchIndex: 0,
+    events: null,
+    eventsError: null,
+    eventsLoading: false,
+  };
+  render();
+
+  api
+    .getResourceManifest(ctx, kind, namespace, name)
+    .then((manifest) => {
+      if (token !== resourceDetailToken || !state.resourceDetail) return;
+      state.resourceDetail.manifest = manifest;
+      render();
+    })
+    .catch((e) => {
+      if (token !== resourceDetailToken || !state.resourceDetail) return;
+      state.resourceDetail.manifestError = String(e);
+      render();
+    });
+}
+
+function closeResourceDetail() {
+  resourceDetailToken += 1;
+  state.resourceDetail = null;
+  state.yamlEdit = null;
+  render();
+}
+
+function setResourceDetailView(view: ResourceDetailState["view"]) {
+  if (!state.resourceDetail) return;
+  state.resourceDetail.view = view;
+  render();
+  if (view === "events" && !state.resourceDetail.events && !state.resourceDetail.eventsLoading) fetchResourceEvents();
+  if (view === "data" && !state.resourceDetail.data && !state.resourceDetail.dataLoading) fetchConfigMapData();
+}
+
+async function fetchConfigMapData() {
+  const rd = state.resourceDetail;
+  if (!rd || rd.kind !== "ConfigMap") return;
+  const token = resourceDetailToken;
+  rd.dataLoading = true;
+  rd.dataError = null;
+  render();
+  try {
+    const data = await api.getConfigMapData(rd.ctx, rd.namespace, rd.name);
+    if (token !== resourceDetailToken || !state.resourceDetail) return;
+    state.resourceDetail.data = data;
+  } catch (e) {
+    if (token !== resourceDetailToken || !state.resourceDetail) return;
+    state.resourceDetail.dataError = String(e);
+  } finally {
+    if (token === resourceDetailToken && state.resourceDetail) state.resourceDetail.dataLoading = false;
+    render();
+  }
+}
+
+function setConfigMapDataSearch(query: string) {
+  if (!state.resourceDetail) return;
+  state.resourceDetail.dataSearch = query;
+  render();
+}
+
+/** Copies one value by its index in the fetched list, so no value has to travel through an inline handler. */
+async function copyConfigMapValue(index: number) {
+  const entry = state.resourceDetail?.data?.[index];
+  if (!entry || entry.binary) return;
+  if (await copyPlainTextToClipboard(entry.value)) showCopyToast(`Copied ${entry.key}`);
+}
+
+async function fetchResourceEvents() {
+  const rd = state.resourceDetail;
+  if (!rd) return;
+  const token = resourceDetailToken;
+  rd.eventsLoading = true;
+  rd.eventsError = null;
+  render();
+  try {
+    const events = await api.getResourceEvents(rd.ctx, rd.kind, rd.namespace, rd.name);
+    if (token !== resourceDetailToken || !state.resourceDetail) return;
+    state.resourceDetail.events = events;
+  } catch (e) {
+    if (token !== resourceDetailToken || !state.resourceDetail) return;
+    state.resourceDetail.eventsError = String(e);
+  } finally {
+    if (token === resourceDetailToken && state.resourceDetail) state.resourceDetail.eventsLoading = false;
+    render();
+  }
+}
+
+function toggleResourceManagedFields() {
+  if (!state.resourceDetail) return;
+  state.resourceDetail.showManagedFields = !state.resourceDetail.showManagedFields;
+  render();
+}
+
+function currentResourceYamlText(rd: ResourceDetailState): string {
+  if (!rd.manifest) return "";
+  return rd.showManagedFields ? rd.manifest.yaml_full : rd.manifest.yaml_without_managed_fields;
+}
+
+function setResourceSearch(_view: string, query: string) {
+  if (!state.resourceDetail) return;
+  state.resourceDetail.yamlSearch = query;
+  state.resourceDetail.yamlSearchIndex = 0;
+  pendingSearchScroll = true;
+  render();
+}
+
+function moveResourceSearch(_view: string, delta: number) {
+  const rd = state.resourceDetail;
+  if (!rd || !rd.yamlSearch) return;
+  const count = countSearchMatches(currentResourceYamlText(rd), rd.yamlSearch);
+  if (count === 0) return;
+  rd.yamlSearchIndex = (((rd.yamlSearchIndex + delta) % count) + count) % count;
+  pendingSearchScroll = true;
+  render();
+}
+
+/** One label/value line of the Overview; `value` is already HTML. */
+function overviewRow(label: string, value: string): string {
+  return `
+    <div class="flex gap-3 border-b border-gridline/60 py-2 text-sm last:border-b-0">
+      <div class="w-36 shrink-0 text-ink-muted">${esc(label)}</div>
+      <div class="min-w-0 flex-1 break-words text-ink-primary">${value}</div>
+    </div>`;
+}
+
+function overviewChips(items: string[]): string {
+  if (items.length === 0) return '<span class="text-ink-muted">—</span>';
+  return `<div class="flex flex-wrap gap-1">${items
+    .map((t) => `<span class="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-xs text-ink-secondary">${esc(t)}</span>`)
+    .join("")}</div>`;
+}
+
+/**
+ * The Overview reads the row the table already loaded, so it needs no fetch of
+ * its own and follows each refresh. Looked up afresh on every render: an
+ * object deleted since the panel opened says so rather than showing stale facts.
+ */
+function renderResourceOverview(rd: ResourceDetailState): string {
+  const { ctx, kind, namespace, name } = rd;
+  const created = (r: { created_at: string | null }) => esc(exactTime(r.created_at).replace("\n", " · ")) || "—";
+  const link = (label: string, k: ResourceKind, ns: string, n: string) =>
+    `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},${jsArg(k)},${jsArg(ns)},${jsArg(n)})" class="text-series-blue hover:underline">${esc(label)}</button>`;
+  const gone = `<div class="text-sm text-ink-muted">Not in the last list fetched for ${esc(ctx)} — it may have been deleted, or the tab has not loaded yet. The YAML tab fetches it directly.</div>`;
+  const rows: string[] = [];
+
+  if (kind === "Namespace") {
+    const n = state.namespaces.get(ctx)?.find((x) => x.name === name);
+    if (!n) return gone;
+    rows.push(overviewRow("Status", `<span class="${namespaceIsHealthy(n) ? "" : "text-status-critical"}">${esc(n.status)}</span>`));
+    // Counted from what other tabs already loaded, never fetched for this.
+    const counts: [string, number | undefined][] = [
+      ["Pods", state.pods.get(ctx)?.filter((p) => p.namespace === name).length],
+      ["Services", state.services.get(ctx)?.filter((s) => s.namespace === name).length],
+      ["Ingresses", state.ingresses.get(ctx)?.filter((i) => i.namespace === name).length],
+      ["PVCs", state.pvcs.get(ctx)?.filter((c) => c.namespace === name).length],
+    ];
+    for (const [label, count] of counts) if (count !== undefined) rows.push(overviewRow(label, `<span class="tabular">${count}</span>`));
+    rows.push(overviewRow("Labels", overviewChips(n.labels)));
+    rows.push(overviewRow("Created", created(n)));
+  } else if (kind === "Service") {
+    const s = state.services.get(ctx)?.find((x) => x.namespace === namespace && x.name === name);
+    if (!s) return gone;
+    rows.push(overviewRow("Status", `<span class="${serviceIsHealthy(s) ? "" : "text-status-critical"}">${esc(serviceStatus(s))}</span>`));
+    rows.push(overviewRow("Type", esc(s.service_type)));
+    rows.push(overviewRow("Cluster IP", `<span class="tabular">${esc(s.cluster_ip) || "—"}</span>`));
+    rows.push(overviewRow("External", s.pending_load_balancer ? '<span class="text-status-warning">pending</span>' : overviewChips(s.external)));
+    rows.push(overviewRow("Ports", overviewChips(s.ports)));
+    rows.push(overviewRow("Endpoints", `<span class="tabular">${serviceEndpointsText(s)}</span> <span class="text-xs text-ink-muted">ready / total</span>`));
+    rows.push(overviewRow("Selector", overviewChips(s.selector)));
+    rows.push(overviewRow("Created", created(s)));
+  } else if (kind === "Ingress") {
+    const i = state.ingresses.get(ctx)?.find((x) => x.namespace === namespace && x.name === name);
+    if (!i) return gone;
+    rows.push(overviewRow("Class", esc(i.class) || '<span class="text-ink-muted">cluster default</span>'));
+    rows.push(overviewRow("Address", i.address.length ? overviewChips(i.address) : '<span class="text-status-critical">none — no controller has picked it up</span>'));
+    rows.push(overviewRow("TLS", i.tls ? "yes" : "no"));
+    if (i.default_backend) rows.push(overviewRow("Default backend", `<span class="font-mono text-xs">${esc(i.default_backend)}</span>`));
+    rows.push(overviewRow("Created", created(i)));
+    const rules = i.rules.length
+      ? `
+        <div class="mt-4 text-xs font-medium uppercase tracking-wide text-ink-muted">Rules</div>
+        <table class="mt-2 w-full text-left text-sm">
+          <thead class="text-xs text-ink-muted"><tr><th class="py-1 pr-3 font-normal">Host</th><th class="py-1 pr-3 font-normal">Path</th><th class="py-1 font-normal">Backend</th></tr></thead>
+          <tbody>${i.rules
+            .map(
+              (r) =>
+                `<tr class="border-t border-gridline/60"><td class="py-1.5 pr-3">${esc(r.host)}</td><td class="py-1.5 pr-3 font-mono text-xs">${esc(r.path)}</td><td class="py-1.5 font-mono text-xs">${esc(r.backend)}</td></tr>`,
+            )
+            .join("")}</tbody>
+        </table>`
+      : "";
+    return `<div>${rows.join("")}</div>${rules}`;
+  } else if (kind === "PersistentVolumeClaim") {
+    const c = state.pvcs.get(ctx)?.find((x) => x.namespace === namespace && x.name === name);
+    if (!c) return gone;
+    rows.push(overviewRow("Status", `<span class="${pvcIsHealthy(c) ? "" : "text-status-critical"}">${esc(c.status)}</span>`));
+    rows.push(overviewRow("Volume", c.volume ? link(c.volume, "PersistentVolume", "", c.volume) : '<span class="text-ink-muted">not bound</span>'));
+    rows.push(overviewRow("Capacity", `<span class="tabular">${esc(c.capacity) || "—"}</span>`));
+    rows.push(overviewRow("Requested", `<span class="tabular">${esc(c.requested) || "—"}</span>`));
+    rows.push(overviewRow("Access modes", esc(c.access_modes.join(", ")) || "—"));
+    rows.push(overviewRow("Storage class", esc(c.storage_class) || "—"));
+    rows.push(overviewRow("Volume mode", esc(c.volume_mode) || "—"));
+    rows.push(overviewRow("Created", created(c)));
+  } else if (kind === "ConfigMap") {
+    const c = state.configmaps.get(ctx)?.find((x) => x.namespace === namespace && x.name === name);
+    if (!c) return gone;
+    rows.push(overviewRow("Size", `<span class="tabular">${formatBytes(c.total_bytes)}</span> <span class="text-xs text-ink-muted">across ${c.keys.length} key${c.keys.length === 1 ? "" : "s"}</span>`));
+    rows.push(overviewRow("Immutable", c.immutable ? "yes" : "no"));
+    rows.push(overviewRow("Created", created(c)));
+    const keys = c.keys.length
+      ? `
+        <div class="mt-4 text-xs font-medium uppercase tracking-wide text-ink-muted">Keys</div>
+        <table class="mt-2 w-full text-left text-sm">
+          <tbody>${c.keys
+            .map(
+              (k) =>
+                `<tr class="border-t border-gridline/60"><td class="py-1.5 pr-3 font-mono text-xs">${esc(k.name)}</td><td class="py-1.5 text-right tabular text-xs text-ink-muted">${formatBytes(k.bytes)}${k.binary ? " · binary" : ""}</td></tr>`,
+            )
+            .join("")}</tbody>
+        </table>
+        <div class="mt-2 text-xs text-ink-muted">The values are under Data.</div>`
+      : "";
+    return `<div>${rows.join("")}</div>${keys}`;
+  } else {
+    const v = state.pvs.get(ctx)?.find((x) => x.name === name);
+    if (!v) return gone;
+    rows.push(overviewRow("Status", `<span class="${pvIsHealthy(v) ? "" : "text-status-critical"}">${esc(v.status)}</span>${v.reason ? ` <span class="text-ink-muted">· ${esc(v.reason)}</span>` : ""}`));
+    rows.push(overviewRow("Claim", v.claim_name ? link(`${v.claim_namespace}/${v.claim_name}`, "PersistentVolumeClaim", v.claim_namespace, v.claim_name) : '<span class="text-ink-muted">unclaimed</span>'));
+    rows.push(overviewRow("Capacity", `<span class="tabular">${esc(v.capacity) || "—"}</span>`));
+    rows.push(overviewRow("Access modes", esc(v.access_modes.join(", ")) || "—"));
+    rows.push(overviewRow("Reclaim policy", esc(v.reclaim_policy) || "—"));
+    rows.push(overviewRow("Storage class", esc(v.storage_class) || "—"));
+    rows.push(overviewRow("Source", `<span class="font-mono text-xs">${esc(v.source) || "—"}</span>`));
+    rows.push(overviewRow("Created", created(v)));
+  }
+  return `<div>${rows.join("")}</div>`;
+}
+
+function renderResourceDetailPanel(): string {
+  const rd = state.resourceDetail;
+  if (!rd) return "";
+  const id = `${rd.ctx}:${rd.kind}:${rd.namespace}:${rd.name}`;
+  const tabs: { id: ResourceDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
+    ...(rd.kind === "ConfigMap" ? [{ id: "data" as const, label: "Data" }] : []),
+    { id: "yaml", label: "YAML" },
+    { id: "events", label: "Events" },
+  ];
+  const body =
+    rd.view === "overview"
+      ? renderResourceOverview(rd)
+      : rd.view === "data"
+        ? renderConfigMapDataView(rd)
+        : rd.view === "yaml"
+          ? renderYamlPane({
+              error: rd.manifestError,
+              loaded: !!rd.manifest,
+              yaml: currentResourceYamlText(rd),
+              editableYaml: rd.manifest?.yaml_without_managed_fields ?? "",
+              showManagedFields: rd.showManagedFields,
+              toggleHandler: "toggleResourceManagedFields",
+              searchKind: "Resource",
+              search: rd.yamlSearch,
+              searchIndex: rd.yamlSearchIndex,
+              scrollId: `resource-yaml:${esc(id)}`,
+              target: { ctx: rd.ctx, kind: rd.kind, namespace: rd.namespace, name: rd.name },
+            })
+          : renderEventsList(`resource-events:${id}`, rd.events, rd.eventsError);
+
+  return `
+    <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeResourceDetail()">
+      ${slideOverShell()}
+        <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
+          <div class="min-w-0">
+            <div class="truncate text-sm font-medium text-ink-primary">${esc(rd.name)}</div>
+            <div class="truncate text-xs text-ink-muted">${esc([rd.kind, rd.namespace, rd.ctx].filter(Boolean).join(" · "))}</div>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            ${writeModeToggle(true)}
+            <button type="button" onclick="window.__app.closeResourceDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
+          </div>
+        </div>
+        <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
+          ${tabs
+            .map(
+              (t) => `
+            <button
+              type="button"
+              onclick="window.__app.setResourceDetailView(${jsArg(t.id)})"
+              data-detail-tab ${rd.view === t.id ? "data-detail-tab-active" : ""}
+              class="rounded-md px-3 py-1.5 text-xs font-medium ${rd.view === t.id ? "bg-surface-3 text-ink-primary" : "text-ink-secondary hover:text-ink-primary"}"
+            >${t.label}</button>`,
+            )
+            .join("")}
+        </div>
+        <div ${detailBodyAttrs(`resource:${id}:${rd.view}`)} class="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">${body}</div>
+      </div>
+    </div>`;
+}
+
 function renderKeda(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
@@ -11669,6 +12985,7 @@ const DETAIL_PANEL_CLOSERS: { isOpen: () => boolean; close: () => void }[] = [
   { isOpen: () => !!state.kedaDetail, close: closeKedaDetail },
   { isOpen: () => !!state.secretDetail, close: closeSecretDetail },
   { isOpen: () => !!state.externalSecretDetail, close: closeExternalSecretDetail },
+  { isOpen: () => !!state.resourceDetail, close: closeResourceDetail },
 ];
 
 function isAnyDetailPanelOpen(): boolean {

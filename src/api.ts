@@ -37,6 +37,14 @@ import type {
   DrainReport,
   NapNodePoolManifest,
   ObjectManifest,
+  NamespaceInfo,
+  ServiceInfo,
+  IngressInfo,
+  PvcInfo,
+  PvInfo,
+  ResourceKind,
+  ConfigMapInfo,
+  ConfigMapEntry,
   MetricsBackendTestResult,
   MetricsOverTimeResult,
   NapResult,
@@ -221,6 +229,19 @@ export const api = {
   /** The one call that returns a Secret value — a single key, on an explicit Reveal. */
   getSecretValue: (contextName: string, namespace: string, name: string, key: string) =>
     invoke<SecretValue>("get_secret_value", { contextName, namespace, name, key }),
+  getNamespaces: (contextName: string) => invoke<NamespaceInfo[]>("get_namespaces", { contextName }),
+  getServices: (contextName: string) => invoke<ServiceInfo[]>("get_services", { contextName }),
+  getIngresses: (contextName: string) => invoke<IngressInfo[]>("get_ingresses", { contextName }),
+  getPvcs: (contextName: string) => invoke<PvcInfo[]>("get_pvcs", { contextName }),
+  getPvs: (contextName: string) => invoke<PvInfo[]>("get_pvs", { contextName }),
+  getConfigMaps: (contextName: string) => invoke<ConfigMapInfo[]>("get_configmaps", { contextName }),
+  getConfigMapData: (contextName: string, namespace: string, name: string) =>
+    invoke<ConfigMapEntry[]>("get_configmap_data", { contextName, namespace, name }),
+  /** The shared panel's YAML; `namespace` is "" for Namespace and PersistentVolume. */
+  getResourceManifest: (contextName: string, kind: ResourceKind, namespace: string, name: string) =>
+    invoke<ObjectManifest>("get_resource_manifest", { contextName, kind, namespace, name }),
+  getResourceEvents: (contextName: string, kind: ResourceKind, namespace: string, name: string) =>
+    invoke<EventInfo[]>("get_resource_events", { contextName, kind, namespace, name }),
   getExternalSecrets: (contextName: string) => invoke<ExternalSecretsResult>("get_external_secrets", { contextName }),
   getExternalSecretDetail: (contextName: string, namespace: string, name: string) =>
     invoke<ExternalSecretDetail>("get_external_secret_detail", { contextName, namespace, name }),
