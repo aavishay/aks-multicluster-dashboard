@@ -179,6 +179,32 @@ pub struct PodReference {
 pub struct NodeManifest {
     pub yaml_full: String,
     pub yaml_without_managed_fields: String,
+    /// What the panel's Overview shows, read from the same fetch as the YAML.
+    pub detail: NodeDetail,
+}
+
+/// The facts a node's YAML buries: why it is not Ready, what is pressuring
+/// it, what keeps pods off it, and what it has to give. Mirrors `NodeDetail` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct NodeDetail {
+    pub conditions: Vec<PodConditionInfo>,
+    /// `key=value:Effect`, or `key:Effect` without a value.
+    pub taints: Vec<String>,
+    /// `key=value`, sorted.
+    pub labels: Vec<String>,
+    pub kernel_version: String,
+    pub container_runtime: String,
+    pub architecture: String,
+    pub operating_system: String,
+    pub internal_ip: String,
+    pub external_ip: String,
+    pub pod_cidrs: Vec<String>,
+    /// The cloud's own ID for it — on AKS, the VMSS instance.
+    pub provider_id: String,
+    /// Every resource the node reports, as the API spells the quantity:
+    /// cpu, memory, pods, ephemeral-storage, and any extended ones (GPUs).
+    pub capacity: std::collections::BTreeMap<String, String>,
+    pub allocatable: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Clone, Debug)]

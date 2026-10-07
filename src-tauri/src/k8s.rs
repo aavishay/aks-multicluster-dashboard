@@ -487,6 +487,7 @@ pub async fn get_node_manifest(context_name: &str, node_name: &str) -> Result<No
     Ok(NodeManifest {
         yaml_full,
         yaml_without_managed_fields,
+        detail: crate::node_detail::node_detail(&node),
     })
 }
 

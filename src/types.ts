@@ -140,6 +140,27 @@ export interface PodReference {
 export interface NodeManifest {
   yaml_full: string;
   yaml_without_managed_fields: string;
+  /** What the panel's Overview shows, from the same fetch. */
+  detail: NodeDetail;
+}
+
+/** Mirrors `NodeDetail` in models.rs. */
+export interface NodeDetail {
+  conditions: PodConditionInfo[];
+  /** `key=value:Effect`, or `key:Effect`. */
+  taints: string[];
+  labels: string[];
+  kernel_version: string;
+  container_runtime: string;
+  architecture: string;
+  operating_system: string;
+  internal_ip: string;
+  external_ip: string;
+  pod_cidrs: string[];
+  provider_id: string;
+  /** cpu, memory, pods, ephemeral-storage and any extended resources, as quantities. */
+  capacity: Record<string, string>;
+  allocatable: Record<string, string>;
 }
 
 export interface WorkloadManifest {

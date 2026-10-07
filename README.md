@@ -275,7 +275,10 @@ Output lands under `src-tauri/target/release/bundle/` — a `.app` plus a
 Overview gives per-cluster health at a glance: Kubernetes version, nodes
 ready, namespace count, pod health, warning event count. Nodes lists every
 node with CPU/memory (capacity, allocatable, and — if `metrics-server` is
-running — live usage), zone, instance type, and cordon status. Workloads
+running — live usage), zone, instance type, and cordon status; a node's panel
+opens on an Overview — why it is not Ready, any memory, disk or PID pressure,
+whether it is cordoned, its taints, capacity against allocatable and use
+(GPUs included), and the pods on it, the failing ones first. Workloads
 covers Deployments/StatefulSets/DaemonSets with desired-vs-ready replica
 counts; a workload's panel opens on an Overview — why a rollout is stuck, the
 replica counts, strategy and revision, the HPA or KEDA object scaling it, its
