@@ -9,6 +9,7 @@ mod kubeconfig;
 mod metrics_backend;
 mod models;
 mod mutate;
+mod node_detail;
 mod pod_detail;
 mod redact;
 mod resources;

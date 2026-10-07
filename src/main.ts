@@ -467,7 +467,7 @@ interface PodDetailState extends MetricsViewState {
 interface NodeDetailState extends MetricsViewState {
   ctx: string;
   name: string;
-  view: "yaml" | "events" | "graph";
+  view: "overview" | "yaml" | "events" | "graph";
   manifest: NodeManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
@@ -2892,7 +2892,8 @@ function openNodeDetail(ctx: string, name: string) {
   state.nodeDetail = {
     ctx,
     name,
-    view: "yaml",
+    // Opens on why it is or is not healthy, rather than on raw YAML.
+    view: "overview",
     manifest: null,
     manifestError: null,
     showManagedFields: false,
@@ -9405,13 +9406,28 @@ function renderPodOverviewView(pd: PodDetailState): string {
   return `${banner}<div>${facts}</div>${inits}${containers}${renderConditionsSection(d.conditions)}${renderUsesSection(ctx, namespace, d.references)}`;
 }
 
+/** Why an Overview has no pod list yet: never loaded, or a first load still streaming in. */
+function podsNotLoadedNote(ctx: string): string {
+  const why = state.podsFirstLoadInFlight.has(ctx)
+    ? "This cluster's pods are still loading — the list appears once every page has arrived."
+    : "This cluster's pods have not been loaded yet — open the Pods tab once.";
+  return `<div class="text-xs text-ink-muted">${why}</div>`;
+}
+
 /** A titled block of an Overview, below its facts. */
 function overviewSection(title: string, body: string): string {
   return `<div class="mt-4 text-xs font-medium uppercase tracking-wide text-ink-muted">${esc(title)}</div><div class="mt-2 flex flex-col gap-2">${body}</div>`;
 }
 
-/** Conditions as the Pod and Workload Overviews show them: anything not True in red. */
-function renderConditionsSection(conditions: PodConditionInfo[]): string {
+/**
+ * Conditions as the Overviews show them, healthy in green and the rest in red.
+ * Healthy usually means True; `isHealthy` overrides that for a node, where
+ * MemoryPressure=True is the bad case.
+ */
+function renderConditionsSection(
+  conditions: PodConditionInfo[],
+  isHealthy: (c: PodConditionInfo) => boolean = (c) => c.status === "True",
+): string {
   if (conditions.length === 0) return "";
   return overviewSection(
     "Conditions",
@@ -9421,7 +9437,7 @@ function renderConditionsSection(conditions: PodConditionInfo[]): string {
           (c) => `
         <tr class="border-t border-gridline/60 first:border-t-0">
           <td class="py-1.5 pr-3">${esc(c.condition_type)}</td>
-          <td class="py-1.5 pr-3 ${c.status === "True" ? "text-status-good" : "text-status-critical"}">${esc(c.status)}</td>
+          <td class="py-1.5 pr-3 ${isHealthy(c) ? "text-status-good" : "text-status-critical"}">${esc(c.status)}</td>
           <td class="py-1.5 text-xs text-ink-secondary" title="${esc(timeTitle("Changed", c.last_transition))}">${esc([c.reason, c.message].filter(Boolean).join(": "))}</td>
         </tr>`,
         )
@@ -9658,18 +9674,164 @@ function renderNodeEventsView(nd: NodeDetailState): string {
   return renderEventsList(`node-events:${nd.ctx}:${nd.name}`, nd.events, nd.eventsError);
 }
 
+/**
+ * A node resource's quantity for a reader: memory and storage in GiB/MiB,
+ * everything else (cpu, pods, GPUs) as the API spells it.
+ */
+function nodeQuantity(resource: string, q: string | undefined): string {
+  if (!q) return "—";
+  if (resource === "memory" || resource === "ephemeral-storage" || resource.startsWith("hugepages-")) {
+    const bytes = quantityBytes(q);
+    return Number.isFinite(bytes) ? formatKi(bytes / 1024) : q;
+  }
+  return q;
+}
+
+/**
+ * The Node panel's Overview: whether it is Ready and if not why, what is
+ * pressuring it, what keeps pods off it, what it has against what it is using,
+ * and the pods on it. Usage and pods come from the Nodes and Pods tabs' loaded
+ * lists — nothing is fetched for this view.
+ */
+function renderNodeOverviewView(nd: NodeDetailState): string {
+  if (nd.manifestError) return `<div class="text-sm text-status-critical">${esc(nd.manifestError)}</div>`;
+  if (!nd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const d = nd.manifest.detail;
+  const { ctx, name } = nd;
+  // Only live usage comes from the Nodes tab's row; every other fact is the
+  // node's own, so a panel opened before that tab loads is still right.
+  const row = state.nodes.get(ctx)?.find((n) => n.name === name);
+
+  // The backend supplies an Unknown Ready when the node has reported none, so
+  // there is always one to read.
+  const ready = d.conditions.find((c) => c.condition_type === "Ready");
+  const readyText = !ready || ready.status === "Unknown" ? "Unknown" : ready.status === "True" ? "Ready" : "Not Ready";
+  // Ready is healthy when True; a pressure condition only when False — Unknown
+  // means the kubelet has not established that the pressure is absent.
+  const isHealthy = (c: PodConditionInfo) => (c.condition_type === "Ready" ? c.status === "True" : c.status === "False");
+  const pressured = d.conditions.filter((c) => c.condition_type !== "Ready" && c.status === "True");
+  const banners = [
+    ...(ready && ready.status !== "True"
+      ? [`<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${readyText === "Unknown" ? "Ready is Unknown" : "Not Ready"}${ready.reason ? ` · ${esc(ready.reason)}` : ""}${ready.message ? `: ${esc(ready.message)}` : ""}</div>`]
+      : []),
+    ...pressured.map(
+      (c) => `<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(c.condition_type)}${c.reason ? ` · ${esc(c.reason)}` : ""}${c.message ? `: ${esc(c.message)}` : ""}</div>`,
+    ),
+    ...(d.unschedulable
+      ? [`<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">Cordoned — no new pods will be scheduled here; the ones already on it keep running.</div>`]
+      : []),
+  ];
+  const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
+
+  // The NAP label alone is enough to link: the NAP panel fetches its own data,
+  // so this does not wait on the NAP tab having loaded.
+  const pool = d.nap_pool
+    ? `<button type="button" onclick="window.__app.openNapDetail(${jsArg(ctx)},${jsArg(d.nap_pool)})" class="text-series-blue hover:underline">${esc(d.nap_pool)}</button> <span class="text-xs text-ink-muted">NAP</span>`
+    : esc(d.agent_pool) || "—";
+
+  const facts = [
+    overviewRow("Status", `<span class="${readyText === "Ready" ? "text-status-good" : "text-status-critical"}">${readyText}</span>`),
+    overviewRow("Schedulable", d.unschedulable ? '<span class="text-status-warning">no — cordoned</span>' : "yes"),
+    overviewRow("Roles", esc(d.roles.join(", ")) || "—"),
+    overviewRow("Node pool", pool),
+    overviewRow("Instance type", esc(d.instance_type) || "—"),
+    overviewRow("Zone", esc(d.zone) || "—"),
+    overviewRow("Internal IP", `<span class="tabular">${esc(d.internal_ip) || "—"}</span>${d.external_ip ? ` <span class="text-xs text-ink-muted">external ${esc(d.external_ip)}</span>` : ""}`),
+    ...(d.pod_cidrs.length ? [overviewRow("Pod CIDR", overviewChips(d.pod_cidrs))] : []),
+    overviewRow("Kubelet", `<span class="font-mono text-xs">${esc(d.kubelet_version) || "—"}</span>`),
+    overviewRow("OS", esc([d.os_image, d.architecture].filter(Boolean).join(" · ")) || "—"),
+    overviewRow("Kernel", `<span class="font-mono text-xs">${esc(d.kernel_version) || "—"}</span>`),
+    overviewRow("Runtime", `<span class="font-mono text-xs">${esc(d.container_runtime) || "—"}</span>`),
+    ...(d.provider_id ? [overviewRow("Provider ID", `<span class="block break-all font-mono text-[11px] leading-snug">${esc(d.provider_id)}</span>`)] : []),
+    overviewRow("Created", d.created_at ? esc(exactTime(d.created_at).replace("\n", " · ")) : "—"),
+  ].join("");
+
+  // Capacity, what the kubelet leaves for pods (allocatable), and use — live
+  // usage from metrics-server for CPU and memory, the pod count for pods.
+  // Pods only once every page of the cluster's list has arrived: a first load
+  // streaming in holds a partial list, which would undercount and could leave
+  // out the very pod the failing-first ordering is there to keep.
+  const podsHere = state.podsLoadedComplete.has(ctx) ? state.pods.get(ctx)?.filter((p) => p.node === name) : undefined;
+  const used: Record<string, string> = {
+    cpu: row?.cpu_usage_millicores != null ? formatMillicores(row.cpu_usage_millicores) : "",
+    memory: row?.memory_usage_ki != null ? formatKi(row.memory_usage_ki) : "",
+    pods: podsHere ? String(podsHere.length) : "",
+  };
+  const standard = ["cpu", "memory", "pods", "ephemeral-storage"];
+  const extended = Object.keys(d.capacity).filter((k) => !standard.includes(k) && !k.startsWith("hugepages-") && d.capacity[k] !== "0");
+  const resources = overviewSection(
+    "Resources",
+    `<table class="w-full text-left text-sm">
+      <thead class="text-xs text-ink-muted"><tr><th class="py-1 pr-3 font-normal"></th><th class="py-1 pr-3 font-normal">Capacity</th><th class="py-1 pr-3 font-normal">Allocatable</th><th class="py-1 font-normal">In use</th></tr></thead>
+      <tbody>${[...standard, ...extended]
+        .map(
+          (r) => `
+        <tr class="border-t border-gridline/60">
+          <td class="py-1.5 pr-3 font-mono text-xs">${esc(r)}</td>
+          <td class="py-1.5 pr-3 tabular">${nodeQuantity(r, d.capacity[r])}</td>
+          <td class="py-1.5 pr-3 tabular">${nodeQuantity(r, d.allocatable[r])}</td>
+          <td class="py-1.5 tabular ${used[r] ? "" : "text-ink-muted"}">${esc(used[r] || "—")}</td>
+        </tr>`,
+        )
+        .join("")}</tbody>
+    </table>`,
+  );
+
+  const taints = overviewSection(
+    "Taints",
+    d.taints.length ? overviewChips(d.taints) : `<div class="text-xs text-ink-muted">No taints.</div>`,
+  );
+
+  const POD_CAP = 50;
+  const pods = !podsHere
+    ? overviewSection("Pods", podsNotLoadedNote(ctx))
+    : overviewSection(
+        `Pods (${podsHere.length})`,
+        podsHere.length === 0
+          ? `<div class="text-xs text-ink-muted">None.</div>`
+          : `<table class="w-full text-left text-sm">
+              <tbody>${[...podsHere]
+                // The ones in trouble first, so a node full of healthy pods
+                // does not push the crashing one past the cap.
+                .sort((a, b) => Number(podIsHealthy(a)) - Number(podIsHealthy(b)))
+                .slice(0, POD_CAP)
+                .map(
+                  (p) => `
+                <tr class="border-t border-gridline/60 first:border-t-0">
+                  <td class="w-5 py-1.5" title="${esc(p.failure_message || p.phase)}">${statusDot(podIsHealthy(p))}</td>
+                  <td class="py-1.5 pr-3"><span class="text-xs text-ink-muted">${esc(p.namespace)}/</span><button type="button" onclick="window.__app.openPodDetail(${jsArg(ctx)},${jsArg(p.namespace)},${jsArg(p.name)})" class="text-series-blue hover:underline">${esc(p.name)}</button></td>
+                  <td class="py-1.5 pr-3 tabular text-xs">${esc(p.ready)}</td>
+                  <td class="py-1.5 tabular text-xs ${p.restarts > 0 ? "text-status-warning" : "text-ink-muted"}">${p.restarts} restart${p.restarts === 1 ? "" : "s"}</td>
+                </tr>`,
+                )
+                .join("")}</tbody>
+            </table>${podsHere.length > POD_CAP ? `<div class="text-xs text-ink-muted">and ${podsHere.length - POD_CAP} more — filter the Pods tab by node to see them all.</div>` : ""}`,
+      );
+
+  const labels = overviewSection("Labels", overviewChips(d.labels));
+
+  return `${banner}<div>${facts}</div>${resources}${renderConditionsSection(d.conditions, isHealthy)}${taints}${pods}${labels}`;
+}
+
 function renderNodeDetailPanel(): string {
   const nd = state.nodeDetail;
   if (!nd) return "";
 
   const tabs: { id: NodeDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "yaml", label: "YAML" },
     { id: "events", label: "Events" },
     { id: "graph", label: "Graph" },
   ];
 
   const body =
-    nd.view === "yaml" ? renderNodeYamlView(nd) : nd.view === "events" ? renderNodeEventsView(nd) : renderNodeGraphView(nd);
+    nd.view === "overview"
+      ? renderNodeOverviewView(nd)
+      : nd.view === "yaml"
+        ? renderNodeYamlView(nd)
+        : nd.view === "events"
+          ? renderNodeEventsView(nd)
+          : renderNodeGraphView(nd);
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeNodeDetail()">
@@ -10108,11 +10270,12 @@ function renderWorkloadOverviewView(wd: WorkloadDetailState): string {
 
   // Its pods, from the Pods tab's list: the row's owner is already resolved
   // from ReplicaSet to Deployment, so this matches on the workload itself.
-  const podList = state.pods.get(ctx);
+  // Only a complete list: a first load streaming in holds a partial one.
+  const podList = state.podsLoadedComplete.has(ctx) ? state.pods.get(ctx) : undefined;
   const ownPods = (podList ?? []).filter((p) => p.namespace === namespace && p.owner_kind === kind && p.owner_name === name);
   const POD_CAP = 50;
   const pods = !podList
-    ? overviewSection("Pods", `<div class="text-xs text-ink-muted">This cluster's pods have not been loaded yet — open the Pods tab once.</div>`)
+    ? overviewSection("Pods", podsNotLoadedNote(ctx))
     : overviewSection(
         `Pods (${ownPods.length})`,
         ownPods.length === 0

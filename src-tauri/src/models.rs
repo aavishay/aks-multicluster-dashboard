@@ -179,6 +179,45 @@ pub struct PodReference {
 pub struct NodeManifest {
     pub yaml_full: String,
     pub yaml_without_managed_fields: String,
+    /// What the panel's Overview shows, read from the same fetch as the YAML.
+    pub detail: NodeDetail,
+}
+
+/// The facts a node's YAML buries: why it is not Ready, what is pressuring
+/// it, what keeps pods off it, and what it has to give. Mirrors `NodeDetail` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct NodeDetail {
+    /// The facts below come from the node itself, not the Nodes tab's row, so
+    /// the Overview is right even when opened before that tab has loaded.
+    pub unschedulable: bool,
+    pub roles: Vec<String>,
+    pub instance_type: String,
+    pub zone: String,
+    /// `karpenter.sh/nodepool`: a NAP pool. Empty for any other node.
+    pub nap_pool: String,
+    /// `agentpool`: the AKS node pool, for a node NAP did not provision.
+    pub agent_pool: String,
+    pub kubelet_version: String,
+    pub os_image: String,
+    pub created_at: Option<String>,
+    pub conditions: Vec<PodConditionInfo>,
+    /// `key=value:Effect`, or `key:Effect` without a value.
+    pub taints: Vec<String>,
+    /// `key=value`, sorted.
+    pub labels: Vec<String>,
+    pub kernel_version: String,
+    pub container_runtime: String,
+    pub architecture: String,
+    pub operating_system: String,
+    pub internal_ip: String,
+    pub external_ip: String,
+    pub pod_cidrs: Vec<String>,
+    /// The cloud's own ID for it — on AKS, the VMSS instance.
+    pub provider_id: String,
+    /// Every resource the node reports, as the API spells the quantity:
+    /// cpu, memory, pods, ephemeral-storage, and any extended ones (GPUs).
+    pub capacity: std::collections::BTreeMap<String, String>,
+    pub allocatable: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
