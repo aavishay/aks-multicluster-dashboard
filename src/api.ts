@@ -38,6 +38,7 @@ import type {
   NapNodePoolManifest,
   ObjectManifest,
   HpaManifest,
+  KedaManifest,
   NamespaceInfo,
   ServiceInfo,
   IngressInfo,
@@ -221,7 +222,7 @@ export const api = {
     invoke<MetricsOverTimeResult>("get_nap_node_pool_metrics_over_time", { contextName, name, rangeMinutes, overrideBackend }),
   getKedaScaledObjects: (contextName: string) => invoke<KedaResult>("get_keda_scaled_objects", { contextName }),
   getKedaManifest: (contextName: string, namespace: string, kind: string, name: string) =>
-    invoke<ObjectManifest>("get_keda_manifest", { contextName, namespace, kind, name }),
+    invoke<KedaManifest>("get_keda_manifest", { contextName, namespace, kind, name }),
   getKedaEvents: (contextName: string, namespace: string, kind: string, name: string) =>
     invoke<EventInfo[]>("get_keda_events", { contextName, namespace, kind, name }),
   getSecrets: (contextName: string) => invoke<SecretInfo[]>("get_secrets", { contextName }),

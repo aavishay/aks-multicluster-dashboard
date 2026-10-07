@@ -770,3 +770,45 @@ export interface HpaDetail {
   owner_kind: string;
   owner_name: string;
 }
+
+/** A KEDA object's YAML and what its panel's Overview shows. Mirrors `KedaManifest` in models.rs. */
+export interface KedaManifest {
+  yaml_full: string;
+  yaml_without_managed_fields: string;
+  detail: KedaDetail;
+}
+
+/** Mirrors `KedaTriggerInfo` in models.rs. */
+export interface KedaTriggerInfo {
+  trigger_type: string;
+  name: string;
+  /** `key=value`, sorted. */
+  metadata: string[];
+  /** `TriggerAuthentication/name` or `ClusterTriggerAuthentication/name`. */
+  auth_ref: string;
+  metric_type: string;
+  /** `Happy` or `Failure`; empty when KEDA has not reported on it. */
+  health: string;
+  failures: number | null;
+}
+
+/** Mirrors `KedaDetail` in models.rs. */
+export interface KedaDetail {
+  target_kind: string;
+  target_name: string;
+  /** Null for a ScaledJob, which has no minimum. */
+  min_replicas: number | null;
+  max_replicas: number;
+  idle_replicas: number | null;
+  polling_interval: number;
+  /** Null for a ScaledJob. */
+  cooldown_period: number | null;
+  fallback: string;
+  paused: boolean;
+  paused_replicas: string | null;
+  hpa_name: string;
+  last_active: string | null;
+  scaling_strategy: string;
+  triggers: KedaTriggerInfo[];
+  conditions: PodConditionInfo[];
+}

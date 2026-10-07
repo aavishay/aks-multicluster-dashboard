@@ -2504,12 +2504,14 @@ fn keda_plural(kind: &str) -> Result<&'static str, String> {
     }
 }
 
-pub async fn get_keda_manifest(context_name: &str, namespace: &str, kind: &str, name: &str) -> Result<ObjectManifest, String> {
+pub async fn get_keda_manifest(context_name: &str, namespace: &str, kind: &str, name: &str) -> Result<KedaManifest, String> {
     let client = client_for_context(context_name).await?;
     let ar = keda_resource(kind, keda_plural(kind)?);
     let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &ar);
     let obj = api.get(name).await.map_err(|e| format!("Failed to get {kind} '{name}': {e}"))?;
-    object_manifest(obj)
+    let detail = crate::keda_detail::keda_detail(&obj, kind);
+    let ObjectManifest { yaml_full, yaml_without_managed_fields } = object_manifest(obj)?;
+    Ok(KedaManifest { yaml_full, yaml_without_managed_fields, detail })
 }
 
 /// Same reasoning as `get_workload_events` (filter by involved object before
