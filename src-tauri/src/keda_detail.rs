@@ -64,14 +64,43 @@ fn triggers(spec: Option<&Value>, status: Option<&Value>) -> Vec<KedaTriggerInfo
         .unwrap_or_default()
 }
 
+/// KEDA's reading of a pause annotation: Go's `strconv.ParseBool` (`1`, `t`,
+/// `T`, `TRUE`, `true`, `True` and their false counterparts), with a value that
+/// does not parse counting as paused — KEDA errs towards not scaling.
+fn pause_flag(value: &str) -> bool {
+    match value {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => true,
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => false,
+        _ => true,
+    }
+}
+
+/// The fallback rule in words, including `fallback.behavior` (KEDA 2.15+):
+/// `static` (the default) holds the fallback count; the `currentReplicas`
+/// variants keep the current count, or the higher or lower of the two.
+fn fallback_text(fallback: Option<&Value>) -> String {
+    let (Some(n), Some(r)) = (i64_at(fallback, "failureThreshold"), i64_at(fallback, "replicas")) else {
+        return String::new();
+    };
+    let after = format!("After {n} failure{} in a row", if n == 1 { "" } else { "s" });
+    let plural = |r: i64| if r == 1 { "" } else { "s" };
+    match json_str(fallback, "behavior") {
+        "currentReplicas" => format!("{after}, keep the current replica count"),
+        "currentReplicasIfHigher" => format!("{after}, keep the current count if it is above {r}, else {r} replica{}", plural(r)),
+        "currentReplicasIfLower" => format!("{after}, keep the current count if it is below {r}, else {r} replica{}", plural(r)),
+        _ => format!("{after}, hold {r} replica{}", plural(r)),
+    }
+}
+
 pub(crate) fn keda_detail(obj: &DynamicObject, kind: &str) -> KedaDetail {
     let spec = obj.data.get("spec");
     let status = obj.data.get("status");
     let is_job = kind == "ScaledJob";
     let target = spec.and_then(|s| s.get("scaleTargetRef"));
     let annotations = obj.metadata.annotations.as_ref();
-    let paused_replicas = annotations.and_then(|a| a.get("autoscaling.keda.sh/paused-replicas")).cloned();
-    let paused = paused_replicas.is_some() || annotations.and_then(|a| a.get("autoscaling.keda.sh/paused")).is_some_and(|v| v == "true");
+    // paused-replicas is a ScaledObject annotation; a ScaledJob ignores it.
+    let paused_replicas = if is_job { None } else { annotations.and_then(|a| a.get("autoscaling.keda.sh/paused-replicas")).cloned() };
+    let paused = paused_replicas.is_some() || annotations.and_then(|a| a.get("autoscaling.keda.sh/paused")).is_some_and(|v| pause_flag(v));
     let fallback = spec.and_then(|s| s.get("fallback"));
 
     KedaDetail {
@@ -84,15 +113,13 @@ pub(crate) fn keda_detail(obj: &DynamicObject, kind: &str) -> KedaDetail {
             }
         },
         target_name: if is_job { String::new() } else { json_str(target, "name").to_string() },
-        min_replicas: if is_job { None } else { Some(i64_at(spec, "minReplicaCount").unwrap_or(0)) },
+        // Both kinds take a minimum, defaulting to 0, as the list mapper reads it.
+        min_replicas: i64_at(spec, "minReplicaCount").unwrap_or(0),
         max_replicas: i64_at(spec, "maxReplicaCount").unwrap_or(100),
         idle_replicas: i64_at(spec, "idleReplicaCount"),
         polling_interval: i64_at(spec, "pollingInterval").unwrap_or(30),
         cooldown_period: if is_job { None } else { Some(i64_at(spec, "cooldownPeriod").unwrap_or(300)) },
-        fallback: match (i64_at(fallback, "failureThreshold"), i64_at(fallback, "replicas")) {
-            (Some(n), Some(r)) => format!("After {n} failure{} in a row, hold {r} replica{}", if n == 1 { "" } else { "s" }, if r == 1 { "" } else { "s" }),
-            _ => String::new(),
-        },
+        fallback: fallback_text(fallback),
         paused,
         paused_replicas,
         hpa_name: json_str(status, "hpaName").to_string(),
@@ -159,7 +186,7 @@ mod tests {
                     },
                     "status": {
                         "hpaName": "keda-hpa-worker",
-                        "health": { "s0-azure-servicebus-orders": { "numberOfFailures": 4, "status": "Failure" } },
+                        "health": { "s0-azure-servicebus-orders": { "numberOfFailures": 4, "status": "Failing" } },
                         "conditions": [{ "type": "Ready", "status": "False", "reason": "ScaledObjectCheckFailed", "message": "failed to ensure HPA" }]
                     }
                 }),
@@ -167,28 +194,49 @@ mod tests {
             "ScaledObject",
         );
         assert_eq!((d.target_kind.as_str(), d.target_name.as_str()), ("Deployment", "worker"));
-        assert_eq!((d.min_replicas, d.max_replicas, d.polling_interval, d.cooldown_period), (Some(0), 20, 30, Some(300)));
+        assert_eq!((d.min_replicas, d.max_replicas, d.polling_interval, d.cooldown_period), (0, 20, 30, Some(300)));
         assert_eq!(d.fallback, "After 3 failures in a row, hold 2 replicas");
         assert_eq!(d.hpa_name, "keda-hpa-worker");
         let t = &d.triggers[0];
         assert_eq!(t.metadata, vec!["messageCount=5", "queueName=orders"]);
-        assert_eq!((t.auth_ref.as_str(), t.health.as_str(), t.failures), ("TriggerAuthentication/sb-auth", "Failure", Some(4)));
+        assert_eq!((t.auth_ref.as_str(), t.health.as_str(), t.failures), ("TriggerAuthentication/sb-auth", "Failing", Some(4)));
         // The second trigger's s1- metric is not in status.health: unreported, not healthy.
         assert_eq!((d.triggers[1].health.as_str(), d.triggers[1].failures), ("", None));
         assert_eq!(d.conditions[0].reason, "ScaledObjectCheckFailed");
     }
 
     #[test]
+    fn fallback_behavior_is_described() {
+        let f = |behavior: &str| fallback_text(Some(&json!({ "failureThreshold": 3, "replicas": 2, "behavior": behavior })));
+        assert_eq!(f("static"), "After 3 failures in a row, hold 2 replicas");
+        assert_eq!(f("currentReplicas"), "After 3 failures in a row, keep the current replica count");
+        assert_eq!(f("currentReplicasIfHigher"), "After 3 failures in a row, keep the current count if it is above 2, else 2 replicas");
+        assert_eq!(f("currentReplicasIfLower"), "After 3 failures in a row, keep the current count if it is below 2, else 2 replicas");
+        assert_eq!(fallback_text(Some(&json!({ "failureThreshold": 3, "replicas": 2 }))), "After 3 failures in a row, hold 2 replicas");
+        assert_eq!(fallback_text(None), "");
+    }
+
+    #[test]
     fn scaled_job_and_paused_annotations() {
-        let job = keda_detail(&obj(None, json!({ "spec": { "jobTargetRef": {}, "scalingStrategy": { "strategy": "accurate" }, "triggers": [] } })), "ScaledJob");
-        assert_eq!((job.target_kind.as_str(), job.min_replicas, job.cooldown_period), ("Job", None, None));
+        let job = keda_detail(
+            &obj(None, json!({ "spec": { "jobTargetRef": {}, "minReplicaCount": 3, "maxReplicaCount": 10, "scalingStrategy": { "strategy": "accurate" }, "triggers": [] } })),
+            "ScaledJob",
+        );
+        assert_eq!((job.target_kind.as_str(), job.min_replicas, job.max_replicas, job.cooldown_period), ("Job", 3, 10, None));
         assert_eq!(job.scaling_strategy, "accurate");
 
         let paused = keda_detail(&obj(Some(("autoscaling.keda.sh/paused-replicas", "0")), json!({ "spec": {} })), "ScaledObject");
         assert!(paused.paused);
         assert_eq!(paused.paused_replicas.as_deref(), Some("0"));
-        let plain = keda_detail(&obj(Some(("autoscaling.keda.sh/paused", "true")), json!({ "spec": {} })), "ScaledObject");
-        assert!(plain.paused && plain.paused_replicas.is_none());
+        // A ScaledJob ignores paused-replicas.
+        let job_with_replicas = keda_detail(&obj(Some(("autoscaling.keda.sh/paused-replicas", "0")), json!({ "spec": {} })), "ScaledJob");
+        assert!(!job_with_replicas.paused && job_with_replicas.paused_replicas.is_none());
+        // ParseBool's spellings, and an unparseable value errs towards paused.
+        for (v, want) in [("true", true), ("True", true), ("1", true), ("false", false), ("0", false), ("yes", true)] {
+            let d = keda_detail(&obj(Some(("autoscaling.keda.sh/paused", v)), json!({ "spec": {} })), "ScaledObject");
+            assert_eq!(d.paused, want, "paused={v}");
+            assert!(d.paused_replicas.is_none());
+        }
     }
 
     /// Fetches every ScaledObject and ScaledJob through the real command path.
@@ -203,7 +251,7 @@ mod tests {
             let m = crate::k8s::get_keda_manifest(&ctx, &o.namespace, &o.kind, &o.name).await.expect("manifest + detail");
             let d = m.detail;
             triggers += d.triggers.len();
-            unhealthy += d.triggers.iter().filter(|t| t.health == "Failure").count();
+            unhealthy += d.triggers.iter().filter(|t| t.health == "Failing").count();
             unreported += d.triggers.iter().filter(|t| t.health.is_empty()).count();
             with_hpa += usize::from(!d.hpa_name.is_empty());
             with_fallback += usize::from(!d.fallback.is_empty());

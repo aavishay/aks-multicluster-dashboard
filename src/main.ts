@@ -11049,7 +11049,8 @@ function renderExternalSecretDetailPanel(): string {
 
 /** A trigger's health as KEDA reports it, or that it has not. */
 function kedaTriggerHealth(t: KedaTriggerInfo): string {
-  if (t.health === "Failure")
+  // KEDA's own spelling: Happy or Failing.
+  if (t.health === "Failing")
     return `<span class="rounded bg-status-critical/15 px-1.5 py-0.5 text-xs text-status-critical">failing${t.failures ? ` · ${t.failures} in a row` : ""}</span>`;
   if (t.health === "Happy") return `<span class="rounded bg-status-good/15 px-1.5 py-0.5 text-xs text-status-good">healthy</span>`;
   if (t.health) return `<span class="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-ink-secondary">${esc(t.health)}</span>`;
@@ -11091,10 +11092,7 @@ function renderKedaOverviewView(kd: KedaDetailState): string {
       : workloadKinds.has(d.target_kind)
         ? `<button type="button" onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(d.target_kind)},${jsArg(namespace)},${jsArg(d.target_name)})" class="text-series-blue hover:underline">${esc(d.target_kind)}/${esc(d.target_name)}</button>`
         : `${esc(d.target_kind)}/${esc(d.target_name)}`;
-  const replicas =
-    d.min_replicas === null
-      ? `up to <span class="tabular">${d.max_replicas}</span> at once`
-      : `<span class="tabular">${d.min_replicas}–${d.max_replicas}</span>${d.idle_replicas !== null ? ` <span class="text-xs text-ink-muted">· ${d.idle_replicas} while idle</span>` : ""}`;
+  const replicas = `<span class="tabular">${d.min_replicas}–${d.max_replicas}</span>${d.target_kind === "Job" ? ' <span class="text-xs text-ink-muted">jobs at once</span>' : ""}${d.idle_replicas !== null ? ` <span class="text-xs text-ink-muted">· ${d.idle_replicas} while idle</span>` : ""}`;
 
   const facts = [
     overviewRow("Scales", target),
@@ -11105,8 +11103,12 @@ function renderKedaOverviewView(kd: KedaDetailState): string {
     overviewRow("Checks triggers", `every <span class="tabular">${d.polling_interval}s</span>`),
     ...(d.cooldown_period !== null ? [overviewRow("Cooldown", `<span class="tabular">${d.cooldown_period}s</span> <span class="text-xs text-ink-muted">after the last activity, before scaling to idle</span>`)] : []),
     ...(d.scaling_strategy ? [overviewRow("Scaling strategy", esc(d.scaling_strategy))] : []),
-    overviewRow("Fallback", esc(d.fallback) || '<span class="text-ink-muted">none — a failing trigger leaves replicas where they are</span>'),
-    overviewRow("Active", active ? (active.status === "True" ? "yes — a trigger is firing" : "no — idle") : "—"),
+    overviewRow("Fallback", esc(d.fallback) || '<span class="text-ink-muted">none configured</span>'),
+    // KEDA starts Active as Unknown; only False means idle.
+    overviewRow(
+      "Active",
+      active?.status === "True" ? "yes — a trigger is firing" : active?.status === "False" ? "no — idle" : '<span class="text-ink-muted">unknown — not determined yet</span>',
+    ),
     overviewRow("Last active", d.last_active ? `<span title="${esc(timeTitle("Active", d.last_active))}">${relativeTime(d.last_active)}</span>` : '<span class="text-ink-muted">never</span>'),
   ].join("");
 

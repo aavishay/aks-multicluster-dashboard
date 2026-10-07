@@ -1108,7 +1108,7 @@ pub struct KedaTriggerInfo {
     pub auth_ref: String,
     /// `AverageValue`, `Value` or `Utilization`, when set.
     pub metric_type: String,
-    /// From `status.health`: `Happy` or `Failure`, and how many failures in a
+    /// From `status.health`: `Happy` or `Failing`, and how many failures in a
     /// row. Empty when KEDA has not reported on this trigger.
     pub health: String,
     pub failures: Option<i64>,
@@ -1119,8 +1119,8 @@ pub struct KedaTriggerInfo {
 pub struct KedaDetail {
     pub target_kind: String,
     pub target_name: String,
-    /// With KEDA's defaults applied when unset: min 0, max 100.
-    pub min_replicas: Option<i64>,
+    /// With KEDA's defaults applied when unset: min 0, max 100. Both kinds.
+    pub min_replicas: i64,
     pub max_replicas: i64,
     /// Replicas while no trigger is active, when set — below `min_replicas`.
     pub idle_replicas: Option<i64>,
@@ -1129,9 +1129,10 @@ pub struct KedaDetail {
     /// Seconds after the last activity before scaling to idle/zero; default 300.
     /// ScaledObject only.
     pub cooldown_period: Option<i64>,
-    /// `After 3 failures, hold 2 replicas` — what KEDA does when a scaler fails.
+    /// What KEDA does when a scaler keeps failing, per `fallback.behavior`.
     pub fallback: String,
-    /// Set by the `autoscaling.keda.sh/paused` annotations.
+    /// Set by the `autoscaling.keda.sh/paused` annotation (parsed as KEDA
+    /// parses it), or by `paused-replicas` on a ScaledObject.
     pub paused: bool,
     pub paused_replicas: Option<String>,
     /// The HPA KEDA created to do the scaling (`status.hpaName`). ScaledObject only.

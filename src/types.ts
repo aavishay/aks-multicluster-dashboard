@@ -787,7 +787,7 @@ export interface KedaTriggerInfo {
   /** `TriggerAuthentication/name` or `ClusterTriggerAuthentication/name`. */
   auth_ref: string;
   metric_type: string;
-  /** `Happy` or `Failure`; empty when KEDA has not reported on it. */
+  /** `Happy` or `Failing`; empty when KEDA has not reported on it. */
   health: string;
   failures: number | null;
 }
@@ -796,8 +796,8 @@ export interface KedaTriggerInfo {
 export interface KedaDetail {
   target_kind: string;
   target_name: string;
-  /** Null for a ScaledJob, which has no minimum. */
-  min_replicas: number | null;
+  /** Both kinds; KEDA's default 0 applied when unset. */
+  min_replicas: number;
   max_replicas: number;
   idle_replicas: number | null;
   polling_interval: number;
