@@ -19,8 +19,12 @@ fn opt_str(v: Option<&Value>, key: &str) -> Option<String> {
     v.and_then(|v| v.get(key)).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
+/// A commit ID shortened the way Git shows it; anything else — a chart
+/// version such as `18.10.12`, a tag — kept whole, since cutting it would name
+/// a different release.
 fn short(rev: &str) -> String {
-    rev.get(..rev.len().min(7)).unwrap_or_default().to_string()
+    let commit = matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit());
+    if commit { rev[..7].to_string() } else { rev.to_string() }
 }
 
 fn array<'a>(v: Option<&'a Value>, key: &str) -> &'a [Value] {
@@ -98,11 +102,13 @@ pub(crate) fn gitops_detail(obj: &DynamicObject) -> GitOpsDetail {
         operation_retries: operation.and_then(|o| o.get("retryCount")).and_then(Value::as_i64),
         sync_failures: array(operation.and_then(|o| o.get("syncResult")), "resources")
             .iter()
+            // A hook's result has no status; its outcome is in `hookPhase`.
             .filter(|r| {
                 let s = json_str(Some(r), "status");
-                !s.is_empty() && s != "Synced" && s != "Pruned"
+                (!s.is_empty() && s != "Synced" && s != "Pruned") || matches!(json_str(Some(r), "hookPhase"), "Failed" | "Error")
             })
             .map(|r| GitOpsSyncFailure {
+                hook_type: json_str(Some(r), "hookType").to_string(),
                 kind: json_str(Some(r), "kind").to_string(),
                 namespace: json_str(Some(r), "namespace").to_string(),
                 name: json_str(Some(r), "name").to_string(),
@@ -137,11 +143,12 @@ pub(crate) fn gitops_detail(obj: &DynamicObject) -> GitOpsDetail {
             .iter()
             .rev()
             .take(HISTORY_SHOWN)
+            // One revision, or one per source for a multi-source app.
             .map(|h| GitOpsHistoryEntry {
-                revision: short(match json_str(Some(h), "revision") {
-                    "" => array(Some(h), "revisions").first().and_then(Value::as_str).unwrap_or_default(),
-                    r => r,
-                }),
+                revisions: match json_str(Some(h), "revision") {
+                    "" => array(Some(h), "revisions").iter().filter_map(Value::as_str).map(short).collect(),
+                    r => vec![short(r)],
+                },
                 deployed_at: opt_str(Some(h), "deployedAt"),
             })
             .collect(),
@@ -168,13 +175,15 @@ mod tests {
                 "syncPolicy": { "automated": { "prune": true, "selfHeal": true }, "syncOptions": ["CreateNamespace=true"], "retry": { "limit": 5 } }
             },
             "status": {
-                "sync": { "status": "OutOfSync", "revision": "abcdef1234567" },
+                "sync": { "status": "OutOfSync", "revision": "abcdef1234567890abcdef1234567890abcdef12" },
                 "health": { "status": "Degraded", "message": "Deployment has timed out progressing" },
                 "operationState": {
                     "phase": "Failed", "message": "one or more objects failed to apply", "startedAt": "2026-10-07T08:00:00Z", "finishedAt": "2026-10-07T08:01:00Z", "retryCount": 2,
                     "syncResult": { "resources": [
                         { "kind": "Deployment", "namespace": "prod-weu", "name": "api", "status": "SyncFailed", "message": "admission webhook denied the request" },
-                        { "kind": "Service", "namespace": "prod-weu", "name": "api", "status": "Synced" }
+                        { "kind": "Service", "namespace": "prod-weu", "name": "api", "status": "Synced" },
+                        { "kind": "Job", "namespace": "prod-weu", "name": "migrate", "hookType": "PreSync", "hookPhase": "Failed", "message": "Job has reached the specified backoff limit" },
+                        { "kind": "Job", "namespace": "prod-weu", "name": "smoke", "hookType": "PostSync", "hookPhase": "Succeeded" }
                     ] }
                 },
                 "resources": [
@@ -184,8 +193,8 @@ mod tests {
                 "conditions": [{ "type": "SyncError", "message": "Failed sync attempt", "lastTransitionTime": "2026-10-07T08:01:00Z" }],
                 "summary": { "images": ["acr.io/api:1.4.2"] },
                 "history": [
-                    { "revision": "1111111aaaa", "deployedAt": "2026-10-01T00:00:00Z" },
-                    { "revision": "2222222bbbb", "deployedAt": "2026-10-05T00:00:00Z" }
+                    { "revision": "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "deployedAt": "2026-10-01T00:00:00Z" },
+                    { "revision": "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "deployedAt": "2026-10-05T00:00:00Z" }
                 ]
             }
         })));
@@ -194,12 +203,13 @@ mod tests {
         assert_eq!(d.sources[0].revision, "abcdef1");
         assert!(d.automated && d.prune && d.self_heal);
         assert_eq!((d.retry_limit, d.operation_retries), (Some(5), Some(2)));
-        assert_eq!(d.sync_failures.len(), 1);
+        assert_eq!(d.sync_failures.len(), 2);
+        assert_eq!((d.sync_failures[1].hook_type.as_str(), d.sync_failures[1].name.as_str()), ("PreSync", "migrate"));
         assert_eq!(d.sync_failures[0].message, "admission webhook denied the request");
         assert_eq!(d.resources[0].health, "Degraded");
         assert!(!d.resource_health_in_tree);
         assert_eq!(d.conditions[0].condition_type, "SyncError");
-        assert_eq!(d.history.iter().map(|h| h.revision.as_str()).collect::<Vec<_>>(), vec!["2222222", "1111111"]);
+        assert_eq!(d.history.iter().map(|h| h.revisions.join(",")).collect::<Vec<_>>(), vec!["2222222", "1111111"]);
     }
 
     #[test]
@@ -207,20 +217,25 @@ mod tests {
         let d = gitops_detail(&app(json!({
             "spec": {
                 "sources": [
-                    { "repoURL": "https://charts", "chart": "redis", "targetRevision": "18.0.0" },
+                    { "repoURL": "https://charts", "chart": "redis", "targetRevision": "18.10.12" },
                     { "repoURL": "https://git/values", "path": "redis", "targetRevision": "HEAD" }
                 ],
                 "destination": { "name": "prod-eus", "namespace": "cache" }
             },
-            "status": { "sync": { "status": "Synced", "revisions": ["18.0.0", "9f8e7d6c5b4a"] }, "resourceHealthSource": "appTree" }
+            "status": {
+                "sync": { "status": "Synced", "revisions": ["18.10.12", "9f8e7d6ccccccccccccccccccccccccccccccccc"] },
+                "resourceHealthSource": "appTree",
+                "history": [{ "revisions": ["18.10.12", "9f8e7d6ccccccccccccccccccccccccccccccccc"], "deployedAt": "2026-10-05T00:00:00Z" }]
+            }
         })));
         assert!(!d.destination_in_cluster);
         assert!(!d.automated);
         assert_eq!(d.sources.len(), 2);
-        assert_eq!((d.sources[0].chart.as_str(), d.sources[0].revision.as_str()), ("redis", "18.0.0"));
+        assert_eq!((d.sources[0].chart.as_str(), d.sources[0].revision.as_str()), ("redis", "18.10.12"));
         assert_eq!(d.sources[1].revision, "9f8e7d6");
         assert_eq!(d.health_status, "Unknown");
         assert!(d.resource_health_in_tree);
+        assert_eq!(d.history[0].revisions, vec!["18.10.12", "9f8e7d6"]);
     }
 
     /// Fetches every Application's manifest through the real command path.

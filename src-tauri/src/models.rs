@@ -805,7 +805,7 @@ pub struct GitOpsSourceInfo {
     pub path: String,
     pub chart: String,
     pub target_revision: String,
-    /// The revision it is synced to, short — index-aligned with the sources.
+    /// The revision it is synced to (a commit ID shortened) — index-aligned with the sources.
     pub revision: String,
 }
 
@@ -825,9 +825,12 @@ pub struct GitOpsManagedResource {
     pub requires_pruning: bool,
 }
 
-/// A resource the last sync failed to apply, with Argo CD's reason.
+/// A resource the last sync failed to apply, or a hook that failed, with
+/// Argo CD's reason.
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 pub struct GitOpsSyncFailure {
+    /// `PreSync`, `Sync`, `PostSync`… for a hook; empty for a resource.
+    pub hook_type: String,
     pub kind: String,
     pub namespace: String,
     pub name: String,
@@ -837,7 +840,8 @@ pub struct GitOpsSyncFailure {
 /// One past deployment, newest first.
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 pub struct GitOpsHistoryEntry {
-    pub revision: String,
+    /// One per source, in the sources' order; commit IDs shortened.
+    pub revisions: Vec<String>,
     pub deployed_at: Option<String>,
 }
 

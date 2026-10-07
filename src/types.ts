@@ -371,7 +371,7 @@ export interface GitOpsSourceInfo {
   path: string;
   chart: string;
   target_revision: string;
-  /** The revision it is synced to, short. */
+  /** The revision it is synced to (a commit ID shortened). */
   revision: string;
 }
 
@@ -389,8 +389,10 @@ export interface GitOpsManagedResource {
   requires_pruning: boolean;
 }
 
-/** A resource the last sync failed to apply, with Argo CD's reason. */
+/** A resource the last sync failed to apply, or a hook that failed, with Argo CD's reason. */
 export interface GitOpsSyncFailure {
+  /** `PreSync`, `Sync`, `PostSync`… for a hook; empty for a resource. */
+  hook_type: string;
   kind: string;
   namespace: string;
   name: string;
@@ -398,7 +400,8 @@ export interface GitOpsSyncFailure {
 }
 
 export interface GitOpsHistoryEntry {
-  revision: string;
+  /** One per source, in the sources' order; commit IDs shortened. */
+  revisions: string[];
   deployed_at: string | null;
 }
 

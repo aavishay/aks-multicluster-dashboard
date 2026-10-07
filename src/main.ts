@@ -11468,7 +11468,10 @@ function renderGitOpsOverviewView(gd: GitOpsDetailState): string {
             `Last sync ${d.operation_phase === "Error" ? "errored" : "failed"}${d.operation_message ? ` · ${esc(d.operation_message)}` : ""}${
               d.sync_failures.length
                 ? `<ul class="mt-2 flex flex-col gap-1 text-xs">${d.sync_failures
-                    .map((f) => `<li><span class="font-mono">${esc(f.kind)}/${f.namespace ? `${esc(f.namespace)}/` : ""}${esc(f.name)}</span>${f.message ? ` — ${esc(f.message)}` : ""}</li>`)
+                    .map(
+                      (f) =>
+                        `<li>${f.hook_type ? `${esc(f.hook_type)} hook ` : ""}<span class="font-mono">${esc(f.kind)}/${f.namespace ? `${esc(f.namespace)}/` : ""}${esc(f.name)}</span>${f.message ? ` — ${esc(f.message)}` : ""}</li>`,
+                    )
                     .join("")}</ul>`
                 : ""
             }`,
@@ -11567,7 +11570,7 @@ function renderGitOpsOverviewView(gd: GitOpsDetailState): string {
           .map(
             (h) => `
         <tr class="border-t border-gridline/60 first:border-t-0">
-          <td class="py-1.5 pr-3 font-mono text-xs">${esc(h.revision) || "—"}</td>
+          <td class="py-1.5 pr-3 font-mono text-xs">${esc(h.revisions.filter(Boolean).join(" · ")) || "—"}</td>
           <td class="py-1.5 text-right text-xs text-ink-muted" title="${esc(timeTitle("Deployed", h.deployed_at))}">${h.deployed_at ? relativeTime(h.deployed_at) : "—"}</td>
         </tr>`,
           )
