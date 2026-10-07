@@ -146,6 +146,18 @@ export interface NodeManifest {
 
 /** Mirrors `NodeDetail` in models.rs. */
 export interface NodeDetail {
+  /** From the node itself, so right even before the Nodes tab has loaded. */
+  unschedulable: boolean;
+  roles: string[];
+  instance_type: string;
+  zone: string;
+  /** `karpenter.sh/nodepool` — a NAP pool; empty otherwise. */
+  nap_pool: string;
+  /** `agentpool` — the AKS node pool. */
+  agent_pool: string;
+  kubelet_version: string;
+  os_image: string;
+  created_at: string | null;
   conditions: PodConditionInfo[];
   /** `key=value:Effect`, or `key:Effect`. */
   taints: string[];

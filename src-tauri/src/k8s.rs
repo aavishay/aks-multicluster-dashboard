@@ -399,6 +399,34 @@ fn node_is_ready(n: &Node) -> bool {
         .unwrap_or(false)
 }
 
+/// What a node's labels say it is. One reading shared by the Nodes table and
+/// the Node panel's Overview, so the two cannot describe a node differently.
+pub(crate) struct NodeIdentity {
+    pub roles: Vec<String>,
+    pub zone: Option<String>,
+    pub instance_type: Option<String>,
+    /// `karpenter.sh/nodepool`: set only on a node NAP provisioned.
+    pub node_pool: Option<String>,
+}
+
+pub(crate) fn node_identity(n: &Node) -> NodeIdentity {
+    let labels = n.labels();
+    let roles: Vec<String> = labels
+        .keys()
+        .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/"))
+        .map(|s| s.to_string())
+        .collect();
+    NodeIdentity {
+        roles: if roles.is_empty() { vec!["worker".to_string()] } else { roles },
+        zone: labels
+            .get("topology.kubernetes.io/zone")
+            .or_else(|| labels.get("failure-domain.beta.kubernetes.io/zone"))
+            .cloned(),
+        instance_type: labels.get("node.kubernetes.io/instance-type").cloned(),
+        node_pool: labels.get("karpenter.sh/nodepool").cloned(),
+    }
+}
+
 pub async fn get_nodes(context_name: &str) -> Result<Vec<NodeInfo>, String> {
     let client = client_for_context(context_name).await?;
     let nodes_api: Api<Node> = Api::all(client.clone());
@@ -418,19 +446,7 @@ pub async fn get_nodes(context_name: &str) -> Result<Vec<NodeInfo>, String> {
             let alloc = status.allocatable.clone().unwrap_or_default();
             let cap = status.capacity.clone().unwrap_or_default();
             let node_info = status.node_info.clone();
-            let labels = n.labels();
-            let roles: Vec<String> = labels
-                .keys()
-                .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/"))
-                .map(|s| s.to_string())
-                .collect();
-            let roles = if roles.is_empty() { vec!["worker".to_string()] } else { roles };
-            let zone = labels
-                .get("topology.kubernetes.io/zone")
-                .or_else(|| labels.get("failure-domain.beta.kubernetes.io/zone"))
-                .cloned();
-            let instance_type = labels.get("node.kubernetes.io/instance-type").cloned();
-            let node_pool = labels.get("karpenter.sh/nodepool").cloned();
+            let NodeIdentity { roles, zone, instance_type, node_pool } = node_identity(&n);
             let conditions: Vec<String> = status
                 .conditions
                 .clone()

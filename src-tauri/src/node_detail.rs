@@ -22,8 +22,8 @@ pub(crate) fn node_detail(node: &Node) -> NodeDetail {
             .map(|a| a.address.clone())
             .unwrap_or_default()
     };
-    NodeDetail {
-        conditions: status
+    let identity = crate::k8s::node_identity(node);
+    let mut conditions: Vec<PodConditionInfo> = status
             .and_then(|s| s.conditions.as_ref())
             .map(|cs| {
                 cs.iter()
@@ -36,7 +36,30 @@ pub(crate) fn node_detail(node: &Node) -> NodeDetail {
                     })
                     .collect()
             })
-            .unwrap_or_default(),
+            .unwrap_or_default();
+    // A node that has not published a Ready condition yet — one just joining —
+    // is Unknown, which the Nodes table already treats as not ready. Said
+    // outright here rather than left as a missing row.
+    if !conditions.iter().any(|c| c.condition_type == "Ready") {
+        conditions.push(PodConditionInfo {
+            condition_type: "Ready".into(),
+            status: "Unknown".into(),
+            reason: "NotReported".into(),
+            message: "The node has not reported a Ready condition yet.".into(),
+            last_transition: None,
+        });
+    }
+    NodeDetail {
+        unschedulable: spec.and_then(|s| s.unschedulable).unwrap_or(false),
+        roles: identity.roles,
+        instance_type: identity.instance_type.unwrap_or_default(),
+        zone: identity.zone.unwrap_or_default(),
+        nap_pool: identity.node_pool.unwrap_or_default(),
+        agent_pool: node.metadata.labels.as_ref().and_then(|l| l.get("agentpool")).cloned().unwrap_or_default(),
+        kubelet_version: info.map(|i| i.kubelet_version.clone()).unwrap_or_default(),
+        os_image: info.map(|i| i.os_image.clone()).unwrap_or_default(),
+        created_at: created_at(&node.metadata.creation_timestamp),
+        conditions,
         taints: spec
             .and_then(|s| s.taints.as_ref())
             .map(|ts| {
@@ -106,6 +129,9 @@ mod tests {
             }),
         };
         let d = node_detail(&node);
+        assert!(d.unschedulable);
+        assert_eq!((d.agent_pool.as_str(), d.nap_pool.as_str()), ("general", ""));
+        assert_eq!(d.roles, vec!["worker"]);
         assert_eq!(d.taints, vec!["node.kubernetes.io/unschedulable:NoSchedule", "sku=gpu:NoSchedule"]);
         assert_eq!(d.conditions[0].reason, "KubeletHasInsufficientMemory");
         assert_eq!(d.pod_cidrs, vec!["10.244.3.0/24"]);
@@ -114,6 +140,13 @@ mod tests {
         assert_eq!(d.allocatable.get("cpu").map(String::as_str), Some("3860m"));
         assert_eq!(d.container_runtime, "containerd://1.7.15");
         assert_eq!(d.labels, vec!["agentpool=general"]);
+    }
+
+    #[test]
+    fn a_node_with_no_ready_condition_reads_as_unknown() {
+        let d = node_detail(&Node { status: Some(NodeStatus::default()), ..Default::default() });
+        let ready = d.conditions.iter().find(|c| c.condition_type == "Ready").expect("synthesised");
+        assert_eq!((ready.status.as_str(), ready.reason.as_str()), ("Unknown", "NotReported"));
     }
 
     /// Maps every node of a real cluster. Prints counts only — no names.

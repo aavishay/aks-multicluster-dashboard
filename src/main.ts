@@ -9406,6 +9406,14 @@ function renderPodOverviewView(pd: PodDetailState): string {
   return `${banner}<div>${facts}</div>${inits}${containers}${renderConditionsSection(d.conditions)}${renderUsesSection(ctx, namespace, d.references)}`;
 }
 
+/** Why an Overview has no pod list yet: never loaded, or a first load still streaming in. */
+function podsNotLoadedNote(ctx: string): string {
+  const why = state.podsFirstLoadInFlight.has(ctx)
+    ? "This cluster's pods are still loading — the list appears once every page has arrived."
+    : "This cluster's pods have not been loaded yet — open the Pods tab once.";
+  return `<div class="text-xs text-ink-muted">${why}</div>`;
+}
+
 /** A titled block of an Overview, below its facts. */
 function overviewSection(title: string, body: string): string {
   return `<div class="mt-4 text-xs font-medium uppercase tracking-wide text-ink-muted">${esc(title)}</div><div class="mt-2 flex flex-col gap-2">${body}</div>`;
@@ -9690,51 +9698,60 @@ function renderNodeOverviewView(nd: NodeDetailState): string {
   if (!nd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
   const d = nd.manifest.detail;
   const { ctx, name } = nd;
+  // Only live usage comes from the Nodes tab's row; every other fact is the
+  // node's own, so a panel opened before that tab loads is still right.
   const row = state.nodes.get(ctx)?.find((n) => n.name === name);
 
+  // The backend supplies an Unknown Ready when the node has reported none, so
+  // there is always one to read.
   const ready = d.conditions.find((c) => c.condition_type === "Ready");
-  const isHealthy = (c: PodConditionInfo) => (c.condition_type === "Ready" ? c.status === "True" : c.status !== "True");
+  const readyText = !ready || ready.status === "Unknown" ? "Unknown" : ready.status === "True" ? "Ready" : "Not Ready";
+  // Ready is healthy when True; a pressure condition only when False — Unknown
+  // means the kubelet has not established that the pressure is absent.
+  const isHealthy = (c: PodConditionInfo) => (c.condition_type === "Ready" ? c.status === "True" : c.status === "False");
   const pressured = d.conditions.filter((c) => c.condition_type !== "Ready" && c.status === "True");
   const banners = [
     ...(ready && ready.status !== "True"
-      ? [`<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">Not Ready${ready.reason ? ` · ${esc(ready.reason)}` : ""}${ready.message ? `: ${esc(ready.message)}` : ""}</div>`]
+      ? [`<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${readyText === "Unknown" ? "Ready is Unknown" : "Not Ready"}${ready.reason ? ` · ${esc(ready.reason)}` : ""}${ready.message ? `: ${esc(ready.message)}` : ""}</div>`]
       : []),
     ...pressured.map(
       (c) => `<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(c.condition_type)}${c.reason ? ` · ${esc(c.reason)}` : ""}${c.message ? `: ${esc(c.message)}` : ""}</div>`,
     ),
-    ...(row?.unschedulable
+    ...(d.unschedulable
       ? [`<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">Cordoned — no new pods will be scheduled here; the ones already on it keep running.</div>`]
       : []),
   ];
   const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
 
-  const napPools = state.nap.get(ctx)?.node_pools ?? [];
-  const pool = row?.node_pool
-    ? napPools.some((p) => p.name === row.node_pool)
-      ? `<button type="button" onclick="window.__app.openNapDetail(${jsArg(ctx)},${jsArg(row.node_pool)})" class="text-series-blue hover:underline">${esc(row.node_pool)}</button> <span class="text-xs text-ink-muted">NAP</span>`
-      : esc(row.node_pool)
-    : esc(d.labels.find((l) => l.startsWith("agentpool="))?.slice("agentpool=".length) ?? "") || "—";
+  // The NAP label alone is enough to link: the NAP panel fetches its own data,
+  // so this does not wait on the NAP tab having loaded.
+  const pool = d.nap_pool
+    ? `<button type="button" onclick="window.__app.openNapDetail(${jsArg(ctx)},${jsArg(d.nap_pool)})" class="text-series-blue hover:underline">${esc(d.nap_pool)}</button> <span class="text-xs text-ink-muted">NAP</span>`
+    : esc(d.agent_pool) || "—";
 
   const facts = [
-    overviewRow("Status", ready ? `<span class="${ready.status === "True" ? "text-status-good" : "text-status-critical"}">${ready.status === "True" ? "Ready" : "Not Ready"}</span>` : "—"),
-    overviewRow("Schedulable", row?.unschedulable ? '<span class="text-status-warning">no — cordoned</span>' : "yes"),
-    overviewRow("Roles", esc(row?.roles.join(", ") || "") || "—"),
+    overviewRow("Status", `<span class="${readyText === "Ready" ? "text-status-good" : "text-status-critical"}">${readyText}</span>`),
+    overviewRow("Schedulable", d.unschedulable ? '<span class="text-status-warning">no — cordoned</span>' : "yes"),
+    overviewRow("Roles", esc(d.roles.join(", ")) || "—"),
     overviewRow("Node pool", pool),
-    overviewRow("Instance type", esc(row?.instance_type ?? "") || "—"),
-    overviewRow("Zone", esc(row?.zone ?? "") || "—"),
+    overviewRow("Instance type", esc(d.instance_type) || "—"),
+    overviewRow("Zone", esc(d.zone) || "—"),
     overviewRow("Internal IP", `<span class="tabular">${esc(d.internal_ip) || "—"}</span>${d.external_ip ? ` <span class="text-xs text-ink-muted">external ${esc(d.external_ip)}</span>` : ""}`),
     ...(d.pod_cidrs.length ? [overviewRow("Pod CIDR", overviewChips(d.pod_cidrs))] : []),
-    overviewRow("Kubelet", `<span class="font-mono text-xs">${esc(row?.kubelet_version ?? "") || "—"}</span>`),
-    overviewRow("OS", esc([row?.os_image, d.architecture].filter(Boolean).join(" · ")) || "—"),
+    overviewRow("Kubelet", `<span class="font-mono text-xs">${esc(d.kubelet_version) || "—"}</span>`),
+    overviewRow("OS", esc([d.os_image, d.architecture].filter(Boolean).join(" · ")) || "—"),
     overviewRow("Kernel", `<span class="font-mono text-xs">${esc(d.kernel_version) || "—"}</span>`),
     overviewRow("Runtime", `<span class="font-mono text-xs">${esc(d.container_runtime) || "—"}</span>`),
     ...(d.provider_id ? [overviewRow("Provider ID", `<span class="block break-all font-mono text-[11px] leading-snug">${esc(d.provider_id)}</span>`)] : []),
-    overviewRow("Created", row?.created_at ? esc(exactTime(row.created_at).replace("\n", " · ")) : "—"),
+    overviewRow("Created", d.created_at ? esc(exactTime(d.created_at).replace("\n", " · ")) : "—"),
   ].join("");
 
   // Capacity, what the kubelet leaves for pods (allocatable), and use — live
   // usage from metrics-server for CPU and memory, the pod count for pods.
-  const podsHere = state.pods.get(ctx)?.filter((p) => p.node === name);
+  // Pods only once every page of the cluster's list has arrived: a first load
+  // streaming in holds a partial list, which would undercount and could leave
+  // out the very pod the failing-first ordering is there to keep.
+  const podsHere = state.podsLoadedComplete.has(ctx) ? state.pods.get(ctx)?.filter((p) => p.node === name) : undefined;
   const used: Record<string, string> = {
     cpu: row?.cpu_usage_millicores != null ? formatMillicores(row.cpu_usage_millicores) : "",
     memory: row?.memory_usage_ki != null ? formatKi(row.memory_usage_ki) : "",
@@ -9762,12 +9779,12 @@ function renderNodeOverviewView(nd: NodeDetailState): string {
 
   const taints = overviewSection(
     "Taints",
-    d.taints.length ? overviewChips(d.taints) : `<div class="text-xs text-ink-muted">None — any pod may be scheduled here.</div>`,
+    d.taints.length ? overviewChips(d.taints) : `<div class="text-xs text-ink-muted">No taints.</div>`,
   );
 
   const POD_CAP = 50;
   const pods = !podsHere
-    ? overviewSection("Pods", `<div class="text-xs text-ink-muted">This cluster's pods have not been loaded yet — open the Pods tab once.</div>`)
+    ? overviewSection("Pods", podsNotLoadedNote(ctx))
     : overviewSection(
         `Pods (${podsHere.length})`,
         podsHere.length === 0
@@ -10253,11 +10270,12 @@ function renderWorkloadOverviewView(wd: WorkloadDetailState): string {
 
   // Its pods, from the Pods tab's list: the row's owner is already resolved
   // from ReplicaSet to Deployment, so this matches on the workload itself.
-  const podList = state.pods.get(ctx);
+  // Only a complete list: a first load streaming in holds a partial one.
+  const podList = state.podsLoadedComplete.has(ctx) ? state.pods.get(ctx) : undefined;
   const ownPods = (podList ?? []).filter((p) => p.namespace === namespace && p.owner_kind === kind && p.owner_name === name);
   const POD_CAP = 50;
   const pods = !podList
-    ? overviewSection("Pods", `<div class="text-xs text-ink-muted">This cluster's pods have not been loaded yet — open the Pods tab once.</div>`)
+    ? overviewSection("Pods", podsNotLoadedNote(ctx))
     : overviewSection(
         `Pods (${ownPods.length})`,
         ownPods.length === 0

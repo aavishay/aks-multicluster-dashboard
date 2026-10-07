@@ -187,6 +187,19 @@ pub struct NodeManifest {
 /// it, what keeps pods off it, and what it has to give. Mirrors `NodeDetail` in types.ts.
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 pub struct NodeDetail {
+    /// The facts below come from the node itself, not the Nodes tab's row, so
+    /// the Overview is right even when opened before that tab has loaded.
+    pub unschedulable: bool,
+    pub roles: Vec<String>,
+    pub instance_type: String,
+    pub zone: String,
+    /// `karpenter.sh/nodepool`: a NAP pool. Empty for any other node.
+    pub nap_pool: String,
+    /// `agentpool`: the AKS node pool, for a node NAP did not provision.
+    pub agent_pool: String,
+    pub kubelet_version: String,
+    pub os_image: String,
+    pub created_at: Option<String>,
     pub conditions: Vec<PodConditionInfo>,
     /// `key=value:Effect`, or `key:Effect` without a value.
     pub taints: Vec<String>,
