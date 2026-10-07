@@ -28,6 +28,9 @@ import type {
   EventInfo,
   GitOpsAppInfo,
   GitOpsAppManifest,
+  GitOpsDetail,
+  GitOpsManagedResource,
+  GitOpsSourceInfo,
   GitOpsResourceDiff,
   GitOpsResult,
   ExternalSecretDetail,
@@ -524,7 +527,7 @@ interface GitOpsDetailState {
   ctx: string;
   namespace: string;
   name: string;
-  view: "yaml" | "events" | "diff";
+  view: "overview" | "yaml" | "events" | "diff";
   manifest: GitOpsAppManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
@@ -3123,7 +3126,7 @@ function moveHelmSearch(_view: string, delta: number) {
 }
 
 // ---------------------------------------------------------------------------
-// GitOps app detail panel (YAML / Events)
+// GitOps app detail panel (Overview / YAML / Diff / Events)
 // ---------------------------------------------------------------------------
 
 function openGitOpsDetail(ctx: string, namespace: string, name: string) {
@@ -3142,7 +3145,7 @@ function openGitOpsDetail(ctx: string, namespace: string, name: string) {
     ctx,
     namespace,
     name,
-    view: "yaml",
+    view: "overview",
     manifest: null,
     manifestError: null,
     showManagedFields: false,
@@ -10453,7 +10456,7 @@ function renderWorkloadDetailPanel(): string {
 }
 
 // ---------------------------------------------------------------------------
-// GitOps app detail panel (YAML / Events)
+// GitOps app detail panel (Overview / YAML / Diff / Events)
 // ---------------------------------------------------------------------------
 
 function renderGitOpsYamlView(gd: GitOpsDetailState): string {
@@ -11387,22 +11390,228 @@ function renderGitOpsDiffView(gd: GitOpsDetailState): string {
     <div data-scroll-id="${esc(scrollId)}" class="min-h-0 flex-1 select-text overflow-auto rounded-md border border-gridline bg-surface-2 py-2 ${MONO_TEXT_CLASSES}">${renderDiffRows(ops)}</div>`);
 }
 
+/** Argo CD's health spelling, coloured: Degraded and Missing are failures; anything short of Healthy is in between. */
+function gitOpsHealthTone(health: string): string {
+  return health === "Healthy" ? "text-status-good" : health === "Degraded" || health === "Missing" ? "text-status-critical" : "text-status-warning";
+}
+
+/**
+ * The group each linkable kind lives in, so a CRD that happens to share a
+ * kind name is not opened in a panel built for something else.
+ */
+const GITOPS_LINKABLE: Record<string, string> = {
+  Deployment: "apps",
+  StatefulSet: "apps",
+  DaemonSet: "apps",
+  Pod: "",
+  Service: "",
+  ConfigMap: "",
+  Secret: "",
+  PersistentVolumeClaim: "",
+  PersistentVolume: "",
+  Namespace: "",
+  Ingress: "networking.k8s.io",
+  HorizontalPodAutoscaler: "autoscaling",
+  ScaledObject: "keda.sh",
+  ScaledJob: "keda.sh",
+  ExternalSecret: "external-secrets.io",
+};
+
+/** A managed resource's name, linked to its own panel when this cluster has it and the app has one. */
+function gitOpsResourceLink(ctx: string, d: GitOpsDetail, r: GitOpsManagedResource): string {
+  const label = `${r.namespace ? `<span class="text-ink-muted">${esc(r.namespace)}/</span>` : ""}${esc(r.name)}`;
+  if (!d.destination_in_cluster || GITOPS_LINKABLE[r.kind] !== r.group) return `<span>${label}</span>`;
+  const [ns, n] = [jsArg(r.namespace), jsArg(r.name)];
+  const call =
+    r.kind === "Deployment" || r.kind === "StatefulSet" || r.kind === "DaemonSet"
+      ? `openWorkloadDetail(${jsArg(ctx)},${jsArg(r.kind)},${ns},${n})`
+      : r.kind === "Pod"
+        ? `openPodDetail(${jsArg(ctx)},${ns},${n})`
+        : r.kind === "Secret"
+          ? `openSecretDetail(${jsArg(ctx)},${ns},${n},${jsArg(state.secrets.get(ctx)?.find((s) => s.namespace === r.namespace && s.name === r.name)?.secret_type ?? "")})`
+          : r.kind === "HorizontalPodAutoscaler"
+            ? `openHpaDetail(${jsArg(ctx)},${ns},${n})`
+            : r.kind === "ScaledObject" || r.kind === "ScaledJob"
+              ? `openKedaDetail(${jsArg(ctx)},${ns},${jsArg(r.kind)},${n})`
+              : r.kind === "ExternalSecret"
+                ? `openExternalSecretDetail(${jsArg(ctx)},${ns},${n})`
+                : `openResourceDetail(${jsArg(ctx)},${jsArg(r.kind)},${ns},${n})`;
+  return `<button type="button" onclick="window.__app.${call}" class="text-left text-series-blue hover:underline">${label}</button>`;
+}
+
+/**
+ * The GitOps panel's Overview: whether the Application is synced and healthy
+ * and if not why, what it deploys from where to where, how it syncs, what the
+ * last sync did, and which of its resources need attention. All from the one
+ * fetched Application.
+ */
+function renderGitOpsOverviewView(gd: GitOpsDetailState): string {
+  if (gd.manifestError) return `<div class="text-sm text-status-critical">${esc(gd.manifestError)}</div>`;
+  if (!gd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const d = gd.manifest.detail;
+  const { ctx } = gd;
+  const red = (html: string) => `<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${html}</div>`;
+  const amber = (html: string) => `<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">${html}</div>`;
+  const outOfSync = d.resources.filter((r) => r.status === "OutOfSync");
+  const opFailed = d.operation_phase === "Failed" || d.operation_phase === "Error";
+
+  const banners = [
+    ...(d.health_status !== "Healthy" && d.health_status !== "Unknown"
+      ? [(d.health_status === "Degraded" || d.health_status === "Missing" ? red : amber)(`${esc(d.health_status)}${d.health_message ? ` · ${esc(d.health_message)}` : ""}`)]
+      : []),
+    ...(d.sync_status === "OutOfSync"
+      ? [amber(`Out of sync — ${outOfSync.length ? `${outOfSync.length} resource${outOfSync.length === 1 ? "" : "s"} differ${outOfSync.length === 1 ? "s" : ""} from Git; the Diff tab shows how` : "the live state differs from Git"}${d.automated ? "" : ". Auto-sync is off, so it stays that way until someone syncs"}.`)]
+      : []),
+    ...(opFailed
+      ? [
+          red(
+            `Last sync ${d.operation_phase === "Error" ? "errored" : "failed"}${d.operation_message ? ` · ${esc(d.operation_message)}` : ""}${
+              d.sync_failures.length
+                ? `<ul class="mt-2 flex flex-col gap-1 text-xs">${d.sync_failures
+                    .map((f) => `<li><span class="font-mono">${esc(f.kind)}/${f.namespace ? `${esc(f.namespace)}/` : ""}${esc(f.name)}</span>${f.message ? ` — ${esc(f.message)}` : ""}</li>`)
+                    .join("")}</ul>`
+                : ""
+            }`,
+          ),
+        ]
+      : []),
+    // Argo CD's conditions carry their severity in the type's suffix.
+    ...d.conditions.filter((c) => c.condition_type.endsWith("Error")).map((c) => red(`${esc(c.condition_type)} · ${esc(c.message)}`)),
+    ...d.conditions.filter((c) => c.condition_type.endsWith("Warning")).map((c) => amber(`${esc(c.condition_type)} · ${esc(c.message)}`)),
+  ];
+  const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
+
+  const revisions = d.sources.map((s) => s.revision).filter(Boolean);
+  const source = (s: GitOpsSourceInfo) =>
+    `<div class="min-w-0"><div class="truncate" title="${esc(s.repo_url)}">${esc(s.repo_url)}</div><div class="text-xs text-ink-secondary">${
+      s.chart ? `chart <span class="font-mono">${esc(s.chart)}</span>` : s.path ? `<span class="font-mono">${esc(s.path)}</span>` : '<span class="text-ink-muted">repository root</span>'
+    } @ <span class="font-mono">${esc(s.target_revision || "HEAD")}</span>${s.revision ? ` <span class="text-ink-muted">→ ${esc(s.revision)}</span>` : ""}</div></div>`;
+  const cluster = d.destination_in_cluster
+    ? `this cluster <span class="text-xs text-ink-muted">(${esc(ctx)})</span>`
+    : esc(d.destination_name || d.destination_server || "—");
+  const lastSync = d.operation_phase
+    ? `<span class="${d.operation_phase === "Succeeded" ? "" : opFailed ? "text-status-critical" : "text-status-warning"}">${esc(d.operation_phase)}</span>${
+        d.operation_finished
+          ? ` <span class="text-ink-muted" title="${esc(timeTitle("Finished", d.operation_finished))}">· ${relativeTime(d.operation_finished)}</span>`
+          : d.operation_started
+            ? ` <span class="text-ink-muted" title="${esc(timeTitle("Started", d.operation_started))}">· started ${relativeTime(d.operation_started)}</span>`
+            : ""
+      }${d.operation_retries ? ` <span class="text-xs text-ink-muted">· ${d.operation_retries} retr${d.operation_retries === 1 ? "y" : "ies"}</span>` : ""}`
+    : '<span class="text-ink-muted">none recorded</span>';
+
+  const facts = [
+    overviewRow(
+      "Sync",
+      `<span class="${d.sync_status === "Synced" ? "text-status-good" : "text-status-warning"}">${esc(d.sync_status)}</span>${revisions.length ? ` <span class="font-mono text-xs text-ink-muted">${esc(revisions.join(" · "))}</span>` : ""}`,
+    ),
+    overviewRow("Health", `<span class="${gitOpsHealthTone(d.health_status)}">${esc(d.health_status)}</span>`),
+    overviewRow("Project", esc(d.project) || "—"),
+    overviewRow(d.sources.length > 1 ? `Sources (${d.sources.length})` : "Source", d.sources.length ? `<div class="flex flex-col gap-1.5">${d.sources.map(source).join("")}</div>` : "—"),
+    overviewRow("Destination", `${cluster} · namespace <span class="font-mono">${esc(d.destination_namespace) || "—"}</span>`),
+    overviewRow(
+      "Sync policy",
+      d.automated
+        ? `automated${d.prune ? " · prunes" : ""}${d.self_heal ? " · self-heals" : ""}${!d.prune && !d.self_heal ? ' <span class="text-xs text-ink-muted">· no prune, no self-heal</span>' : ""}`
+        : '<span class="text-ink-secondary">manual — syncs only when someone asks</span>',
+    ),
+    ...(d.sync_options.length ? [overviewRow("Sync options", overviewChips(d.sync_options))] : []),
+    ...(d.retry_limit !== null ? [overviewRow("Retries", `up to <span class="tabular">${d.retry_limit}</span> on failure`)] : []),
+    overviewRow("Last sync", lastSync),
+  ].join("");
+
+  // A resource's health is known only when Argo CD writes it onto the Application.
+  const attention = d.resources.filter((r) => r.status === "OutOfSync" || r.requires_pruning || (r.health && r.health !== "Healthy"));
+  const kindCounts = [...d.resources.reduce((m, r) => m.set(r.kind, (m.get(r.kind) ?? 0) + 1), new Map<string, number>())]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([k, n]) => `${n} ${k}`);
+  const attentionRows = attention
+    .map(
+      (r) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3 text-xs text-ink-muted">${esc(r.kind)}</td>
+          <td class="py-1.5 pr-3">${gitOpsResourceLink(ctx, d, r)}</td>
+          <td class="py-1.5 pr-3 text-xs ${r.status === "Synced" ? "text-ink-secondary" : "text-status-warning"}">${esc(r.status)}${r.requires_pruning ? " · to prune" : ""}</td>
+          <td class="py-1.5 text-xs ${r.health ? gitOpsHealthTone(r.health) : "text-ink-muted"}" title="${esc(r.health_message)}">${esc(r.health) || "—"}</td>
+        </tr>`,
+    )
+    .join("");
+  // With health in Argo CD's app tree, an unhealthy app can't say which
+  // resource is why; its workloads are the usual suspects.
+  const suspects =
+    d.resource_health_in_tree && d.health_status !== "Healthy"
+      ? d.resources.filter((r) => r.group === "apps" && (r.kind === "Deployment" || r.kind === "StatefulSet" || r.kind === "DaemonSet"))
+      : [];
+  // An app's health is its worst resource's, so a Healthy app needs no note.
+  const inTreeNote =
+    d.resource_health_in_tree && d.health_status !== "Healthy"
+      ? `<div class="text-xs text-ink-muted">Argo CD keeps each resource's health in its app tree rather than on the Application, so which one is ${esc(d.health_status)} can't be shown here${
+          suspects.length ? `. Its workloads, where that usually comes from: ${suspects.map((r) => gitOpsResourceLink(ctx, d, r)).join(", ")}` : ""
+        }.</div>`
+      : "";
+  const resources = overviewSection(
+    `Resources (${d.resources.length})`,
+    d.resources.length === 0
+      ? `<div class="text-xs text-ink-muted">Argo CD lists no resources for this app.</div>`
+      : `${kindCounts.length ? overviewChips(kindCounts) : ""}${
+          attention.length
+            ? `<table class="w-full text-left text-sm"><tbody>${attentionRows}</tbody></table>`
+            : `<div class="text-xs text-ink-secondary">All synced${d.health_status === "Healthy" ? " and healthy" : ""}.</div>`
+        }${inTreeNote}`,
+  );
+
+  const images = d.images.length ? overviewSection(`Images (${d.images.length})`, overviewChips(d.images)) : "";
+  const history = d.history.length
+    ? overviewSection(
+        "Recent deployments",
+        `<table class="w-full text-left text-sm"><tbody>${d.history
+          .map(
+            (h) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3 font-mono text-xs">${esc(h.revision) || "—"}</td>
+          <td class="py-1.5 text-right text-xs text-ink-muted" title="${esc(timeTitle("Deployed", h.deployed_at))}">${h.deployed_at ? relativeTime(h.deployed_at) : "—"}</td>
+        </tr>`,
+          )
+          .join("")}</tbody></table>`,
+      )
+    : "";
+  // Argo CD conditions have no status — each exists only while it holds.
+  const conditions = d.conditions.length
+    ? overviewSection(
+        "Conditions",
+        `<table class="w-full text-left text-sm"><tbody>${d.conditions
+          .map(
+            (c) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3 ${c.condition_type.endsWith("Error") ? "text-status-critical" : c.condition_type.endsWith("Warning") ? "text-status-warning" : ""}">${esc(c.condition_type)}</td>
+          <td class="py-1.5 text-xs text-ink-secondary" title="${esc(timeTitle("Since", c.last_transition))}">${esc(c.message)}</td>
+        </tr>`,
+          )
+          .join("")}</tbody></table>`,
+      )
+    : "";
+
+  return `${banner}<div>${facts}</div>${resources}${images}${history}${conditions}`;
+}
+
 function renderGitOpsDetailPanel(): string {
   const gd = state.gitOpsDetail;
   if (!gd) return "";
 
   const tabs: { id: GitOpsDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "yaml", label: "YAML" },
     { id: "diff", label: "Diff" },
     { id: "events", label: "Events" },
   ];
 
   const body =
-    gd.view === "yaml"
-      ? renderGitOpsYamlView(gd)
-      : gd.view === "diff"
-        ? renderGitOpsDiffView(gd)
-        : renderEventsList(`gitops-events:${gd.ctx}:${gd.namespace}:${gd.name}`, gd.events, gd.eventsError);
+    gd.view === "overview"
+      ? renderGitOpsOverviewView(gd)
+      : gd.view === "yaml"
+        ? renderGitOpsYamlView(gd)
+        : gd.view === "diff"
+          ? renderGitOpsDiffView(gd)
+          : renderEventsList(`gitops-events:${gd.ctx}:${gd.namespace}:${gd.name}`, gd.events, gd.eventsError);
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeGitOpsDetail()">
@@ -13059,7 +13268,7 @@ function renderGitOps(): string {
               <td>
                 <button
                   type="button"
-                  title="View Application details (YAML, Events)"
+                  title="View Application details (Overview, YAML, Diff, Events)"
                   data-row-open onclick="window.__app.openGitOpsDetail(${jsArg(ctx)},${jsArg(a.namespace)},${jsArg(a.name)})"
                   class="text-ink-primary hover:text-series-blue hover:underline"
                 >${esc(a.name)}</button>

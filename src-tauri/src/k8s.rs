@@ -2546,7 +2546,9 @@ pub async fn get_gitops_manifest(context_name: &str, namespace: &str, name: &str
     let ar = argocd_application_resource();
     let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &ar);
     let obj = api.get(name).await.map_err(|e| format!("Failed to get Application '{name}': {e}"))?;
-    object_manifest(obj)
+    let detail = crate::gitops_detail::gitops_detail(&obj);
+    let ObjectManifest { yaml_full, yaml_without_managed_fields } = object_manifest(obj)?;
+    Ok(GitOpsAppManifest { yaml_full, yaml_without_managed_fields, detail })
 }
 
 /// Same reasoning as `get_workload_events` (filter before the cap).

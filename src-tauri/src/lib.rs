@@ -3,6 +3,7 @@ mod claude;
 mod commands;
 mod exec;
 mod external_secrets;
+mod gitops_detail;
 mod helm;
 mod hpa_detail;
 mod k8s;
