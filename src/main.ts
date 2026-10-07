@@ -11675,16 +11675,30 @@ function pvIsHealthy(v: PvInfo): boolean {
 }
 
 /**
- * A Kubernetes quantity in bytes, for sorting capacities: "10Gi" must sort
- * below "1Ti", which as text it does not. Unparseable sorts first.
+ * A Kubernetes quantity as a plain number, for sorting capacities: "10Gi" must
+ * sort below "1Ti", which as text it does not. Covers the whole quantity
+ * grammar — binary suffixes (Ki…Ei), decimal SI suffixes (n, u, m, k, M…E;
+ * case matters, `m` is milli), and exponents (`1e9`, `5E-3`) — so no valid
+ * capacity falls through. Anything else is NaN, sorted after every real value.
  */
 function quantityBytes(q: string): number {
-  const m = /^([0-9.]+)\s*([KMGTPE]i?|k)?$/.exec(q.trim());
-  if (!m) return -1;
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+))(?:(Ki|Mi|Gi|Ti|Pi|Ei)|([numkMGTPE])|[eE]([+-]?\d+))?$/.exec(q.trim());
+  if (!m) return Number.NaN;
   const n = Number(m[1]);
-  const unit = m[2] ?? "";
-  const pow = { "": 0, k: 1, K: 1, M: 2, G: 3, T: 4, P: 5, E: 6 }[unit.replace("i", "")] ?? 0;
-  return n * (unit.endsWith("i") ? 1024 : 1000) ** pow;
+  if (m[2]) return n * 1024 ** ["Ki", "Mi", "Gi", "Ti", "Pi", "Ei"].indexOf(m[2]) * 1024;
+  if (m[3]) return n * 10 ** { n: -9, u: -6, m: -3, k: 3, M: 6, G: 9, T: 12, P: 15, E: 18 }[m[3] as "n"];
+  if (m[4]) return n * 10 ** Number(m[4]);
+  return n;
+}
+
+/**
+ * The Capacity columns' sort key. An empty or unparseable capacity sorts after
+ * every real one in ascending order, rather than ahead of them as -1 did, and
+ * NaN never reaches the comparator, where it would leave the order undefined.
+ */
+function capacitySortKey(q: string): number {
+  const bytes = quantityBytes(q);
+  return Number.isFinite(bytes) ? bytes : Number.MAX_VALUE;
 }
 
 /** The Cluster cell shared by the five tables: a link that filters to that cluster. */
@@ -11928,7 +11942,7 @@ function renderPvcs(): string {
     { key: "name", label: "Name", value: (r) => r.c.name, filter: "string" },
     { key: "status", label: "Status", value: (r) => r.c.status, filter: "enum" },
     { key: "volume", label: "Volume", value: (r) => r.c.volume, filter: "string" },
-    { key: "capacity", label: "Capacity", value: (r) => size(r.c), filter: "string", sortValue: (r) => quantityBytes(size(r.c)) },
+    { key: "capacity", label: "Capacity", value: (r) => size(r.c), filter: "string", sortValue: (r) => capacitySortKey(size(r.c)) },
     { key: "access", label: "Access", value: (r) => r.c.access_modes.join(","), filter: "enum" },
     { key: "storageClass", label: "Storage class", value: (r) => r.c.storage_class, filter: "enum" },
     resourceAgeColumn((r) => r.c),
@@ -11975,7 +11989,7 @@ function renderPvs(): string {
     { key: "name", label: "Name", value: (r) => r.v.name, filter: "string" },
     { key: "status", label: "Status", value: (r) => r.v.status, filter: "enum" },
     { key: "claim", label: "Claim", value: (r) => claim(r.v), filter: "string" },
-    { key: "capacity", label: "Capacity", value: (r) => r.v.capacity, filter: "string", sortValue: (r) => quantityBytes(r.v.capacity) },
+    { key: "capacity", label: "Capacity", value: (r) => r.v.capacity, filter: "string", sortValue: (r) => capacitySortKey(r.v.capacity) },
     { key: "access", label: "Access", value: (r) => r.v.access_modes.join(","), filter: "enum" },
     { key: "reclaim", label: "Reclaim", value: (r) => r.v.reclaim_policy, filter: "enum" },
     { key: "storageClass", label: "Storage class", value: (r) => r.v.storage_class, filter: "enum" },

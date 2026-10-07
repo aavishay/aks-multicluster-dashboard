@@ -269,31 +269,48 @@ pub(crate) fn pvc_info(pvc: PersistentVolumeClaim) -> PvcInfo {
     }
 }
 
+/// What backs a volume: the CSI driver when there is one — on AKS nearly
+/// always — or the in-tree volume type for one provisioned before the CSI
+/// migration, named as the API spells the field. FlexVolume names its driver,
+/// which says more than "flexVolume". Every source this k8s-openapi version
+/// knows is listed, so a known type never shows as blank.
+fn pv_source(s: &k8s_openapi::api::core::v1::PersistentVolumeSpec) -> String {
+    if let Some(csi) = &s.csi {
+        return csi.driver.clone();
+    }
+    if let Some(flex) = &s.flex_volume {
+        return format!("flexVolume ({})", flex.driver);
+    }
+    let in_tree = [
+        (s.aws_elastic_block_store.is_some(), "awsElasticBlockStore"),
+        (s.azure_disk.is_some(), "azureDisk"),
+        (s.azure_file.is_some(), "azureFile"),
+        (s.cephfs.is_some(), "cephfs"),
+        (s.cinder.is_some(), "cinder"),
+        (s.fc.is_some(), "fc"),
+        (s.flocker.is_some(), "flocker"),
+        (s.gce_persistent_disk.is_some(), "gcePersistentDisk"),
+        (s.glusterfs.is_some(), "glusterfs"),
+        (s.host_path.is_some(), "hostPath"),
+        (s.iscsi.is_some(), "iscsi"),
+        (s.local.is_some(), "local"),
+        (s.nfs.is_some(), "nfs"),
+        (s.photon_persistent_disk.is_some(), "photonPersistentDisk"),
+        (s.portworx_volume.is_some(), "portworxVolume"),
+        (s.quobyte.is_some(), "quobyte"),
+        (s.rbd.is_some(), "rbd"),
+        (s.scale_io.is_some(), "scaleIO"),
+        (s.storageos.is_some(), "storageos"),
+        (s.vsphere_volume.is_some(), "vsphereVolume"),
+    ];
+    in_tree.iter().find(|(set, _)| *set).map(|(_, name)| name.to_string()).unwrap_or_default()
+}
+
 pub(crate) fn pv_info(pv: PersistentVolume) -> PvInfo {
     let spec = pv.spec.as_ref();
     let status = pv.status.as_ref();
     let claim = spec.and_then(|s| s.claim_ref.as_ref());
-    // The CSI driver when there is one, which on AKS is nearly always; the
-    // in-tree type for volumes provisioned before the CSI migration.
-    let source = spec
-        .map(|s| {
-            if let Some(csi) = &s.csi {
-                csi.driver.clone()
-            } else if s.azure_disk.is_some() {
-                "azureDisk".to_string()
-            } else if s.azure_file.is_some() {
-                "azureFile".to_string()
-            } else if s.nfs.is_some() {
-                "nfs".to_string()
-            } else if s.host_path.is_some() {
-                "hostPath".to_string()
-            } else if s.local.is_some() {
-                "local".to_string()
-            } else {
-                String::new()
-            }
-        })
-        .unwrap_or_default();
+    let source = spec.map(pv_source).unwrap_or_default();
     PvInfo {
         name: pv.metadata.name.clone().unwrap_or_default(),
         capacity: spec
@@ -724,6 +741,27 @@ mod tests {
         assert_eq!(info.total_bytes, 2 + 4 + 300);
         assert!(info.immutable);
         assert!(info.keys.iter().all(|k| k.name != "a.json" || k.bytes == 2));
+    }
+
+    #[test]
+    fn pv_source_names_in_tree_types_and_flex_drivers() {
+        use k8s_openapi::api::core::v1::{FlexPersistentVolumeSource, GCEPersistentDiskVolumeSource, ISCSIPersistentVolumeSource};
+        let gce = PersistentVolumeSpec {
+            gce_persistent_disk: Some(GCEPersistentDiskVolumeSource { pd_name: "disk-1".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(pv_source(&gce), "gcePersistentDisk");
+        let iscsi = PersistentVolumeSpec {
+            iscsi: Some(ISCSIPersistentVolumeSource { iqn: "iqn".into(), target_portal: "10.0.0.1:3260".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(pv_source(&iscsi), "iscsi");
+        let flex = PersistentVolumeSpec {
+            flex_volume: Some(FlexPersistentVolumeSource { driver: "example/lvm".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(pv_source(&flex), "flexVolume (example/lvm)");
+        assert_eq!(pv_source(&PersistentVolumeSpec::default()), "");
     }
 
     #[test]

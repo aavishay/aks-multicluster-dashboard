@@ -119,8 +119,18 @@ pub(crate) fn references(spec: &PodSpec) -> Vec<PodReference> {
             }
         }
     }
-    for c in spec.init_containers.iter().flatten().chain(spec.containers.iter()) {
-        for from in c.env_from.iter().flatten() {
+    // Ephemeral containers too: one added by `kubectl debug` reads its own
+    // env, and "every" reference should not miss it. Their type differs from
+    // Container's, so the two env fields are gathered into one shape first.
+    let envs = spec
+        .init_containers
+        .iter()
+        .flatten()
+        .chain(spec.containers.iter())
+        .map(|c| (c.env_from.as_ref(), c.env.as_ref()))
+        .chain(spec.ephemeral_containers.iter().flatten().map(|c| (c.env_from.as_ref(), c.env.as_ref())));
+    for (env_from, env) in envs {
+        for from in env_from.into_iter().flatten() {
             if let Some(r) = &from.config_map_ref {
                 note(&mut refs, "ConfigMap", &r.name, "envFrom");
             }
@@ -128,7 +138,7 @@ pub(crate) fn references(spec: &PodSpec) -> Vec<PodReference> {
                 note(&mut refs, "Secret", &r.name, "envFrom");
             }
         }
-        for e in c.env.iter().flatten() {
+        for e in env.into_iter().flatten() {
             let Some(src) = &e.value_from else { continue };
             if let Some(r) = &src.config_map_key_ref {
                 note(&mut refs, "ConfigMap", &r.name, "env");
@@ -361,6 +371,25 @@ mod tests {
                 ("Secret", "acr", "imagePull".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn an_ephemeral_containers_env_counts_as_a_reference() {
+        use k8s_openapi::api::core::v1::{EphemeralContainer, SecretEnvSource};
+        let pod = Pod {
+            spec: Some(PodSpec {
+                containers: vec![Container { name: "app".into(), ..Default::default() }],
+                ephemeral_containers: Some(vec![EphemeralContainer {
+                    name: "debugger".into(),
+                    env_from: Some(vec![EnvFromSource { secret_ref: Some(SecretEnvSource { name: "debug-creds".into(), ..Default::default() }), ..Default::default() }]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let refs = pod_detail(&pod).references;
+        assert_eq!(refs, vec![PodReference { kind: "Secret".into(), name: "debug-creds".into(), via: vec!["envFrom".into()] }]);
     }
 
     /// Maps every pod of a real cluster. Prints counts only — no names.
