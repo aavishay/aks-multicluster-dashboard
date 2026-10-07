@@ -9,9 +9,12 @@ mod kubeconfig;
 mod metrics_backend;
 mod models;
 mod mutate;
+mod pod_detail;
 mod redact;
+mod resources;
 mod retry;
 mod secrets;
+mod workload_detail;
 
 /// A macOS app launched via Finder/Dock/Launchpad is spawned by launchd with
 /// a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) rather than the user's
@@ -151,6 +154,15 @@ pub fn run() {
             commands::get_keda_scaled_objects,
             commands::get_keda_manifest,
             commands::get_keda_events,
+            commands::get_namespaces,
+            commands::get_services,
+            commands::get_ingresses,
+            commands::get_pvcs,
+            commands::get_pvs,
+            commands::get_configmaps,
+            commands::get_configmap_data,
+            commands::get_resource_manifest,
+            commands::get_resource_events,
             commands::get_nap_node_pool_manifest,
             commands::get_nap_node_pool_events,
             commands::get_nap_node_pool_metrics_over_time,

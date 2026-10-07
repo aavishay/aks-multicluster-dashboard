@@ -97,6 +97,82 @@ pub struct PodManifest {
     pub containers: Vec<String>,
     pub yaml_full: String,
     pub yaml_without_managed_fields: String,
+    /// What the panel's Overview shows, read from the same fetch as the YAML.
+    pub detail: PodDetail,
+}
+
+/// The facts a pod's YAML buries: where it runs, what each container is
+/// doing and why it last stopped, and what it mounts. Mirrors `PodDetail` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct PodDetail {
+    pub phase: String,
+    /// `status.reason` / `status.message`: set for a pod-level failure such as Evicted.
+    pub reason: String,
+    pub message: String,
+    pub node: String,
+    pub pod_ip: String,
+    pub host_ip: String,
+    pub qos_class: String,
+    pub service_account: String,
+    pub priority_class: String,
+    pub restart_policy: String,
+    pub start_time: Option<String>,
+    /// The controller that owns it as the API records it — usually a
+    /// ReplicaSet; the row's `owner_*` already resolves that to its Deployment.
+    pub controller_kind: String,
+    pub controller_name: String,
+    pub init_containers: Vec<ContainerDetail>,
+    pub containers: Vec<ContainerDetail>,
+    pub conditions: Vec<PodConditionInfo>,
+    /// Every ConfigMap, Secret and PersistentVolumeClaim it reads, deduplicated,
+    /// with how — so the panel can link to each.
+    pub references: Vec<PodReference>,
+}
+
+/// One container (or init container) of a pod: its spec and its status merged.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct ContainerDetail {
+    pub name: String,
+    pub image: String,
+    pub ready: bool,
+    pub restart_count: i32,
+    /// `running`, `waiting`, `terminated`, or empty before the kubelet reports.
+    pub state: String,
+    /// Waiting: `CrashLoopBackOff`, `ImagePullBackOff`… Terminated: `Completed`, `OOMKilled`, `Error`.
+    pub state_reason: String,
+    pub state_message: String,
+    /// When it started running, or when it finished.
+    pub state_since: Option<String>,
+    pub exit_code: Option<i32>,
+    /// Why the previous run ended — the line that explains a restart loop.
+    pub last_reason: String,
+    pub last_exit_code: Option<i32>,
+    pub last_finished: Option<String>,
+    pub last_message: String,
+    pub cpu_request: String,
+    pub cpu_limit: String,
+    pub memory_request: String,
+    pub memory_limit: String,
+    /// `8080/TCP`, or `http 8080/TCP` when named.
+    pub ports: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct PodConditionInfo {
+    pub condition_type: String,
+    pub status: String,
+    pub reason: String,
+    pub message: String,
+    pub last_transition: Option<String>,
+}
+
+/// An object a pod reads. `kind` is `ConfigMap`, `Secret` or `PersistentVolumeClaim`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct PodReference {
+    pub kind: String,
+    pub name: String,
+    /// How it is used, deduplicated: `volume`, `env`, `envFrom`, `imagePull`.
+    pub via: Vec<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -112,6 +188,43 @@ pub struct WorkloadManifest {
     /// From the workload's own pod template — same for every pod it owns,
     /// so there's no need to ask any particular pod instance for this.
     pub containers: Vec<String>,
+    /// What the panel's Overview shows, read from the same fetch as the YAML.
+    pub detail: WorkloadDetail,
+}
+
+/// The facts a workload's YAML buries: how it rolls out, what it selects,
+/// whether the controller has caught up, and what its pods are built from.
+/// Mirrors `WorkloadDetail` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct WorkloadDetail {
+    /// `RollingUpdate (max surge 25%, max unavailable 25%)`, `Recreate`, `OnDelete`…
+    pub strategy: String,
+    /// `key=value` for matchLabels, `key In (a, b)` for each expression.
+    pub selector: Vec<String>,
+    /// The pod template's labels, `key=value` — what a Service selects on.
+    pub template_labels: Vec<String>,
+    /// Deployment: the `deployment.kubernetes.io/revision` annotation.
+    /// StatefulSet: `currentRevision`, and `updateRevision` when a rollout is underway.
+    pub revision: String,
+    pub update_revision: String,
+    pub generation: i64,
+    pub observed_generation: i64,
+    /// Deployment `spec.paused`: rollouts are held until it is resumed.
+    pub paused: bool,
+    /// StatefulSet: the headless Service that gives its pods stable names.
+    pub service_name: String,
+    pub pod_management_policy: String,
+    /// StatefulSet volumeClaimTemplates: one PVC per pod is created from each.
+    pub volume_claim_templates: Vec<String>,
+    /// DaemonSet / pod template `nodeSelector`, `key=value`.
+    pub node_selector: Vec<String>,
+    /// DaemonSet: pods running where they should not.
+    pub misscheduled: i32,
+    pub conditions: Vec<PodConditionInfo>,
+    /// The pod template's containers, spec only — there is no status for a template.
+    pub init_containers: Vec<ContainerDetail>,
+    pub containers: Vec<ContainerDetail>,
+    pub references: Vec<PodReference>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -730,4 +843,159 @@ pub struct HelmReleaseDetail {
     pub default_values_yaml: String,
     pub manifest: String,
     pub notes: String,
+}
+
+/// A Namespace. Mirrors `NamespaceInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct NamespaceInfo {
+    pub name: String,
+    /// `Active`, or `Terminating` while its contents are being deleted — a
+    /// namespace stuck there is the usual reason to come looking.
+    pub status: String,
+    /// `key=value`, sorted, for display and filtering.
+    pub labels: Vec<String>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// A Service. Mirrors `ServiceInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ServiceInfo {
+    pub namespace: String,
+    pub name: String,
+    /// `ClusterIP`, `NodePort`, `LoadBalancer` or `ExternalName`.
+    pub service_type: String,
+    /// `None` for a headless Service, as kubectl prints it.
+    pub cluster_ip: String,
+    /// What reaches it from outside: a LoadBalancer's assigned IPs or
+    /// hostnames, `spec.externalIPs`, or an ExternalName's target. Empty when
+    /// there is none — including a LoadBalancer still waiting for one.
+    pub external: Vec<String>,
+    /// kubectl's `PORT(S)` shape: `80/TCP`, or `80:30080/TCP` with a node port.
+    pub ports: Vec<String>,
+    /// `key=value`, sorted. Empty for a selector-less Service.
+    pub selector: Vec<String>,
+    /// A LoadBalancer with no address yet: provisioning, or stuck.
+    pub pending_load_balancer: bool,
+    /// Ready endpoints behind it, from its EndpointSlices. `None` when there is
+    /// nothing to count against — no selector, or an ExternalName — or when
+    /// EndpointSlices could not be listed.
+    pub endpoints_ready: Option<i64>,
+    pub endpoints_total: Option<i64>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// One `host` + `path` → backend line of an Ingress.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct IngressRuleInfo {
+    /// `*` for a rule with no host.
+    pub host: String,
+    pub path: String,
+    /// `service:port`, or `Kind/name` for a resource backend.
+    pub backend: String,
+}
+
+/// An Ingress (networking.k8s.io/v1). Mirrors `IngressInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct IngressInfo {
+    pub namespace: String,
+    pub name: String,
+    /// `spec.ingressClassName`, falling back to the older
+    /// `kubernetes.io/ingress.class` annotation. Empty: the cluster default.
+    pub class: String,
+    /// Every host its rules name, deduplicated; `*` for a host-less rule.
+    pub hosts: Vec<String>,
+    /// What the controller published in `status.loadBalancer`: IPs or
+    /// hostnames. Empty until a controller has picked it up.
+    pub address: Vec<String>,
+    pub tls: bool,
+    pub rules: Vec<IngressRuleInfo>,
+    pub default_backend: Option<String>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// A PersistentVolumeClaim. Mirrors `PvcInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct PvcInfo {
+    pub namespace: String,
+    pub name: String,
+    /// `Bound`, `Pending` or `Lost`.
+    pub status: String,
+    /// The PersistentVolume it is bound to. Empty until bound.
+    pub volume: String,
+    /// What the bound volume provides (`status.capacity.storage`). Empty until bound.
+    pub capacity: String,
+    /// What was asked for (`spec.resources.requests.storage`).
+    pub requested: String,
+    /// kubectl's abbreviations: RWO, ROX, RWX, RWOP.
+    pub access_modes: Vec<String>,
+    pub storage_class: String,
+    pub volume_mode: String,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// A PersistentVolume. Mirrors `PvInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct PvInfo {
+    pub name: String,
+    pub capacity: String,
+    pub access_modes: Vec<String>,
+    /// `Retain`, `Delete` or `Recycle`.
+    pub reclaim_policy: String,
+    /// `Available`, `Bound`, `Released`, `Failed` or `Pending`.
+    pub status: String,
+    /// The claim it is bound to, as `namespace/name`. Empty when unclaimed.
+    pub claim_namespace: String,
+    pub claim_name: String,
+    pub storage_class: String,
+    /// What backs it: the CSI driver (`disk.csi.azure.com`), or the in-tree
+    /// volume type for an older volume (`azureDisk`, `nfs`, `hostPath`, …).
+    pub source: String,
+    /// `status.reason`, set when a volume has Failed.
+    pub reason: String,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// One key of a ConfigMap, without its value. Mirrors `ConfigMapKeyInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ConfigMapKeyInfo {
+    pub name: String,
+    /// Length in bytes: the text for `data`, the decoded bytes for `binaryData`.
+    pub bytes: usize,
+    /// From `binaryData`, which has no text to show.
+    pub binary: bool,
+}
+
+/// A ConfigMap, listed with its keys and their sizes but not their values:
+/// a cluster's ConfigMaps can run to megabytes (dashboards, CA bundles, whole
+/// config files), which the table does not need. Mirrors `ConfigMapInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ConfigMapInfo {
+    pub namespace: String,
+    pub name: String,
+    pub keys: Vec<ConfigMapKeyInfo>,
+    pub total_bytes: usize,
+    pub immutable: bool,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// One key of a ConfigMap with its value, for the panel's Data view.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ConfigMapEntry {
+    pub key: String,
+    /// The text. Empty for a `binaryData` key, which is not shown.
+    pub value: String,
+    pub binary: bool,
+    pub bytes: usize,
 }

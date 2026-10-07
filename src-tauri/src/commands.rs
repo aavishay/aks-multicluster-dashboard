@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::{ai, claude, external_secrets, helm, k8s, kubeconfig, metrics_backend, mutate, retry, secrets};
+use crate::{ai, claude, external_secrets, helm, k8s, kubeconfig, metrics_backend, mutate, resources, retry, secrets};
 use std::future::Future;
 use std::time::Duration;
 
@@ -734,4 +734,52 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(attempts.get(), 1, "a non-transient error should not be retried at all");
     }
+}
+
+#[tauri::command]
+pub async fn get_namespaces(context_name: String) -> Result<Vec<NamespaceInfo>, String> {
+    with_retry(&context_name, || resources::get_namespaces(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_services(context_name: String) -> Result<Vec<ServiceInfo>, String> {
+    with_retry(&context_name, || resources::get_services(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_ingresses(context_name: String) -> Result<Vec<IngressInfo>, String> {
+    with_retry(&context_name, || resources::get_ingresses(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_pvcs(context_name: String) -> Result<Vec<PvcInfo>, String> {
+    with_retry(&context_name, || resources::get_pvcs(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_pvs(context_name: String) -> Result<Vec<PvInfo>, String> {
+    with_retry(&context_name, || resources::get_pvs(&context_name)).await
+}
+
+/// The YAML behind the Namespaces, Services, Ingress, PVC, PV and ConfigMaps
+/// panels, which share one panel; `namespace` is empty for the two
+/// cluster-scoped kinds.
+#[tauri::command]
+pub async fn get_resource_manifest(context_name: String, kind: String, namespace: String, name: String) -> Result<ObjectManifest, String> {
+    with_retry(&context_name, || resources::get_resource_manifest(&context_name, &kind, &namespace, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_resource_events(context_name: String, kind: String, namespace: String, name: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || resources::get_resource_events(&context_name, &kind, &namespace, &name)).await
+}
+
+#[tauri::command]
+pub async fn get_configmaps(context_name: String) -> Result<Vec<ConfigMapInfo>, String> {
+    with_retry(&context_name, || resources::get_configmaps(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_configmap_data(context_name: String, namespace: String, name: String) -> Result<Vec<ConfigMapEntry>, String> {
+    with_retry(&context_name, || resources::get_configmap_data(&context_name, &namespace, &name)).await
 }

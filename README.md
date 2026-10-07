@@ -242,6 +242,11 @@ Resource Usage tab) `metrics.k8s.io` — e.g. bind your Azure AD user/group to
 the built-in `view` ClusterRole, or `Azure Kubernetes Service RBAC Reader`
 at the Azure role-assignment level.
 
+The PV tab needs cluster-scoped read on `persistentvolumes`, which `view`
+does not include, so with it alone that tab shows a permission error while the
+others work. The Services tab also reads `endpointslices` to count ready
+endpoints; without that, the Endpoints column shows "—" rather than failing.
+
 The Secrets tab needs more than that: both of those roles leave Secrets out
 on purpose, so with either one the tab shows a permission error for every
 cluster. It needs `list` and `get` on `secrets` — for example
@@ -272,8 +277,27 @@ ready, namespace count, pod health, warning event count. Nodes lists every
 node with CPU/memory (capacity, allocatable, and — if `metrics-server` is
 running — live usage), zone, instance type, and cordon status. Workloads
 covers Deployments/StatefulSets/DaemonSets with desired-vs-ready replica
-counts. Pods is a live pod table with restarts and per-pod CPU/memory. Resource
+counts; a workload's panel opens on an Overview — why a rollout is stuck, the
+replica counts, strategy and revision, the HPA or KEDA object scaling it, its
+pods and the Services that select it, its conditions, and what its pod
+template runs and reads. Pods is a live pod table with restarts and per-pod CPU/memory; a pod's
+panel opens on an Overview — each container's state, restarts, why it last
+exited (OOMKilled, exit code), image and resources, the pod's conditions, its
+node and owner, and every ConfigMap, Secret and PVC it uses, each a link.
+Resource
 Usage rolls the fleet's CPU/memory usage-vs-allocatable into two bars.
+Namespaces lists each namespace with its status, flagging any stuck
+Terminating. Services shows type, cluster IP, external address, ports and
+ready endpoints, flagging a LoadBalancer still waiting for an address and a
+selector that matches no ready pod. Ingress shows class, hosts, the address
+its controller published, TLS and backends, flagging one no controller has
+picked up. PVC and PV list claims and volumes with status, capacity, access
+modes and storage class, each linking to the other; a claim not Bound and a
+volume Failed or Pending are flagged. ConfigMaps lists each ConfigMap's keys,
+total size and whether it is immutable; its values are fetched only when you
+open one, where a Data view shows each key's value with a filter over names
+and values. Those six share one panel: an Overview of what the row means, the
+YAML, and the object's events.
 Events surfaces recent cluster events, defaulting to warnings only. Secrets
 lists every Secret with its type and key count; its panel shows each key's
 name and size, keeps values masked until you reveal one, and forgets them
