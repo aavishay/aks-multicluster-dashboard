@@ -1038,3 +1038,51 @@ pub struct ConfigMapEntry {
     pub binary: bool,
     pub bytes: usize,
 }
+
+/// An HPA's YAML and what its panel's Overview shows, from one fetch.
+#[derive(Serialize, Clone, Debug)]
+pub struct HpaManifest {
+    pub yaml_full: String,
+    pub yaml_without_managed_fields: String,
+    pub detail: HpaDetail,
+}
+
+/// One declared metric beside its current reading. Mirrors `HpaMetricRow` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct HpaMetricRow {
+    /// `Resource`, `ContainerResource`, `Pods`, `Object` or `External`.
+    pub kind: String,
+    /// `cpu`, `sidecar/memory`, `queue_length`.
+    pub name: String,
+    /// `70%`, or a quantity.
+    pub target: String,
+    /// The same form, or `<unknown>` when the HPA has no reading.
+    pub current: String,
+}
+
+/// What an HPA's YAML buries. Mirrors `HpaDetail` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct HpaDetail {
+    /// The replica bounds and counts, target and last scale, from the same
+    /// object as the metrics and conditions below. Not from the table's row,
+    /// which refreshes on its own clock: mixing the two could pair one
+    /// revision's replica count with another's ScalingLimited message.
+    pub target_kind: String,
+    pub target_name: String,
+    pub min_replicas: i64,
+    pub max_replicas: i64,
+    pub current_replicas: i64,
+    pub desired_replicas: i64,
+    pub last_scale_at: Option<String>,
+    pub metrics: Vec<HpaMetricRow>,
+    /// How it scales up and down, one line per rule — or Kubernetes' defaults,
+    /// said as such, when `behavior` is not set.
+    pub scale_up: Vec<String>,
+    pub scale_down: Vec<String>,
+    pub behavior_is_default: bool,
+    pub conditions: Vec<PodConditionInfo>,
+    /// The object that owns it, when one does — a KEDA ScaledObject creates and
+    /// owns the HPA that does its scaling.
+    pub owner_kind: String,
+    pub owner_name: String,
+}

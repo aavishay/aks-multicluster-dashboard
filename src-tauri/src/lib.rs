@@ -4,6 +4,7 @@ mod commands;
 mod exec;
 mod external_secrets;
 mod helm;
+mod hpa_detail;
 mod k8s;
 mod kubeconfig;
 mod metrics_backend;

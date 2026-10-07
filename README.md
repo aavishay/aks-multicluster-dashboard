@@ -301,7 +301,11 @@ total size and whether it is immutable; its values are fetched only when you
 open one, where a Data view shows each key's value with a filter over names
 and values. Those six share one panel: an Overview of what the row means, the
 YAML, and the object's events.
-Events surfaces recent cluster events, defaulting to warnings only. Secrets
+Events surfaces recent cluster events, defaulting to warnings only. HPA lists
+each autoscaler with its replicas and metrics; its panel opens on an Overview —
+why it is not scaling when it is not, each metric against its target, the
+scale-up and scale-down behavior (Kubernetes' defaults said as such), and the
+KEDA ScaledObject that owns it, if one does. Secrets
 lists every Secret with its type and key count; its panel shows each key's
 name and size, keeps values masked until you reveal one, and forgets them
 when it closes. Helm's own release Secrets are listed without their contents,

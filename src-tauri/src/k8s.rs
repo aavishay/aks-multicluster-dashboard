@@ -2273,10 +2273,21 @@ fn status_metric(metric: &MetricStatus) -> Option<HpaMetric> {
 /// in the one column this tab exists for. The two lists normally arrive in the
 /// same order, but nothing in the API promises it.
 fn format_hpa_targets(spec: &[MetricSpec], status: &[MetricStatus]) -> String {
+    hpa_metric_rows(spec, status)
+        .iter()
+        .map(|m| format!("{}: {}/{}", m.name, m.current, m.target))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Each declared metric with its reading, paired as `format_hpa_targets`
+/// describes. Shared with the HPA panel's Overview, which shows the same
+/// pairing as a table — one implementation, so the two cannot disagree.
+pub(crate) fn hpa_metric_rows(spec: &[MetricSpec], status: &[MetricStatus]) -> Vec<HpaMetricRow> {
     let mut observed: Vec<(HpaMetric, bool)> = status.iter().filter_map(status_metric).map(|m| (m, false)).collect();
 
-    let mut parts = Vec::new();
-    for declared in spec.iter().filter_map(spec_metric) {
+    let mut rows = Vec::new();
+    for (declared, metric) in spec.iter().filter_map(|m| spec_metric(m).map(|d| (d, m))) {
         let mut current = "<unknown>".to_string();
         for (reading, taken) in observed.iter_mut() {
             if !*taken && reading.key == declared.key {
@@ -2285,9 +2296,9 @@ fn format_hpa_targets(spec: &[MetricSpec], status: &[MetricStatus]) -> String {
                 break;
             }
         }
-        parts.push(format!("{}: {}/{}", declared.label, current, declared.value));
+        rows.push(HpaMetricRow { kind: metric.type_.clone(), name: declared.label, target: declared.value, current });
     }
-    parts.join(", ")
+    rows
 }
 
 /// A condition by type: whether it is True, plus its reason and message.
@@ -2361,14 +2372,21 @@ pub async fn get_hpas(context_name: &str) -> Result<Vec<HpaInfo>, String> {
     Ok(list.items.into_iter().map(hpa_to_info).collect())
 }
 
-pub async fn get_hpa_manifest(context_name: &str, namespace: &str, name: &str) -> Result<ObjectManifest, String> {
+pub async fn get_hpa_manifest(context_name: &str, namespace: &str, name: &str) -> Result<HpaManifest, String> {
     let client = client_for_context(context_name).await?;
     let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &hpa_resource());
     let obj = api
         .get(name)
         .await
         .map_err(|e| format!("Failed to get HorizontalPodAutoscaler '{name}': {e}"))?;
-    object_manifest(obj)
+    // The Overview's detail from the same object, read as the typed v2 HPA
+    // rather than fetched again: hpa_resource asks for autoscaling/v2, which is
+    // exactly what HorizontalPodAutoscaler deserializes.
+    let typed: HorizontalPodAutoscaler = serde_json::to_value(&obj)
+        .and_then(serde_json::from_value)
+        .map_err(|e| format!("Failed to read HorizontalPodAutoscaler '{name}': {e}"))?;
+    let ObjectManifest { yaml_full, yaml_without_managed_fields } = object_manifest(obj)?;
+    Ok(HpaManifest { yaml_full, yaml_without_managed_fields, detail: crate::hpa_detail::hpa_detail(&typed) })
 }
 
 /// Same reasoning as `get_keda_events` (filter before the cap).
