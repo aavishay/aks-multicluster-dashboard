@@ -16,6 +16,8 @@ import type {
   ContainerDetail,
   HpaManifest,
   HpaMetricRow,
+  KedaManifest,
+  KedaTriggerInfo,
   PodConditionInfo,
   PodReference,
   ConfigMapInfo,
@@ -685,8 +687,8 @@ interface KedaDetailState extends MetricsViewState {
   name: string;
   targetKind: string;
   targetName: string;
-  view: "yaml" | "events" | "graph";
-  manifest: ObjectManifest | null;
+  view: "overview" | "yaml" | "events" | "graph";
+  manifest: KedaManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
   yamlSearch: string;
@@ -4577,7 +4579,8 @@ function openKedaDetail(ctx: string, namespace: string, kind: string, name: stri
     name,
     targetKind: row?.target_kind ?? "",
     targetName: row?.target_name ?? "",
-    view: "yaml",
+    // Opens on whether it is scaling and on what, rather than on raw YAML.
+    view: "overview",
     manifest: null,
     manifestError: null,
     showManagedFields: false,
@@ -11044,11 +11047,112 @@ function renderExternalSecretDetailPanel(): string {
     </div>`;
 }
 
+/** A trigger's health as KEDA reports it, or that it has not. */
+function kedaTriggerHealth(t: KedaTriggerInfo): string {
+  // KEDA's own spelling: Happy or Failing.
+  if (t.health === "Failing")
+    return `<span class="rounded bg-status-critical/15 px-1.5 py-0.5 text-xs text-status-critical">failing${t.failures ? ` · ${t.failures} in a row` : ""}</span>`;
+  if (t.health === "Happy") return `<span class="rounded bg-status-good/15 px-1.5 py-0.5 text-xs text-status-good">healthy</span>`;
+  if (t.health) return `<span class="rounded bg-surface-3 px-1.5 py-0.5 text-xs text-ink-secondary">${esc(t.health)}</span>`;
+  return `<span class="text-xs text-ink-muted">not reported</span>`;
+}
+
+/**
+ * The KEDA panel's Overview: whether it is ready and scaling, what it scales
+ * between which bounds and how often it looks, each trigger and whether KEDA
+ * can read it, and the HPA it drives. All from the one fetched object.
+ */
+function renderKedaOverviewView(kd: KedaDetailState): string {
+  if (kd.manifestError) return `<div class="text-sm text-status-critical">${esc(kd.manifestError)}</div>`;
+  if (!kd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const d = kd.manifest.detail;
+  const { ctx, namespace } = kd;
+  const condition = (type: string) => d.conditions.find((c) => c.condition_type === type);
+  const ready = condition("Ready");
+  const fallback = condition("Fallback");
+  const active = condition("Active");
+
+  const banners = [
+    ...(ready && ready.status !== "True"
+      ? [`<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">Not ready · ${esc([ready.reason, ready.message].filter(Boolean).join(": "))}</div>`]
+      : []),
+    ...(fallback?.status === "True"
+      ? [`<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">In fallback · ${esc([fallback.reason, fallback.message].filter(Boolean).join(": ") || d.fallback)}</div>`]
+      : []),
+    ...(d.paused
+      ? [`<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">Paused — KEDA is not scaling this${d.paused_replicas !== null ? `, holding it at ${esc(d.paused_replicas)} replica${d.paused_replicas === "1" ? "" : "s"}` : ""}.</div>`]
+      : []),
+  ];
+  const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
+
+  const workloadKinds = new Set(["Deployment", "StatefulSet", "DaemonSet"]);
+  const target =
+    d.target_kind === "Job"
+      ? '<span class="text-ink-secondary">a new Job per scaling event, from its job template</span>'
+      : workloadKinds.has(d.target_kind)
+        ? `<button type="button" onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(d.target_kind)},${jsArg(namespace)},${jsArg(d.target_name)})" class="text-series-blue hover:underline">${esc(d.target_kind)}/${esc(d.target_name)}</button>`
+        : `${esc(d.target_kind)}/${esc(d.target_name)}`;
+  const replicas = `<span class="tabular">${d.min_replicas}–${d.max_replicas}</span>${d.target_kind === "Job" ? ' <span class="text-xs text-ink-muted">jobs at once</span>' : ""}${d.idle_replicas !== null ? ` <span class="text-xs text-ink-muted">· ${d.idle_replicas} while idle</span>` : ""}`;
+
+  const facts = [
+    overviewRow("Scales", target),
+    overviewRow("Replicas", replicas),
+    ...(d.hpa_name
+      ? [overviewRow("HPA", `<button type="button" onclick="window.__app.openHpaDetail(${jsArg(ctx)},${jsArg(namespace)},${jsArg(d.hpa_name)})" class="text-series-blue hover:underline">${esc(d.hpa_name)}</button> <span class="text-xs text-ink-muted">created and driven by KEDA</span>`)]
+      : []),
+    overviewRow("Checks triggers", `every <span class="tabular">${d.polling_interval}s</span>`),
+    ...(d.cooldown_period !== null ? [overviewRow("Cooldown", `<span class="tabular">${d.cooldown_period}s</span> <span class="text-xs text-ink-muted">after the last activity, before scaling to idle</span>`)] : []),
+    ...(d.scaling_strategy ? [overviewRow("Scaling strategy", esc(d.scaling_strategy))] : []),
+    overviewRow("Fallback", esc(d.fallback) || '<span class="text-ink-muted">none configured</span>'),
+    // KEDA starts Active as Unknown; only False means idle.
+    overviewRow(
+      "Active",
+      active?.status === "True" ? "yes — a trigger is firing" : active?.status === "False" ? "no — idle" : '<span class="text-ink-muted">unknown — not determined yet</span>',
+    ),
+    overviewRow("Last active", d.last_active ? `<span title="${esc(timeTitle("Active", d.last_active))}">${relativeTime(d.last_active)}</span>` : '<span class="text-ink-muted">never</span>'),
+  ].join("");
+
+  const triggers = overviewSection(
+    `Triggers (${d.triggers.length})`,
+    d.triggers.length === 0
+      ? `<div class="text-xs text-ink-muted">No triggers.</div>`
+      : d.triggers
+          .map(
+            (t) => `
+        <div class="rounded-md border border-gridline bg-surface-1 p-3">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex min-w-0 items-center gap-2">
+              <span class="truncate font-mono text-sm text-ink-primary">${esc(t.trigger_type)}</span>
+              ${t.name ? `<span class="text-xs text-ink-muted">${esc(t.name)}</span>` : ""}
+              ${t.metric_type ? `<span class="text-xs text-ink-muted">${esc(t.metric_type)}</span>` : ""}
+            </div>
+            ${kedaTriggerHealth(t)}
+          </div>
+          ${t.auth_ref ? `<div class="mt-1.5 text-xs"><span class="text-ink-muted">Auth</span> <span class="font-mono">${esc(t.auth_ref)}</span></div>` : ""}
+          ${t.metadata.length ? `<div class="mt-2">${overviewChips(t.metadata)}</div>` : ""}
+        </div>`,
+          )
+          .join(""),
+  );
+
+  // Ready and Fallback have a right answer; Active False is simply idle and
+  // Paused is a choice, so those two are neutral either way.
+  const isHealthy = (c: PodConditionInfo): boolean | null =>
+    c.condition_type === "Active" || c.condition_type === "Paused"
+      ? null
+      : c.condition_type === "Fallback"
+        ? c.status === "False"
+        : c.status === "True";
+
+  return `${banner}<div>${facts}</div>${triggers}${renderConditionsSection(d.conditions, isHealthy)}`;
+}
+
 function renderKedaDetailPanel(): string {
   const kd = state.kedaDetail;
   if (!kd) return "";
 
   const tabs: { id: KedaDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "yaml", label: "YAML" },
     { id: "events", label: "Events" },
     // Omitted rather than shown broken when there is no plottable target.
@@ -11056,11 +11160,13 @@ function renderKedaDetailPanel(): string {
   ];
 
   const body =
-    kd.view === "yaml"
-      ? renderKedaYamlView(kd)
-      : kd.view === "events"
-        ? renderEventsList(`keda-events:${kd.ctx}:${kd.namespace}:${kd.kind}:${kd.name}`, kd.events, kd.eventsError)
-        : renderKedaGraphView(kd);
+    kd.view === "overview"
+      ? renderKedaOverviewView(kd)
+      : kd.view === "yaml"
+        ? renderKedaYamlView(kd)
+        : kd.view === "events"
+          ? renderEventsList(`keda-events:${kd.ctx}:${kd.namespace}:${kd.kind}:${kd.name}`, kd.events, kd.eventsError)
+          : renderKedaGraphView(kd);
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeKedaDetail()">

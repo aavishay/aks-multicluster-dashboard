@@ -305,7 +305,11 @@ Events surfaces recent cluster events, defaulting to warnings only. HPA lists
 each autoscaler with its replicas and metrics; its panel opens on an Overview —
 why it is not scaling when it is not, each metric against its target, the
 scale-up and scale-down behavior (Kubernetes' defaults said as such), and the
-KEDA ScaledObject that owns it, if one does. Secrets
+KEDA ScaledObject that owns it, if one does. KEDA lists ScaledObjects and
+ScaledJobs; their panel opens on an Overview — why one is not ready, whether
+it is paused or in fallback, what it scales between which bounds and how often
+it looks (KEDA's defaults applied where unset), each trigger with its
+authentication and whether KEDA can read it, and the HPA it drives. Secrets
 lists every Secret with its type and key count; its panel shows each key's
 name and size, keeps values masked until you reveal one, and forgets them
 when it closes. Helm's own release Secrets are listed without their contents,

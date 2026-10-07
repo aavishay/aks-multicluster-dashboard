@@ -1086,3 +1086,60 @@ pub struct HpaDetail {
     pub owner_kind: String,
     pub owner_name: String,
 }
+
+/// A KEDA object's YAML and what its panel's Overview shows, from one fetch.
+#[derive(Serialize, Clone, Debug)]
+pub struct KedaManifest {
+    pub yaml_full: String,
+    pub yaml_without_managed_fields: String,
+    pub detail: KedaDetail,
+}
+
+/// One trigger of a ScaledObject or ScaledJob. Mirrors `KedaTriggerInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct KedaTriggerInfo {
+    /// `azure-servicebus`, `prometheus`, `cpu`, `cron`…
+    pub trigger_type: String,
+    /// `spec.triggers[].name`, when set.
+    pub name: String,
+    /// `key=value`, in key order — what the scaler is told to watch.
+    pub metadata: Vec<String>,
+    /// `TriggerAuthentication/name` or `ClusterTriggerAuthentication/name`.
+    pub auth_ref: String,
+    /// `AverageValue`, `Value` or `Utilization`, when set.
+    pub metric_type: String,
+    /// From `status.health`: `Happy` or `Failing`, and how many failures in a
+    /// row. Empty when KEDA has not reported on this trigger.
+    pub health: String,
+    pub failures: Option<i64>,
+}
+
+/// What a KEDA object's YAML buries. Mirrors `KedaDetail` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct KedaDetail {
+    pub target_kind: String,
+    pub target_name: String,
+    /// With KEDA's defaults applied when unset: min 0, max 100. Both kinds.
+    pub min_replicas: i64,
+    pub max_replicas: i64,
+    /// Replicas while no trigger is active, when set — below `min_replicas`.
+    pub idle_replicas: Option<i64>,
+    /// Seconds between checks of each trigger; KEDA's default is 30.
+    pub polling_interval: i64,
+    /// Seconds after the last activity before scaling to idle/zero; default 300.
+    /// ScaledObject only.
+    pub cooldown_period: Option<i64>,
+    /// What KEDA does when a scaler keeps failing, per `fallback.behavior`.
+    pub fallback: String,
+    /// Set by the `autoscaling.keda.sh/paused` annotation (parsed as KEDA
+    /// parses it), or by `paused-replicas` on a ScaledObject.
+    pub paused: bool,
+    pub paused_replicas: Option<String>,
+    /// The HPA KEDA created to do the scaling (`status.hpaName`). ScaledObject only.
+    pub hpa_name: String,
+    pub last_active: Option<String>,
+    /// ScaledJob: `default`, `custom`, `accurate` or `eager`.
+    pub scaling_strategy: String,
+    pub triggers: Vec<KedaTriggerInfo>,
+    pub conditions: Vec<PodConditionInfo>,
+}
