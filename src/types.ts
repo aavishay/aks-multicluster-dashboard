@@ -695,7 +695,10 @@ export type TabId =
   | "helm"
   | "configmaps"
   | "secrets"
+  | "serviceaccounts"
   | "externalsecrets"
+  | "secretstores"
+  | "pdbs"
   | "cost";
 
 /** Azure Node Auto Provisioning (managed Karpenter). `installed: false` means the CRDs aren't registered, i.e. NAP is off for this cluster. */
@@ -909,7 +912,84 @@ export interface PvInfo {
 }
 
 /** The kinds behind the shared resource detail panel. */
-export type ResourceKind = "Namespace" | "Service" | "Ingress" | "PersistentVolumeClaim" | "PersistentVolume" | "ConfigMap";
+export type ResourceKind =
+  | "Namespace"
+  | "Service"
+  | "Ingress"
+  | "PersistentVolumeClaim"
+  | "PersistentVolume"
+  | "ConfigMap"
+  | "ServiceAccount"
+  | "PodDisruptionBudget"
+  | "SecretStore"
+  | "ClusterSecretStore";
+
+/** A ServiceAccount. Mirrors `ServiceAccountInfo` in models.rs. */
+export interface ServiceAccountInfo {
+  namespace: string;
+  name: string;
+  /** `azure.workload.identity/client-id`: the identity its pods sign in to Azure as. */
+  workload_identity_client_id: string;
+  workload_identity_tenant_id: string;
+  /** Seconds. */
+  workload_identity_token_expiration: string;
+  image_pull_secrets: string[];
+  secrets: string[];
+  /** Null when unset, which Kubernetes treats as true. */
+  automount_token: boolean | null;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/** A PodDisruptionBudget. Mirrors `PdbInfo` in models.rs. */
+export interface PdbInfo {
+  namespace: string;
+  name: string;
+  min_available: string | null;
+  max_unavailable: string | null;
+  selector: string[];
+  current_healthy: number;
+  desired_healthy: number;
+  expected_pods: number;
+  /** 0 blocks every voluntary eviction. */
+  disruptions_allowed: number;
+  unhealthy_pod_eviction_policy: string;
+  reason: string;
+  message: string;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/** An ESO SecretStore or ClusterSecretStore. Mirrors `SecretStoreInfo` in models.rs. */
+export interface SecretStoreInfo {
+  kind: "SecretStore" | "ClusterSecretStore";
+  /** Empty for a ClusterSecretStore. */
+  namespace: string;
+  name: string;
+  /** `azurekv`, `aws`, `vault`… */
+  provider: string;
+  /** A vault URL, server or region. */
+  target: string;
+  auth: string;
+  identity: string;
+  ready: boolean;
+  reason: string;
+  message: string;
+  capabilities: string;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/** Same `installed` semantics as `ExternalSecretsResult`. */
+export interface SecretStoresResult {
+  installed: boolean;
+  /** One of the two kinds failed to list; the other's stores are still here. */
+  error: string | null;
+  stores: SecretStoreInfo[];
+}
 
 /** One key of a ConfigMap, without its value. Mirrors `ConfigMapKeyInfo` in models.rs. */
 export interface ConfigMapKeyInfo {

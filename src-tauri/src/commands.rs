@@ -780,6 +780,21 @@ pub async fn get_configmaps(context_name: String) -> Result<Vec<ConfigMapInfo>, 
 }
 
 #[tauri::command]
+pub async fn get_service_accounts(context_name: String) -> Result<Vec<ServiceAccountInfo>, String> {
+    with_retry(&context_name, || resources::get_service_accounts(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_pdbs(context_name: String) -> Result<Vec<PdbInfo>, String> {
+    with_retry(&context_name, || resources::get_pdbs(&context_name)).await
+}
+
+#[tauri::command]
+pub async fn get_secret_stores(context_name: String) -> Result<SecretStoresResult, String> {
+    with_retry(&context_name, || external_secrets::get_secret_stores(&context_name)).await
+}
+
+#[tauri::command]
 pub async fn get_configmap_data(context_name: String, namespace: String, name: String) -> Result<Vec<ConfigMapEntry>, String> {
     with_retry(&context_name, || resources::get_configmap_data(&context_name, &namespace, &name)).await
 }
