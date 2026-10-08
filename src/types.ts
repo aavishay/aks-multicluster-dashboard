@@ -360,7 +360,90 @@ export interface HpaInfo {
   created_at: string | null;
 }
 
-export type GitOpsAppManifest = ObjectManifest;
+export interface GitOpsAppManifest extends ObjectManifest {
+  /** What the panel's Overview shows, read from the same fetch as the YAML. */
+  detail: GitOpsDetail;
+}
+
+/** One source of an Application (several for a multi-source app). */
+export interface GitOpsSourceInfo {
+  repo_url: string;
+  path: string;
+  chart: string;
+  target_revision: string;
+  /** The revision it is synced to (a commit ID shortened). */
+  revision: string;
+}
+
+/** One resource the Application manages, from `status.resources`. */
+export interface GitOpsManagedResource {
+  group: string;
+  kind: string;
+  namespace: string;
+  name: string;
+  /** `Synced` or `OutOfSync`. */
+  status: string;
+  /** Empty for a kind Argo CD assigns no health to, or when it keeps health in its app tree. */
+  health: string;
+  health_message: string;
+  requires_pruning: boolean;
+}
+
+/** A resource the last sync failed to apply, or a hook that failed, with Argo CD's reason. */
+export interface GitOpsSyncFailure {
+  /** `PreSync`, `Sync`, `PostSync`… for a hook; empty for a resource. */
+  hook_type: string;
+  kind: string;
+  namespace: string;
+  name: string;
+  message: string;
+}
+
+export interface GitOpsHistoryEntry {
+  /** One per source, in the sources' order; commit IDs shortened. */
+  revisions: string[];
+  deployed_at: string | null;
+}
+
+/** An Argo CD condition. They have no status: one exists only while it holds. */
+export interface GitOpsCondition {
+  condition_type: string;
+  message: string;
+  last_transition: string | null;
+}
+
+/** What an Application's YAML buries. Mirrors `GitOpsDetail` in models.rs. */
+export interface GitOpsDetail {
+  project: string;
+  sources: GitOpsSourceInfo[];
+  destination_server: string;
+  destination_name: string;
+  destination_namespace: string;
+  /** Deploys to the cluster Argo CD runs in — the one this panel is open on. */
+  destination_in_cluster: boolean;
+  sync_status: string;
+  health_status: string;
+  health_message: string;
+  automated: boolean;
+  prune: boolean;
+  self_heal: boolean;
+  sync_options: string[];
+  retry_limit: number | null;
+  /** The last sync operation: `Succeeded`, `Failed`, `Error`, `Running`… */
+  operation_phase: string;
+  operation_message: string;
+  operation_started: string | null;
+  operation_finished: string | null;
+  operation_retries: number | null;
+  sync_failures: GitOpsSyncFailure[];
+  resources: GitOpsManagedResource[];
+  /** Argo CD keeps each resource's health in its app tree, so `resources[].health` is empty. */
+  resource_health_in_tree: boolean;
+  conditions: GitOpsCondition[];
+  images: string[];
+  /** Newest first. */
+  history: GitOpsHistoryEntry[];
+}
 
 /**
  * One resource an ArgoCD Application manages that is **not** Synced, with both

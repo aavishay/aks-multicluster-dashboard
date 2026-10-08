@@ -790,7 +790,105 @@ pub struct KedaScaledObjectInfo {
     pub created_at: Option<String>,
 }
 
-pub type GitOpsAppManifest = ObjectManifest;
+#[derive(Serialize, Clone, Debug)]
+pub struct GitOpsAppManifest {
+    pub yaml_full: String,
+    pub yaml_without_managed_fields: String,
+    /// What the panel's Overview shows, read from the same fetch as the YAML.
+    pub detail: GitOpsDetail,
+}
+
+/// One source of an Application (several for a multi-source app).
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct GitOpsSourceInfo {
+    pub repo_url: String,
+    pub path: String,
+    pub chart: String,
+    pub target_revision: String,
+    /// The revision it is synced to (a commit ID shortened) — index-aligned with the sources.
+    pub revision: String,
+}
+
+/// One resource the Application manages, from `status.resources`.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct GitOpsManagedResource {
+    pub group: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    /// `Synced` or `OutOfSync`.
+    pub status: String,
+    /// `Healthy`, `Progressing`, `Degraded`, `Missing`, `Suspended`; empty for
+    /// a kind Argo CD assigns no health to.
+    pub health: String,
+    pub health_message: String,
+    pub requires_pruning: bool,
+}
+
+/// A resource the last sync failed to apply, or a hook that failed, with
+/// Argo CD's reason.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct GitOpsSyncFailure {
+    /// `PreSync`, `Sync`, `PostSync`… for a hook; empty for a resource.
+    pub hook_type: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub message: String,
+}
+
+/// One past deployment, newest first.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct GitOpsHistoryEntry {
+    /// One per source, in the sources' order; commit IDs shortened.
+    pub revisions: Vec<String>,
+    pub deployed_at: Option<String>,
+}
+
+/// An Argo CD condition. They have no status: one exists only while it holds.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct GitOpsCondition {
+    /// `ComparisonError`, `SyncError`, `OrphanedResourceWarning`…
+    pub condition_type: String,
+    pub message: String,
+    pub last_transition: Option<String>,
+}
+
+/// What an Application's YAML buries. Mirrors `GitOpsDetail` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct GitOpsDetail {
+    pub project: String,
+    pub sources: Vec<GitOpsSourceInfo>,
+    pub destination_server: String,
+    pub destination_name: String,
+    pub destination_namespace: String,
+    /// Deploys to the cluster Argo CD runs in — the one this panel is open on,
+    /// so its resources can be linked to their own panels.
+    pub destination_in_cluster: bool,
+    pub sync_status: String,
+    pub health_status: String,
+    pub health_message: String,
+    pub automated: bool,
+    pub prune: bool,
+    pub self_heal: bool,
+    pub sync_options: Vec<String>,
+    pub retry_limit: Option<i64>,
+    /// The last sync operation: `Succeeded`, `Failed`, `Error`, `Running`…
+    pub operation_phase: String,
+    pub operation_message: String,
+    pub operation_started: Option<String>,
+    pub operation_finished: Option<String>,
+    pub operation_retries: Option<i64>,
+    pub sync_failures: Vec<GitOpsSyncFailure>,
+    pub resources: Vec<GitOpsManagedResource>,
+    /// `status.resourceHealthSource: appTree` (the Argo CD 3 default): each
+    /// resource's health lives in Argo CD's app tree, not on the Application,
+    /// so `resources[].health` is empty and can't say what is unhealthy.
+    pub resource_health_in_tree: bool,
+    pub conditions: Vec<GitOpsCondition>,
+    pub images: Vec<String>,
+    pub history: Vec<GitOpsHistoryEntry>,
+}
 
 /// What a drain asked the API server to do, and what it declined.
 ///
