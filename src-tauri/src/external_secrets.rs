@@ -119,10 +119,18 @@ fn store_info(obj: &DynamicObject, kind: &str) -> SecretStoreInfo {
         "" => auth_obj.and_then(Value::as_object).and_then(|a| a.keys().next().cloned()).unwrap_or_default(),
         t => t.to_string(),
     };
-    let identity = match json_str(conf, "identityId") {
-        "" => json_str(conf.and_then(|c| c.get("serviceAccountRef")), "name").to_string(),
-        id => id.to_string(),
-    };
+    // Azure names the identity beside its method; the others put a service
+    // account under the chosen auth method — `auth.kubernetes` for Vault,
+    // `auth.jwt` for AWS, `auth.workloadIdentity` for GCP.
+    fn sa_ref(v: Option<&Value>) -> &str {
+        json_str(v.and_then(|v| v.get("serviceAccountRef")), "name")
+    }
+    let method = auth_obj.and_then(Value::as_object).and_then(|a| a.values().next());
+    let identity = [json_str(conf, "identityId"), sa_ref(conf), sa_ref(method)]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_string();
     let (ready, reason, message) = ready_condition(status);
     SecretStoreInfo {
         kind: kind.to_string(),
@@ -396,12 +404,14 @@ mod tests {
             &obj(json!({
                 "apiVersion": "external-secrets.io/v1", "kind": "ClusterSecretStore",
                 "metadata": { "name": "vault" },
-                "spec": { "provider": { "vault": { "server": "https://vault:8200", "auth": { "kubernetes": { "role": "eso" } } } } },
+                "spec": { "provider": { "vault": { "server": "https://vault:8200", "auth": { "kubernetes": { "role": "eso", "serviceAccountRef": { "name": "eso-vault" } } } } } },
                 "status": { "conditions": [{ "type": "Ready", "status": "False", "reason": "InvalidProviderConfig", "message": "permission denied" }] }
             })),
             "ClusterSecretStore",
         );
         assert_eq!((s.namespace.as_str(), s.provider.as_str(), s.target.as_str(), s.auth.as_str()), ("", "vault", "https://vault:8200", "kubernetes"));
+        // Nested under the chosen auth method, not beside it.
+        assert_eq!(s.identity, "eso-vault");
         assert!(!s.ready);
         assert_eq!(s.message, "permission denied");
     }

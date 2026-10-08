@@ -686,6 +686,10 @@ interface ResourceDetailState {
   events: EventInfo[] | null;
   eventsError: string | null;
   eventsLoading: boolean;
+  /** Tab lists the Overview reads that are being fetched for it, because they had never loaded. */
+  listsLoading: TabId[];
+  /** Why one of those fetches failed. */
+  listErrors: Partial<Record<TabId, string>>;
 }
 
 interface KedaDetailState extends MetricsViewState {
@@ -13160,22 +13164,28 @@ function openResourceDetail(ctx: string, kind: ResourceKind, namespace: string, 
     events: null,
     eventsError: null,
     eventsLoading: false,
+    listsLoading: [],
+    listErrors: {},
   };
-  render();
 
-  // The Overview reads its tab's list. Opened from a link on another panel,
-  // that tab may never have loaded for this cluster — fetch it rather than
-  // say so.
-  const tab = RESOURCE_KIND_TAB[kind];
-  if (!tabHasDataForContext(tab, ctx)) {
+  // The Overview reads its tab's list — and a store's, the ExternalSecrets
+  // that use it. Opened from a link on another panel, those may never have
+  // loaded for this cluster: fetch them rather than say so.
+  const lists: TabId[] = [RESOURCE_KIND_TAB[kind], ...(kind === "SecretStore" || kind === "ClusterSecretStore" ? (["externalsecrets"] as const) : [])];
+  for (const tab of lists) {
+    if (tabHasDataForContext(tab, ctx)) continue;
+    state.resourceDetail.listsLoading.push(tab);
     fetchTabDataForContext(tab, ctx)
-      .then(() => {
-        if (token === resourceDetailToken && state.resourceDetail) render();
+      .catch((e) => {
+        if (token === resourceDetailToken && state.resourceDetail) state.resourceDetail.listErrors[tab] = String(e);
       })
-      .catch(() => {
-        // The YAML tab still fetches the object itself; the Overview keeps its "not loaded" note.
+      .finally(() => {
+        if (token !== resourceDetailToken || !state.resourceDetail) return;
+        state.resourceDetail.listsLoading = state.resourceDetail.listsLoading.filter((t) => t !== tab);
+        render();
       });
   }
+  render();
 
   api
     .getResourceManifest(ctx, kind, namespace, name)
@@ -13314,7 +13324,12 @@ function renderResourceOverview(rd: ResourceDetailState): string {
   const created = (r: { created_at: string | null }) => esc(exactTime(r.created_at).replace("\n", " · ")) || "—";
   const link = (label: string, k: ResourceKind, ns: string, n: string) =>
     `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},${jsArg(k)},${jsArg(ns)},${jsArg(n)})" class="text-series-blue hover:underline">${esc(label)}</button>`;
-  const gone = `<div class="text-sm text-ink-muted">Not in the last list fetched for ${esc(ctx)} — it may have been deleted, or the tab has not loaded yet. The YAML tab fetches it directly.</div>`;
+  const ownTab = RESOURCE_KIND_TAB[kind];
+  const gone = rd.listsLoading.includes(ownTab)
+    ? `<div class="text-sm text-ink-muted">Loading…</div>`
+    : rd.listErrors[ownTab]
+      ? `<div class="text-sm text-status-critical">${esc(rd.listErrors[ownTab]!)}</div><div class="mt-1 text-xs text-ink-muted">The YAML tab fetches the object directly.</div>`
+      : `<div class="text-sm text-ink-muted">Not in the last list fetched for ${esc(ctx)} — it may have been deleted, or the tab has not loaded yet. The YAML tab fetches it directly.</div>`;
   const rows: string[] = [];
 
   if (kind === "Namespace") {
@@ -13458,7 +13473,11 @@ function renderResourceOverview(rd: ResourceDetailState): string {
     const usedBy = overviewSection(
       loaded ? `Used by (${users.length})` : "Used by",
       !loaded
-        ? `<div class="text-xs text-ink-muted">Open the ExternalSecrets tab once to see which ExternalSecrets read from it.</div>`
+        ? rd.listsLoading.includes("externalsecrets")
+          ? `<div class="text-xs text-ink-muted">Loading the ExternalSecrets…</div>`
+          : rd.listErrors.externalsecrets
+            ? `<div class="text-xs text-status-critical">Could not list ExternalSecrets: ${esc(rd.listErrors.externalsecrets)}</div>`
+            : `<div class="text-xs text-ink-muted">The ExternalSecrets have not been listed for this cluster.</div>`
         : users.length === 0
           ? `<div class="text-xs text-ink-muted">No ExternalSecret reads from it.</div>`
           : `<table class="w-full text-left text-sm"><tbody>${users
