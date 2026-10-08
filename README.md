@@ -336,7 +336,11 @@ public fields reach the window. The Keys view shows each key's name and size,
 keeps values masked until you reveal one, and forgets them when it closes. Helm's own release Secrets are listed without their contents,
 which the Helm tab already shows. ServiceAccounts shows each account's Azure
 workload identity (its client ID), image pull secrets and whether it mounts a
-token. SecretStores lists External Secrets Operator's SecretStores and
+token. ExternalSecrets lists External Secrets Operator's syncs with their
+store, target Secret and whether they are synced; one's panel opens on an
+Overview — why a sync fails beside its store's own health, the target Secret
+and whether it exists, how often it refreshes, and its creation, deletion and
+template behaviour (ESO's defaults said as such). SecretStores lists External Secrets Operator's SecretStores and
 ClusterSecretStores with their provider, vault, sign-in method and whether ESO
 can reach them; a store's panel lists the ExternalSecrets reading from it. PDB
 lists PodDisruptionBudgets with what each allows right now, flagging one that

@@ -546,6 +546,25 @@ export interface ExternalSecretDetail {
   /** `spec.dataFrom`, one readable line per entry. */
   data_from: string[];
   manifest: ObjectManifest;
+  /** What the panel's Overview shows, read from the same fetch. */
+  overview: ExternalSecretOverview;
+}
+
+/** What an ExternalSecret's YAML buries, with ESO's defaults applied. Mirrors `ExternalSecretOverview` in models.rs. */
+export interface ExternalSecretOverview {
+  /** The row's facts, from this fetch rather than the list. */
+  info: ExternalSecretInfo;
+  creation_policy: string;
+  deletion_policy: string;
+  refresh_policy: string;
+  target_immutable: boolean;
+  template: boolean;
+  template_engine: string;
+  template_merge_policy: string;
+  template_keys: string[];
+  /** The Secret ESO last wrote. */
+  synced_secret: string;
+  conditions: PodConditionInfo[];
 }
 
 /** One key of a Secret — its name and decoded size, never its value. Mirrors `SecretKeyInfo` in models.rs. */

@@ -611,6 +611,34 @@ pub struct ExternalSecretDetail {
     /// `spec.dataFrom`, one readable line per entry.
     pub data_from: Vec<String>,
     pub manifest: ObjectManifest,
+    /// What the panel's Overview shows, read from the same fetch.
+    pub overview: ExternalSecretOverview,
+}
+
+/// What an ExternalSecret's YAML buries, with ESO's defaults applied.
+/// Mirrors `ExternalSecretOverview` in types.ts.
+#[derive(Serialize, Clone, Debug)]
+pub struct ExternalSecretOverview {
+    /// The same facts the list row carries, from this fetch rather than the
+    /// list, so the Overview is right however the panel was opened.
+    pub info: ExternalSecretInfo,
+    /// `Owner` (the default), `Orphan`, `Merge` or `None`.
+    pub creation_policy: String,
+    /// `Retain` (the default), `Delete` or `Merge`.
+    pub deletion_policy: String,
+    /// `Periodic` (the default), `OnChange` or `CreatedOnce`.
+    pub refresh_policy: String,
+    pub target_immutable: bool,
+    /// `spec.target.template` is set: the Secret's keys are rendered, not copied.
+    pub template: bool,
+    pub template_engine: String,
+    /// `Replace` (the default) or `Merge`: what happens to keys the template does not name.
+    pub template_merge_policy: String,
+    /// Keys the template writes.
+    pub template_keys: Vec<String>,
+    /// `status.binding.name`: the Secret ESO last wrote.
+    pub synced_secret: String,
+    pub conditions: Vec<PodConditionInfo>,
 }
 
 /// One key of a Secret: its name and decoded size, never its value.
