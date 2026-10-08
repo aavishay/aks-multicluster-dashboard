@@ -16,6 +16,9 @@ use serde_json::Value;
 const DEFAULT_EXPIRE_AFTER: &str = "720h";
 const DEFAULT_CONSOLIDATION_POLICY: &str = "WhenEmptyOrUnderutilized";
 const DEFAULT_CONSOLIDATE_AFTER: &str = "0s";
+/// v1beta1's: its policy was named differently, and it had no delay to
+/// default — `consolidateAfter` could not even be set with WhenUnderutilized.
+const V1BETA1_DEFAULT_CONSOLIDATION_POLICY: &str = "WhenUnderutilized";
 const DEFAULT_BUDGET_NODES: &str = "10%";
 
 /// Shown first, in this order; anything else only when it is limited or in use.
@@ -96,6 +99,7 @@ pub(crate) fn nap_detail(obj: &DynamicObject) -> NapDetail {
         })
         .collect();
     let budgets_default = budgets.is_empty();
+    let v1beta1 = obj.types.as_ref().is_some_and(|t| t.api_version.ends_with("/v1beta1"));
 
     NapDetail {
         node_class_kind: json_str(node_class, "kind").to_string(),
@@ -125,10 +129,12 @@ pub(crate) fn nap_detail(obj: &DynamicObject) -> NapDetail {
             .unwrap_or_else(|| DEFAULT_EXPIRE_AFTER.to_string()),
         termination_grace_period: duration(template_spec, "terminationGracePeriod").unwrap_or_default(),
         consolidation_policy: match json_str(disruption, "consolidationPolicy") {
+            "" if v1beta1 => V1BETA1_DEFAULT_CONSOLIDATION_POLICY.to_string(),
             "" => DEFAULT_CONSOLIDATION_POLICY.to_string(),
             p => p.to_string(),
         },
-        consolidate_after: duration(disruption, "consolidateAfter").unwrap_or_else(|| DEFAULT_CONSOLIDATE_AFTER.to_string()),
+        // Empty for a v1beta1 pool that sets none: no delay at all.
+        consolidate_after: duration(disruption, "consolidateAfter").unwrap_or_else(|| if v1beta1 { String::new() } else { DEFAULT_CONSOLIDATE_AFTER.to_string() }),
         budgets: if budgets_default {
             vec![NapBudget { nodes: DEFAULT_BUDGET_NODES.to_string(), ..Default::default() }]
         } else {
@@ -152,7 +158,7 @@ pub(crate) fn nap_detail(obj: &DynamicObject) -> NapDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kube::api::ObjectMeta;
+    use kube::api::{ObjectMeta, TypeMeta};
     use serde_json::json;
 
     fn pool(data: Value) -> DynamicObject {
@@ -221,9 +227,12 @@ mod tests {
     }
 
     #[test]
-    fn a_v1beta1_pool_keeps_expire_after_under_disruption() {
-        let d = nap_detail(&pool(json!({ "spec": { "disruption": { "expireAfter": "168h", "consolidationPolicy": "WhenUnderutilized" } } })));
-        assert_eq!((d.expire_after.as_str(), d.consolidation_policy.as_str()), ("168h", "WhenUnderutilized"));
+    fn a_v1beta1_pool_keeps_expire_after_under_disruption_and_its_own_defaults() {
+        let mut obj = pool(json!({ "spec": { "disruption": { "expireAfter": "168h" } } }));
+        obj.types = Some(TypeMeta { api_version: "karpenter.sh/v1beta1".into(), kind: "NodePool".into() });
+        let d = nap_detail(&obj);
+        assert_eq!(d.expire_after, "168h");
+        assert_eq!((d.consolidation_policy.as_str(), d.consolidate_after.as_str()), ("WhenUnderutilized", ""));
     }
 
     /// Fetches every NodePool's manifest through the real command path.

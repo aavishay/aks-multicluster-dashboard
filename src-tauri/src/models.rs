@@ -724,9 +724,11 @@ pub struct NapDetail {
     pub expire_after: String,
     /// How long a draining node may take before it is forced; empty for no limit.
     pub termination_grace_period: String,
-    /// `WhenEmptyOrUnderutilized` or `WhenEmpty`; Karpenter's default applied.
+    /// `WhenEmptyOrUnderutilized` or `WhenEmpty` (v1beta1: `WhenUnderutilized`);
+    /// Karpenter's default for the pool's API version applied.
     pub consolidation_policy: String,
-    /// How long a node must stay empty or underutilized first, or `Never`.
+    /// How long a node must stay empty or underutilized first, or `Never`;
+    /// empty for a v1beta1 pool that sets none, which has no delay.
     pub consolidate_after: String,
     /// The pool's budgets, or Karpenter's default of 10% when it sets none.
     pub budgets: Vec<NapBudget>,

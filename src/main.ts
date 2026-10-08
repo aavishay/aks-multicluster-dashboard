@@ -51,6 +51,7 @@ import type {
   NapNodePoolInfo,
   NapBudget,
   NapNodePoolManifest,
+  NapRequirement,
   NapResourceUse,
   NapResult,
   ObjectManifest,
@@ -10514,8 +10515,24 @@ function napResourceLabel(name: string): string {
   return name === "cpu" ? "CPU" : name === "nvidia.com/gpu" ? "GPU" : name;
 }
 
+/** A budget of `0` or `0%`, which lets no node be disrupted. */
+function napBudgetAllowsNone(b: NapBudget): boolean {
+  return /^0+%?$/.test(b.nodes.trim());
+}
+
+/** What the capacity-type requirement allows, read with its operator. */
+function napCapacityText(r: NapRequirement | undefined): string {
+  // Karpenter's default when nothing constrains it.
+  if (!r || r.operator === "DoesNotExist") return '<span class="text-ink-muted">on-demand — no capacity-type requirement</span>';
+  const values = esc(r.values.join(", "));
+  if (r.operator === "In") return values || "—";
+  if (r.operator === "NotIn") return `anything but ${values}`;
+  if (r.operator === "Exists") return "any — spot or on-demand";
+  return `${esc(r.operator)} ${values}`;
+}
+
 function napBudgetText(b: NapBudget): string {
-  const nodes = b.nodes === "0" ? "no nodes" : `${esc(b.nodes)} of nodes`;
+  const nodes = napBudgetAllowsNone(b) ? "no nodes" : `${esc(b.nodes)} of nodes`;
   const reasons = b.reasons.length ? ` · for ${esc(b.reasons.join(", "))}` : "";
   const when = b.schedule ? ` · from <span class="whitespace-nowrap font-mono">${esc(b.schedule)}</span>${b.duration ? ` for ${esc(b.duration)}` : ""}` : "";
   return `${nodes} at a time${reasons}${when}`;
@@ -10537,7 +10554,7 @@ function renderNapOverviewView(nd: NapDetailState): string {
   const why = (c: PodConditionInfo) => esc([c.reason, c.message].filter(Boolean).join(": "));
   const ready = d.conditions.find((c) => c.condition_type === "Ready");
   const atLimit = d.resources.filter((r) => r.limit !== null && r.used >= r.limit);
-  const blocked = d.budgets.some((b) => b.nodes === "0" && !b.reasons.length && !b.schedule);
+  const blocked = d.budgets.some((b) => napBudgetAllowsNone(b) && !b.reasons.length && !b.schedule);
 
   const banners = [
     ...(ready && ready.status !== "True" ? [red(`Not ready${why(ready) ? ` · ${why(ready)}` : ""}`)] : []),
@@ -10550,16 +10567,15 @@ function renderNapOverviewView(nd: NapDetailState): string {
   ];
   const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
 
-  const capacity = d.requirements.find((r) => r.key === "karpenter.sh/capacity-type");
   const facts = [
     overviewRow("Node class", d.node_class_name ? `${esc(d.node_class_kind || "NodeClass")}/${esc(d.node_class_name)}` : "—"),
     overviewRow("Weight", d.weight !== null ? `<span class="tabular">${d.weight}</span> <span class="text-xs text-ink-muted">higher is tried first</span>` : '<span class="text-ink-muted">unset — tried after any weighted pool</span>'),
-    overviewRow("Capacity", capacity ? esc(capacity.values.join(", ")) || "—" : '<span class="text-ink-muted">on-demand — no capacity-type requirement</span>'),
+    overviewRow("Capacity", napCapacityText(d.requirements.find((r) => r.key === "karpenter.sh/capacity-type"))),
     overviewRow(
       "Consolidation",
       d.consolidate_after === "Never"
         ? '<span class="text-ink-secondary">off — consolidateAfter is Never</span>'
-        : `${d.consolidation_policy === "WhenEmpty" ? "empty nodes only" : d.consolidation_policy === "WhenEmptyOrUnderutilized" ? "empty or underutilized nodes" : esc(d.consolidation_policy)} <span class="text-xs text-ink-muted">· after ${esc(d.consolidate_after)}</span>`,
+        : `${d.consolidation_policy === "WhenEmpty" ? "empty nodes only" : d.consolidation_policy === "WhenEmptyOrUnderutilized" || d.consolidation_policy === "WhenUnderutilized" ? "empty or underutilized nodes" : esc(d.consolidation_policy)}${d.consolidate_after ? ` <span class="text-xs text-ink-muted">· after ${esc(d.consolidate_after)}</span>` : ""}`,
     ),
     overviewRow("Node lifetime", d.expire_after === "Never" ? '<span class="text-ink-secondary">never expire</span>' : `replaced after <span class="tabular">${esc(d.expire_after)}</span>`),
     ...(d.termination_grace_period ? [overviewRow("Drain timeout", `forced after <span class="tabular">${esc(d.termination_grace_period)}</span>`)] : []),
@@ -10574,7 +10590,8 @@ function renderNapOverviewView(nd: NapDetailState): string {
     "Provisioned",
     d.resources
       .map((r) => {
-        const pct = r.limit ? Math.min(100, Math.round((r.used / r.limit) * 100)) : null;
+        // A limit of zero allows nothing, so it is full from the start.
+        const pct = r.limit === null ? null : r.limit === 0 ? 100 : Math.min(100, Math.round((r.used / r.limit) * 100));
         return `
         <div class="text-sm">
           <div class="flex items-baseline justify-between gap-3">

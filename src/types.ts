@@ -691,8 +691,9 @@ export interface NapDetail {
   expire_after: string;
   /** Empty for no limit. */
   termination_grace_period: string;
+  /** `WhenEmptyOrUnderutilized` or `WhenEmpty` (v1beta1: `WhenUnderutilized`). */
   consolidation_policy: string;
-  /** A duration or `Never`. */
+  /** A duration or `Never`; empty for a v1beta1 pool that sets none — no delay. */
   consolidate_after: string;
   /** The pool's budgets, or Karpenter's default of 10% when it sets none. */
   budgets: NapBudget[];
