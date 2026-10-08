@@ -17,7 +17,7 @@
 
 use crate::k8s::{age_days, age_seconds, created_at};
 use crate::kubeconfig::client_for_context;
-use crate::models::{ObjectManifest, SecretDetail, SecretInfo, SecretKeyInfo, SecretValue};
+use crate::models::{ObjectManifest, SecretCertificates, SecretDetail, SecretInfo, SecretKeyInfo, SecretOverview, SecretOwner, SecretValue};
 use base64::Engine;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, ListParams};
@@ -149,7 +149,88 @@ async fn get_secret(context_name: &str, namespace: &str, name: &str) -> Result<S
 
 pub async fn get_secret_detail(context_name: &str, namespace: &str, name: &str) -> Result<SecretDetail, String> {
     let secret = get_secret(context_name, namespace, name).await?;
-    Ok(SecretDetail { keys: keys_of(&secret), manifest: redacted_manifest(&secret)? })
+    Ok(SecretDetail { keys: keys_of(&secret), manifest: redacted_manifest(&secret)?, overview: overview_of(&secret) })
+}
+
+/// The end-entity certificate in a bundle, wherever it sits: one that is not
+/// a CA and issues none of the others. A lone certificate is its own leaf,
+/// CA or not; a bundle of CAs has none.
+fn leaf_of(all: &[crate::x509::CertificateInfo]) -> Option<&crate::x509::CertificateInfo> {
+    if let [only] = all {
+        return Some(only);
+    }
+    let issues_another = |c: &crate::x509::CertificateInfo| all.iter().any(|o| !std::ptr::eq(o, c) && o.issuer == c.subject);
+    let mut end_entities = all.iter().filter(|c| !c.is_ca);
+    let first = end_entities.clone().next();
+    end_entities.find(|c| !issues_another(c)).or(first)
+}
+
+/// How many certificates of one key to describe. A CA bundle can hold well
+/// over a hundred; the count says how many more there are.
+const CERTS_SHOWN: usize = 20;
+
+/// What a Secret is for and who writes it.
+///
+/// Values are read here, in Rust, only to describe them: a certificate's
+/// public fields, a pull secret's registry hosts. No value, and nothing that
+/// would let one be reconstructed, goes into the result.
+fn overview_of(s: &Secret) -> SecretOverview {
+    let annotation = |k: &str| s.metadata.annotations.as_ref().and_then(|a| a.get(k)).cloned().unwrap_or_default();
+    let label = |k: &str| s.metadata.labels.as_ref().and_then(|l| l.get(k)).cloned().unwrap_or_default();
+    let data = s.data.as_ref();
+
+    let certificates = data
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, value)| {
+            let text = std::str::from_utf8(&value.0).ok()?;
+            let all = crate::x509::parse_pem_bundle(text);
+            (!all.is_empty()).then(|| SecretCertificates {
+                key: key.clone(),
+                total: all.len(),
+                leaf: leaf_of(&all).cloned(),
+                certificates: all.into_iter().take(CERTS_SHOWN).collect(),
+            })
+        })
+        .collect();
+
+    // Only for a pull-secret type, and only its own key: `.dockerconfigjson`
+    // nests hosts under `auths`, the legacy `.dockercfg` has them at the top.
+    // Only the keys are read — never `auth` or a password.
+    let secret_type = s.type_.clone().unwrap_or_else(|| "Opaque".to_string());
+    let registries = match secret_type.as_str() {
+        "kubernetes.io/dockerconfigjson" => Some((".dockerconfigjson", true)),
+        "kubernetes.io/dockercfg" => Some((".dockercfg", false)),
+        _ => None,
+    }
+    .and_then(|(key, nested)| {
+        let json: Value = serde_json::from_slice(&data?.get(key)?.0).ok()?;
+        let hosts = if nested { json.get("auths")? } else { &json };
+        Some(hosts.as_object()?.keys().cloned().collect::<Vec<_>>())
+    })
+    .unwrap_or_default();
+
+    SecretOverview {
+        secret_type,
+        immutable: s.immutable.unwrap_or(false),
+        created_at: created_at(&s.metadata.creation_timestamp),
+        owners: s
+            .metadata
+            .owner_references
+            .iter()
+            .flatten()
+            .map(|o| SecretOwner { kind: o.kind.clone(), name: o.name.clone() })
+            .collect(),
+        managed_by: label("app.kubernetes.io/managed-by"),
+        helm_release: annotation("meta.helm.sh/release-name"),
+        helm_namespace: annotation("meta.helm.sh/release-namespace"),
+        cert_manager_certificate: annotation("cert-manager.io/certificate-name"),
+        cert_manager_issuer: annotation("cert-manager.io/issuer-name"),
+        cert_manager_issuer_kind: annotation("cert-manager.io/issuer-kind"),
+        service_account: annotation("kubernetes.io/service-account.name"),
+        certificates,
+        registries,
+    }
 }
 
 fn value_of(raw: &[u8]) -> SecretValue {
@@ -287,5 +368,129 @@ mod tests {
             value_of(&binary),
             SecretValue { bytes: 4, text: None, base64: Some(base64::engine::general_purpose::STANDARD.encode(binary)) }
         );
+    }
+
+    #[test]
+    fn the_overview_describes_a_tls_secret_without_its_values() {
+        let key = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n";
+        let chain = format!("{}\n{}\n", crate::x509::tests::LEAF, crate::x509::tests::CA);
+        let s = Secret {
+            metadata: ObjectMeta {
+                name: Some("api-tls".into()),
+                namespace: Some("prod".into()),
+                annotations: Some(BTreeMap::from([
+                    ("cert-manager.io/certificate-name".to_string(), "api".to_string()),
+                    ("cert-manager.io/issuer-name".to_string(), "letsencrypt".to_string()),
+                    ("cert-manager.io/issuer-kind".to_string(), "ClusterIssuer".to_string()),
+                ])),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/tls".into()),
+            data: Some(BTreeMap::from([
+                ("tls.crt".to_string(), ByteString(chain.into_bytes())),
+                ("tls.key".to_string(), ByteString(key.as_bytes().to_vec())),
+            ])),
+            ..Default::default()
+        };
+        let o = overview_of(&s);
+        assert_eq!((o.cert_manager_certificate.as_str(), o.cert_manager_issuer_kind.as_str()), ("api", "ClusterIssuer"));
+        // Only the key holding certificates; the private key is not one.
+        assert_eq!(o.certificates.len(), 1);
+        assert_eq!((o.certificates[0].key.as_str(), o.certificates[0].total), ("tls.crt", 2));
+        assert_eq!(o.secret_type, "kubernetes.io/tls");
+        assert_eq!(o.certificates[0].certificates[0].sans[0], "api.example.com");
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(!json.contains("PRIVATE KEY") && !json.contains("MIIEvQ"), "a value leaked: {json}");
+    }
+
+    #[test]
+    fn a_pull_secret_names_its_registries_and_nothing_else() {
+        let config = format!(r#"{{"auths":{{"myacr.azurecr.io":{{"username":"u","password":"{PASSWORD}","auth":"{TOKEN}"}},"ghcr.io":{{"auth":"{TOKEN}"}}}}}}"#);
+        let s = Secret {
+            metadata: ObjectMeta {
+                name: Some("acr".into()),
+                owner_references: Some(vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "external-secrets.io/v1".into(),
+                    kind: "ExternalSecret".into(),
+                    name: "acr".into(),
+                    uid: "u".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/dockerconfigjson".into()),
+            data: Some(BTreeMap::from([(".dockerconfigjson".to_string(), ByteString(config.into_bytes()))])),
+            ..Default::default()
+        };
+        let o = overview_of(&s);
+        assert_eq!(o.registries, vec!["ghcr.io", "myacr.azurecr.io"]);
+        assert_eq!(o.owners, vec![SecretOwner { kind: "ExternalSecret".into(), name: "acr".into() }]);
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(!json.contains(PASSWORD) && !json.contains(TOKEN), "a value leaked: {json}");
+    }
+
+    #[test]
+    fn the_leaf_is_found_wherever_the_bundle_puts_it() {
+        use crate::x509::tests::{CA, FAR, LEAF};
+        let parse = |pem: String| crate::x509::parse_pem_bundle(&pem);
+        // CA first, leaf second: the leaf is still the one whose expiry counts.
+        let ca_first = parse(format!("{CA}\n{LEAF}\n"));
+        assert_eq!(leaf_of(&ca_first).map(|c| c.subject.as_str()), Some("O=Fleet Test, CN=api.example.com"));
+        // A lone certificate is its own leaf, even a CA.
+        assert!(leaf_of(&parse(CA.to_string())).is_some_and(|c| c.is_ca));
+        // A bundle of CAs has none.
+        assert!(leaf_of(&parse(format!("{CA}\n{CA}\n"))).is_none());
+        // Two unrelated end-entity certificates: the first.
+        assert_eq!(leaf_of(&parse(format!("{FAR}\n{LEAF}\n"))).map(|c| c.subject.as_str()), Some("CN=far.example.com"));
+    }
+
+    #[test]
+    fn registries_come_only_from_a_pull_secret_types_own_key() {
+        let cfg = |json: &str| ByteString(json.as_bytes().to_vec());
+        let secret = |type_: &str, data: Vec<(&str, ByteString)>| Secret {
+            type_: Some(type_.into()),
+            data: Some(data.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+            ..Default::default()
+        };
+        // Arbitrary JSON in an Opaque Secret is not a list of registries.
+        assert!(overview_of(&secret("Opaque", vec![(".dockercfg", cfg(r#"{"internal-name":{}}"#))])).registries.is_empty());
+        // A legacy pull secret reads `.dockercfg`, even beside a `.dockerconfigjson`.
+        let legacy = secret(
+            "kubernetes.io/dockercfg",
+            vec![(".dockercfg", cfg(r#"{"old.registry":{}}"#)), (".dockerconfigjson", cfg(r#"{"auths":{"new.registry":{}}}"#))],
+        );
+        assert_eq!(overview_of(&legacy).registries, vec!["old.registry"]);
+    }
+
+    /// Reads every Secret's overview through the real command path. Prints
+    /// counts only — no names, subjects or hosts.
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set SECRET_OVERVIEW_TEST_CONTEXT to run"]
+    async fn secret_overviews_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("SECRET_OVERVIEW_TEST_CONTEXT") else { return };
+        let client = client_for_context(&ctx).await.expect("client");
+        let api: Api<Secret> = Api::all(client);
+        let list = api.list(&ListParams::default().fields(&format!("type!={HELM_RELEASE_TYPE}"))).await.expect("secrets");
+        let now = chrono::Utc::now();
+        let (mut with_certs, mut certs, mut unparsed_tls, mut expired, mut within_30d, mut pull, mut owned, mut cert_manager) = (0, 0, 0, 0, 0, 0, 0, 0);
+        for s in &list.items {
+            let o = overview_of(s);
+            with_certs += usize::from(!o.certificates.is_empty());
+            certs += o.certificates.iter().map(|c| c.total).sum::<usize>();
+            unparsed_tls += usize::from(s.type_.as_deref() == Some("kubernetes.io/tls") && !o.certificates.iter().any(|c| c.key == "tls.crt"));
+            for c in o.certificates.iter().filter_map(|c| c.leaf.as_ref()) {
+                let after = c.not_after.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).expect("every leaf has an expiry");
+                expired += usize::from(after < now);
+                within_30d += usize::from(after >= now && after < now + chrono::Duration::days(30));
+            }
+            pull += usize::from(!o.registries.is_empty());
+            owned += usize::from(!o.owners.is_empty());
+            cert_manager += usize::from(!o.cert_manager_certificate.is_empty());
+        }
+        println!(
+            "secrets={} with_certs={with_certs} certs={certs} tls_unparsed={unparsed_tls} leaf_expired={expired} leaf_within_30d={within_30d} pull_secrets={pull} owned={owned} cert_manager={cert_manager}",
+            list.items.len()
+        );
+        assert_eq!(unparsed_tls, 0, "a kubernetes.io/tls Secret's tls.crt did not parse");
     }
 }
