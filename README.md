@@ -321,7 +321,12 @@ an Overview — why it is degraded or out of sync, what the last sync did and
 each resource it failed to apply, its sources and destination, how it syncs,
 the resources that need attention (each a link when the app deploys to the
 cluster it runs in), its images and recent deployments — with a Diff of each
-drifted resource beside it. Secrets
+drifted resource beside it. Helm lists every release with its chart, status
+and revision count, read straight from Helm's release Secrets; a release's
+panel opens on an Overview — why it failed or is stuck pending, which chart
+and app version it runs, which values it overrides, what it rendered (its
+workloads with whether they are ready, each a link), its hooks and subcharts,
+and every stored revision — beside its values, manifest and notes. Secrets
 lists every Secret with its type and key count; its panel shows each key's
 name and size, keeps values masked until you reveal one, and forgets them
 when it closes. Helm's own release Secrets are listed without their contents,

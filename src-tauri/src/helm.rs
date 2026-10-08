@@ -17,7 +17,7 @@
 //! release, and then fetches just those payloads, concurrently.
 
 use crate::kubeconfig::client_for_context;
-use crate::models::{HelmReleaseDetail, HelmReleaseInfo, HelmRevisionInfo};
+use crate::models::{HelmDependency, HelmHistoryEntry, HelmHook, HelmOverview, HelmReleaseDetail, HelmReleaseInfo, HelmResource, HelmRevisionInfo};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
@@ -259,12 +259,16 @@ pub async fn get_helm_release_detail(
     revision: i64,
 ) -> Result<HelmReleaseDetail, String> {
     let client = client_for_context(context_name).await?;
-    let secrets: Api<Secret> = Api::namespaced(client, namespace);
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let secret_name = format!("sh.helm.release.v1.{name}.v{revision}");
-    let secret = secrets
-        .get(&secret_name)
-        .await
-        .map_err(|e| format!("Failed to get Helm release secret '{secret_name}': {e}"))?;
+    // The history is every revision's labels — metadata only, so it costs one
+    // small round trip, run alongside the payload fetch.
+    let lp = ListParams::default()
+        .labels(&format!("{HELM_OWNER_LABEL},name={name}"))
+        .fields(&format!("type={HELM_SECRET_TYPE}"));
+    let (secret, metas) = tokio::join!(secrets.get(&secret_name), secrets.list_metadata(&lp));
+    let secret = secret.map_err(|e| format!("Failed to get Helm release secret '{secret_name}': {e}"))?;
+    let history = metas.map(|l| history_from_metadata(&l.items)).map_err(|e| format!("Failed to list revisions of '{name}': {e}"));
 
     let raw = secret
         .data
@@ -273,12 +277,141 @@ pub async fn get_helm_release_detail(
         .ok_or_else(|| format!("Secret '{secret_name}' has no 'release' key"))?;
     let payload = decode_release_payload(&raw.0)?;
 
+    let mut overview = overview_from_payload(&payload, history);
+    resolve_scopes(&client, &mut overview.resources).await;
+
     Ok(HelmReleaseDetail {
         values_yaml: json_to_yaml_or_empty(payload.get("config")),
         default_values_yaml: json_to_yaml_or_empty(payload.pointer("/chart/values")),
         manifest: payload.get("manifest").and_then(|m| m.as_str()).unwrap_or_default().to_string(),
         notes: str_at(&payload, &["info", "notes"]).to_string(),
+        overview,
     })
+}
+
+/// Marks each rendered object namespaced or cluster-scoped, as the API
+/// server's discovery says for its group, version and kind — the only reliable
+/// answer, since a chart may render any CRD and the same kind name can mean
+/// different things in different groups.
+///
+/// One request per distinct apiVersion, issued concurrently; a chart renders
+/// a handful. A version that fails to discover leaves its objects at `None`
+/// rather than failing the panel.
+async fn resolve_scopes(client: &kube::Client, resources: &mut [HelmResource]) {
+    let mut versions: Vec<&str> = resources.iter().map(|r| r.api_version.as_str()).collect();
+    versions.sort_unstable();
+    versions.dedup();
+    let discovered = futures::future::join_all(versions.into_iter().map(|av| {
+        let client = client.clone();
+        let av = av.to_string();
+        async move {
+            let gv: kube::core::GroupVersion = av.parse().ok()?;
+            let group = kube::discovery::oneshot::pinned_group(&client, &gv).await.ok()?;
+            Some(
+                group
+                    .versioned_resources(&gv.version)
+                    .into_iter()
+                    .map(|(ar, caps)| ((av.clone(), ar.kind), caps.scope == kube::discovery::Scope::Namespaced))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }))
+    .await;
+    let scopes: HashMap<(String, String), bool> = discovered.into_iter().flatten().flatten().collect();
+    for r in resources.iter_mut() {
+        r.namespaced = scopes.get(&(r.api_version.clone(), r.kind.clone())).copied();
+    }
+}
+
+/// Every stored revision, newest first, from the labels Helm puts on each Secret.
+fn history_from_metadata(metas: &[kube::core::PartialObjectMeta<Secret>]) -> Vec<HelmHistoryEntry> {
+    let mut out: Vec<HelmHistoryEntry> = metas
+        .iter()
+        .filter_map(|m| {
+            let rev = parse_revision_metadata(m)?;
+            let modified_at = m
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("modifiedAt"))
+                .and_then(|t| t.parse::<i64>().ok())
+                .and_then(|t| DateTime::from_timestamp(t, 0))
+                .map(|t| t.to_rfc3339());
+            Some(HelmHistoryEntry { revision: rev.revision, status: rev.status, modified_at })
+        })
+        .collect();
+    out.sort_by(|a, b| b.revision.cmp(&a.revision));
+    out
+}
+
+/// A Helm timestamp as RFC 3339 UTC, or `None` for an empty or zero one —
+/// Go writes an unset time as `0001-01-01T00:00:00Z`.
+fn helm_time(raw: &str) -> Option<String> {
+    parse_helm_time(raw).filter(|t| t.timestamp() > 0).map(|t| t.to_rfc3339())
+}
+
+fn str_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value.and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect()).unwrap_or_default()
+}
+
+fn overview_from_payload(payload: &serde_json::Value, history: Result<Vec<HelmHistoryEntry>, String>) -> HelmOverview {
+    let meta = payload.pointer("/chart/metadata");
+    let meta_str = |key: &str| meta.and_then(|m| m.get(key)).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let (history, history_error) = match history {
+        Ok(h) => (h, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    HelmOverview {
+        status: str_at(payload, &["info", "status"]).to_string(),
+        description: str_at(payload, &["info", "description"]).to_string(),
+        first_deployed: helm_time(str_at(payload, &["info", "first_deployed"])),
+        last_deployed: helm_time(str_at(payload, &["info", "last_deployed"])),
+        chart_name: meta_str("name"),
+        chart_version: meta_str("version"),
+        app_version: meta_str("appVersion"),
+        chart_description: meta_str("description"),
+        home: meta_str("home"),
+        sources: str_list(meta.and_then(|m| m.get("sources"))),
+        kube_version: meta_str("kubeVersion"),
+        deprecated: meta.and_then(|m| m.get("deprecated")).and_then(|v| v.as_bool()).unwrap_or(false),
+        dependencies: meta
+            .and_then(|m| m.get("dependencies"))
+            .and_then(|d| d.as_array())
+            .map(|deps| {
+                deps.iter()
+                    .map(|d| HelmDependency {
+                        name: str_at(d, &["name"]).to_string(),
+                        alias: str_at(d, &["alias"]).to_string(),
+                        version: str_at(d, &["version"]).to_string(),
+                        repository: str_at(d, &["repository"]).to_string(),
+                        condition: str_at(d, &["condition"]).to_string(),
+                        // Helm writes the evaluated result back; absent means it was never switched off.
+                        enabled: d.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        overridden_keys: payload.get("config").and_then(|c| c.as_object()).map(|o| o.keys().cloned().collect()).unwrap_or_default(),
+        resources: manifest_resources(payload.get("manifest").and_then(|m| m.as_str()).unwrap_or_default()),
+        hooks: payload
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks
+                    .iter()
+                    .map(|h| HelmHook {
+                        name: str_at(h, &["name"]).to_string(),
+                        kind: str_at(h, &["kind"]).to_string(),
+                        events: str_list(h.get("events")),
+                        phase: str_at(h, &["last_run", "phase"]).to_string(),
+                        completed_at: helm_time(str_at(h, &["last_run", "completed_at"])),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        history,
+        history_error,
+    }
 }
 
 /// An index of what a release renders, in place of the manifest itself.
@@ -293,8 +426,17 @@ pub async fn get_helm_release_detail(
 /// is a concatenation of documents Helm already rendered, and a YAML parse
 /// would fail the whole inventory on one chart that emits something odd.
 pub fn manifest_inventory(manifest: &str) -> Vec<String> {
+    manifest_resources(manifest)
+        .into_iter()
+        .map(|r| if r.namespace.is_empty() { format!("{} {}", r.kind, r.name) } else { format!("{} {}/{}", r.kind, r.namespace, r.name) })
+        .collect()
+}
+
+/// Each object a release rendered: its apiVersion, kind, namespace and name.
+pub fn manifest_resources(manifest: &str) -> Vec<HelmResource> {
     let mut out = Vec::new();
     for doc in manifest.split("\n---") {
+        let mut api_version = "";
         let mut kind = "";
         let mut name = "";
         let mut namespace = "";
@@ -305,6 +447,9 @@ pub fn manifest_inventory(manifest: &str) -> Vec<String> {
             // document's kind.
             if let Some(rest) = line.strip_prefix("kind: ") {
                 kind = rest.trim();
+                in_metadata = false;
+            } else if let Some(rest) = line.strip_prefix("apiVersion: ") {
+                api_version = rest.trim().trim_matches('"');
                 in_metadata = false;
             } else if line.starts_with("metadata:") {
                 in_metadata = true;
@@ -319,10 +464,12 @@ pub fn manifest_inventory(manifest: &str) -> Vec<String> {
         if kind.is_empty() || name.is_empty() {
             continue;
         }
-        out.push(if namespace.is_empty() {
-            format!("{kind} {name}")
-        } else {
-            format!("{kind} {namespace}/{name}")
+        out.push(HelmResource {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            namespaced: None,
         });
     }
     out
@@ -618,6 +765,108 @@ rules: []
         assert_eq!(
             manifest_inventory(manifest),
             vec!["Deployment prod/api".to_string(), "ClusterRole api-scan".to_string()]
+        );
+    }
+
+    #[test]
+    fn resources_carry_their_api_version() {
+        let manifest = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n---\napiVersion: \"networking.k8s.io/v1\"\nkind: Ingress\nmetadata:\n  name: web\n  namespace: edge\n";
+        assert_eq!(
+            manifest_resources(manifest),
+            vec![
+                HelmResource { api_version: "apps/v1".into(), kind: "Deployment".into(), namespace: String::new(), name: "api".into(), namespaced: None },
+                HelmResource { api_version: "networking.k8s.io/v1".into(), kind: "Ingress".into(), namespace: "edge".into(), name: "web".into(), namespaced: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn overview_reads_chart_hooks_dependencies_and_overrides() {
+        let payload = serde_json::json!({
+            "info": { "status": "pending-upgrade", "description": "Preparing upgrade", "first_deployed": "2026-04-29T00:46:42.9+03:00", "last_deployed": "0001-01-01T00:00:00Z" },
+            "chart": { "metadata": {
+                "name": "redis", "version": "18.10.12", "appVersion": "7.2.4", "description": "In-memory store", "home": "https://redis.io",
+                "sources": ["https://github.com/bitnami/charts"], "kubeVersion": ">=1.25.0-0", "deprecated": true,
+                "dependencies": [
+                    { "name": "common", "version": "2.x.x", "repository": "oci://registry/bitnami", "enabled": true },
+                    { "name": "metrics", "alias": "exporter", "version": "1.0.0", "repository": "", "condition": "metrics.enabled", "enabled": false }
+                ]
+            } },
+            "config": { "replica": { "replicaCount": 3 }, "auth": { "enabled": false } },
+            "manifest": "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: redis-master\n",
+            "hooks": [
+                { "name": "redis-migrate", "kind": "Job", "events": ["pre-upgrade"], "last_run": { "phase": "Failed", "completed_at": "2026-10-07T08:00:00Z" } },
+                { "name": "redis-test", "kind": "Pod", "events": ["test"], "last_run": { "phase": "", "completed_at": "0001-01-01T00:00:00Z" } }
+            ]
+        });
+        let history = vec![HelmHistoryEntry { revision: 4, status: "pending-upgrade".into(), modified_at: None }];
+        let o = overview_from_payload(&payload, Ok(history.clone()));
+        assert_eq!((o.status.as_str(), o.chart_name.as_str(), o.chart_version.as_str(), o.app_version.as_str()), ("pending-upgrade", "redis", "18.10.12", "7.2.4"));
+        assert_eq!(o.first_deployed.as_deref(), Some("2026-04-28T21:46:42.900+00:00"));
+        // Go's zero time is no time at all.
+        assert_eq!(o.last_deployed, None);
+        assert!(o.deprecated);
+        assert_eq!(o.kube_version, ">=1.25.0-0");
+        assert_eq!(o.dependencies.len(), 2);
+        assert!(o.dependencies[0].enabled && !o.dependencies[1].enabled);
+        assert_eq!((o.dependencies[1].alias.as_str(), o.dependencies[1].condition.as_str()), ("exporter", "metrics.enabled"));
+        assert_eq!(o.overridden_keys, vec!["auth", "replica"]);
+        assert_eq!(o.resources[0].kind, "StatefulSet");
+        assert_eq!((o.hooks[0].phase.as_str(), o.hooks[0].events.clone()), ("Failed", vec!["pre-upgrade".to_string()]));
+        assert_eq!(o.hooks[1].completed_at, None);
+        assert_eq!((o.history, o.history_error), (history, None));
+
+        let failed = overview_from_payload(&payload, Err("forbidden".into()));
+        assert!(failed.history.is_empty());
+        assert_eq!(failed.history_error.as_deref(), Some("forbidden"));
+    }
+
+    #[test]
+    fn history_comes_newest_first_from_the_labels() {
+        use kube::core::PartialObjectMetaExt;
+        let meta = |rev: &str, status: &str, at: &str| {
+            kube::api::ObjectMeta {
+                name: Some(format!("sh.helm.release.v1.api.v{rev}")),
+                namespace: Some("apps".into()),
+                labels: Some([("name", "api"), ("owner", "helm"), ("version", rev), ("status", status), ("modifiedAt", at)].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+                ..Default::default()
+            }
+            .into_response_partial::<Secret>()
+        };
+        let h = history_from_metadata(&[meta("1", "superseded", "1790000000"), meta("3", "deployed", "1791000000"), meta("2", "failed", "x")]);
+        assert_eq!(h.iter().map(|e| (e.revision, e.status.as_str())).collect::<Vec<_>>(), vec![(3, "deployed"), (2, "failed"), (1, "superseded")]);
+        assert_eq!(h[0].modified_at.as_deref(), Some("2026-10-03T04:00:00+00:00"));
+        assert_eq!(h[1].modified_at, None);
+    }
+
+    /// Fetches every release's detail through the real command path.
+    /// Prints counts only — no names, values or messages.
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set HELM_OVERVIEW_TEST_CONTEXT to run"]
+    async fn helm_overview_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("HELM_OVERVIEW_TEST_CONTEXT") else { return };
+        let releases = get_helm_releases(&ctx).await.expect("releases");
+        let (mut resources, mut hooks, mut failed_hooks, mut deps, mut disabled_deps, mut pending, mut overridden) = (0, 0, 0, 0, 0, 0, 0);
+        let (mut unresolved, mut cluster_scoped) = (0, 0);
+        for r in &releases {
+            let o = get_helm_release_detail(&ctx, &r.namespace, &r.name, r.revision).await.expect("detail").overview;
+            assert_eq!(o.status, r.status);
+            assert_eq!(o.history.len() as i64, r.revision_count);
+            assert_eq!(o.history.first().map(|h| h.revision), Some(r.revision));
+            assert!(o.history_error.is_none());
+            resources += o.resources.len();
+            unresolved += o.resources.iter().filter(|r| r.namespaced.is_none()).count();
+            cluster_scoped += o.resources.iter().filter(|r| r.namespaced == Some(false)).count();
+            hooks += o.hooks.len();
+            failed_hooks += o.hooks.iter().filter(|h| h.phase == "Failed").count();
+            deps += o.dependencies.len();
+            disabled_deps += o.dependencies.iter().filter(|d| !d.enabled).count();
+            pending += usize::from(o.status.starts_with("pending-"));
+            overridden += usize::from(!o.overridden_keys.is_empty());
+        }
+        println!(
+            "releases={} resources={resources} cluster_scoped={cluster_scoped} unresolved_scope={unresolved} hooks={hooks} failed_hooks={failed_hooks} deps={deps} disabled_deps={disabled_deps} pending={pending} with_overrides={overridden}",
+            releases.len()
         );
     }
 

@@ -1055,6 +1055,84 @@ pub struct HelmReleaseDetail {
     pub default_values_yaml: String,
     pub manifest: String,
     pub notes: String,
+    /// What the panel's Overview shows, read from the same payload.
+    pub overview: HelmOverview,
+}
+
+/// A subchart the chart depends on, with whether Helm enabled it for this release.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct HelmDependency {
+    pub name: String,
+    pub alias: String,
+    pub version: String,
+    pub repository: String,
+    /// The values path that switches it on or off, e.g. `redis.enabled`.
+    pub condition: String,
+    /// As Helm evaluated it for this release.
+    pub enabled: bool,
+}
+
+/// One object the release rendered, from its manifest.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct HelmResource {
+    pub api_version: String,
+    pub kind: String,
+    /// As written in the manifest; empty when the chart leaves it to the
+    /// release namespace, or for a cluster-scoped kind.
+    pub namespace: String,
+    pub name: String,
+    /// Whether the kind is namespaced, from the API server's discovery for
+    /// its group and version. `None` when discovery could not say — a CRD
+    /// since removed, or a group the reader may not discover.
+    pub namespaced: Option<bool>,
+}
+
+/// A chart hook and how its last run went.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct HelmHook {
+    pub name: String,
+    pub kind: String,
+    /// `pre-install`, `post-upgrade`, `test`…
+    pub events: Vec<String>,
+    /// `Succeeded`, `Failed`, `Running`; empty if it has not run.
+    pub phase: String,
+    pub completed_at: Option<String>,
+}
+
+/// One stored revision, from its Secret's labels alone.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct HelmHistoryEntry {
+    pub revision: i64,
+    pub status: String,
+    /// Helm's `modifiedAt` label, RFC 3339 UTC.
+    pub modified_at: Option<String>,
+}
+
+/// What a release's payload buries. Mirrors `HelmOverview` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct HelmOverview {
+    pub status: String,
+    pub description: String,
+    pub first_deployed: Option<String>,
+    pub last_deployed: Option<String>,
+    pub chart_name: String,
+    pub chart_version: String,
+    pub app_version: String,
+    pub chart_description: String,
+    pub home: String,
+    pub sources: Vec<String>,
+    /// The chart's Kubernetes version constraint, e.g. `>=1.25.0-0`.
+    pub kube_version: String,
+    pub deprecated: bool,
+    pub dependencies: Vec<HelmDependency>,
+    /// Top-level keys of the user-supplied values.
+    pub overridden_keys: Vec<String>,
+    pub resources: Vec<HelmResource>,
+    pub hooks: Vec<HelmHook>,
+    /// Every stored revision, newest first.
+    pub history: Vec<HelmHistoryEntry>,
+    /// Why the history could not be listed, when it could not.
+    pub history_error: Option<String>,
 }
 
 /// A Namespace. Mirrors `NamespaceInfo` in types.ts.
