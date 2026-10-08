@@ -11354,7 +11354,6 @@ function renderExternalSecretKeysView(ed: ExternalSecretDetailState): string {
     </div>`;
 }
 
-/** The sync status, always on screen above the tabs: it is the reason anyone opens an ExternalSecret. */
 /** What each creation policy does to the target Secret. */
 const ES_CREATION_POLICY: Record<string, string> = {
   Owner: "ESO creates it and owns it — deleted with this ExternalSecret",
@@ -11411,8 +11410,12 @@ function renderExternalSecretOverviewView(ed: ExternalSecretDetailState): string
       ? "loading…"
       : ed.listErrors.secretstores
         ? `<span class="text-status-critical">${esc(ed.listErrors.secretstores)}</span>`
-        : state.secretStores.has(ctx)
-          ? '<span class="text-status-warning">not found on this cluster</span>'
+        : // One store kind may have failed to list while the other succeeded:
+          // then absence proves nothing, so say why rather than "not found".
+          state.secretStores.get(ctx)?.error
+          ? `<span class="text-status-warning">not listed — ${esc(state.secretStores.get(ctx)!.error!)}</span>`
+          : state.secretStores.has(ctx)
+            ? '<span class="text-status-warning">not found on this cluster</span>'
           : "";
   const targetLink = `<button type="button" onclick="window.__app.openSecretDetail(${jsArg(ctx)},${jsArg(namespace)},${jsArg(e.target_name)},${jsArg(target?.secret_type ?? e.target_type)})" class="text-series-blue hover:underline">${esc(e.target_name)}</button>`;
   const targetState = target
