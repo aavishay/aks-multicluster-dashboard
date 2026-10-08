@@ -188,7 +188,7 @@ fn controller_owner(refs: &Option<Vec<OwnerReference>>) -> Option<(&str, &str)> 
 /// failed to parse and fell back to zero — so the Pods/Nodes tabs showed
 /// "0m" CPU for everything while memory (whose "Ki"/"Mi" suffixes were
 /// covered) looked correct.
-fn parse_cpu_millicores(q: &str) -> i64 {
+pub(crate) fn parse_cpu_millicores(q: &str) -> i64 {
     // Ordered longest-suffix-first isn't needed here — these are all distinct
     // single characters — but the shape mirrors `parse_memory_ki` below.
     let units: [(&str, f64); 3] = [
@@ -205,7 +205,7 @@ fn parse_cpu_millicores(q: &str) -> i64 {
     (q.parse::<f64>().unwrap_or(0.0) * 1000.0).round() as i64
 }
 
-fn parse_memory_ki(q: &str) -> i64 {
+pub(crate) fn parse_memory_ki(q: &str) -> i64 {
     // Kubernetes' own canonical Quantity serialization uses lowercase "k" for
     // decimal kilo (1000ies never being uppercase, per resource.Quantity's
     // suffix table); "K" is kept alongside it only for leniency, since it's
@@ -2090,7 +2090,10 @@ pub(crate) fn object_manifest(obj: DynamicObject) -> Result<ObjectManifest, Stri
 
 pub async fn get_nap_node_pool_manifest(context_name: &str, name: &str) -> Result<NapNodePoolManifest, String> {
     let client = client_for_context(context_name).await?;
-    object_manifest(get_karpenter(&client, "NodePool", "nodepools", name).await?)
+    let obj = get_karpenter(&client, "NodePool", "nodepools", name).await?;
+    let detail = crate::nap_detail::nap_detail(&obj);
+    let ObjectManifest { yaml_full, yaml_without_managed_fields } = object_manifest(obj)?;
+    Ok(NapNodePoolManifest { yaml_full, yaml_without_managed_fields, detail })
 }
 
 /// Same reasoning as `get_node_events`: a NodePool is cluster-scoped, so
