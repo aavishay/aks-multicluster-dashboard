@@ -259,7 +259,7 @@ pub async fn get_helm_release_detail(
     revision: i64,
 ) -> Result<HelmReleaseDetail, String> {
     let client = client_for_context(context_name).await?;
-    let secrets: Api<Secret> = Api::namespaced(client, namespace);
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let secret_name = format!("sh.helm.release.v1.{name}.v{revision}");
     // The history is every revision's labels — metadata only, so it costs one
     // small round trip, run alongside the payload fetch.
@@ -277,13 +277,50 @@ pub async fn get_helm_release_detail(
         .ok_or_else(|| format!("Secret '{secret_name}' has no 'release' key"))?;
     let payload = decode_release_payload(&raw.0)?;
 
+    let mut overview = overview_from_payload(&payload, history);
+    resolve_scopes(&client, &mut overview.resources).await;
+
     Ok(HelmReleaseDetail {
         values_yaml: json_to_yaml_or_empty(payload.get("config")),
         default_values_yaml: json_to_yaml_or_empty(payload.pointer("/chart/values")),
         manifest: payload.get("manifest").and_then(|m| m.as_str()).unwrap_or_default().to_string(),
         notes: str_at(&payload, &["info", "notes"]).to_string(),
-        overview: overview_from_payload(&payload, history),
+        overview,
     })
+}
+
+/// Marks each rendered object namespaced or cluster-scoped, as the API
+/// server's discovery says for its group, version and kind — the only reliable
+/// answer, since a chart may render any CRD and the same kind name can mean
+/// different things in different groups.
+///
+/// One request per distinct apiVersion, issued concurrently; a chart renders
+/// a handful. A version that fails to discover leaves its objects at `None`
+/// rather than failing the panel.
+async fn resolve_scopes(client: &kube::Client, resources: &mut [HelmResource]) {
+    let mut versions: Vec<&str> = resources.iter().map(|r| r.api_version.as_str()).collect();
+    versions.sort_unstable();
+    versions.dedup();
+    let discovered = futures::future::join_all(versions.into_iter().map(|av| {
+        let client = client.clone();
+        let av = av.to_string();
+        async move {
+            let gv: kube::core::GroupVersion = av.parse().ok()?;
+            let group = kube::discovery::oneshot::pinned_group(&client, &gv).await.ok()?;
+            Some(
+                group
+                    .versioned_resources(&gv.version)
+                    .into_iter()
+                    .map(|(ar, caps)| ((av.clone(), ar.kind), caps.scope == kube::discovery::Scope::Namespaced))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }))
+    .await;
+    let scopes: HashMap<(String, String), bool> = discovered.into_iter().flatten().flatten().collect();
+    for r in resources.iter_mut() {
+        r.namespaced = scopes.get(&(r.api_version.clone(), r.kind.clone())).copied();
+    }
 }
 
 /// Every stored revision, newest first, from the labels Helm puts on each Secret.
@@ -432,6 +469,7 @@ pub fn manifest_resources(manifest: &str) -> Vec<HelmResource> {
             kind: kind.to_string(),
             namespace: namespace.to_string(),
             name: name.to_string(),
+            namespaced: None,
         });
     }
     out
@@ -736,8 +774,8 @@ rules: []
         assert_eq!(
             manifest_resources(manifest),
             vec![
-                HelmResource { api_version: "apps/v1".into(), kind: "Deployment".into(), namespace: String::new(), name: "api".into() },
-                HelmResource { api_version: "networking.k8s.io/v1".into(), kind: "Ingress".into(), namespace: "edge".into(), name: "web".into() },
+                HelmResource { api_version: "apps/v1".into(), kind: "Deployment".into(), namespace: String::new(), name: "api".into(), namespaced: None },
+                HelmResource { api_version: "networking.k8s.io/v1".into(), kind: "Ingress".into(), namespace: "edge".into(), name: "web".into(), namespaced: None },
             ]
         );
     }
@@ -809,6 +847,7 @@ rules: []
         let Ok(ctx) = std::env::var("HELM_OVERVIEW_TEST_CONTEXT") else { return };
         let releases = get_helm_releases(&ctx).await.expect("releases");
         let (mut resources, mut hooks, mut failed_hooks, mut deps, mut disabled_deps, mut pending, mut overridden) = (0, 0, 0, 0, 0, 0, 0);
+        let (mut unresolved, mut cluster_scoped) = (0, 0);
         for r in &releases {
             let o = get_helm_release_detail(&ctx, &r.namespace, &r.name, r.revision).await.expect("detail").overview;
             assert_eq!(o.status, r.status);
@@ -816,6 +855,8 @@ rules: []
             assert_eq!(o.history.first().map(|h| h.revision), Some(r.revision));
             assert!(o.history_error.is_none());
             resources += o.resources.len();
+            unresolved += o.resources.iter().filter(|r| r.namespaced.is_none()).count();
+            cluster_scoped += o.resources.iter().filter(|r| r.namespaced == Some(false)).count();
             hooks += o.hooks.len();
             failed_hooks += o.hooks.iter().filter(|h| h.phase == "Failed").count();
             deps += o.dependencies.len();
@@ -824,7 +865,7 @@ rules: []
             overridden += usize::from(!o.overridden_keys.is_empty());
         }
         println!(
-            "releases={} resources={resources} hooks={hooks} failed_hooks={failed_hooks} deps={deps} disabled_deps={disabled_deps} pending={pending} with_overrides={overridden}",
+            "releases={} resources={resources} cluster_scoped={cluster_scoped} unresolved_scope={unresolved} hooks={hooks} failed_hooks={failed_hooks} deps={deps} disabled_deps={disabled_deps} pending={pending} with_overrides={overridden}",
             releases.len()
         );
     }
