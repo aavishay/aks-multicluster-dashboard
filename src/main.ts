@@ -13942,7 +13942,10 @@ function renderHelm(): string {
 // Helm release detail panel (Overview / Values / Manifest / Notes)
 // ---------------------------------------------------------------------------
 
-/** Kinds a chart may render that live outside any namespace. */
+/**
+ * Built-in kinds that live outside any namespace — only a fallback for an
+ * object whose scope discovery could not resolve.
+ */
 const CLUSTER_SCOPED_KINDS = new Set([
   "Namespace",
   "PersistentVolume",
@@ -13985,7 +13988,9 @@ function renderHelmOverviewView(hd: HelmDetailState): string {
   const resources = o.resources.map((r) => ({
     group: apiGroup(r.api_version),
     kind: r.kind,
-    namespace: r.namespace || (CLUSTER_SCOPED_KINDS.has(r.kind) ? "" : namespace),
+    // The API server's discovery decides; a cluster-scoped object keeps no
+    // namespace even if the chart wrote one, which the API server ignores.
+    namespace: r.namespaced === false ? "" : r.namespace || (r.namespaced ?? !CLUSTER_SCOPED_KINDS.has(r.kind) ? namespace : ""),
     name: r.name,
   }));
   const loadedWorkloads = state.workloads.get(ctx);
@@ -14044,7 +14049,9 @@ function renderHelmOverviewView(hd: HelmDetailState): string {
     if (!isWorkload(r)) return "";
     const w = workloadOf(r);
     if (!loadedWorkloads) return '<span class="text-ink-muted">—</span>';
-    if (!w) return '<span class="text-ink-muted">not found</span>';
+    // The Workloads list drops a kind it could not list rather than failing,
+    // so absence from it is not proof of absence from the cluster.
+    if (!w) return `<span class="text-ink-muted" title="Not in the Workloads tab's last list, which may be missing a kind it could not list">—</span>`;
     return `<span class="tabular ${w.healthy ? "text-ink-secondary" : "text-status-warning"}">${w.ready}/${w.desired} ready</span>`;
   };
   const resourceSection = overviewSection(

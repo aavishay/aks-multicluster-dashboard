@@ -608,6 +608,8 @@ export interface HelmResource {
   /** Empty when the chart leaves it to the release namespace, or for a cluster-scoped kind. */
   namespace: string;
   name: string;
+  /** From API discovery for its group/version/kind; null when discovery could not say. */
+  namespaced: boolean | null;
 }
 
 export interface HelmHook {

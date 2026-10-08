@@ -1081,6 +1081,10 @@ pub struct HelmResource {
     /// release namespace, or for a cluster-scoped kind.
     pub namespace: String,
     pub name: String,
+    /// Whether the kind is namespaced, from the API server's discovery for
+    /// its group and version. `None` when discovery could not say — a CRD
+    /// since removed, or a group the reader may not discover.
+    pub namespaced: Option<bool>,
 }
 
 /// A chart hook and how its last run went.
