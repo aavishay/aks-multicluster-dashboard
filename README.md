@@ -330,7 +330,13 @@ and every stored revision — beside its values, manifest and notes. Secrets
 lists every Secret with its type and key count; its panel shows each key's
 name and size, keeps values masked until you reveal one, and forgets them
 when it closes. Helm's own release Secrets are listed without their contents,
-which the Helm tab already shows. The
+which the Helm tab already shows. ServiceAccounts shows each account's Azure
+workload identity (its client ID), image pull secrets and whether it mounts a
+token. SecretStores lists External Secrets Operator's SecretStores and
+ClusterSecretStores with their provider, vault, sign-in method and whether ESO
+can reach them; a store's panel lists the ExternalSecrets reading from it. PDB
+lists PodDisruptionBudgets with what each allows right now, flagging one that
+blocks every eviction — the one a drain or node upgrade will wait on. The
 sidebar auto-refreshes cluster health badges, and there's a refresh interval
 selector (15s/30s/60s/5m/off) for the active tab, defaulting to 15s.
 

@@ -7,17 +7,17 @@
 
 use crate::k8s::{age_days, age_seconds, created_at, event_to_info, json_str, list_events_sorted, object_manifest};
 use crate::kubeconfig::client_for_context;
-use crate::models::{EventInfo, ExternalSecretDetail, ExternalSecretInfo, ExternalSecretMapping, ExternalSecretsResult};
+use crate::models::{EventInfo, ExternalSecretDetail, ExternalSecretInfo, ExternalSecretMapping, ExternalSecretsResult, SecretStoreInfo, SecretStoresResult};
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams};
 use kube::Client;
 use serde_json::Value;
 
-const GROUP: &str = "external-secrets.io";
+pub(crate) const GROUP: &str = "external-secrets.io";
 
 /// ESO promoted `ExternalSecret` to `v1` in 0.17 and still serves `v1beta1`
 /// beside it, while older installs serve only `v1beta1`. Tried newest-first,
 /// falling back on 404, so an older cluster is not reported as having no ESO.
-const VERSIONS: &[&str] = &["v1", "v1beta1"];
+pub(crate) const VERSIONS: &[&str] = &["v1", "v1beta1"];
 
 fn resource(version: &str) -> ApiResource {
     ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(GROUP, version, "ExternalSecret"), "externalsecrets")
@@ -98,6 +98,91 @@ pub async fn get_external_secrets(context_name: &str) -> Result<ExternalSecretsR
         }
     }
     Ok(ExternalSecretsResult { installed: false, error: None, external_secrets: Vec::new() })
+}
+
+/// A store's provider, read generically: ESO has some thirty providers, each
+/// with its own fields, so this names the common ones and falls back to the
+/// provider's name alone.
+fn store_info(obj: &DynamicObject, kind: &str) -> SecretStoreInfo {
+    let spec = obj.data.get("spec");
+    let status = obj.data.get("status");
+    let (provider, conf) = spec
+        .and_then(|s| s.get("provider"))
+        .and_then(Value::as_object)
+        .and_then(|p| p.iter().next())
+        .map(|(k, v)| (k.clone(), Some(v)))
+        .unwrap_or_default();
+    let first = |keys: &[&str]| keys.iter().map(|k| json_str(conf, k)).find(|v| !v.is_empty()).unwrap_or_default().to_string();
+    let auth_obj = conf.and_then(|c| c.get("auth"));
+    // Azure names its method; the others are known by which auth block is set.
+    let auth = match json_str(conf, "authType") {
+        "" => auth_obj.and_then(Value::as_object).and_then(|a| a.keys().next().cloned()).unwrap_or_default(),
+        t => t.to_string(),
+    };
+    let identity = match json_str(conf, "identityId") {
+        "" => json_str(conf.and_then(|c| c.get("serviceAccountRef")), "name").to_string(),
+        id => id.to_string(),
+    };
+    let (ready, reason, message) = ready_condition(status);
+    SecretStoreInfo {
+        kind: kind.to_string(),
+        namespace: obj.metadata.namespace.clone().unwrap_or_default(),
+        name: obj.metadata.name.clone().unwrap_or_default(),
+        provider,
+        target: first(&["vaultUrl", "server", "region", "projectID", "remoteNamespace", "url"]),
+        auth,
+        identity,
+        ready,
+        reason,
+        message,
+        capabilities: json_str(status, "capabilities").to_string(),
+        age_days: age_days(obj.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(obj.metadata.creation_timestamp.clone()),
+        created_at: created_at(&obj.metadata.creation_timestamp),
+    }
+}
+
+/// Every SecretStore and ClusterSecretStore, newest API version first.
+///
+/// The two are listed separately and either may fail alone: a reader allowed
+/// namespaced stores but not cluster-wide ones still gets the first, with the
+/// second's failure reported rather than the whole tab failing.
+pub async fn get_secret_stores(context_name: &str) -> Result<SecretStoresResult, String> {
+    let client = client_for_context(context_name).await?;
+    let list = |kind: &'static str, plural: &'static str| {
+        let client = client.clone();
+        async move {
+            for version in VERSIONS {
+                let ar = ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(GROUP, version, kind), plural);
+                let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+                match api.list(&ListParams::default()).await {
+                    Ok(list) => return Ok(Some(list.items.iter().map(|o| store_info(o, kind)).collect::<Vec<_>>())),
+                    Err(kube::Error::Api(resp)) if resp.code == 404 => continue,
+                    Err(e) => return Err(format!("Failed to list {kind}s: {e}")),
+                }
+            }
+            Ok(None)
+        }
+    };
+    let (namespaced, cluster) = tokio::join!(list("SecretStore", "secretstores"), list("ClusterSecretStore", "clustersecretstores"));
+    let mut stores = Vec::new();
+    let mut errors = Vec::new();
+    let mut installed = false;
+    for result in [namespaced, cluster] {
+        match result {
+            Ok(Some(s)) => {
+                installed = true;
+                stores.extend(s);
+            }
+            Ok(None) => {}
+            Err(e) => errors.push(e),
+        }
+    }
+    // Both failing is the tab failing, not a partial answer.
+    if !installed && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok(SecretStoresResult { installed, error: (!errors.is_empty()).then(|| errors.join("; ")), stores })
 }
 
 async fn get_one(client: &Client, namespace: &str, name: &str) -> Result<DynamicObject, String> {
@@ -286,5 +371,38 @@ mod tests {
             "Generated by Password db-pass"
         );
         assert_eq!(describe_data_from(&json!({ "somethingNew": {} })), "An entry this panel does not recognise — see the YAML");
+    }
+
+    #[test]
+    fn an_azure_key_vault_store_names_its_vault_and_identity() {
+        let s = store_info(
+            &obj(json!({
+                "apiVersion": "external-secrets.io/v1", "kind": "SecretStore",
+                "metadata": { "name": "kv", "namespace": "prod" },
+                "spec": { "provider": { "azurekv": { "authType": "ManagedIdentity", "identityId": "abc", "vaultUrl": "https://kv.vault.azure.net", "tenantId": "t" } } },
+                "status": { "capabilities": "ReadWrite", "conditions": [{ "type": "Ready", "status": "True", "reason": "Valid", "message": "store validated" }] }
+            })),
+            "SecretStore",
+        );
+        assert_eq!((s.provider.as_str(), s.target.as_str()), ("azurekv", "https://kv.vault.azure.net"));
+        assert_eq!((s.auth.as_str(), s.identity.as_str()), ("ManagedIdentity", "abc"));
+        assert!(s.ready);
+        assert_eq!(s.capabilities, "ReadWrite");
+    }
+
+    #[test]
+    fn another_provider_is_known_by_its_auth_block() {
+        let s = store_info(
+            &obj(json!({
+                "apiVersion": "external-secrets.io/v1", "kind": "ClusterSecretStore",
+                "metadata": { "name": "vault" },
+                "spec": { "provider": { "vault": { "server": "https://vault:8200", "auth": { "kubernetes": { "role": "eso" } } } } },
+                "status": { "conditions": [{ "type": "Ready", "status": "False", "reason": "InvalidProviderConfig", "message": "permission denied" }] }
+            })),
+            "ClusterSecretStore",
+        );
+        assert_eq!((s.namespace.as_str(), s.provider.as_str(), s.target.as_str(), s.auth.as_str()), ("", "vault", "https://vault:8200", "kubernetes"));
+        assert!(!s.ready);
+        assert_eq!(s.message, "permission denied");
     }
 }

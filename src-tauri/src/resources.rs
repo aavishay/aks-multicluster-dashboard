@@ -1,6 +1,7 @@
-//! The core object kinds behind the Namespaces, Services, Ingress, PVC, PV and
-//! ConfigMaps tabs: one list per kind, and a single manifest/events pair shared
-//! by all six detail panels.
+//! The object kinds behind the Namespaces, Services, Ingress, PVC, PV,
+//! ConfigMaps, ServiceAccounts and PDB tabs: one list per kind, and a single
+//! manifest/events pair shared by their detail panels — and by the
+//! SecretStores tab's, whose list lives with the rest of ESO.
 //!
 //! Lists go through the typed k8s-openapi structs, so the mapping into each
 //! row is ordinary field access and can be unit-tested on hand-built objects.
@@ -11,13 +12,16 @@
 use crate::k8s::{age_days, age_seconds, created_at, event_to_info, list_events_sorted, object_manifest};
 use crate::kubeconfig::client_for_context;
 use crate::models::{
-    ConfigMapEntry, ConfigMapInfo, ConfigMapKeyInfo, EventInfo, IngressInfo, IngressRuleInfo, NamespaceInfo, ObjectManifest, PvInfo,
-    PvcInfo, ServiceInfo,
+    ConfigMapEntry, ConfigMapInfo, ConfigMapKeyInfo, EventInfo, IngressInfo, IngressRuleInfo, NamespaceInfo, ObjectManifest, PdbInfo,
+    PvInfo, PvcInfo, ServiceAccountInfo, ServiceInfo,
 };
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Service, ServiceAccount};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressBackend};
-use kube::api::{Api, ApiResource, DynamicObject, ListParams};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams};
 use kube::Client;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -33,6 +37,10 @@ enum Kind {
     PersistentVolumeClaim,
     PersistentVolume,
     ConfigMap,
+    ServiceAccount,
+    PodDisruptionBudget,
+    SecretStore,
+    ClusterSecretStore,
 }
 
 impl Kind {
@@ -44,23 +52,39 @@ impl Kind {
             "PersistentVolumeClaim" => Ok(Self::PersistentVolumeClaim),
             "PersistentVolume" => Ok(Self::PersistentVolume),
             "ConfigMap" => Ok(Self::ConfigMap),
+            "ServiceAccount" => Ok(Self::ServiceAccount),
+            "PodDisruptionBudget" => Ok(Self::PodDisruptionBudget),
+            "SecretStore" => Ok(Self::SecretStore),
+            "ClusterSecretStore" => Ok(Self::ClusterSecretStore),
             other => Err(format!("Unknown resource kind '{other}'")),
         }
     }
 
-    fn api_resource(self) -> ApiResource {
+    /// Where to fetch it, newest version first. One for a built-in kind; ESO's
+    /// stores are served at `v1` or only at `v1beta1` depending on its version.
+    fn api_resources(self) -> Vec<ApiResource> {
+        let eso = |kind: &str, plural: &str| {
+            crate::external_secrets::VERSIONS
+                .iter()
+                .map(|v| ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(crate::external_secrets::GROUP, v, kind), plural))
+                .collect()
+        };
         match self {
-            Self::Namespace => ApiResource::erase::<Namespace>(&()),
-            Self::Service => ApiResource::erase::<Service>(&()),
-            Self::Ingress => ApiResource::erase::<Ingress>(&()),
-            Self::PersistentVolumeClaim => ApiResource::erase::<PersistentVolumeClaim>(&()),
-            Self::PersistentVolume => ApiResource::erase::<PersistentVolume>(&()),
-            Self::ConfigMap => ApiResource::erase::<ConfigMap>(&()),
+            Self::Namespace => vec![ApiResource::erase::<Namespace>(&())],
+            Self::Service => vec![ApiResource::erase::<Service>(&())],
+            Self::Ingress => vec![ApiResource::erase::<Ingress>(&())],
+            Self::PersistentVolumeClaim => vec![ApiResource::erase::<PersistentVolumeClaim>(&())],
+            Self::PersistentVolume => vec![ApiResource::erase::<PersistentVolume>(&())],
+            Self::ConfigMap => vec![ApiResource::erase::<ConfigMap>(&())],
+            Self::ServiceAccount => vec![ApiResource::erase::<ServiceAccount>(&())],
+            Self::PodDisruptionBudget => vec![ApiResource::erase::<PodDisruptionBudget>(&())],
+            Self::SecretStore => eso("SecretStore", "secretstores"),
+            Self::ClusterSecretStore => eso("ClusterSecretStore", "clustersecretstores"),
         }
     }
 
     fn namespaced(self) -> bool {
-        matches!(self, Self::Service | Self::Ingress | Self::PersistentVolumeClaim | Self::ConfigMap)
+        !matches!(self, Self::Namespace | Self::PersistentVolume | Self::ClusterSecretStore)
     }
 }
 
@@ -367,6 +391,71 @@ pub(crate) fn configmap_info(cm: ConfigMap) -> ConfigMapInfo {
     }
 }
 
+/// `azure.workload.identity/…` annotations, read off the account.
+const WORKLOAD_IDENTITY: &str = "azure.workload.identity/";
+
+pub(crate) fn service_account_info(sa: ServiceAccount) -> ServiceAccountInfo {
+    let annotation = |key: &str| {
+        sa.metadata.annotations.as_ref().and_then(|a| a.get(&format!("{WORKLOAD_IDENTITY}{key}"))).cloned().unwrap_or_default()
+    };
+    ServiceAccountInfo {
+        namespace: sa.metadata.namespace.clone().unwrap_or_default(),
+        name: sa.metadata.name.clone().unwrap_or_default(),
+        workload_identity_client_id: annotation("client-id"),
+        workload_identity_tenant_id: annotation("tenant-id"),
+        workload_identity_token_expiration: annotation("service-account-token-expiration"),
+        image_pull_secrets: sa.image_pull_secrets.iter().flatten().map(|r| r.name.clone()).collect(),
+        secrets: sa.secrets.iter().flatten().filter_map(|r| r.name.clone()).collect(),
+        automount_token: sa.automount_service_account_token,
+        age_days: age_days(sa.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(sa.metadata.creation_timestamp.clone()),
+        created_at: created_at(&sa.metadata.creation_timestamp),
+    }
+}
+
+fn int_or_string(v: &IntOrString) -> String {
+    match v {
+        IntOrString::Int(i) => i.to_string(),
+        IntOrString::String(s) => s.clone(),
+    }
+}
+
+/// A label selector as `key=value` and `key In (a,b)` terms.
+pub(crate) fn selector_terms(sel: Option<&LabelSelector>) -> Vec<String> {
+    let Some(sel) = sel else { return Vec::new() };
+    let mut out = pairs(sel.match_labels.as_ref());
+    out.extend(sel.match_expressions.iter().flatten().map(|e| match e.values.as_deref() {
+        Some(vs) if !vs.is_empty() => format!("{} {} ({})", e.key, e.operator, vs.join(",")),
+        _ => format!("{} {}", e.key, e.operator),
+    }));
+    out
+}
+
+pub(crate) fn pdb_info(pdb: PodDisruptionBudget) -> PdbInfo {
+    let spec = pdb.spec.as_ref();
+    let status = pdb.status.as_ref();
+    let condition = status.and_then(|s| s.conditions.as_ref()).and_then(|cs| cs.iter().find(|c| c.type_ == "DisruptionAllowed"));
+    PdbInfo {
+        namespace: pdb.metadata.namespace.clone().unwrap_or_default(),
+        name: pdb.metadata.name.clone().unwrap_or_default(),
+        min_available: spec.and_then(|s| s.min_available.as_ref()).map(int_or_string),
+        max_unavailable: spec.and_then(|s| s.max_unavailable.as_ref()).map(int_or_string),
+        selector: selector_terms(spec.and_then(|s| s.selector.as_ref())),
+        current_healthy: status.map_or(0, |s| s.current_healthy),
+        desired_healthy: status.map_or(0, |s| s.desired_healthy),
+        expected_pods: status.map_or(0, |s| s.expected_pods),
+        disruptions_allowed: status.map_or(0, |s| s.disruptions_allowed),
+        unhealthy_pod_eviction_policy: spec
+            .and_then(|s| s.unhealthy_pod_eviction_policy.clone())
+            .unwrap_or_else(|| "IfHealthyBudget".to_string()),
+        reason: condition.map(|c| c.reason.clone()).unwrap_or_default(),
+        message: condition.map(|c| c.message.clone()).unwrap_or_default(),
+        age_days: age_days(pdb.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(pdb.metadata.creation_timestamp.clone()),
+        created_at: created_at(&pdb.metadata.creation_timestamp),
+    }
+}
+
 async fn list_all<K>(client: &Client, what: &str) -> Result<Vec<K>, String>
 where
     K: kube::Resource<DynamicType = ()> + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -416,6 +505,16 @@ pub async fn get_configmaps(context_name: &str) -> Result<Vec<ConfigMapInfo>, St
     Ok(list_all::<ConfigMap>(&client, "configmaps").await?.into_iter().map(configmap_info).collect())
 }
 
+pub async fn get_service_accounts(context_name: &str) -> Result<Vec<ServiceAccountInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    Ok(list_all::<ServiceAccount>(&client, "serviceaccounts").await?.into_iter().map(service_account_info).collect())
+}
+
+pub async fn get_pdbs(context_name: &str) -> Result<Vec<PdbInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    Ok(list_all::<PodDisruptionBudget>(&client, "poddisruptionbudgets").await?.into_iter().map(pdb_info).collect())
+}
+
 /// One ConfigMap's keys with their values, for the panel's Data view — fetched
 /// when it opens rather than carried by every row of the table.
 pub async fn get_configmap_data(context_name: &str, namespace: &str, name: &str) -> Result<Vec<ConfigMapEntry>, String> {
@@ -425,19 +524,26 @@ pub async fn get_configmap_data(context_name: &str, namespace: &str, name: &str)
     Ok(configmap_entries(&cm))
 }
 
-/// The YAML for any of the six kinds. `namespace` is ignored for the two
+/// The YAML for any of these kinds. `namespace` is ignored for the
 /// cluster-scoped ones.
 pub async fn get_resource_manifest(context_name: &str, kind: &str, namespace: &str, name: &str) -> Result<ObjectManifest, String> {
     let k = Kind::parse(kind)?;
     let client = client_for_context(context_name).await?;
-    let ar = k.api_resource();
-    let api: Api<DynamicObject> = if k.namespaced() {
-        Api::namespaced_with(client, namespace, &ar)
-    } else {
-        Api::all_with(client, &ar)
-    };
-    let obj = api.get(name).await.map_err(|e| format!("Failed to get {kind} '{name}': {e}"))?;
-    object_manifest(obj)
+    let mut tried = Vec::new();
+    for ar in k.api_resources() {
+        let api: Api<DynamicObject> = if k.namespaced() {
+            Api::namespaced_with(client.clone(), namespace, &ar)
+        } else {
+            Api::all_with(client.clone(), &ar)
+        };
+        match api.get(name).await {
+            Ok(obj) => return object_manifest(obj),
+            // A version this cluster doesn't serve: try the next one.
+            Err(kube::Error::Api(resp)) if resp.code == 404 => tried.push(ar.api_version),
+            Err(e) => return Err(format!("Failed to get {kind} '{name}': {e}")),
+        }
+    }
+    Err(format!("{kind} '{name}' not found (tried {})", tried.join(", ")))
 }
 
 /// Events about one object, filtered by involved object before the cluster-wide
@@ -771,5 +877,83 @@ mod tests {
         assert!(Kind::parse("PersistentVolume").is_ok());
         assert!(!Kind::parse("Namespace").unwrap().namespaced());
         assert!(Kind::parse("Ingress").unwrap().namespaced());
+        assert!(Kind::parse("SecretStore").unwrap().namespaced());
+        assert!(!Kind::parse("ClusterSecretStore").unwrap().namespaced());
+        // ESO's stores are tried at each version it may serve.
+        assert_eq!(Kind::parse("SecretStore").unwrap().api_resources().len(), 2);
+    }
+
+    #[test]
+    fn a_service_account_reads_its_workload_identity() {
+        let sa: ServiceAccount = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api", "namespace": "prod", "annotations": {
+                "azure.workload.identity/client-id": "00000000-1111-2222-3333-444444444444",
+                "azure.workload.identity/service-account-token-expiration": "3600"
+            } },
+            "imagePullSecrets": [{ "name": "acr" }],
+            "automountServiceAccountToken": false
+        }))
+        .unwrap();
+        let i = service_account_info(sa);
+        assert_eq!(i.workload_identity_client_id, "00000000-1111-2222-3333-444444444444");
+        assert_eq!((i.workload_identity_tenant_id.as_str(), i.workload_identity_token_expiration.as_str()), ("", "3600"));
+        assert_eq!(i.image_pull_secrets, vec!["acr"]);
+        assert_eq!(i.automount_token, Some(false));
+    }
+
+    #[test]
+    fn a_pdb_that_blocks_every_eviction() {
+        let pdb: PodDisruptionBudget = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api", "namespace": "prod" },
+            "spec": { "minAvailable": "100%", "selector": { "matchLabels": { "app": "api" }, "matchExpressions": [{ "key": "tier", "operator": "In", "values": ["web", "edge"] }] } },
+            "status": {
+                "currentHealthy": 2, "desiredHealthy": 2, "expectedPods": 2, "disruptionsAllowed": 0,
+                "conditions": [{ "type": "DisruptionAllowed", "status": "False", "reason": "InsufficientPods", "message": "", "lastTransitionTime": "2026-10-07T08:00:00Z" }]
+            }
+        }))
+        .unwrap();
+        let i = pdb_info(pdb);
+        assert_eq!((i.min_available.as_deref(), i.max_unavailable.as_deref()), (Some("100%"), None));
+        assert_eq!(i.selector, vec!["app=api", "tier In (web,edge)"]);
+        assert_eq!((i.expected_pods, i.disruptions_allowed), (2, 0));
+        assert_eq!(i.reason, "InsufficientPods");
+        // Kubernetes' default when the field is unset.
+        assert_eq!(i.unhealthy_pod_eviction_policy, "IfHealthyBudget");
+    }
+
+    /// Lists both kinds and fetches one manifest of each through the real
+    /// command path. Prints counts only.
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set RESOURCE_TABS_TEST_CONTEXT to run"]
+    async fn service_accounts_and_pdbs_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("RESOURCE_TABS_TEST_CONTEXT") else { return };
+        let (sas, pdbs) = (get_service_accounts(&ctx).await.expect("sas"), get_pdbs(&ctx).await.expect("pdbs"));
+        let wi = sas.iter().filter(|s| !s.workload_identity_client_id.is_empty()).count();
+        let blocking = pdbs.iter().filter(|p| p.expected_pods > 0 && p.disruptions_allowed == 0).count();
+        let selecting_none = pdbs.iter().filter(|p| p.expected_pods == 0).count();
+        if let Some(s) = sas.first() {
+            get_resource_manifest(&ctx, "ServiceAccount", &s.namespace, &s.name).await.expect("sa manifest");
+        }
+        if let Some(p) = pdbs.first() {
+            get_resource_manifest(&ctx, "PodDisruptionBudget", &p.namespace, &p.name).await.expect("pdb manifest");
+        }
+        let stores = crate::external_secrets::get_secret_stores(&ctx).await.expect("stores");
+        for kind in ["SecretStore", "ClusterSecretStore"] {
+            if let Some(s) = stores.stores.iter().find(|s| s.kind == kind) {
+                get_resource_manifest(&ctx, kind, &s.namespace, &s.name).await.expect("store manifest");
+            }
+        }
+        let not_ready = stores.stores.iter().filter(|s| !s.ready).count();
+        let providers: std::collections::BTreeSet<&str> = stores.stores.iter().map(|s| s.provider.as_str()).collect();
+        println!(
+            "sas={} workload_identity={wi} pdbs={} blocking={blocking} selecting_none={selecting_none} eso_installed={} stores={} cluster_stores={} not_ready={not_ready} providers={} store_error={}",
+            sas.len(),
+            pdbs.len(),
+            stores.installed,
+            stores.stores.iter().filter(|s| s.kind == "SecretStore").count(),
+            stores.stores.iter().filter(|s| s.kind == "ClusterSecretStore").count(),
+            providers.len(),
+            stores.error.is_some()
+        );
     }
 }

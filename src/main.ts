@@ -21,6 +21,10 @@ import type {
   PodConditionInfo,
   PodReference,
   ConfigMapInfo,
+  PdbInfo,
+  SecretStoreInfo,
+  SecretStoresResult,
+  ServiceAccountInfo,
   AiProvider,
   ClaudeDiagnosisPayload,
   ClusterEntry,
@@ -839,6 +843,9 @@ interface AppState {
   pvcs: Map<string, PvcInfo[]>;
   pvs: Map<string, PvInfo[]>;
   configmaps: Map<string, ConfigMapInfo[]>;
+  serviceAccounts: Map<string, ServiceAccountInfo[]>;
+  pdbs: Map<string, PdbInfo[]>;
+  secretStores: Map<string, SecretStoresResult>;
   keda: Map<string, KedaResult>;
   gitops: Map<string, GitOpsResult>;
   helm: Map<string, HelmReleaseInfo[]>;
@@ -970,6 +977,9 @@ const state: AppState = {
   pvcs: new Map(),
   pvs: new Map(),
   configmaps: new Map(),
+  serviceAccounts: new Map(),
+  pdbs: new Map(),
+  secretStores: new Map(),
   keda: new Map(),
   gitops: new Map(),
   helm: new Map(),
@@ -1853,11 +1863,14 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "nap", label: "NAP" },
   { id: "hpa", label: "HPA" },
   { id: "keda", label: "KEDA" },
+  { id: "pdbs", label: "PDB" },
   { id: "gitops", label: "GitOps" },
   { id: "helm", label: "Helm" },
   { id: "configmaps", label: "ConfigMaps" },
   { id: "secrets", label: "Secrets" },
+  { id: "serviceaccounts", label: "ServiceAccounts" },
   { id: "externalsecrets", label: "ExternalSecrets" },
+  { id: "secretstores", label: "SecretStores" },
   { id: "cost", label: "Cost" },
 ];
 
@@ -2076,6 +2089,15 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
     case "externalsecrets":
       state.externalSecrets.set(ctx, await api.getExternalSecrets(ctx));
       break;
+    case "secretstores":
+      state.secretStores.set(ctx, await api.getSecretStores(ctx));
+      break;
+    case "serviceaccounts":
+      state.serviceAccounts.set(ctx, await api.getServiceAccounts(ctx));
+      break;
+    case "pdbs":
+      state.pdbs.set(ctx, await api.getPdbs(ctx));
+      break;
     case "namespaces":
       state.namespaces.set(ctx, await api.getNamespaces(ctx));
       break;
@@ -2129,6 +2151,12 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
       return state.secrets.has(ctx);
     case "externalsecrets":
       return state.externalSecrets.has(ctx);
+    case "secretstores":
+      return state.secretStores.has(ctx);
+    case "serviceaccounts":
+      return state.serviceAccounts.has(ctx);
+    case "pdbs":
+      return state.pdbs.has(ctx);
     case "namespaces":
       return state.namespaces.has(ctx);
     case "services":
@@ -2439,6 +2467,9 @@ const TAB_PALETTE_INFO: Record<TabId, { hint: string; aliases: string[] }> = {
   helm: { hint: "Releases and their revisions", aliases: ["chart", "release"] },
   secrets: { hint: "Keys and sizes, values masked", aliases: ["secret", "credentials", "password"] },
   externalsecrets: { hint: "External Secrets Operator syncs", aliases: ["eso", "external", "vault", "keyvault"] },
+  secretstores: { hint: "Where ExternalSecrets read from", aliases: ["clustersecretstore", "store", "eso", "keyvault", "vault", "provider"] },
+  serviceaccounts: { hint: "Workload identity and pull secrets", aliases: ["sa", "identity", "workload identity", "imagepullsecrets", "rbac"] },
+  pdbs: { hint: "Pod disruption budgets, and what blocks a drain", aliases: ["poddisruptionbudget", "disruption", "drain", "eviction", "budget"] },
   cost: { hint: "Billing — not wired up yet", aliases: ["billing", "spend"] },
 };
 
@@ -2560,6 +2591,14 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
       r = across(state.externalSecrets, (res) => n(res.external_secrets, (x) => !x.ready));
       label = "not synced";
       break;
+    case "secretstores":
+      r = across(state.secretStores, (res) => n(res.stores, (x) => !x.ready));
+      label = "not ready";
+      break;
+    case "pdbs":
+      r = across(state.pdbs, (list) => n(list, (x) => !pdbIsHealthy(x)));
+      label = "blocking evictions";
+      break;
     case "namespaces":
       r = across(state.namespaces, (list) => n(list, (x) => !namespaceIsHealthy(x)));
       label = "terminating";
@@ -2585,6 +2624,7 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
     case "metrics":
     case "configmaps":
     case "secrets":
+    case "serviceaccounts":
     case "cost":
       return null;
   }
@@ -7078,6 +7118,12 @@ function renderTabContentBody(): string {
       return renderSecrets();
     case "externalsecrets":
       return renderExternalSecrets();
+    case "secretstores":
+      return renderSecretStores();
+    case "serviceaccounts":
+      return renderServiceAccounts();
+    case "pdbs":
+      return renderPdbs();
     case "namespaces":
       return renderNamespaces();
     case "services":
@@ -9404,7 +9450,12 @@ function renderPodOverviewView(pd: PodDetailState): string {
     overviewRow("Owner", owner),
     overviewRow("Pod IP", `<span class="tabular">${esc(d.pod_ip) || "—"}</span>${d.host_ip ? ` <span class="text-xs text-ink-muted">on host ${esc(d.host_ip)}</span>` : ""}`),
     overviewRow("QoS class", esc(d.qos_class) || "—"),
-    overviewRow("Service account", esc(d.service_account) || "—"),
+    overviewRow(
+      "Service account",
+      d.service_account
+        ? `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'ServiceAccount',${jsArg(namespace)},${jsArg(d.service_account)})" class="text-series-blue hover:underline">${esc(d.service_account)}</button>`
+        : "—",
+    ),
     ...(d.priority_class ? [overviewRow("Priority class", esc(d.priority_class))] : []),
     overviewRow("Restart policy", esc(d.restart_policy) || "—"),
     overviewRow("Started", d.start_time ? esc(exactTime(d.start_time).replace("\n", " · ")) : "—"),
@@ -11143,7 +11194,7 @@ function renderExternalSecretStatusStrip(ed: ExternalSecretDetailState): string 
       </div>
       ${!e.ready && e.message ? `<div class="mt-1 break-words text-status-critical">${esc(e.message)}</div>` : ""}
       <div class="mt-1 text-ink-muted">
-        From ${esc(e.store_kind)} <span class="text-ink-primary">${esc(e.store_name)}</span>
+        From ${esc(e.store_kind)} <button type="button" title="Open the store this reads from" onclick="window.__app.openResourceDetail(${jsArg(ed.ctx)},${jsArg(e.store_kind)},${jsArg(e.store_kind === "ClusterSecretStore" ? "" : ed.namespace)},${jsArg(e.store_name)})" class="text-ink-primary hover:text-series-blue hover:underline">${esc(e.store_name)}</button>
         · refreshes ${e.refresh_interval ? `every ${esc(e.refresh_interval)}` : "on ESO's default"}
         · writes Secret <button type="button" title="Open the Secret this writes" onclick="window.__app.openSecretDetail(${jsArg(ed.ctx)},${jsArg(ed.namespace)},${jsArg(e.target_name)},${jsArg(e.target_type)})" class="text-ink-primary hover:text-series-blue hover:underline">${esc(e.target_name)}</button>
       </div>
@@ -11579,6 +11630,10 @@ const PANEL_LINKABLE: Record<string, string> = {
   ScaledObject: "keda.sh",
   ScaledJob: "keda.sh",
   ExternalSecret: "external-secrets.io",
+  ServiceAccount: "",
+  PodDisruptionBudget: "policy",
+  SecretStore: "external-secrets.io",
+  ClusterSecretStore: "external-secrets.io",
 };
 
 /** The API group of an `apiVersion`: empty for the core group's bare `v1`. */
@@ -12851,6 +12906,165 @@ function renderConfigMaps(): string {
   });
 }
 
+function renderServiceAccounts(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; a: ServiceAccountInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.serviceAccounts.get(ctx) ?? []).map((a) => ({ ctx, a })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No ServiceAccounts found.</div>`;
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.a.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.a.name, filter: "string" },
+    { key: "identity", label: "Workload identity", value: (r) => r.a.workload_identity_client_id, filter: "string" },
+    { key: "pull", label: "Pull secrets", value: (r) => r.a.image_pull_secrets.join(", "), filter: "string" },
+    { key: "automount", label: "Automount token", value: (r) => (r.a.automount_token === false ? "no" : "yes"), filter: "enum" },
+    resourceAgeColumn((r) => r.a),
+  ];
+  return resourceTable({
+    tab: "serviceaccounts",
+    noun: "ServiceAccounts",
+    allRows,
+    rows: allRows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.a.namespace}:${r.a.name}`,
+    renderRow: ({ ctx, a }) => `
+      <tr>
+        ${rowCheckboxCell("serviceaccounts", `${ctx}:${a.namespace}:${a.name}`)}
+        ${multi ? resourceClusterCell("serviceaccounts", ctx) : ""}
+        ${resourceNamespaceCell("serviceaccounts", a.namespace)}
+        ${resourceNameCell(ctx, "ServiceAccount", a.namespace, a.name)}
+        <td class="truncate font-mono text-xs" title="${esc(a.workload_identity_client_id)}">${esc(a.workload_identity_client_id) || '<span class="font-sans text-ink-muted">—</span>'}</td>
+        <td class="truncate" title="${esc(a.image_pull_secrets.join("\n"))}">${esc(a.image_pull_secrets.join(", ")) || '<span class="text-ink-muted">—</span>'}</td>
+        <td>${a.automount_token === false ? "no" : `yes${a.automount_token === null ? ' <span class="text-ink-muted">· default</span>' : ""}`}</td>
+        ${resourceAgeCell(a)}
+      </tr>`,
+  });
+}
+
+/** A PDB that matches pods yet allows no disruption: every drain and node upgrade waits on it. */
+function pdbIsHealthy(p: PdbInfo): boolean {
+  return !(p.expected_pods > 0 && p.disruptions_allowed === 0);
+}
+
+function pdbStatus(p: PdbInfo): string {
+  if (!pdbIsHealthy(p)) return "Blocks evictions";
+  if (p.expected_pods === 0) return "Selects no pods";
+  return `${p.disruptions_allowed} allowed`;
+}
+
+/** What the budget asks for, as written. */
+function pdbBudgetText(p: PdbInfo): string {
+  return p.min_available !== null ? `min available ${p.min_available}` : p.max_unavailable !== null ? `max unavailable ${p.max_unavailable}` : "—";
+}
+
+function renderPdbs(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; p: PdbInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.pdbs.get(ctx) ?? []).map((p) => ({ ctx, p })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No PodDisruptionBudgets found.</div>`;
+  const rows = state.unhealthyOnly.pdbs ? allRows.filter((r) => !pdbIsHealthy(r.p)) : allRows;
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.p.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.p.name, filter: "string" },
+    { key: "budget", label: "Budget", value: (r) => pdbBudgetText(r.p), filter: "string" },
+    { key: "allowed", label: "Allowed", value: (r) => r.p.disruptions_allowed, filter: "number" },
+    {
+      key: "healthy",
+      label: "Healthy",
+      value: (r) => r.p.current_healthy,
+      filter: "number",
+      copyText: (r) => `${r.p.current_healthy}/${r.p.desired_healthy} (${r.p.expected_pods} expected)`,
+    },
+    { key: "selector", label: "Selector", value: (r) => r.p.selector.join(", "), filter: "string" },
+    resourceAgeColumn((r) => r.p),
+  ];
+  return resourceTable({
+    tab: "pdbs",
+    noun: "PodDisruptionBudgets",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.p.namespace}:${r.p.name}`,
+    health: { healthy: (r) => pdbIsHealthy(r.p), unhealthyLabel: "blocking evictions", statusText: (r) => pdbStatus(r.p) },
+    renderRow: ({ ctx, p }) => `
+      <tr>
+        ${rowCheckboxCell("pdbs", `${ctx}:${p.namespace}:${p.name}`)}
+        <td title="${esc(pdbStatus(p))}">${statusDot(pdbIsHealthy(p), p.expected_pods === 0)}</td>
+        ${multi ? resourceClusterCell("pdbs", ctx) : ""}
+        ${resourceNamespaceCell("pdbs", p.namespace)}
+        ${resourceNameCell(ctx, "PodDisruptionBudget", p.namespace, p.name)}
+        <td class="tabular">${esc(pdbBudgetText(p))}</td>
+        <td class="tabular ${pdbIsHealthy(p) ? "" : "text-status-critical"}" title="${esc(pdbStatus(p))}">${p.disruptions_allowed}</td>
+        <td class="tabular ${p.expected_pods === 0 ? "text-ink-muted" : ""}" title="Healthy now / needed healthy · pods it matches">${p.current_healthy}/${p.desired_healthy} <span class="text-ink-muted">· ${p.expected_pods} pod${p.expected_pods === 1 ? "" : "s"}</span></td>
+        <td class="truncate text-ink-secondary" title="${esc(p.selector.join("\n"))}">${esc(p.selector.join(", ")) || '<span class="text-ink-muted">—</span>'}</td>
+        ${resourceAgeCell(p)}
+      </tr>`,
+  });
+}
+
+function renderSecretStores(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  const results = ctxs.map((ctx) => ({ ctx, result: state.secretStores.get(ctx) }));
+  const answered = results.filter((r) => r.result);
+  const notInstalled = answered.filter((r) => !r.result!.installed).map((r) => r.ctx);
+  // One kind listed and the other refused: said once, above the stores that did list.
+  const partial = answered
+    .filter((r) => r.result!.error)
+    .map((r) => `<div class="mb-3 rounded-md border border-status-warning/40 bg-status-warning/10 px-3 py-2 text-xs text-status-warning">${multi ? `${esc(r.ctx)}: ` : ""}${esc(r.result!.error!)}</div>`)
+    .join("");
+  type Row = { ctx: string; s: SecretStoreInfo };
+  const allRows: Row[] = results.flatMap((r) => (r.result?.stores ?? []).map((s) => ({ ctx: r.ctx, s })));
+
+  if (allRows.length === 0 && !state.tabLoading) {
+    if (notInstalled.length > 0 && notInstalled.length === answered.length) {
+      return addonNotInstalledPanel("External Secrets Operator not installed", "External Secrets Operator", "secretstores.external-secrets.io", multi);
+    }
+    if (state.tabErrorsByContext.size > 0) return addonPartialNotice("External Secrets Operator", notInstalled);
+    return `${addonPartialNotice("External Secrets Operator", notInstalled)}${partial}<div class="text-sm text-ink-muted">No SecretStores found.</div>`;
+  }
+
+  const rows = state.unhealthyOnly.secretstores ? allRows.filter((r) => !r.s.ready) : allRows;
+  const status = (s: SecretStoreInfo) => (s.ready ? "Ready" : s.reason || "Not ready");
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "scope", label: "Scope", value: (r) => (r.s.kind === "ClusterSecretStore" ? "Cluster" : "Namespaced"), filter: "enum" },
+    { key: "namespace", label: "Namespace", value: (r) => r.s.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.s.name, filter: "string" },
+    { key: "provider", label: "Provider", value: (r) => r.s.provider, filter: "enum" },
+    { key: "target", label: "Target", value: (r) => r.s.target, filter: "string" },
+    { key: "auth", label: "Auth", value: (r) => r.s.auth, filter: "enum" },
+    { key: "capabilities", label: "Capabilities", value: (r) => r.s.capabilities, filter: "enum" },
+    resourceAgeColumn((r) => r.s),
+  ];
+  return `${addonPartialNotice("External Secrets Operator", notInstalled)}${partial}${resourceTable({
+    tab: "secretstores",
+    noun: "SecretStores",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.s.kind}:${r.s.namespace}:${r.s.name}`,
+    health: { healthy: (r) => r.s.ready, unhealthyLabel: "not ready", statusText: (r) => status(r.s) },
+    renderRow: ({ ctx, s }) => `
+      <tr>
+        ${rowCheckboxCell("secretstores", `${ctx}:${s.kind}:${s.namespace}:${s.name}`)}
+        <td title="${esc([status(s), s.message].filter(Boolean).join(": "))}">${statusDot(s.ready)}</td>
+        ${multi ? resourceClusterCell("secretstores", ctx) : ""}
+        <td class="${s.kind === "ClusterSecretStore" ? "" : "text-ink-secondary"}">${s.kind === "ClusterSecretStore" ? "Cluster" : "Namespaced"}</td>
+        ${s.namespace ? resourceNamespaceCell("secretstores", s.namespace) : '<td class="text-ink-muted">—</td>'}
+        ${resourceNameCell(ctx, s.kind, s.namespace, s.name)}
+        <td>${esc(s.provider) || "—"}</td>
+        <td class="truncate" title="${esc(s.target)}">${esc(s.target) || '<span class="text-ink-muted">—</span>'}</td>
+        <td class="truncate text-ink-secondary" title="${esc([s.auth, s.identity].filter(Boolean).join(" · "))}">${esc(s.auth) || '<span class="text-ink-muted">—</span>'}</td>
+        <td class="text-ink-secondary">${esc(s.capabilities) || "—"}</td>
+        ${resourceAgeCell(s)}
+      </tr>`,
+  })}`;
+}
+
 /**
  * A ConfigMap's values, one card per key, with a filter on key names and
  * values both. Not masked as Secrets are — a ConfigMap holds configuration,
@@ -12907,8 +13121,22 @@ function renderConfigMapDataView(rd: ResourceDetailState): string {
 }
 
 // ---------------------------------------------------------------------------
-// The detail panel those six tabs share (Overview / YAML / Events, and Data for a ConfigMap)
+// The detail panel the resource tabs share (Overview / YAML / Events, and Data for a ConfigMap)
 // ---------------------------------------------------------------------------
+
+/** The tab whose list each resource panel's Overview reads. */
+const RESOURCE_KIND_TAB: Record<ResourceKind, TabId> = {
+  Namespace: "namespaces",
+  Service: "services",
+  Ingress: "ingresses",
+  PersistentVolumeClaim: "pvcs",
+  PersistentVolume: "pvs",
+  ConfigMap: "configmaps",
+  ServiceAccount: "serviceaccounts",
+  PodDisruptionBudget: "pdbs",
+  SecretStore: "secretstores",
+  ClusterSecretStore: "secretstores",
+};
 
 function openResourceDetail(ctx: string, kind: ResourceKind, namespace: string, name: string) {
   // Every other panel, through the registry rather than by name.
@@ -12934,6 +13162,20 @@ function openResourceDetail(ctx: string, kind: ResourceKind, namespace: string, 
     eventsLoading: false,
   };
   render();
+
+  // The Overview reads its tab's list. Opened from a link on another panel,
+  // that tab may never have loaded for this cluster — fetch it rather than
+  // say so.
+  const tab = RESOURCE_KIND_TAB[kind];
+  if (!tabHasDataForContext(tab, ctx)) {
+    fetchTabDataForContext(tab, ctx)
+      .then(() => {
+        if (token === resourceDetailToken && state.resourceDetail) render();
+      })
+      .catch(() => {
+        // The YAML tab still fetches the object itself; the Overview keeps its "not loaded" note.
+      });
+  }
 
   api
     .getResourceManifest(ctx, kind, namespace, name)
@@ -13153,6 +13395,83 @@ function renderResourceOverview(rd: ResourceDetailState): string {
         <div class="mt-2 text-xs text-ink-muted">The values are under Data.</div>`
       : "";
     return `<div>${rows.join("")}</div>${keys}`;
+  } else if (kind === "ServiceAccount") {
+    const a = state.serviceAccounts.get(ctx)?.find((x) => x.namespace === namespace && x.name === name);
+    if (!a) return gone;
+    const secretLink = (n: string) =>
+      `<button type="button" onclick="window.__app.openSecretDetail(${jsArg(ctx)},${jsArg(namespace)},${jsArg(n)},${jsArg(state.secrets.get(ctx)?.find((x) => x.namespace === namespace && x.name === n)?.secret_type ?? "")})" class="text-series-blue hover:underline">${esc(n)}</button>`;
+    rows.push(
+      overviewRow(
+        "Workload identity",
+        a.workload_identity_client_id
+          ? `<span class="font-mono text-xs">${esc(a.workload_identity_client_id)}</span><div class="text-xs text-ink-muted">pods using this account sign in to Azure as this client ID</div>`
+          : '<span class="text-ink-muted">none — no azure.workload.identity/client-id annotation</span>',
+      ),
+    );
+    if (a.workload_identity_tenant_id) rows.push(overviewRow("Tenant", `<span class="font-mono text-xs">${esc(a.workload_identity_tenant_id)}</span>`));
+    if (a.workload_identity_token_expiration) rows.push(overviewRow("Token lifetime", `<span class="tabular">${esc(a.workload_identity_token_expiration)}s</span>`));
+    rows.push(overviewRow("Pull secrets", a.image_pull_secrets.length ? a.image_pull_secrets.map(secretLink).join(", ") : '<span class="text-ink-muted">none</span>'));
+    if (a.secrets.length) rows.push(overviewRow("Token secrets", a.secrets.map(secretLink).join(", ")));
+    rows.push(overviewRow("Automount token", a.automount_token === false ? "no — pods get no API token unless they ask" : a.automount_token === null ? "yes <span class=\"text-xs text-ink-muted\">· Kubernetes' default</span>" : "yes"));
+    rows.push(overviewRow("Created", created(a)));
+  } else if (kind === "PodDisruptionBudget") {
+    const p = state.pdbs.get(ctx)?.find((x) => x.namespace === namespace && x.name === name);
+    if (!p) return gone;
+    const banner = !pdbIsHealthy(p)
+      ? `<div class="mb-3 rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">Blocks every eviction — ${p.current_healthy} of ${p.expected_pods} pod${p.expected_pods === 1 ? "" : "s"} ${p.current_healthy === 1 ? "is" : "are"} healthy and it needs ${p.desired_healthy}, so a drain or node upgrade waits on it.</div>`
+      : p.expected_pods === 0
+        ? `<div class="mb-3 rounded-md border border-gridline bg-surface-2 p-3 text-sm text-ink-secondary">Selects no pods — it protects nothing, so check the selector.</div>`
+        : "";
+    rows.push(overviewRow("Disruptions allowed", `<span class="tabular ${pdbIsHealthy(p) ? "" : "text-status-critical"}">${p.disruptions_allowed}</span> <span class="text-xs text-ink-muted">pods may be evicted right now</span>`));
+    rows.push(overviewRow("Budget", esc(pdbBudgetText(p))));
+    rows.push(overviewRow("Healthy", `<span class="tabular">${p.current_healthy}</span> <span class="text-xs text-ink-muted">of ${p.expected_pods} matched · needs ${p.desired_healthy}</span>`));
+    rows.push(overviewRow("Selector", overviewChips(p.selector)));
+    rows.push(
+      overviewRow(
+        "Unhealthy pods",
+        p.unhealthy_pod_eviction_policy === "AlwaysAllow"
+          ? "always evictable"
+          : 'evictable only while the budget holds <span class="text-xs text-ink-muted">· IfHealthyBudget</span>',
+      ),
+    );
+    if (p.reason) rows.push(overviewRow("Condition", `${esc(p.reason)}${p.message ? ` <span class="text-xs text-ink-muted">· ${esc(p.message)}</span>` : ""}`));
+    rows.push(overviewRow("Created", created(p)));
+    return `${banner}<div>${rows.join("")}</div>`;
+  } else if (kind === "SecretStore" || kind === "ClusterSecretStore") {
+    const st = state.secretStores.get(ctx)?.stores.find((x) => x.kind === kind && x.namespace === namespace && x.name === name);
+    if (!st) return gone;
+    const banner = st.ready
+      ? ""
+      : `<div class="mb-3 rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">Not ready${st.reason ? ` · ${esc(st.reason)}` : ""}${st.message ? `: ${esc(st.message)}` : ""}</div>`;
+    rows.push(overviewRow("Status", st.ready ? `<span class="text-status-good">Ready</span>${st.message ? ` <span class="text-xs text-ink-muted">· ${esc(st.message)}</span>` : ""}` : `<span class="text-status-critical">${esc(st.reason || "Not ready")}</span>`));
+    rows.push(overviewRow("Scope", kind === "ClusterSecretStore" ? "every namespace" : `namespace <span class="font-mono">${esc(namespace)}</span> only`));
+    rows.push(overviewRow("Provider", esc(st.provider) || "—"));
+    rows.push(overviewRow("Target", st.target ? `<span class="break-all">${esc(st.target)}</span>` : "—"));
+    rows.push(overviewRow("Auth", `${esc(st.auth) || "—"}${st.identity ? `<div class="font-mono text-xs text-ink-secondary">${esc(st.identity)}</div>` : ""}`));
+    rows.push(overviewRow("Capabilities", esc(st.capabilities) || "—"));
+    rows.push(overviewRow("Created", created(st)));
+    // From the ExternalSecrets tab's rows, when they are loaded.
+    const loaded = state.externalSecrets.get(ctx);
+    const users = (loaded?.external_secrets ?? []).filter(
+      (e) => e.store_kind === kind && e.store_name === name && (kind === "ClusterSecretStore" || e.namespace === namespace),
+    );
+    const usedBy = overviewSection(
+      loaded ? `Used by (${users.length})` : "Used by",
+      !loaded
+        ? `<div class="text-xs text-ink-muted">Open the ExternalSecrets tab once to see which ExternalSecrets read from it.</div>`
+        : users.length === 0
+          ? `<div class="text-xs text-ink-muted">No ExternalSecret reads from it.</div>`
+          : `<table class="w-full text-left text-sm"><tbody>${users
+              .map(
+                (e) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3"><button type="button" onclick="window.__app.openExternalSecretDetail(${jsArg(ctx)},${jsArg(e.namespace)},${jsArg(e.name)})" class="text-left text-series-blue hover:underline"><span class="text-ink-muted">${esc(e.namespace)}/</span>${esc(e.name)}</button></td>
+          <td class="py-1.5 text-right text-xs ${e.ready ? "text-ink-secondary" : "text-status-critical"}">${e.ready ? "synced" : "not synced"}</td>
+        </tr>`,
+              )
+              .join("")}</tbody></table>`,
+    );
+    return `${banner}<div>${rows.join("")}</div>${usedBy}`;
   } else {
     const v = state.pvs.get(ctx)?.find((x) => x.name === name);
     if (!v) return gone;

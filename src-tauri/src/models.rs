@@ -1276,6 +1276,92 @@ pub struct ConfigMapInfo {
     pub created_at: Option<String>,
 }
 
+/// A ServiceAccount: which Azure identity its pods get, and what it pulls
+/// images with. Mirrors `ServiceAccountInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct ServiceAccountInfo {
+    pub namespace: String,
+    pub name: String,
+    /// `azure.workload.identity/client-id`: the managed identity or app its
+    /// pods sign in to Azure as, through Workload Identity.
+    pub workload_identity_client_id: String,
+    /// `azure.workload.identity/tenant-id`, when it overrides the cluster's.
+    pub workload_identity_tenant_id: String,
+    /// `azure.workload.identity/service-account-token-expiration`, in seconds.
+    pub workload_identity_token_expiration: String,
+    pub image_pull_secrets: Vec<String>,
+    /// Legacy token Secrets listed on the account.
+    pub secrets: Vec<String>,
+    /// `None` when unset, which Kubernetes treats as true.
+    pub automount_token: Option<bool>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// A PodDisruptionBudget, and whether it lets a drain through. Mirrors
+/// `PdbInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct PdbInfo {
+    pub namespace: String,
+    pub name: String,
+    /// As written: a count or a percentage. At most one of the two is set.
+    pub min_available: Option<String>,
+    pub max_unavailable: Option<String>,
+    /// `key=value` and `key In (a,b)` terms.
+    pub selector: Vec<String>,
+    pub current_healthy: i32,
+    pub desired_healthy: i32,
+    pub expected_pods: i32,
+    /// How many pods may be evicted right now; 0 blocks every voluntary eviction.
+    pub disruptions_allowed: i32,
+    /// `IfHealthyBudget` (the default) or `AlwaysAllow`.
+    pub unhealthy_pod_eviction_policy: String,
+    /// The DisruptionAllowed condition's reason and message.
+    pub reason: String,
+    pub message: String,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// An External Secrets Operator `SecretStore` or `ClusterSecretStore`:
+/// where ExternalSecrets read from, and whether ESO can reach it. Mirrors
+/// `SecretStoreInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct SecretStoreInfo {
+    /// `SecretStore` or `ClusterSecretStore`.
+    pub kind: String,
+    /// Empty for a ClusterSecretStore.
+    pub namespace: String,
+    pub name: String,
+    /// The `spec.provider` key: `azurekv`, `aws`, `vault`, `gcpsm`…
+    pub provider: String,
+    /// Where it reads from: an Azure vault URL, a Vault server, an AWS region.
+    pub target: String,
+    /// How it signs in: `ManagedIdentity`, `WorkloadIdentity`, `ServicePrincipal`…
+    pub auth: String,
+    /// The identity it signs in as, when it names one.
+    pub identity: String,
+    pub ready: bool,
+    pub reason: String,
+    pub message: String,
+    /// `ReadOnly`, `WriteOnly` or `ReadWrite`.
+    pub capabilities: String,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// The SecretStores tab's result. `installed: false` means ESO's CRDs are not
+/// registered on the cluster.
+#[derive(Serialize, Clone, Debug)]
+pub struct SecretStoresResult {
+    pub installed: bool,
+    pub error: Option<String>,
+    pub stores: Vec<SecretStoreInfo>,
+}
+
 /// One key of a ConfigMap with its value, for the panel's Data view.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct ConfigMapEntry {

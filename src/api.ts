@@ -46,6 +46,9 @@ import type {
   PvInfo,
   ResourceKind,
   ConfigMapInfo,
+  PdbInfo,
+  SecretStoresResult,
+  ServiceAccountInfo,
   ConfigMapEntry,
   MetricsBackendTestResult,
   MetricsOverTimeResult,
@@ -245,6 +248,9 @@ export const api = {
   getResourceEvents: (contextName: string, kind: ResourceKind, namespace: string, name: string) =>
     invoke<EventInfo[]>("get_resource_events", { contextName, kind, namespace, name }),
   getExternalSecrets: (contextName: string) => invoke<ExternalSecretsResult>("get_external_secrets", { contextName }),
+  getSecretStores: (contextName: string) => invoke<SecretStoresResult>("get_secret_stores", { contextName }),
+  getServiceAccounts: (contextName: string) => invoke<ServiceAccountInfo[]>("get_service_accounts", { contextName }),
+  getPdbs: (contextName: string) => invoke<PdbInfo[]>("get_pdbs", { contextName }),
   getExternalSecretDetail: (contextName: string, namespace: string, name: string) =>
     invoke<ExternalSecretDetail>("get_external_secret_detail", { contextName, namespace, name }),
   getExternalSecretEvents: (contextName: string, namespace: string, name: string) =>
