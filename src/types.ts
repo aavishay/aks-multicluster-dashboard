@@ -586,6 +586,68 @@ export interface HelmReleaseDetail {
   default_values_yaml: string;
   manifest: string;
   notes: string;
+  /** What the panel's Overview shows, read from the same payload. */
+  overview: HelmOverview;
+}
+
+/** A subchart, with whether Helm enabled it for this release. */
+export interface HelmDependency {
+  name: string;
+  alias: string;
+  version: string;
+  repository: string;
+  /** The values path that switches it, e.g. `redis.enabled`. */
+  condition: string;
+  enabled: boolean;
+}
+
+/** One object the release rendered. */
+export interface HelmResource {
+  api_version: string;
+  kind: string;
+  /** Empty when the chart leaves it to the release namespace, or for a cluster-scoped kind. */
+  namespace: string;
+  name: string;
+}
+
+export interface HelmHook {
+  name: string;
+  kind: string;
+  events: string[];
+  /** `Succeeded`, `Failed`, `Running`; empty if it has not run. */
+  phase: string;
+  completed_at: string | null;
+}
+
+/** One stored revision, from its Secret's labels. */
+export interface HelmHistoryEntry {
+  revision: number;
+  status: string;
+  modified_at: string | null;
+}
+
+/** What a release's payload buries. Mirrors `HelmOverview` in models.rs. */
+export interface HelmOverview {
+  status: string;
+  description: string;
+  first_deployed: string | null;
+  last_deployed: string | null;
+  chart_name: string;
+  chart_version: string;
+  app_version: string;
+  chart_description: string;
+  home: string;
+  sources: string[];
+  kube_version: string;
+  deprecated: boolean;
+  dependencies: HelmDependency[];
+  /** Top-level keys of the user-supplied values. */
+  overridden_keys: string[];
+  resources: HelmResource[];
+  hooks: HelmHook[];
+  /** Newest first. */
+  history: HelmHistoryEntry[];
+  history_error: string | null;
 }
 
 export type AiProvider = "claude" | "gemini" | "ollama";

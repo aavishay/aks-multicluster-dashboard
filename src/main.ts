@@ -28,8 +28,6 @@ import type {
   EventInfo,
   GitOpsAppInfo,
   GitOpsAppManifest,
-  GitOpsDetail,
-  GitOpsManagedResource,
   GitOpsSourceInfo,
   GitOpsResourceDiff,
   GitOpsResult,
@@ -748,7 +746,7 @@ interface HelmDetailState {
   namespace: string;
   name: string;
   revision: number;
-  view: "values" | "manifest" | "notes";
+  view: "overview" | "values" | "manifest" | "notes";
   detail: HelmReleaseDetail | null;
   detailError: string | null;
   /** Values tab only: show the chart's defaults instead of the user's overrides. */
@@ -3027,7 +3025,7 @@ function moveNodeSearch(_view: string, delta: number) {
 }
 
 // ---------------------------------------------------------------------------
-// Helm release detail panel (Values / Manifest / Notes)
+// Helm release detail panel (Overview / Values / Manifest / Notes)
 // ---------------------------------------------------------------------------
 
 function openHelmDetail(ctx: string, namespace: string, name: string, revision: number) {
@@ -3047,7 +3045,7 @@ function openHelmDetail(ctx: string, namespace: string, name: string, revision: 
     namespace,
     name,
     revision,
-    view: "values",
+    view: "overview",
     detail: null,
     detailError: null,
     showDefaultValues: false,
@@ -3056,7 +3054,7 @@ function openHelmDetail(ctx: string, namespace: string, name: string, revision: 
   };
   render();
 
-  // One fetch covers all three tabs: they're separate fields of the same
+  // One fetch covers all four tabs: they're separate fields of the same
   // decoded release payload, so splitting them would mean re-fetching and
   // re-gunzipping the same Secret per tab.
   api
@@ -3101,6 +3099,8 @@ function toggleHelmDefaultValues() {
 function currentHelmText(hd: HelmDetailState): string {
   if (!hd.detail) return "";
   switch (hd.view) {
+    case "overview":
+      return "";
     case "values":
       return hd.showDefaultValues ? hd.detail.default_values_yaml : hd.detail.values_yaml;
     case "manifest":
@@ -11559,10 +11559,11 @@ function gitOpsHealthTone(health: string): string {
 }
 
 /**
- * The group each linkable kind lives in, so a CRD that happens to share a
- * kind name is not opened in a panel built for something else.
+ * The kinds that have a panel of their own, each with the API group it lives
+ * in, so a CRD that happens to share a kind name is not opened in a panel
+ * built for something else.
  */
-const GITOPS_LINKABLE: Record<string, string> = {
+const PANEL_LINKABLE: Record<string, string> = {
   Deployment: "apps",
   StatefulSet: "apps",
   DaemonSet: "apps",
@@ -11580,10 +11581,19 @@ const GITOPS_LINKABLE: Record<string, string> = {
   ExternalSecret: "external-secrets.io",
 };
 
-/** A managed resource's name, linked to its own panel when this cluster has it and the app has one. */
-function gitOpsResourceLink(ctx: string, d: GitOpsDetail, r: GitOpsManagedResource): string {
+/** The API group of an `apiVersion`: empty for the core group's bare `v1`. */
+function apiGroup(apiVersion: string): string {
+  const slash = apiVersion.indexOf("/");
+  return slash < 0 ? "" : apiVersion.slice(0, slash);
+}
+
+/**
+ * An object's name, linked to its own panel when it has one — and when
+ * `inThisCluster`, since a GitOps app may deploy to another cluster entirely.
+ */
+function resourcePanelLink(ctx: string, r: { group: string; kind: string; namespace: string; name: string }, inThisCluster = true): string {
   const label = `${r.namespace ? `<span class="text-ink-muted">${esc(r.namespace)}/</span>` : ""}${esc(r.name)}`;
-  if (!d.destination_in_cluster || GITOPS_LINKABLE[r.kind] !== r.group) return `<span>${label}</span>`;
+  if (!inThisCluster || PANEL_LINKABLE[r.kind] !== r.group) return `<span>${label}</span>`;
   const [ns, n] = [jsArg(r.namespace), jsArg(r.name)];
   const call =
     r.kind === "Deployment" || r.kind === "StatefulSet" || r.kind === "DaemonSet"
@@ -11695,7 +11705,7 @@ function renderGitOpsOverviewView(gd: GitOpsDetailState): string {
       (r) => `
         <tr class="border-t border-gridline/60 first:border-t-0">
           <td class="py-1.5 pr-3 text-xs text-ink-muted">${esc(r.kind)}</td>
-          <td class="py-1.5 pr-3">${gitOpsResourceLink(ctx, d, r)}</td>
+          <td class="py-1.5 pr-3">${resourcePanelLink(ctx, r, d.destination_in_cluster)}</td>
           <td class="py-1.5 pr-3 text-xs ${r.status === "Synced" ? "text-ink-secondary" : "text-status-warning"}">${esc(r.status)}${r.requires_pruning ? " · to prune" : ""}</td>
           <td class="py-1.5 text-xs ${r.health ? gitOpsHealthTone(r.health) : "text-ink-muted"}" title="${esc(r.health_message)}">${esc(r.health) || "—"}</td>
         </tr>`,
@@ -11711,7 +11721,7 @@ function renderGitOpsOverviewView(gd: GitOpsDetailState): string {
   const inTreeNote =
     d.resource_health_in_tree && d.health_status !== "Healthy"
       ? `<div class="text-xs text-ink-muted">Argo CD keeps each resource's health in its app tree rather than on the Application, so which one is ${esc(d.health_status)} can't be shown here${
-          suspects.length ? `. Its workloads, where that usually comes from: ${suspects.map((r) => gitOpsResourceLink(ctx, d, r)).join(", ")}` : ""
+          suspects.length ? `. Its workloads, where that usually comes from: ${suspects.map((r) => resourcePanelLink(ctx, r, d.destination_in_cluster)).join(", ")}` : ""
         }.</div>`
       : "";
   const resources = overviewSection(
@@ -13587,7 +13597,7 @@ function renderHelm(): string {
               <td>
                 <button
                   type="button"
-                  title="View release details (Values, Manifest, Notes)"
+                  title="View release details (Overview, Values, Manifest, Notes)"
                   data-row-open onclick="window.__app.openHelmDetail(${jsArg(ctx)},${jsArg(r.namespace)},${jsArg(r.name)},${r.revision})"
                   class="text-ink-primary hover:text-series-blue hover:underline"
                 >${esc(r.name)}</button>
@@ -13610,8 +13620,188 @@ function renderHelm(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Helm release detail panel (Values / Manifest / Notes)
+// Helm release detail panel (Overview / Values / Manifest / Notes)
 // ---------------------------------------------------------------------------
+
+/** Kinds a chart may render that live outside any namespace. */
+const CLUSTER_SCOPED_KINDS = new Set([
+  "Namespace",
+  "PersistentVolume",
+  "StorageClass",
+  "ClusterRole",
+  "ClusterRoleBinding",
+  "CustomResourceDefinition",
+  "PriorityClass",
+  "IngressClass",
+  "MutatingWebhookConfiguration",
+  "ValidatingWebhookConfiguration",
+  "APIService",
+  "ClusterIssuer",
+  "ClusterSecretStore",
+]);
+
+/** How many rendered objects the Overview lists before the Manifest tab takes over. */
+const HELM_RESOURCES_SHOWN = 50;
+
+/** A revision's status coloured: failures red, the live one plain, history muted, anything in flight amber. */
+function helmRevisionTone(status: string): string {
+  return status === "failed" ? "text-status-critical" : status === "deployed" ? "" : status === "superseded" ? "text-ink-muted" : "text-status-warning";
+}
+
+/**
+ * The Helm panel's Overview: whether the release is deployed and if not why,
+ * which chart and version it runs, what it overrides, what it rendered and
+ * whether those workloads are ready, its hooks and subcharts, and its stored
+ * history. All from the one decoded release, plus the Workloads tab's rows
+ * when they are loaded.
+ */
+function renderHelmOverviewView(hd: HelmDetailState): string {
+  const o = hd.detail!.overview;
+  const { ctx, namespace } = hd;
+  const red = (html: string) => `<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${html}</div>`;
+  const amber = (html: string) => `<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">${html}</div>`;
+
+  // What the chart rendered, with the release namespace filled in where the
+  // chart leaves it to Helm.
+  const resources = o.resources.map((r) => ({
+    group: apiGroup(r.api_version),
+    kind: r.kind,
+    namespace: r.namespace || (CLUSTER_SCOPED_KINDS.has(r.kind) ? "" : namespace),
+    name: r.name,
+  }));
+  const loadedWorkloads = state.workloads.get(ctx);
+  const workloadOf = (r: { group: string; kind: string; namespace: string; name: string }) =>
+    r.group === "apps" ? loadedWorkloads?.find((w) => w.kind === r.kind && w.namespace === r.namespace && w.name === r.name) : undefined;
+  const isWorkload = (r: { group: string; kind: string }) => r.group === "apps" && ["Deployment", "StatefulSet", "DaemonSet"].includes(r.kind);
+  const notReady = resources.filter((r) => isWorkload(r) && workloadOf(r) && !workloadOf(r)!.healthy);
+  const failedHooks = o.hooks.filter((h) => h.phase === "Failed");
+  const since = o.history[0]?.modified_at ?? o.last_deployed;
+
+  const banners = [
+    ...(o.status === "failed" ? [red(`Failed${o.description ? ` · ${esc(o.description)}` : ""}`)] : []),
+    ...(o.status.startsWith("pending-")
+      ? [
+          amber(
+            `Stuck in ${esc(o.status)}${since ? `, which started <span title="${esc(timeTitle("Started", since))}">${relativeTime(since)}</span>` : ""} — Helm refuses another upgrade until it finishes or is rolled back.`,
+          ),
+        ]
+      : []),
+    ...(o.status === "uninstalling" ? [amber("Being uninstalled.")] : []),
+    ...(failedHooks.length ? [red(`Hook${failedHooks.length === 1 ? "" : "s"} failed: ${failedHooks.map((h) => `<span class="font-mono">${esc(h.kind)}/${esc(h.name)}</span>`).join(", ")}`)] : []),
+    ...(notReady.length ? [amber(`Not ready: ${notReady.map((r) => resourcePanelLink(ctx, r)).join(", ")}`)] : []),
+    ...(o.deprecated ? [amber("This chart version is marked deprecated by its maintainers.")] : []),
+  ];
+  const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
+
+  const stored = o.history.length;
+  const failedRevisions = o.history.filter((h) => h.status === "failed").length;
+  const facts = [
+    overviewRow("Status", `<span class="${helmStatusClass(o.status)}">${esc(o.status) || "—"}</span>${o.description && o.status !== "failed" ? ` <span class="text-xs text-ink-muted">· ${esc(o.description)}</span>` : ""}`),
+    overviewRow("Chart", `<span class="font-mono">${esc(o.chart_name)}-${esc(o.chart_version)}</span>${o.chart_description ? `<div class="text-xs text-ink-secondary">${esc(o.chart_description)}</div>` : ""}`),
+    overviewRow("App version", esc(o.app_version) || "—"),
+    overviewRow(
+      "Revision",
+      `<span class="tabular">${hd.revision}</span>${stored ? ` <span class="text-xs text-ink-muted">· ${stored} stored${failedRevisions ? `, <span class="text-status-critical">${failedRevisions} failed</span>` : ""}</span>` : ""}`,
+    ),
+    overviewRow("Last deployed", o.last_deployed ? `<span title="${esc(timeTitle("Deployed", o.last_deployed))}">${relativeTime(o.last_deployed)}</span>` : "—"),
+    overviewRow("First installed", o.first_deployed ? `<span title="${esc(timeTitle("Installed", o.first_deployed))}">${relativeTime(o.first_deployed)}</span>` : "—"),
+    overviewRow(
+      "Values",
+      o.overridden_keys.length
+        ? `${overviewChips(o.overridden_keys)}<button type="button" onclick="window.__app.setHelmDetailView('values')" class="mt-1 text-xs text-series-blue hover:underline">Show the overrides</button>`
+        : '<span class="text-ink-secondary">the chart\'s defaults — nothing overridden</span>',
+    ),
+    ...(o.kube_version ? [overviewRow("Kubernetes", `requires <span class="font-mono">${esc(o.kube_version)}</span>`)] : []),
+    ...(o.home ? [overviewRow("Home", `<span class="break-all">${esc(o.home)}</span>`)] : []),
+    ...(o.sources.length ? [overviewRow("Sources", `<div class="flex flex-col">${o.sources.map((src) => `<span class="break-all">${esc(src)}</span>`).join("")}</div>`)] : []),
+  ].join("");
+
+  // Workloads first — they are what "is it working" turns on — then the rest by kind.
+  const ordered = [...resources].sort((a, b) => Number(isWorkload(b)) - Number(isWorkload(a)) || a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name));
+  const kindCounts = [...resources.reduce((m, r) => m.set(r.kind, (m.get(r.kind) ?? 0) + 1), new Map<string, number>())]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([k, n]) => `${n} ${k}`);
+  const readiness = (r: (typeof resources)[number]) => {
+    if (!isWorkload(r)) return "";
+    const w = workloadOf(r);
+    if (!loadedWorkloads) return '<span class="text-ink-muted">—</span>';
+    if (!w) return '<span class="text-ink-muted">not found</span>';
+    return `<span class="tabular ${w.healthy ? "text-ink-secondary" : "text-status-warning"}">${w.ready}/${w.desired} ready</span>`;
+  };
+  const resourceSection = overviewSection(
+    `Resources (${resources.length})`,
+    resources.length === 0
+      ? `<div class="text-xs text-ink-muted">This release renders nothing.</div>`
+      : `${overviewChips(kindCounts)}<table class="w-full text-left text-sm"><tbody>${ordered
+          .slice(0, HELM_RESOURCES_SHOWN)
+          .map(
+            (r) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3 text-xs text-ink-muted">${esc(r.kind)}</td>
+          <td class="py-1.5 pr-3">${resourcePanelLink(ctx, r)}</td>
+          <td class="py-1.5 text-right text-xs">${readiness(r)}</td>
+        </tr>`,
+          )
+          .join("")}</tbody></table>${
+          resources.length > HELM_RESOURCES_SHOWN
+            ? `<button type="button" onclick="window.__app.setHelmDetailView('manifest')" class="self-start text-xs text-series-blue hover:underline">${resources.length - HELM_RESOURCES_SHOWN} more in the Manifest tab</button>`
+            : ""
+        }${
+          !loadedWorkloads && resources.some(isWorkload) ? '<div class="text-xs text-ink-muted">Open the Workloads tab once to see whether these workloads are ready.</div>' : ""
+        }`,
+  );
+
+  const hooks = o.hooks.length
+    ? overviewSection(
+        `Hooks (${o.hooks.length})`,
+        `<table class="w-full text-left text-sm"><tbody>${o.hooks
+          .map(
+            (h) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3 text-xs text-ink-muted">${esc(h.kind)}</td>
+          <td class="py-1.5 pr-3 font-mono text-xs">${esc(h.name)}</td>
+          <td class="py-1.5 pr-3 text-xs text-ink-secondary">${esc(h.events.join(", "))}</td>
+          <td class="py-1.5 text-right text-xs ${h.phase === "Failed" ? "text-status-critical" : h.phase === "Succeeded" ? "text-ink-secondary" : h.phase ? "text-status-warning" : "text-ink-muted"}" title="${esc(timeTitle("Completed", h.completed_at))}">${esc(h.phase) || "not run"}${h.completed_at ? ` · ${relativeTime(h.completed_at)}` : ""}</td>
+        </tr>`,
+          )
+          .join("")}</tbody></table>`,
+      )
+    : "";
+
+  const deps = o.dependencies.length
+    ? overviewSection(
+        `Subcharts (${o.dependencies.length})`,
+        `<table class="w-full text-left text-sm"><tbody>${o.dependencies
+          .map(
+            (d) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3"><span class="font-mono text-xs">${esc(d.alias || d.name)}</span>${d.alias ? ` <span class="text-xs text-ink-muted">(${esc(d.name)})</span>` : ""}</td>
+          <td class="py-1.5 pr-3 font-mono text-xs text-ink-secondary">${esc(d.version)}</td>
+          <td class="py-1.5 text-right text-xs ${d.enabled ? "text-ink-secondary" : "text-ink-muted"}">${d.enabled ? "enabled" : "disabled"}${d.condition ? ` <span class="text-ink-muted">· ${esc(d.condition)}</span>` : ""}</td>
+        </tr>`,
+          )
+          .join("")}</tbody></table>`,
+      )
+    : "";
+
+  const history = overviewSection(
+    "History",
+    o.history_error
+      ? `<div class="text-xs text-status-critical">${esc(o.history_error)}</div>`
+      : `<table class="w-full text-left text-sm"><tbody>${o.history
+          .map(
+            (h) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3 tabular text-xs">${h.revision}${h.revision === hd.revision ? ' <span class="text-ink-muted">· this one</span>' : ""}</td>
+          <td class="py-1.5 pr-3 text-xs ${helmRevisionTone(h.status)}">${esc(h.status)}</td>
+          <td class="py-1.5 text-right text-xs text-ink-muted" title="${esc(timeTitle("Changed", h.modified_at))}">${h.modified_at ? relativeTime(h.modified_at) : "—"}</td>
+        </tr>`,
+          )
+          .join("")}</tbody></table>`,
+  );
+
+  return `${banner}<div>${facts}</div>${resourceSection}${hooks}${deps}${history}`;
+}
 
 function renderHelmDetailBody(hd: HelmDetailState): string {
   if (hd.detailError) {
@@ -13620,6 +13810,7 @@ function renderHelmDetailBody(hd: HelmDetailState): string {
   if (!hd.detail) {
     return `<div class="text-sm text-ink-muted">Loading…</div>`;
   }
+  if (hd.view === "overview") return renderHelmOverviewView(hd);
 
   const text = currentHelmText(hd);
   const scrollId = `helm-${hd.view}:${esc(hd.ctx)}:${esc(hd.namespace)}:${esc(hd.name)}`;
@@ -13669,6 +13860,7 @@ function renderHelmDetailPanel(): string {
   if (!hd) return "";
 
   const tabs: { id: HelmDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "values", label: "Values" },
     { id: "manifest", label: "Manifest" },
     { id: "notes", label: "Notes" },
