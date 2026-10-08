@@ -96,6 +96,11 @@ fn name(t: &Tlv) -> String {
 /// UTCTime (`YYMMDDHHMMSSZ`, 1950–2049) or GeneralizedTime (`YYYYMMDDHHMMSSZ`).
 fn time(t: &Tlv) -> Option<String> {
     let s = std::str::from_utf8(t.body).ok()?.strip_suffix('Z')?;
+    // Digits only before any slicing: a multi-byte character would put a
+    // slice boundary inside it, and malformed bytes must not panic.
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let (year, rest) = match t.tag {
         0x17 if s.len() == 12 => {
             let yy: i32 = s[..2].parse().ok()?;
@@ -273,6 +278,15 @@ D5T5FjM6DHNLuEhwsOU=
         let c = &parse_pem_bundle(FAR)[0];
         assert_eq!(c.subject, "CN=far.example.com");
         assert_eq!(c.not_after.as_deref(), Some("2054-02-23T18:50:51+00:00"));
+    }
+
+    #[test]
+    fn a_malformed_time_is_rejected_not_a_panic() {
+        // Right byte length, but `é` puts a slice boundary inside a character.
+        for (tag, body) in [(0x17, "0\u{e9}000000000Z"), (0x18, "20\u{e9}0000000000Z"), (0x17, "26100818505xZ")] {
+            assert_eq!(time(&Tlv { tag, body: body.as_bytes() }), None, "{body}");
+        }
+        assert_eq!(time(&Tlv { tag: 0x17, body: b"261008185039Z" }).as_deref(), Some("2026-10-08T18:50:39+00:00"));
     }
 
     #[test]

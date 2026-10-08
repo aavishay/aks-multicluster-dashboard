@@ -4343,6 +4343,8 @@ function openSecretDetail(ctx: string, namespace: string, name: string, secretTy
     .then((detail) => {
       if (token !== secretDetailToken || !state.secretDetail) return;
       state.secretDetail.detail = detail;
+      // The fetched type is authoritative; a caller without a list row passes "".
+      state.secretDetail.secretType = detail.overview.secret_type;
       render();
     })
     .catch((e) => {
@@ -11059,8 +11061,12 @@ function renderSecretKeysView(sd: SecretDetailState): string {
 /** Days left before a certificate within which the Overview warns. */
 const CERT_WARN_DAYS = 30;
 
-/** What each built-in Secret type holds, in words. */
-const SECRET_TYPE_MEANING: Record<string, string> = {
+/**
+ * What each built-in Secret type holds, in words. A Map, not an object: a
+ * custom type named `constructor` must not find a prototype method.
+ */
+const SECRET_TYPE_MEANING = new Map<string, string>(
+  Object.entries({
   Opaque: "arbitrary keys",
   "kubernetes.io/tls": "a TLS certificate and its private key",
   "kubernetes.io/dockerconfigjson": "credentials for pulling images from a registry",
@@ -11070,7 +11076,8 @@ const SECRET_TYPE_MEANING: Record<string, string> = {
   "kubernetes.io/ssh-auth": "an SSH private key",
   "bootstrap.kubernetes.io/token": "a token nodes use to join the cluster",
   "helm.sh/release.v1": "one revision of a Helm release — the Helm tab reads it",
-};
+  }),
+);
 
 /** A certificate's expiry against now: past, close, or comfortably ahead. */
 function certExpiry(notAfter: string | null): { tone: string; text: string; days: number | null } {
@@ -11099,11 +11106,10 @@ function renderSecretOverviewView(sd: SecretDetailState): string {
   if (!sd.detail) return `<div class="text-sm text-ink-muted">Loading…</div>`;
   const o = sd.detail.overview;
   const { ctx, namespace } = sd;
-  const row = state.secrets.get(ctx)?.find((s) => s.namespace === namespace && s.name === sd.name);
 
-  // A key's first certificate is its leaf, or the only one: that is the one
-  // whose expiry breaks whatever uses it.
-  const leaves = o.certificates.map((k) => ({ key: k.key, cert: k.certificates[0], expiry: certExpiry(k.certificates[0]?.not_after ?? null) }));
+  // Each key's leaf, which the backend picks out of the whole bundle: the one
+  // whose expiry breaks whatever uses it. A bundle of CAs has none.
+  const leaves = o.certificates.flatMap((k) => (k.leaf ? [{ key: k.key, cert: k.leaf, expiry: certExpiry(k.leaf.not_after) }] : []));
   const banners = leaves
     .filter((l) => l.expiry.days !== null && l.expiry.days < CERT_WARN_DAYS)
     .map((l) => {
@@ -11153,14 +11159,14 @@ function renderSecretOverviewView(sd: SecretDetailState): string {
 
   const keys = sd.detail.keys;
   const facts = [
-    overviewRow("Type", `<span class="font-mono text-xs">${esc(sd.secretType)}</span>${SECRET_TYPE_MEANING[sd.secretType] ? `<div class="text-xs text-ink-secondary">${esc(SECRET_TYPE_MEANING[sd.secretType])}</div>` : ""}`),
+    overviewRow("Type", `<span class="font-mono text-xs">${esc(o.secret_type)}</span>${SECRET_TYPE_MEANING.has(o.secret_type) ? `<div class="text-xs text-ink-secondary">${esc(SECRET_TYPE_MEANING.get(o.secret_type)!)}</div>` : ""}`),
     overviewRow(
       "Keys",
       `<span class="tabular">${keys.length}</span> <span class="text-xs text-ink-muted">· ${formatBytes(keys.reduce((n, k) => n + k.bytes, 0))} · values under Keys</span>`,
     ),
     ...(o.registries.length ? [overviewRow("Registries", overviewChips(o.registries))] : []),
-    ...(row ? [overviewRow("Immutable", row.immutable ? "yes" : "no")] : []),
-    ...(row?.created_at ? [overviewRow("Created", esc(exactTime(row.created_at).replace("\n", " · ")))] : []),
+    overviewRow("Immutable", o.immutable ? "yes" : "no"),
+    ...(o.created_at ? [overviewRow("Created", esc(exactTime(o.created_at).replace("\n", " · ")))] : []),
   ].join("");
 
   const writtenBy = overviewSection("Written by", writers.length ? `<div>${writers.join("")}</div>` : `<div class="text-xs text-ink-muted">Nothing records a writer — no owner, Helm release or cert-manager annotation.</div>`);
@@ -11179,14 +11185,14 @@ function renderSecretOverviewView(sd: SecretDetailState): string {
           ${k.certificates
             .map((c, i) => {
               const e = certExpiry(c.not_after);
-              const selfSigned = c.subject === c.issuer;
+              // No self-signed badge: matching names do not prove it, and nothing here verifies signatures.
               return `
           <div class="${i ? "mt-2 border-t border-gridline/60 pt-2" : ""} text-sm">
             <div class="flex flex-wrap items-baseline justify-between gap-2">
-              <span class="min-w-0 break-all text-ink-primary">${esc(commonName(c.subject))}${c.is_ca ? ' <span class="rounded bg-surface-3 px-1 text-xs text-ink-secondary">CA</span>' : ""}${selfSigned ? ' <span class="rounded bg-surface-3 px-1 text-xs text-ink-secondary">self-signed</span>' : ""}</span>
+              <span class="min-w-0 break-all text-ink-primary">${esc(commonName(c.subject))}${c.is_ca ? ' <span class="rounded bg-surface-3 px-1 text-xs text-ink-secondary">CA</span>' : ""}</span>
               <span class="text-xs ${e.tone}" title="${esc(timeTitle("Valid until", c.not_after))}">${esc(e.text)}</span>
             </div>
-            ${selfSigned ? "" : `<div class="text-xs text-ink-muted">issued by ${esc(commonName(c.issuer))}</div>`}
+            <div class="text-xs text-ink-muted" title="${esc(c.issuer)}">issued by ${esc(commonName(c.issuer))}</div>
             ${c.sans.length ? `<div class="mt-1">${overviewChips(c.sans)}</div>` : ""}
           </div>`;
             })

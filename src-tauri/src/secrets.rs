@@ -152,6 +152,19 @@ pub async fn get_secret_detail(context_name: &str, namespace: &str, name: &str) 
     Ok(SecretDetail { keys: keys_of(&secret), manifest: redacted_manifest(&secret)?, overview: overview_of(&secret) })
 }
 
+/// The end-entity certificate in a bundle, wherever it sits: one that is not
+/// a CA and issues none of the others. A lone certificate is its own leaf,
+/// CA or not; a bundle of CAs has none.
+fn leaf_of(all: &[crate::x509::CertificateInfo]) -> Option<&crate::x509::CertificateInfo> {
+    if let [only] = all {
+        return Some(only);
+    }
+    let issues_another = |c: &crate::x509::CertificateInfo| all.iter().any(|o| !std::ptr::eq(o, c) && o.issuer == c.subject);
+    let mut end_entities = all.iter().filter(|c| !c.is_ca);
+    let first = end_entities.clone().next();
+    end_entities.find(|c| !issues_another(c)).or(first)
+}
+
 /// How many certificates of one key to describe. A CA bundle can hold well
 /// over a hundred; the count says how many more there are.
 const CERTS_SHOWN: usize = 20;
@@ -172,22 +185,35 @@ fn overview_of(s: &Secret) -> SecretOverview {
         .filter_map(|(key, value)| {
             let text = std::str::from_utf8(&value.0).ok()?;
             let all = crate::x509::parse_pem_bundle(text);
-            (!all.is_empty()).then(|| SecretCertificates { key: key.clone(), total: all.len(), certificates: all.into_iter().take(CERTS_SHOWN).collect() })
+            (!all.is_empty()).then(|| SecretCertificates {
+                key: key.clone(),
+                total: all.len(),
+                leaf: leaf_of(&all).cloned(),
+                certificates: all.into_iter().take(CERTS_SHOWN).collect(),
+            })
         })
         .collect();
 
-    // `.dockerconfigjson` nests hosts under `auths`; the legacy `.dockercfg`
-    // has them at the top. Only the keys are read — never `auth` or a password.
-    let registries = [(".dockerconfigjson", true), (".dockercfg", false)]
-        .into_iter()
-        .find_map(|(key, nested)| {
-            let json: Value = serde_json::from_slice(&data?.get(key)?.0).ok()?;
-            let hosts = if nested { json.get("auths")? } else { &json };
-            Some(hosts.as_object()?.keys().cloned().collect::<Vec<_>>())
-        })
-        .unwrap_or_default();
+    // Only for a pull-secret type, and only its own key: `.dockerconfigjson`
+    // nests hosts under `auths`, the legacy `.dockercfg` has them at the top.
+    // Only the keys are read — never `auth` or a password.
+    let secret_type = s.type_.clone().unwrap_or_else(|| "Opaque".to_string());
+    let registries = match secret_type.as_str() {
+        "kubernetes.io/dockerconfigjson" => Some((".dockerconfigjson", true)),
+        "kubernetes.io/dockercfg" => Some((".dockercfg", false)),
+        _ => None,
+    }
+    .and_then(|(key, nested)| {
+        let json: Value = serde_json::from_slice(&data?.get(key)?.0).ok()?;
+        let hosts = if nested { json.get("auths")? } else { &json };
+        Some(hosts.as_object()?.keys().cloned().collect::<Vec<_>>())
+    })
+    .unwrap_or_default();
 
     SecretOverview {
+        secret_type,
+        immutable: s.immutable.unwrap_or(false),
+        created_at: created_at(&s.metadata.creation_timestamp),
         owners: s
             .metadata
             .owner_references
@@ -371,6 +397,7 @@ mod tests {
         // Only the key holding certificates; the private key is not one.
         assert_eq!(o.certificates.len(), 1);
         assert_eq!((o.certificates[0].key.as_str(), o.certificates[0].total), ("tls.crt", 2));
+        assert_eq!(o.secret_type, "kubernetes.io/tls");
         assert_eq!(o.certificates[0].certificates[0].sans[0], "api.example.com");
         let json = serde_json::to_string(&o).unwrap();
         assert!(!json.contains("PRIVATE KEY") && !json.contains("MIIEvQ"), "a value leaked: {json}");
@@ -402,6 +429,39 @@ mod tests {
         assert!(!json.contains(PASSWORD) && !json.contains(TOKEN), "a value leaked: {json}");
     }
 
+    #[test]
+    fn the_leaf_is_found_wherever_the_bundle_puts_it() {
+        use crate::x509::tests::{CA, FAR, LEAF};
+        let parse = |pem: String| crate::x509::parse_pem_bundle(&pem);
+        // CA first, leaf second: the leaf is still the one whose expiry counts.
+        let ca_first = parse(format!("{CA}\n{LEAF}\n"));
+        assert_eq!(leaf_of(&ca_first).map(|c| c.subject.as_str()), Some("O=Fleet Test, CN=api.example.com"));
+        // A lone certificate is its own leaf, even a CA.
+        assert!(leaf_of(&parse(CA.to_string())).is_some_and(|c| c.is_ca));
+        // A bundle of CAs has none.
+        assert!(leaf_of(&parse(format!("{CA}\n{CA}\n"))).is_none());
+        // Two unrelated end-entity certificates: the first.
+        assert_eq!(leaf_of(&parse(format!("{FAR}\n{LEAF}\n"))).map(|c| c.subject.as_str()), Some("CN=far.example.com"));
+    }
+
+    #[test]
+    fn registries_come_only_from_a_pull_secret_types_own_key() {
+        let cfg = |json: &str| ByteString(json.as_bytes().to_vec());
+        let secret = |type_: &str, data: Vec<(&str, ByteString)>| Secret {
+            type_: Some(type_.into()),
+            data: Some(data.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+            ..Default::default()
+        };
+        // Arbitrary JSON in an Opaque Secret is not a list of registries.
+        assert!(overview_of(&secret("Opaque", vec![(".dockercfg", cfg(r#"{"internal-name":{}}"#))])).registries.is_empty());
+        // A legacy pull secret reads `.dockercfg`, even beside a `.dockerconfigjson`.
+        let legacy = secret(
+            "kubernetes.io/dockercfg",
+            vec![(".dockercfg", cfg(r#"{"old.registry":{}}"#)), (".dockerconfigjson", cfg(r#"{"auths":{"new.registry":{}}}"#))],
+        );
+        assert_eq!(overview_of(&legacy).registries, vec!["old.registry"]);
+    }
+
     /// Reads every Secret's overview through the real command path. Prints
     /// counts only — no names, subjects or hosts.
     #[tokio::test]
@@ -418,7 +478,7 @@ mod tests {
             with_certs += usize::from(!o.certificates.is_empty());
             certs += o.certificates.iter().map(|c| c.total).sum::<usize>();
             unparsed_tls += usize::from(s.type_.as_deref() == Some("kubernetes.io/tls") && !o.certificates.iter().any(|c| c.key == "tls.crt"));
-            for c in o.certificates.iter().filter_map(|c| c.certificates.first()) {
+            for c in o.certificates.iter().filter_map(|c| c.leaf.as_ref()) {
                 let after = c.not_after.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).expect("every leaf has an expiry");
                 expired += usize::from(after < now);
                 within_30d += usize::from(after >= now && after < now + chrono::Duration::days(30));

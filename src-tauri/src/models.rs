@@ -656,8 +656,11 @@ pub struct SecretDetail {
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 pub struct SecretCertificates {
     pub key: String,
-    /// Leaf first, as the bundle lists them; capped at `CERTS_SHOWN`.
+    /// In the bundle's order; capped at `CERTS_SHOWN`.
     pub certificates: Vec<crate::x509::CertificateInfo>,
+    /// The end-entity certificate whose expiry breaks whatever uses this key,
+    /// found among all of them before the cap. `None` for a bundle of CAs.
+    pub leaf: Option<crate::x509::CertificateInfo>,
     /// How many the key holds — more than shown for a CA bundle.
     pub total: usize,
 }
@@ -672,6 +675,10 @@ pub struct SecretOwner {
 /// What a Secret is for and who writes it. Mirrors `SecretOverview` in types.ts.
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 pub struct SecretOverview {
+    /// From the fetched Secret itself, so the Overview needs no list row.
+    pub secret_type: String,
+    pub immutable: bool,
+    pub created_at: Option<String>,
     pub owners: Vec<SecretOwner>,
     /// `app.kubernetes.io/managed-by`.
     pub managed_by: String,

@@ -586,16 +586,22 @@ export interface CertificateInfo {
   is_ca: boolean;
 }
 
-/** The certificates in one key, leaf first. */
+/** The certificates in one key, in the bundle's order. */
 export interface SecretCertificates {
   key: string;
   certificates: CertificateInfo[];
+  /** The end-entity certificate, found before the cap; null for a bundle of CAs. */
+  leaf: CertificateInfo | null;
   /** How many the key holds — more than shown for a CA bundle. */
   total: number;
 }
 
 /** What a Secret is for and who writes it. Mirrors `SecretOverview` in models.rs. */
 export interface SecretOverview {
+  /** From the fetched Secret itself. */
+  secret_type: string;
+  immutable: boolean;
+  created_at: string | null;
   owners: { kind: string; name: string }[];
   managed_by: string;
   helm_release: string;
