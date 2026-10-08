@@ -49,7 +49,10 @@ import type {
   MetricSample,
   MetricsOverTimeResult,
   NapNodePoolInfo,
+  NapBudget,
   NapNodePoolManifest,
+  NapRequirement,
+  NapResourceUse,
   NapResult,
   ObjectManifest,
   NodeInfo,
@@ -555,7 +558,7 @@ interface GitOpsDetailState {
 interface NapDetailState extends MetricsViewState {
   ctx: string;
   name: string;
-  view: "yaml" | "events" | "graph";
+  view: "overview" | "yaml" | "events" | "graph";
   manifest: NapNodePoolManifest | null;
   manifestError: string | null;
   showManagedFields: boolean;
@@ -3285,7 +3288,7 @@ function moveGitOpsSearch(_view: string, delta: number) {
 }
 
 // ---------------------------------------------------------------------------
-// NAP node pool detail panel (YAML / Events / Graph)
+// NAP node pool detail panel (Overview / YAML / Events / Graph)
 // ---------------------------------------------------------------------------
 
 function openNapDetail(ctx: string, name: string) {
@@ -3303,7 +3306,7 @@ function openNapDetail(ctx: string, name: string) {
   state.napDetail = {
     ctx,
     name,
-    view: "yaml",
+    view: "overview",
     manifest: null,
     manifestError: null,
     showManagedFields: false,
@@ -10499,22 +10502,182 @@ function renderNapGraphView(nd: NapDetailState): string {
   return renderMetricsGraphView(nd, "setNapMetricsRange", `nap:${nd.ctx}:${nd.name}`, note);
 }
 
+/** How many of a pool's nodes the Overview lists before handing over to the Nodes tab. */
+const NAP_NODES_SHOWN = 20;
+
+/** A pool's provisioned amount of one resource, in the unit it is counted in. */
+function napQuantity(r: NapResourceUse, v: number): string {
+  return r.unit === "millicores" ? formatMillicores(v) : r.unit === "ki" ? formatKi(v) : String(v);
+}
+
+/** Karpenter's resource names as people say them. */
+function napResourceLabel(name: string): string {
+  return name === "cpu" ? "CPU" : name === "nvidia.com/gpu" ? "GPU" : name;
+}
+
+/** A budget of `0` or `0%`, which lets no node be disrupted. */
+function napBudgetAllowsNone(b: NapBudget): boolean {
+  return /^0+%?$/.test(b.nodes.trim());
+}
+
+/** What the capacity-type requirement allows, read with its operator. */
+function napCapacityText(r: NapRequirement | undefined): string {
+  // Karpenter's default when nothing constrains it.
+  if (!r || r.operator === "DoesNotExist") return '<span class="text-ink-muted">on-demand — no capacity-type requirement</span>';
+  const values = esc(r.values.join(", "));
+  if (r.operator === "In") return values || "—";
+  if (r.operator === "NotIn") return `anything but ${values}`;
+  if (r.operator === "Exists") return "any — spot or on-demand";
+  return `${esc(r.operator)} ${values}`;
+}
+
+function napBudgetText(b: NapBudget): string {
+  const nodes = napBudgetAllowsNone(b) ? "no nodes" : `${esc(b.nodes)} of nodes`;
+  const reasons = b.reasons.length ? ` · for ${esc(b.reasons.join(", "))}` : "";
+  const when = b.schedule ? ` · from <span class="whitespace-nowrap font-mono">${esc(b.schedule)}</span>${b.duration ? ` for ${esc(b.duration)}` : ""}` : "";
+  return `${nodes} at a time${reasons}${when}`;
+}
+
+/**
+ * The NAP panel's Overview: whether the NodePool is ready and if not why, how
+ * close it is to its limits, what nodes it may create, when Karpenter may take
+ * them away again, and the nodes it has. All from the one fetched NodePool,
+ * plus the Nodes tab's rows when they are loaded.
+ */
+function renderNapOverviewView(nd: NapDetailState): string {
+  if (nd.manifestError) return `<div class="text-sm text-status-critical">${esc(nd.manifestError)}</div>`;
+  if (!nd.manifest) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const d = nd.manifest.detail;
+  const { ctx, name } = nd;
+  const red = (html: string) => `<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${html}</div>`;
+  const amber = (html: string) => `<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">${html}</div>`;
+  const why = (c: PodConditionInfo) => esc([c.reason, c.message].filter(Boolean).join(": "));
+  const ready = d.conditions.find((c) => c.condition_type === "Ready");
+  const atLimit = d.resources.filter((r) => r.limit !== null && r.used >= r.limit);
+  const blocked = d.budgets.some((b) => napBudgetAllowsNone(b) && !b.reasons.length && !b.schedule);
+
+  const banners = [
+    ...(ready && ready.status !== "True" ? [red(`Not ready${why(ready) ? ` · ${why(ready)}` : ""}`)] : []),
+    // What Ready rolls up, named — it says which part is failing.
+    ...d.conditions.filter((c) => c.condition_type !== "Ready" && c.status === "False").map((c) => red(`${esc(c.condition_type)}${why(c) ? ` · ${why(c)}` : ""}`)),
+    ...(atLimit.length
+      ? [amber(`At its ${esc(atLimit.map((r) => napResourceLabel(r.name)).join(" and "))} limit — Karpenter creates no more nodes from this pool until some go away.`)]
+      : []),
+    ...(blocked ? [amber("Disruption is blocked — a budget allows no nodes at a time, so Karpenter neither consolidates nor replaces expired or drifted nodes.")] : []),
+  ];
+  const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
+
+  const facts = [
+    overviewRow("Node class", d.node_class_name ? `${esc(d.node_class_kind || "NodeClass")}/${esc(d.node_class_name)}` : "—"),
+    overviewRow("Weight", d.weight !== null ? `<span class="tabular">${d.weight}</span> <span class="text-xs text-ink-muted">higher is tried first</span>` : '<span class="text-ink-muted">unset — tried after any weighted pool</span>'),
+    overviewRow("Capacity", napCapacityText(d.requirements.find((r) => r.key === "karpenter.sh/capacity-type"))),
+    overviewRow(
+      "Consolidation",
+      d.consolidate_after === "Never"
+        ? '<span class="text-ink-secondary">off — consolidateAfter is Never</span>'
+        : `${d.consolidation_policy === "WhenEmpty" ? "empty nodes only" : d.consolidation_policy === "WhenEmptyOrUnderutilized" || d.consolidation_policy === "WhenUnderutilized" ? "empty or underutilized nodes" : esc(d.consolidation_policy)}${d.consolidate_after ? ` <span class="text-xs text-ink-muted">· after ${esc(d.consolidate_after)}</span>` : ""}`,
+    ),
+    overviewRow("Node lifetime", d.expire_after === "Never" ? '<span class="text-ink-secondary">never expire</span>' : `replaced after <span class="tabular">${esc(d.expire_after)}</span>`),
+    ...(d.termination_grace_period ? [overviewRow("Drain timeout", `forced after <span class="tabular">${esc(d.termination_grace_period)}</span>`)] : []),
+    overviewRow(
+      d.budgets.length > 1 ? `Budgets (${d.budgets.length})` : "Budget",
+      `<div class="flex flex-col gap-0.5">${d.budgets.map((b) => `<div>${napBudgetText(b)}</div>`).join("")}</div>${d.budgets_default ? '<div class="text-xs text-ink-muted">Karpenter\'s default — the pool sets none</div>' : ""}`,
+    ),
+  ].join("");
+
+  // What Karpenter's limits bound is the capacity it has provisioned, not live use.
+  const usage = overviewSection(
+    "Provisioned",
+    d.resources
+      .map((r) => {
+        // A limit of zero allows nothing, so it is full from the start.
+        const pct = r.limit === null ? null : r.limit === 0 ? 100 : Math.min(100, Math.round((r.used / r.limit) * 100));
+        return `
+        <div class="text-sm">
+          <div class="flex items-baseline justify-between gap-3">
+            <span class="text-ink-muted">${esc(napResourceLabel(r.name))}</span>
+            <span class="tabular">${napQuantity(r, r.used)}${r.limit !== null ? ` <span class="text-ink-muted">of ${napQuantity(r, r.limit)}${pct !== null ? ` · ${pct}%` : ""}</span>` : ' <span class="text-xs text-ink-muted">no limit</span>'}</span>
+          </div>
+          ${pct !== null ? `<div class="mt-1">${usageBar(pct)}</div>` : ""}
+        </div>`;
+      })
+      .join(""),
+  );
+
+  const requirements = d.requirements.length
+    ? overviewSection(
+        "Requirements",
+        `<table class="w-full text-left text-sm"><tbody>${d.requirements
+          .map(
+            (r) => `
+        <tr class="border-t border-gridline/60 align-top first:border-t-0">
+          <td class="py-1.5 pr-3 font-mono text-xs">${esc(r.key)}</td>
+          <td class="py-1.5 pr-3 text-xs text-ink-muted">${esc(r.operator)}</td>
+          <td class="py-1.5">${r.values.length ? overviewChips(r.values) : ""}${r.min_values !== null ? `<div class="mt-1 text-xs text-ink-muted">at least ${r.min_values} must stay possible</div>` : ""}</td>
+        </tr>`,
+          )
+          .join("")}</tbody></table>`,
+      )
+    : "";
+  const marks = [
+    ...(d.taints.length ? [overviewRow("Taints", overviewChips(d.taints))] : []),
+    ...(d.startup_taints.length ? [overviewRow("Startup taints", overviewChips(d.startup_taints))] : []),
+    ...(d.labels.length ? [overviewRow("Labels", overviewChips(d.labels))] : []),
+  ];
+  const nodeMarks = marks.length ? overviewSection("On every node", `<div>${marks.join("")}</div>`) : "";
+
+  // From the Nodes tab's rows, so only once they have been loaded.
+  const loaded = state.nodes.get(ctx);
+  const mine = (loaded ?? []).filter((n) => n.node_pool === name).sort((a, b) => Number(a.ready) - Number(b.ready) || a.name.localeCompare(b.name));
+  const nodes = overviewSection(
+    loaded ? `Nodes (${mine.length})` : "Nodes",
+    !loaded
+      ? `<div class="text-xs text-ink-muted">This cluster's nodes have not been loaded yet — open the Nodes tab once.</div>`
+      : mine.length === 0
+        ? `<div class="text-xs text-ink-muted">None right now — Karpenter creates them when pods need them.</div>`
+        : `<table class="w-full text-left text-sm"><tbody>${mine
+            .slice(0, NAP_NODES_SHOWN)
+            .map(
+              (n) => `
+        <tr class="border-t border-gridline/60 first:border-t-0">
+          <td class="py-1.5 pr-3"><button type="button" onclick="window.__app.openNodeDetail(${jsArg(ctx)},${jsArg(n.name)})" class="text-left text-series-blue hover:underline">${esc(n.name)}</button></td>
+          <td class="py-1.5 pr-3 text-xs ${!n.ready ? "text-status-critical" : n.unschedulable ? "text-status-warning" : "text-ink-secondary"}">${n.ready ? "Ready" : "NotReady"}${n.unschedulable ? " · cordoned" : ""}</td>
+          <td class="py-1.5 pr-3 text-xs text-ink-muted">${esc(n.instance_type ?? "")}</td>
+          <td class="py-1.5 text-right text-xs text-ink-muted" title="${esc(timeTitle("Created", n.created_at))}">${formatAgeDetailed(n.age_days, n.age_seconds)}</td>
+        </tr>`,
+            )
+            .join("")}</tbody></table>${
+            mine.length > NAP_NODES_SHOWN
+              ? `<button type="button" onclick="window.__app.closeNapDetail();window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(name)})" class="self-start text-xs text-series-blue hover:underline">All ${mine.length} in the Nodes tab</button>`
+              : ""
+          }`,
+  );
+
+  // NodeRegistrationHealthy stays Unknown until the pool has launched a node.
+  const isHealthy = (c: PodConditionInfo): boolean | null => (c.status === "Unknown" && c.condition_type === "NodeRegistrationHealthy" ? null : c.status === "True");
+
+  return `${banner}<div>${facts}</div>${usage}${requirements}${nodeMarks}${nodes}${renderConditionsSection(d.conditions, isHealthy)}`;
+}
+
 function renderNapDetailPanel(): string {
   const nd = state.napDetail;
   if (!nd) return "";
 
   const tabs: { id: NapDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "yaml", label: "YAML" },
     { id: "events", label: "Events" },
     { id: "graph", label: "Graph" },
   ];
 
   const body =
-    nd.view === "yaml"
-      ? renderNapYamlView(nd)
-      : nd.view === "events"
-        ? renderEventsList(`nap-events:${nd.ctx}:${nd.name}`, nd.events, nd.eventsError)
-        : renderNapGraphView(nd);
+    nd.view === "overview"
+      ? renderNapOverviewView(nd)
+      : nd.view === "yaml"
+        ? renderNapYamlView(nd)
+        : nd.view === "events"
+          ? renderEventsList(`nap-events:${nd.ctx}:${nd.name}`, nd.events, nd.eventsError)
+          : renderNapGraphView(nd);
 
   return `
     <div class="fixed inset-0 z-40 flex justify-end bg-black/40" onclick="window.__app.closeNapDetail()">
@@ -11867,7 +12030,7 @@ function renderNap(): string {
                 <span class="inline-flex items-center gap-1.5">
                   <button
                     type="button"
-                    title="View node pool details (YAML, Events, Graph)"
+                    title="View node pool details (Overview, YAML, Events, Graph)"
                     data-row-open onclick="window.__app.openNapDetail(${jsArg(ctx)},${jsArg(p.name)})"
                     class="shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"
                   >

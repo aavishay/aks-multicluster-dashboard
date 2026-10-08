@@ -309,7 +309,13 @@ KEDA ScaledObject that owns it, if one does. KEDA lists ScaledObjects and
 ScaledJobs; their panel opens on an Overview — why one is not ready, whether
 it is paused or in fallback, what it scales between which bounds and how often
 it looks (KEDA's defaults applied where unset), each trigger with its
-authentication and whether KEDA can read it, and the HPA it drives. GitOps
+authentication and whether KEDA can read it, and the HPA it drives. NAP
+lists Node Auto Provisioning's Karpenter NodePools with their node counts and
+how much of their CPU and memory limits they have provisioned; a pool's panel
+opens on an Overview — why it is not ready, whether it has hit a limit, what
+nodes it may create (node class, weight, capacity type, requirements, taints
+and labels), when Karpenter consolidates or replaces them (its defaults said
+as such), and the nodes it has. GitOps
 lists Argo CD Applications with their sync and health; an app's panel opens on
 an Overview — why it is degraded or out of sync, what the last sync did and
 each resource it failed to apply, its sources and destination, how it syncs,

@@ -641,7 +641,66 @@ export interface NapResult {
   node_pools: NapNodePoolInfo[];
 }
 
-export type NapNodePoolManifest = ObjectManifest;
+export interface NapNodePoolManifest extends ObjectManifest {
+  /** What the panel's Overview shows, read from the same fetch as the YAML. */
+  detail: NapDetail;
+}
+
+/** One scheduling requirement nodes from the pool must meet. */
+export interface NapRequirement {
+  key: string;
+  operator: string;
+  values: string[];
+  /** At least this many distinct values must remain possible. */
+  min_values: number | null;
+}
+
+/** How many nodes Karpenter may disrupt at once, for which reasons, and when. */
+export interface NapBudget {
+  /** A count or a percentage; `"0"` blocks disruption. */
+  nodes: string;
+  /** Empty for every reason. */
+  reasons: string[];
+  /** Cron schedule the budget is active from, for `duration`; empty for always. */
+  schedule: string;
+  duration: string;
+}
+
+/** What the pool has provisioned of one resource, against its limit. */
+export interface NapResourceUse {
+  name: string;
+  unit: "millicores" | "ki" | "count";
+  used: number;
+  /** `null` when the pool sets no limit, which Karpenter treats as unbounded. */
+  limit: number | null;
+}
+
+/** What a NodePool's YAML buries. Mirrors `NapDetail` in models.rs. */
+export interface NapDetail {
+  node_class_kind: string;
+  node_class_name: string;
+  /** Higher is tried first; `null` is the lowest. */
+  weight: number | null;
+  requirements: NapRequirement[];
+  /** `key=value:Effect`. */
+  taints: string[];
+  startup_taints: string[];
+  /** `key=value`. */
+  labels: string[];
+  /** A duration or `Never`; Karpenter's default applied. */
+  expire_after: string;
+  /** Empty for no limit. */
+  termination_grace_period: string;
+  /** `WhenEmptyOrUnderutilized` or `WhenEmpty` (v1beta1: `WhenUnderutilized`). */
+  consolidation_policy: string;
+  /** A duration or `Never`; empty for a v1beta1 pool that sets none — no delay. */
+  consolidate_after: string;
+  /** The pool's budgets, or Karpenter's default of 10% when it sets none. */
+  budgets: NapBudget[];
+  budgets_default: boolean;
+  resources: NapResourceUse[];
+  conditions: PodConditionInfo[];
+}
 
 export interface NapNodePoolInfo {
   name: string;

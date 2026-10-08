@@ -660,7 +660,82 @@ pub struct SecretValue {
     pub base64: Option<String>,
 }
 
-pub type NapNodePoolManifest = ObjectManifest;
+#[derive(Serialize, Clone, Debug)]
+pub struct NapNodePoolManifest {
+    pub yaml_full: String,
+    pub yaml_without_managed_fields: String,
+    /// What the panel's Overview shows, read from the same fetch as the YAML.
+    pub detail: NapDetail,
+}
+
+/// One scheduling requirement nodes from the pool must meet.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct NapRequirement {
+    pub key: String,
+    /// `In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, `Lt`.
+    pub operator: String,
+    pub values: Vec<String>,
+    /// At least this many distinct values must remain possible — Karpenter's
+    /// guard against narrowing to a single instance type.
+    pub min_values: Option<i64>,
+}
+
+/// A disruption budget: how many nodes Karpenter may disrupt at once, for
+/// which reasons, and when.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct NapBudget {
+    /// A count or a percentage, `"0"` blocking disruption outright.
+    pub nodes: String,
+    /// Empty for every reason.
+    pub reasons: Vec<String>,
+    /// A cron schedule the budget is active from, for `duration`; empty for always.
+    pub schedule: String,
+    pub duration: String,
+}
+
+/// What the pool has provisioned of one resource, against its limit.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct NapResourceUse {
+    /// `cpu`, `memory`, `nodes`, `nvidia.com/gpu`…
+    pub name: String,
+    /// `millicores`, `ki` or `count` — how `used` and `limit` are measured.
+    pub unit: String,
+    pub used: i64,
+    /// `None` when the pool sets no limit for it, which Karpenter treats as unbounded.
+    pub limit: Option<i64>,
+}
+
+/// What a NodePool's YAML buries. Mirrors `NapDetail` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct NapDetail {
+    pub node_class_kind: String,
+    pub node_class_name: String,
+    /// Higher is tried first; `None` is the lowest.
+    pub weight: Option<i64>,
+    pub requirements: Vec<NapRequirement>,
+    /// `key=value:Effect`, on every node the pool creates.
+    pub taints: Vec<String>,
+    /// Taints expected to be removed once the node is initialised.
+    pub startup_taints: Vec<String>,
+    /// `key=value` labels on every node the pool creates.
+    pub labels: Vec<String>,
+    /// How long a node lives before Karpenter replaces it, or `Never`;
+    /// Karpenter's default of 720h applied when unset.
+    pub expire_after: String,
+    /// How long a draining node may take before it is forced; empty for no limit.
+    pub termination_grace_period: String,
+    /// `WhenEmptyOrUnderutilized` or `WhenEmpty` (v1beta1: `WhenUnderutilized`);
+    /// Karpenter's default for the pool's API version applied.
+    pub consolidation_policy: String,
+    /// How long a node must stay empty or underutilized first, or `Never`;
+    /// empty for a v1beta1 pool that sets none, which has no delay.
+    pub consolidate_after: String,
+    /// The pool's budgets, or Karpenter's default of 10% when it sets none.
+    pub budgets: Vec<NapBudget>,
+    pub budgets_default: bool,
+    pub resources: Vec<NapResourceUse>,
+    pub conditions: Vec<PodConditionInfo>,
+}
 
 /// One Karpenter `NodePool` — the provisioning policy — plus its own live
 /// rollup of what it has actually provisioned (`status.resources`), which is
