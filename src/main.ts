@@ -607,7 +607,7 @@ interface SecretDetailState {
   name: string;
   /** From the row, so the header is right before the detail call returns. */
   secretType: string;
-  view: "keys" | "yaml";
+  view: "overview" | "keys" | "yaml";
   detail: SecretDetail | null;
   detailError: string | null;
   showManagedFields: boolean;
@@ -4326,7 +4326,7 @@ function openSecretDetail(ctx: string, namespace: string, name: string, secretTy
     namespace,
     name,
     secretType,
-    view: "keys",
+    view: "overview",
     detail: null,
     detailError: null,
     showManagedFields: false,
@@ -11056,17 +11056,164 @@ function renderSecretKeysView(sd: SecretDetailState): string {
     </div>`;
 }
 
+/** Days left before a certificate within which the Overview warns. */
+const CERT_WARN_DAYS = 30;
+
+/** What each built-in Secret type holds, in words. */
+const SECRET_TYPE_MEANING: Record<string, string> = {
+  Opaque: "arbitrary keys",
+  "kubernetes.io/tls": "a TLS certificate and its private key",
+  "kubernetes.io/dockerconfigjson": "credentials for pulling images from a registry",
+  "kubernetes.io/dockercfg": "credentials for pulling images (the legacy format)",
+  "kubernetes.io/service-account-token": "an API token for a service account",
+  "kubernetes.io/basic-auth": "a username and password",
+  "kubernetes.io/ssh-auth": "an SSH private key",
+  "bootstrap.kubernetes.io/token": "a token nodes use to join the cluster",
+  "helm.sh/release.v1": "one revision of a Helm release — the Helm tab reads it",
+};
+
+/** A certificate's expiry against now: past, close, or comfortably ahead. */
+function certExpiry(notAfter: string | null): { tone: string; text: string; days: number | null } {
+  if (!notAfter) return { tone: "text-ink-muted", text: "no expiry recorded", days: null };
+  const days = (Date.parse(notAfter) - Date.now()) / 86_400_000;
+  // Rounded to the nearest unit, so two renders a moment apart agree.
+  const unit = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const a = Math.abs(days);
+  const span = a < 1 ? "less than a day" : a < 60 ? unit(Math.round(a), "day") : a < 730 ? unit(Math.round(a / 30.44), "month") : unit(Math.round(a / 365.25), "year");
+  if (days < 0) return { tone: "text-status-critical", text: `expired ${span} ago`, days };
+  return { tone: days < CERT_WARN_DAYS ? "text-status-warning" : "text-ink-secondary", text: `expires in ${span}`, days };
+}
+
+/** `CN=api, O=x` → `api`, or the whole name when it has no CN. */
+function commonName(dn: string): string {
+  return dn.split(", ").find((p) => p.startsWith("CN="))?.slice(3) || dn;
+}
+
+/**
+ * The Secrets panel's Overview: what the Secret's type holds, who writes it,
+ * and — read in Rust, never shipped as values — its certificates with their
+ * names and expiry, and a pull secret's registries.
+ */
+function renderSecretOverviewView(sd: SecretDetailState): string {
+  if (sd.detailError) return `<div class="text-sm text-status-critical">${esc(sd.detailError)}</div>`;
+  if (!sd.detail) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const o = sd.detail.overview;
+  const { ctx, namespace } = sd;
+  const row = state.secrets.get(ctx)?.find((s) => s.namespace === namespace && s.name === sd.name);
+
+  // A key's first certificate is its leaf, or the only one: that is the one
+  // whose expiry breaks whatever uses it.
+  const leaves = o.certificates.map((k) => ({ key: k.key, cert: k.certificates[0], expiry: certExpiry(k.certificates[0]?.not_after ?? null) }));
+  const banners = leaves
+    .filter((l) => l.expiry.days !== null && l.expiry.days < CERT_WARN_DAYS)
+    .map((l) => {
+      const bad = l.expiry.days! < 0;
+      return `<div class="rounded-md border ${bad ? "border-status-critical/40 bg-status-critical/10 text-status-critical" : "border-status-warning/40 bg-status-warning/10 text-status-warning"} p-3 text-sm">
+        The certificate in <span class="font-mono">${esc(l.key)}</span> (${esc(commonName(l.cert.subject))}) ${esc(l.expiry.text)}
+        <span title="${esc(timeTitle("Expires", l.cert.not_after))}">· ${esc(exactTime(l.cert.not_after).split("\n")[0])}</span>
+      </div>`;
+    });
+  const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
+
+  // Owners and the token's account live in the Secret's own namespace.
+  const serviceAccountLink = (name: string) =>
+    `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'ServiceAccount',${jsArg(namespace)},${jsArg(name)})" class="text-series-blue hover:underline">${esc(name)}</button>`;
+  const ownerLink = (kind: string, name: string) =>
+    kind === "ExternalSecret"
+      ? `<button type="button" onclick="window.__app.openExternalSecretDetail(${jsArg(ctx)},${jsArg(namespace)},${jsArg(name)})" class="text-series-blue hover:underline">${esc(name)}</button>`
+      : kind === "ServiceAccount"
+        ? serviceAccountLink(name)
+        : esc(name);
+  const helmRow = o.helm_release ? state.helm.get(ctx)?.find((r) => r.namespace === (o.helm_namespace || namespace) && r.name === o.helm_release) : undefined;
+  const writers = [
+    ...o.owners.map((w) => overviewRow(w.kind, `${ownerLink(w.kind, w.name)} <span class="text-xs text-ink-muted">owns it</span>`)),
+    ...(o.helm_release
+      ? [
+          overviewRow(
+            "Helm release",
+            helmRow
+              ? `<button type="button" onclick="window.__app.openHelmDetail(${jsArg(ctx)},${jsArg(helmRow.namespace)},${jsArg(helmRow.name)},${helmRow.revision})" class="text-series-blue hover:underline">${esc(o.helm_release)}</button>`
+              : esc(o.helm_release),
+          ),
+        ]
+      : []),
+    ...(o.cert_manager_certificate
+      ? [
+          overviewRow(
+            "cert-manager",
+            `Certificate <span class="font-mono">${esc(o.cert_manager_certificate)}</span>${o.cert_manager_issuer ? ` <span class="text-xs text-ink-muted">· from ${esc(o.cert_manager_issuer_kind || "Issuer")} ${esc(o.cert_manager_issuer)}</span>` : ""}`,
+          ),
+        ]
+      : []),
+    ...(o.service_account
+      ? [overviewRow("Service account", `${serviceAccountLink(o.service_account)} <span class="text-xs text-ink-muted">its token</span>`)]
+      : []),
+    ...(o.managed_by && !o.helm_release ? [overviewRow("Managed by", esc(o.managed_by))] : []),
+  ];
+
+  const keys = sd.detail.keys;
+  const facts = [
+    overviewRow("Type", `<span class="font-mono text-xs">${esc(sd.secretType)}</span>${SECRET_TYPE_MEANING[sd.secretType] ? `<div class="text-xs text-ink-secondary">${esc(SECRET_TYPE_MEANING[sd.secretType])}</div>` : ""}`),
+    overviewRow(
+      "Keys",
+      `<span class="tabular">${keys.length}</span> <span class="text-xs text-ink-muted">· ${formatBytes(keys.reduce((n, k) => n + k.bytes, 0))} · values under Keys</span>`,
+    ),
+    ...(o.registries.length ? [overviewRow("Registries", overviewChips(o.registries))] : []),
+    ...(row ? [overviewRow("Immutable", row.immutable ? "yes" : "no")] : []),
+    ...(row?.created_at ? [overviewRow("Created", esc(exactTime(row.created_at).replace("\n", " · ")))] : []),
+  ].join("");
+
+  const writtenBy = overviewSection("Written by", writers.length ? `<div>${writers.join("")}</div>` : `<div class="text-xs text-ink-muted">Nothing records a writer — no owner, Helm release or cert-manager annotation.</div>`);
+
+  const certSection = o.certificates.length
+    ? overviewSection(
+        "Certificates",
+        o.certificates
+          .map(
+            (k) => `
+        <div class="rounded-md border border-gridline bg-surface-1 p-3">
+          <div class="mb-2 flex items-center justify-between gap-2 text-xs">
+            <span class="font-mono text-ink-primary">${esc(k.key)}</span>
+            <span class="text-ink-muted">${k.total === 1 ? "1 certificate" : `${k.total} certificates${k.total > k.certificates.length ? ` · first ${k.certificates.length} shown` : ""}`}</span>
+          </div>
+          ${k.certificates
+            .map((c, i) => {
+              const e = certExpiry(c.not_after);
+              const selfSigned = c.subject === c.issuer;
+              return `
+          <div class="${i ? "mt-2 border-t border-gridline/60 pt-2" : ""} text-sm">
+            <div class="flex flex-wrap items-baseline justify-between gap-2">
+              <span class="min-w-0 break-all text-ink-primary">${esc(commonName(c.subject))}${c.is_ca ? ' <span class="rounded bg-surface-3 px-1 text-xs text-ink-secondary">CA</span>' : ""}${selfSigned ? ' <span class="rounded bg-surface-3 px-1 text-xs text-ink-secondary">self-signed</span>' : ""}</span>
+              <span class="text-xs ${e.tone}" title="${esc(timeTitle("Valid until", c.not_after))}">${esc(e.text)}</span>
+            </div>
+            ${selfSigned ? "" : `<div class="text-xs text-ink-muted">issued by ${esc(commonName(c.issuer))}</div>`}
+            ${c.sans.length ? `<div class="mt-1">${overviewChips(c.sans)}</div>` : ""}
+          </div>`;
+            })
+            .join("")}
+        </div>`,
+          )
+          .join(""),
+      )
+    : "";
+
+  return `${banner}<div>${facts}</div>${writtenBy}${certSection}`;
+}
+
 function renderSecretDetailPanel(): string {
   const sd = state.secretDetail;
   if (!sd) return "";
 
   const tabs: { id: SecretDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "keys", label: "Keys" },
     { id: "yaml", label: "YAML" },
   ];
 
   const body =
-    sd.view === "keys"
+    sd.view === "overview"
+      ? renderSecretOverviewView(sd)
+      : sd.view === "keys"
       ? renderSecretKeysView(sd)
       : renderYamlPane({
           error: sd.detailError,

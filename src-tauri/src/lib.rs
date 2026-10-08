@@ -20,6 +20,7 @@ mod resources;
 mod retry;
 mod secrets;
 mod workload_detail;
+mod x509;
 
 /// A macOS app launched via Finder/Dock/Launchpad is spawned by launchd with
 /// a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) rather than the user's

@@ -647,6 +647,47 @@ pub struct SecretInfo {
 pub struct SecretDetail {
     pub keys: Vec<SecretKeyInfo>,
     pub manifest: ObjectManifest,
+    /// What the panel's Overview shows — about the Secret, never its values.
+    pub overview: SecretOverview,
+}
+
+/// The certificates in one key, read in Rust; only their public metadata
+/// crosses to the webview.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct SecretCertificates {
+    pub key: String,
+    /// Leaf first, as the bundle lists them; capped at `CERTS_SHOWN`.
+    pub certificates: Vec<crate::x509::CertificateInfo>,
+    /// How many the key holds — more than shown for a CA bundle.
+    pub total: usize,
+}
+
+/// An object that owns the Secret, from `ownerReferences`.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct SecretOwner {
+    pub kind: String,
+    pub name: String,
+}
+
+/// What a Secret is for and who writes it. Mirrors `SecretOverview` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct SecretOverview {
+    pub owners: Vec<SecretOwner>,
+    /// `app.kubernetes.io/managed-by`.
+    pub managed_by: String,
+    /// `meta.helm.sh/release-name` and `-namespace`: the Helm release that created it.
+    pub helm_release: String,
+    pub helm_namespace: String,
+    /// cert-manager's `cert-manager.io/certificate-name`, `issuer-name` and `issuer-kind`.
+    pub cert_manager_certificate: String,
+    pub cert_manager_issuer: String,
+    pub cert_manager_issuer_kind: String,
+    /// `kubernetes.io/service-account.name`, for a service-account token.
+    pub service_account: String,
+    /// Each key holding PEM certificates.
+    pub certificates: Vec<SecretCertificates>,
+    /// The registry hosts a pull secret holds credentials for — hosts only.
+    pub registries: Vec<String>,
 }
 
 /// One revealed value. Exactly one of `text` and `base64` is set.

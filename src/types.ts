@@ -572,6 +572,41 @@ export interface SecretInfo {
 export interface SecretDetail {
   keys: SecretKeyInfo[];
   manifest: ObjectManifest;
+  /** What the panel's Overview shows — about the Secret, never its values. */
+  overview: SecretOverview;
+}
+
+/** One certificate's public fields. Mirrors `CertificateInfo` in x509.rs. */
+export interface CertificateInfo {
+  subject: string;
+  issuer: string;
+  sans: string[];
+  not_before: string | null;
+  not_after: string | null;
+  is_ca: boolean;
+}
+
+/** The certificates in one key, leaf first. */
+export interface SecretCertificates {
+  key: string;
+  certificates: CertificateInfo[];
+  /** How many the key holds — more than shown for a CA bundle. */
+  total: number;
+}
+
+/** What a Secret is for and who writes it. Mirrors `SecretOverview` in models.rs. */
+export interface SecretOverview {
+  owners: { kind: string; name: string }[];
+  managed_by: string;
+  helm_release: string;
+  helm_namespace: string;
+  cert_manager_certificate: string;
+  cert_manager_issuer: string;
+  cert_manager_issuer_kind: string;
+  service_account: string;
+  certificates: SecretCertificates[];
+  /** Registry hosts only. */
+  registries: string[];
 }
 
 /** One revealed value. Exactly one of `text` and `base64` is set. */

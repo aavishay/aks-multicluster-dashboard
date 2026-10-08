@@ -327,9 +327,13 @@ panel opens on an Overview — why it failed or is stuck pending, which chart
 and app version it runs, which values it overrides, what it rendered (its
 workloads with whether they are ready, each a link), its hooks and subcharts,
 and every stored revision — beside its values, manifest and notes. Secrets
-lists every Secret with its type and key count; its panel shows each key's
-name and size, keeps values masked until you reveal one, and forgets them
-when it closes. Helm's own release Secrets are listed without their contents,
+lists every Secret with its type and key count; its panel opens on an
+Overview — what the type holds, who writes it (an ExternalSecret, a Helm
+release, cert-manager, a ServiceAccount's token), a pull secret's registries,
+and every certificate it holds with its names, issuer and expiry, flagged once
+expired or within 30 days. Certificates are read in the backend and only their
+public fields reach the window. The Keys view shows each key's name and size,
+keeps values masked until you reveal one, and forgets them when it closes. Helm's own release Secrets are listed without their contents,
 which the Helm tab already shows. ServiceAccounts shows each account's Azure
 workload identity (its client ID), image pull secrets and whether it mounts a
 token. SecretStores lists External Secrets Operator's SecretStores and
