@@ -1852,32 +1852,97 @@ function filterSummary(tab: TabId, totalCount: number, filteredCount: number): s
     </div>`;
 }
 
-const TABS: { id: TabId; label: string }[] = [
-  { id: "overview", label: "Overview" },
-  { id: "nodes", label: "Nodes" },
-  { id: "namespaces", label: "Namespaces" },
-  { id: "workloads", label: "Workloads" },
-  { id: "pods", label: "Pods" },
-  { id: "services", label: "Services" },
-  { id: "ingresses", label: "Ingress" },
-  { id: "pvcs", label: "PVC" },
-  { id: "pvs", label: "PV" },
-  { id: "resources", label: "Resource Usage" },
-  { id: "metrics", label: "Metrics" },
-  { id: "events", label: "Events" },
-  { id: "nap", label: "NAP" },
-  { id: "hpa", label: "HPA" },
-  { id: "keda", label: "KEDA" },
-  { id: "pdbs", label: "PDB" },
-  { id: "gitops", label: "GitOps" },
-  { id: "helm", label: "Helm" },
-  { id: "configmaps", label: "ConfigMaps" },
-  { id: "secrets", label: "Secrets" },
-  { id: "serviceaccounts", label: "ServiceAccounts" },
-  { id: "externalsecrets", label: "ExternalSecrets" },
-  { id: "secretstores", label: "SecretStores" },
-  { id: "cost", label: "Cost" },
+/**
+ * The tabs, in eight groups. Too many to fit one row at 125% — they ran off
+ * the bar's edge — so the bar is two rows: the groups, then the active
+ * group's tabs. The groups are also the tab order: Left/Right steps through
+ * them group by group, and the switcher lists them in it.
+ */
+const TAB_GROUPS: { id: string; label: string; tabs: { id: TabId; label: string }[] }[] = [
+  { id: "overview", label: "Overview", tabs: [{ id: "overview", label: "Overview" }] },
+  {
+    id: "cluster",
+    label: "Cluster",
+    tabs: [
+      { id: "nodes", label: "Nodes" },
+      { id: "namespaces", label: "Namespaces" },
+      { id: "nap", label: "NAP" },
+      { id: "events", label: "Events" },
+    ],
+  },
+  {
+    id: "workloads",
+    label: "Workloads",
+    tabs: [
+      { id: "workloads", label: "Workloads" },
+      { id: "pods", label: "Pods" },
+      { id: "hpa", label: "HPA" },
+      { id: "keda", label: "KEDA" },
+      { id: "pdbs", label: "PDB" },
+    ],
+  },
+  {
+    id: "network",
+    label: "Network",
+    tabs: [
+      { id: "services", label: "Services" },
+      { id: "ingresses", label: "Ingress" },
+    ],
+  },
+  {
+    id: "storage",
+    label: "Storage",
+    tabs: [
+      { id: "pvcs", label: "PVC" },
+      { id: "pvs", label: "PV" },
+    ],
+  },
+  {
+    id: "config",
+    label: "Config",
+    tabs: [
+      { id: "configmaps", label: "ConfigMaps" },
+      { id: "secrets", label: "Secrets" },
+      { id: "serviceaccounts", label: "ServiceAccounts" },
+      { id: "externalsecrets", label: "ExternalSecrets" },
+      { id: "secretstores", label: "SecretStores" },
+    ],
+  },
+  {
+    id: "delivery",
+    label: "Delivery",
+    tabs: [
+      { id: "gitops", label: "GitOps" },
+      { id: "helm", label: "Helm" },
+    ],
+  },
+  {
+    id: "insights",
+    label: "Insights",
+    tabs: [
+      { id: "resources", label: "Resource Usage" },
+      { id: "metrics", label: "Metrics" },
+      { id: "cost", label: "Cost" },
+    ],
+  },
 ];
+
+const TABS: { id: TabId; label: string }[] = TAB_GROUPS.flatMap((g) => g.tabs);
+
+/** The group a tab sits in. Every tab is in exactly one. */
+function tabGroupOf(tab: TabId): (typeof TAB_GROUPS)[number] {
+  return TAB_GROUPS.find((g) => g.tabs.some((t) => t.id === tab)) ?? TAB_GROUPS[0];
+}
+
+/** The last tab used in each group, so going back to a group returns to it. */
+const lastTabInGroup = new Map<string, TabId>();
+
+/** A group's button: the tab last used in it, or its first. */
+function selectTabGroup(groupId: string) {
+  const group = TAB_GROUPS.find((g) => g.id === groupId);
+  if (!group) return;
+  selectTab(lastTabInGroup.get(group.id) ?? group.tabs[0].id);
+}
 
 function statusDot(healthy: boolean | undefined, unknown = false): string {
   const color = unknown ? "bg-ink-muted" : healthy ? "bg-status-good" : "bg-status-critical";
@@ -2807,8 +2872,126 @@ function toggleClusterPaletteHighlighted() {
 
 interface ViewSnapshot {
   tab: TabId;
-  podsFilter: Partial<Record<string, ColumnFilterState>> | undefined;
-  podsUnhealthyOnly: boolean | undefined;
+  /** Every tab's filters and unhealthy-only switch, as a drill-down may set any of them. */
+  filters: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
+  unhealthyOnly: Partial<Record<TabId, boolean>>;
+  /**
+   * Tabs besides the one returned to whose filters Back puts back: those the
+   * navigation away from this view overwrote — a drill-down's Pods or Nodes.
+   * Empty for an ordinary move, so the reader's own edits elsewhere survive.
+   */
+  restoreTabs: TabId[];
+  /** The detail panel open at the time, so Back can return into it. */
+  panel: PanelSnapshot | null;
+}
+
+/**
+ * An open detail panel, as much as it takes to put it back exactly: which
+ * object, which of its views, and how far each of its scroll areas was
+ * scrolled. The object is refetched on return — a panel shows live state,
+ * and what it showed a minute ago may have changed.
+ */
+interface PanelSnapshot {
+  /** Which object, for telling two snapshots of the same view apart. */
+  key: string;
+  reopen: () => void;
+  view: string;
+  setView: (view: string) => void;
+  scroll: Map<string, { top: number; left: number }>;
+}
+
+/** Set while Back or Forward reopens a panel, so that reopening is not itself recorded. */
+let restoringView = false;
+
+/**
+ * Scroll offsets waiting for a reopened panel's content to arrive: applied
+ * by `render` once each area is tall enough to take its offset, and dropped
+ * after a few seconds should the content never get that tall.
+ */
+let pendingPanelScroll: { positions: Map<string, { top: number; left: number }>; until: number } | null = null;
+
+function currentPanelSnapshot(): PanelSnapshot | null {
+  // Both axes: an unwrapped YAML or log pane scrolls sideways too.
+  const scroll = new Map<string, { top: number; left: number }>();
+  document.querySelectorAll<HTMLElement>("[data-detail-body], [data-detail-body] [data-scroll-id]").forEach((el) => {
+    if (el.dataset.scrollId && (el.scrollTop > 0 || el.scrollLeft > 0)) scroll.set(el.dataset.scrollId, { top: el.scrollTop, left: el.scrollLeft });
+  });
+  const make = <V extends string>(key: string, reopen: () => void, view: V, setView: (v: V) => void): PanelSnapshot => ({
+    key,
+    reopen,
+    view,
+    setView: setView as (v: string) => void,
+    scroll,
+  });
+  // Only scalar identity fields are captured, never the panel state itself:
+  // a history entry must not keep a Secret panel's revealed values alive
+  // after the panel is closed and claims to have forgotten them.
+  const s = state;
+  if (s.podDetail) {
+    const { ctx, namespace, name, view } = s.podDetail;
+    return make(`pod:${ctx}:${namespace}:${name}`, () => openPodDetail(ctx, namespace, name), view, setPodDetailView);
+  }
+  if (s.nodeDetail) {
+    const { ctx, name, view } = s.nodeDetail;
+    return make(`node:${ctx}:${name}`, () => openNodeDetail(ctx, name), view, setNodeDetailView);
+  }
+  if (s.workloadDetail) {
+    const { ctx, kind, namespace, name, view } = s.workloadDetail;
+    return make(`workload:${ctx}:${kind}:${namespace}:${name}`, () => openWorkloadDetail(ctx, kind, namespace, name), view, setWorkloadDetailView);
+  }
+  if (s.gitOpsDetail) {
+    const { ctx, namespace, name, view } = s.gitOpsDetail;
+    return make(`gitops:${ctx}:${namespace}:${name}`, () => openGitOpsDetail(ctx, namespace, name), view, setGitOpsDetailView);
+  }
+  if (s.helmDetail) {
+    const { ctx, namespace, name, revision, view } = s.helmDetail;
+    return make(`helm:${ctx}:${namespace}:${name}:${revision}`, () => openHelmDetail(ctx, namespace, name, revision), view, setHelmDetailView);
+  }
+  if (s.napDetail) {
+    const { ctx, name, view } = s.napDetail;
+    return make(`nap:${ctx}:${name}`, () => openNapDetail(ctx, name), view, setNapDetailView);
+  }
+  if (s.kedaDetail) {
+    const { ctx, namespace, kind, name, view } = s.kedaDetail;
+    return make(`keda:${ctx}:${namespace}:${kind}:${name}`, () => openKedaDetail(ctx, namespace, kind, name), view, setKedaDetailView);
+  }
+  if (s.hpaDetail) {
+    const { ctx, namespace, name, view } = s.hpaDetail;
+    return make(`hpa:${ctx}:${namespace}:${name}`, () => openHpaDetail(ctx, namespace, name), view, setHpaDetailView);
+  }
+  if (s.secretDetail) {
+    const { ctx, namespace, name, secretType, view } = s.secretDetail;
+    return make(`secret:${ctx}:${namespace}:${name}`, () => openSecretDetail(ctx, namespace, name, secretType), view, setSecretDetailView);
+  }
+  if (s.externalSecretDetail) {
+    const { ctx, namespace, name, view } = s.externalSecretDetail;
+    return make(`externalsecret:${ctx}:${namespace}:${name}`, () => openExternalSecretDetail(ctx, namespace, name), view, setExternalSecretDetailView);
+  }
+  if (s.resourceDetail) {
+    const { ctx, kind, namespace, name, view } = s.resourceDetail;
+    return make(`resource:${ctx}:${kind}:${namespace}:${name}`, () => openResourceDetail(ctx, kind, namespace, name), view, setResourceDetailView);
+  }
+  return null;
+}
+
+/** Two snapshots of the same place — Back skips over those rather than doing nothing visible. */
+function snapshotKey(v: ViewSnapshot): string {
+  return `${v.tab}|${v.panel?.key ?? ""}|${JSON.stringify([v.filters, v.unhealthyOnly], (_k, x) => (x instanceof Set ? [...x] : x))}`;
+}
+
+/** After a render, puts a reopened panel's scroll areas back where they were, as their content arrives. */
+function applyPendingPanelScroll(app: HTMLElement) {
+  const pending = pendingPanelScroll;
+  if (!pending) return;
+  for (const [id, pos] of [...pending.positions]) {
+    const el = [...app.querySelectorAll<HTMLElement>("[data-scroll-id]")].find((e) => e.dataset.scrollId === id);
+    if (el && el.scrollHeight - el.clientHeight >= pos.top && el.scrollWidth - el.clientWidth >= pos.left) {
+      el.scrollTop = pos.top;
+      el.scrollLeft = pos.left;
+      pending.positions.delete(id);
+    }
+  }
+  if (pending.positions.size === 0 || Date.now() > pending.until) pendingPanelScroll = null;
 }
 
 /**
@@ -2833,49 +3016,79 @@ function cloneColumnFilterRecord(
 }
 
 /**
- * The current tab plus whatever pods-tab filter/unhealthy state a drill-down
- * (`viewPodsForWorkload`/`viewPodsForNode`) is about to clobber — the only
- * state any navigation function in this file mutates besides `activeTab`. A
- * plain tab switch's pods fields just get written back unchanged, so this one
- * snapshot shape covers both cases.
+ * Where the reader is: the tab, its filters, and an open panel. Filters are
+ * captured for every tab but restored only for the tab being returned to and
+ * the two a drill-down overwrites — see `applyViewSnapshot`.
  */
 function currentViewSnapshot(): ViewSnapshot {
   return {
     tab: state.activeTab,
-    podsFilter: cloneColumnFilterRecord(state.filterState.pods),
-    podsUnhealthyOnly: state.unhealthyOnly.pods,
+    filters: Object.fromEntries(Object.entries(state.filterState).map(([tab, rec]) => [tab, cloneColumnFilterRecord(rec)])),
+    unhealthyOnly: { ...state.unhealthyOnly },
+    restoreTabs: [],
+    panel: currentPanelSnapshot(),
   };
 }
 
 function applyViewSnapshot(snapshot: ViewSnapshot) {
-  state.activeTab = snapshot.tab;
-  state.filterState.pods = snapshot.podsFilter;
-  state.unhealthyOnly.pods = snapshot.podsUnhealthyOnly;
+  restoringView = true;
+  // Before anything reopens: a restore still pending from an earlier step
+  // must not land on a panel that happens to share a scroll ID.
+  pendingPanelScroll = null;
+  try {
+    closeOpenDetailPanel();
+    state.activeTab = snapshot.tab;
+    // The tab returned to comes back exactly as it was, and so does any tab
+    // the navigation away from it overwrote. Other tabs keep their filters:
+    // edits made since are the reader's, not navigation's.
+    for (const tab of new Set<TabId>([snapshot.tab, ...snapshot.restoreTabs])) {
+      state.filterState[tab] = cloneColumnFilterRecord(snapshot.filters[tab]);
+      state.unhealthyOnly[tab] = snapshot.unhealthyOnly[tab];
+    }
+    if (snapshot.panel) {
+      snapshot.panel.reopen();
+      snapshot.panel.setView(snapshot.panel.view);
+      pendingPanelScroll = snapshot.panel.scroll.size ? { positions: new Map(snapshot.panel.scroll), until: Date.now() + 8000 } : null;
+    }
+  } finally {
+    restoringView = false;
+  }
   render();
   loadTabData();
 }
 
-/** Called by every function that changes `state.activeTab`, right before it does so. */
-function pushViewHistory() {
-  viewHistory.back.push(currentViewSnapshot());
+/**
+ * Called by every function that changes `state.activeTab` or opens a detail
+ * panel, right before it does so — so following a link from one panel to
+ * another can be undone, back into the panel it came from.
+ */
+function pushViewHistory(overwrites: TabId[] = []) {
+  if (restoringView) return;
+  viewHistory.back.push({ ...currentViewSnapshot(), restoreTabs: overwrites });
   // Navigating somewhere new abandons the forward trail, as in a browser.
   viewHistory.forward.length = 0;
 }
 
-/** Cmd+Left. No-op at the start of history. */
-function goBackView() {
-  const previous = viewHistory.back.pop();
-  if (!previous) return;
-  viewHistory.forward.push(currentViewSnapshot());
+/** Cmd+Left. Returns false at the start of history. */
+function goBackView(): boolean {
+  const here = currentViewSnapshot();
+  let previous = viewHistory.back.pop();
+  // A panel closed by hand left its opening entry behind, pointing at the
+  // view already on screen; skip those rather than spend a keypress on them.
+  while (previous && snapshotKey(previous) === snapshotKey(here)) previous = viewHistory.back.pop();
+  if (!previous) return false;
+  viewHistory.forward.push(here);
   applyViewSnapshot(previous);
+  return true;
 }
 
-/** Cmd+Right. No-op unless a `goBackView` has left something to return to. */
-function goForwardView() {
+/** Cmd+Right. Returns false unless a `goBackView` has left something to return to. */
+function goForwardView(): boolean {
   const next = viewHistory.forward.pop();
-  if (!next) return;
+  if (!next) return false;
   viewHistory.back.push(currentViewSnapshot());
   applyViewSnapshot(next);
+  return true;
 }
 
 function selectTab(tab: TabId) {
@@ -2888,7 +3101,7 @@ function selectTab(tab: TabId) {
 
 /** Drill down from a Workloads row into its pods, pre-filtered to just that workload. */
 function viewPodsForWorkload(ctx: string, kind: string, namespace: string, name: string) {
-  pushViewHistory();
+  pushViewHistory(["pods"]);
   state.filterState.pods = {
     cluster: { enumValues: new Set([ctx]) },
     namespace: { enumValues: new Set([namespace]) },
@@ -2902,7 +3115,7 @@ function viewPodsForWorkload(ctx: string, kind: string, namespace: string, name:
 
 /** Drill down from a Nodes row into its pods, pre-filtered to just that node. */
 function viewPodsForNode(ctx: string, nodeName: string) {
-  pushViewHistory();
+  pushViewHistory(["pods"]);
   state.filterState.pods = {
     cluster: { enumValues: new Set([ctx]) },
     node: { enumValues: new Set([nodeName]) },
@@ -2915,7 +3128,9 @@ function viewPodsForNode(ctx: string, nodeName: string) {
 
 /** Drill down from a NAP row into the nodes it actually provisioned. */
 function viewNodesForNodePool(ctx: string, poolName: string) {
-  pushViewHistory();
+  // Recorded before the NAP panel it is followed from closes, so Back returns into that panel.
+  pushViewHistory(["nodes"]);
+  closeOpenDetailPanel();
   state.filterState.nodes = {
     cluster: { enumValues: new Set([ctx]) },
     node_pool: { enumValues: new Set([poolName]) },
@@ -2931,6 +3146,7 @@ function viewNodesForNodePool(ctx: string, poolName: string) {
 // ---------------------------------------------------------------------------
 
 function openNodeDetail(ctx: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeWorkloadDetail();
@@ -3074,6 +3290,7 @@ function moveNodeSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openHelmDetail(ctx: string, namespace: string, name: string, revision: number) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -3178,6 +3395,7 @@ function moveHelmSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openGitOpsDetail(ctx: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -3337,6 +3555,7 @@ function moveGitOpsSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openNapDetail(ctx: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4195,6 +4414,7 @@ function kedaTargetIsGraphable(targetKind: string, targetName: string): boolean 
 // a third view here would duplicate one of the two.
 
 function openHpaDetail(ctx: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4311,6 +4531,7 @@ function moveHpaSearch(_view: string, delta: number) {
 // Secret to an AI provider.
 
 function openSecretDetail(ctx: string, namespace: string, name: string, secretType: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4494,6 +4715,7 @@ async function copySecretKey(key: string) {
 // has been failing, which the Ready condition alone cannot.
 
 function openExternalSecretDetail(ctx: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4624,6 +4846,7 @@ function moveExternalSecretSearch(_view: string, delta: number) {
 }
 
 function openKedaDetail(ctx: string, namespace: string, kind: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4785,6 +5008,7 @@ function moveKedaSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -5187,6 +5411,7 @@ function manualRefresh() {
 // ---------------------------------------------------------------------------
 
 function openPodDetail(ctx: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -5540,6 +5765,7 @@ function setMetricsRange(minutes: number) {
   goToTabFromPalette,
   toggleClusterPaletteHighlighted,
   selectTab,
+  selectTabGroup,
   viewPodsForWorkload,
   viewPodsForNode,
   openPodDetail,
@@ -5890,12 +6116,17 @@ function render(carried?: PreRenderState) {
       el.scrollLeft = pos.left;
     }
   });
+  // After the ordinary restore, which knows nothing of a panel just reopened by Back.
+  applyPendingPanelScroll(app);
   restoreSelectionSnapshot(app, selectionSnapshot);
 
   // After the scroll restore, which would otherwise put the bar back where it
   // was: a tab reached by the keyboard, a drill-down or Back can be off the
   // visible end of it. Only on a change, so reading along the bar is never
   // yanked back to the active tab.
+  // Recorded here rather than in selectTab: a drill-down, Back and the
+  // switcher all set the tab directly, and every one of them renders.
+  lastTabInGroup.set(tabGroupOf(state.activeTab).id, state.activeTab);
   if (state.activeTab !== lastRenderedActiveTab) {
     lastRenderedActiveTab = state.activeTab;
     app.querySelector<HTMLElement>("[data-tab-active]")?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -6183,7 +6414,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       ["← →", "Previous or next tab"],
       ["↑ ↓ PgUp PgDn Home End", "Scroll a tab with no table, like Metrics or Cost"],
-      [`${withMod("←")} ${withMod("→")}`, "Back and forward through views"],
+      [`${withMod("←")} ${withMod("→")}`, "Back and forward through views — panels included, at the tab and scroll you left"],
       [withMod("B"), "Show or hide the cluster list"],
       [withMod("S"), "Switch cluster"],
       [withMod("R"), "Refresh now"],
@@ -6202,6 +6433,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     title: "Everywhere",
     items: [
       [withMod("K"), "Go to a tab"],
+      [`${withMod("1")}–${withMod(String(TAB_GROUPS.length))}`, "Switch tab group"],
       [withMod("F"), "Search — the panel's box, or this table's filter"],
       ["?", "This list"],
       ["Esc", "Back out a layer: the field, then what's open, then filters, then write mode"],
@@ -7015,30 +7247,67 @@ function renderTopbar(): string {
 }
 
 /**
- * The tab bar scrolls sideways rather than wrapping or clipping. At 125% UI
- * scale on an ordinary window there are more tabs than width: without this
- * the bar ran off its right edge with no way to reach the rest, and a
- * two-word label ("Resource Usage") broke onto two lines to make room.
+ * The tab bar: a row of groups, then the active group's tabs. Each row
+ * still scrolls sideways rather than wrapping should a narrow window need
+ * it, and `render` brings the active tab into view when it changes — see
+ * `lastRenderedActiveTab`.
  *
- * `data-scroll-id` keeps its offset across renders, and `render` brings the
- * active tab into view whenever it changes — see `lastRenderedActiveTab`.
+ * A group's badge adds up its tabs' problem counts, so something wrong in a
+ * tab that isn't showing is still visible from the top row.
  */
 function renderTabs(): string {
-  return `
-    <nav data-scroll-id="tab-bar" class="tab-bar flex gap-1 overflow-x-auto border-b border-gridline bg-surface-1 px-5">
-      ${TABS.map(
-        (t) => `
+  const activeGroup = tabGroupOf(state.activeTab);
+  const badge = (count: number, partial: boolean, critical: boolean, title: string) =>
+    count > 0
+      ? `<span title="${esc(title)}" class="rounded px-1 text-xs tabular ${critical ? "bg-status-critical/15 text-status-critical" : "bg-status-warning/15 text-status-warning"}">${count}${partial ? "+" : ""}</span>`
+      : "";
+  const groupButtons = TAB_GROUPS.map((g, i) => {
+    const problems = g.tabs.map((t) => ({ t, p: tabProblemCount(t.id) })).filter((x) => x.p && x.p.count > 0);
+    const count = problems.reduce((n, x) => n + x.p!.count, 0);
+    const title = problems.map((x) => `${x.t.label}: ${x.p!.count}${x.p!.loaded < x.p!.total ? "+" : ""} ${x.p!.label}`).join("\n");
+    const active = g.id === activeGroup.id;
+    return `
         <button
-          onclick="window.__app.selectTab(${jsArg(t.id)})"
-          ${state.activeTab === t.id ? "data-tab-active" : ""}
-          class="shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
-            state.activeTab === t.id
-              ? "border-series-blue text-ink-primary"
-              : "border-transparent text-ink-muted hover:text-ink-secondary"
+          type="button"
+          onclick="window.__app.selectTabGroup(${jsArg(g.id)})"
+          title="${esc(i < 9 ? `${g.label} (${withMod(String(i + 1))})` : g.label)}"
+          ${active ? 'data-tab-group-active aria-current="true"' : ""}
+          class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2.5 py-1 text-sm font-medium transition-colors ${
+            active ? "bg-surface-3 text-ink-primary" : "text-ink-muted hover:bg-surface-2 hover:text-ink-secondary"
           }"
-        >${t.label}</button>`,
-      ).join("")}
-    </nav>`;
+        >${esc(g.label)}${badge(
+          count,
+          problems.some((x) => x.p!.loaded < x.p!.total),
+          problems.some((x) => x.p!.tone === "critical"),
+          title,
+        )}</button>`;
+  }).join("");
+  // A group of one — Overview — has no second row to choose from.
+  const tabButtons =
+    activeGroup.tabs.length > 1
+      ? activeGroup.tabs
+          .map((t) => {
+            const p = tabProblemCount(t.id);
+            const active = state.activeTab === t.id;
+            return `
+        <button
+          type="button"
+          onclick="window.__app.selectTab(${jsArg(t.id)})"
+          ${active ? 'data-tab-active aria-current="page"' : ""}
+          class="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
+            active ? "border-series-blue text-ink-primary" : "border-transparent text-ink-muted hover:text-ink-secondary"
+          }"
+        >${esc(t.label)}${p ? badge(p.count, p.loaded < p.total, p.tone === "critical", `${p.count}${p.loaded < p.total ? "+" : ""} ${p.label}`) : ""}</button>`;
+          })
+          .join("")
+      : `<span data-tab-active class="sr-only">${esc(activeGroup.tabs[0].label)}</span>`;
+  return `
+    <nav aria-label="Tab groups" data-scroll-id="tab-groups" class="tab-bar flex gap-1 overflow-x-auto border-b border-gridline bg-surface-1 px-4 py-1.5">${groupButtons}</nav>
+    ${
+      activeGroup.tabs.length > 1
+        ? `<nav aria-label="${esc(activeGroup.label)} tabs" data-scroll-id="tab-bar" class="tab-bar flex gap-1 overflow-x-auto border-b border-gridline bg-surface-1 px-5">${tabButtons}</nav>`
+        : tabButtons
+    }`;
 }
 
 function renderEmptyState(): string {
@@ -10722,7 +10991,7 @@ function renderNapOverviewView(nd: NapDetailState): string {
             )
             .join("")}</tbody></table>${
             mine.length > NAP_NODES_SHOWN
-              ? `<button type="button" onclick="window.__app.closeNapDetail();window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(name)})" class="self-start text-xs text-series-blue hover:underline">All ${mine.length} in the Nodes tab</button>`
+              ? `<button type="button" onclick="window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(name)})" class="self-start text-xs text-series-blue hover:underline">All ${mine.length} in the Nodes tab</button>`
               : ""
           }`,
   );
@@ -13464,6 +13733,7 @@ const RESOURCE_KIND_TAB: Record<ResourceKind, TabId> = {
 };
 
 function openResourceDetail(ctx: string, kind: ResourceKind, namespace: string, name: string) {
+  pushViewHistory();
   // Every other panel, through the registry rather than by name.
   for (const p of DETAIL_PANEL_CLOSERS) if (p.isOpen() && p.close !== closeResourceDetail) p.close();
   const token = ++resourceDetailToken;
@@ -15746,6 +16016,15 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
+  // Cmd+1 to Cmd+8 switch tab groups, in the bar's order. Not while anything
+  // sits over the table: a panel, palette or dialog belongs to the view it
+  // opened on, and switching the view under it would strand it.
+  if (/^[1-9]$/.test(e.key) && Number(e.key) <= TAB_GROUPS.length) {
+    e.preventDefault();
+    if (!isAnyOverlayOpen()) selectTabGroup(TAB_GROUPS[Number(e.key) - 1].id);
+    return;
+  }
+
   // Cmd+F focuses an open detail panel's search box. Not gated on
   // isEditableTarget, for the same reason as Cmd+S above: there's no
   // competing meaning inside a text field, and re-pressing it to reselect
@@ -15804,16 +16083,16 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
+  // Cmd+Left / Cmd+Right walk the view history, panels included: from a
+  // panel reached by a link in another, Back returns to that panel on the
+  // same view and scroll position; from a panel opened off a table, to the
+  // table. With no history left, Back still closes an open panel.
   if (e.key === "ArrowLeft" && !isEditableTarget(e.target)) {
-    if (!closeOpenDetailPanel()) goBackView();
+    if (!goBackView()) closeOpenDetailPanel();
     return;
   }
-  // Deliberately no panel handling here: a detail panel is a full-screen
-  // overlay, so stepping the tab underneath it would change something the
-  // reader can't see. Cmd+Left closing a panel is an Escape-like convenience
-  // that costs no history, which is why it has no forward counterpart.
   if (e.key === "ArrowRight" && !isEditableTarget(e.target)) {
-    if (!isAnyDetailPanelOpen()) goForwardView();
+    goForwardView();
     return;
   }
   // "=" is the unshifted key that carries "+" on a US layout, and some layouts
