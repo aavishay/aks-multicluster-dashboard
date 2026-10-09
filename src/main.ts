@@ -1852,32 +1852,97 @@ function filterSummary(tab: TabId, totalCount: number, filteredCount: number): s
     </div>`;
 }
 
-const TABS: { id: TabId; label: string }[] = [
-  { id: "overview", label: "Overview" },
-  { id: "nodes", label: "Nodes" },
-  { id: "namespaces", label: "Namespaces" },
-  { id: "workloads", label: "Workloads" },
-  { id: "pods", label: "Pods" },
-  { id: "services", label: "Services" },
-  { id: "ingresses", label: "Ingress" },
-  { id: "pvcs", label: "PVC" },
-  { id: "pvs", label: "PV" },
-  { id: "resources", label: "Resource Usage" },
-  { id: "metrics", label: "Metrics" },
-  { id: "events", label: "Events" },
-  { id: "nap", label: "NAP" },
-  { id: "hpa", label: "HPA" },
-  { id: "keda", label: "KEDA" },
-  { id: "pdbs", label: "PDB" },
-  { id: "gitops", label: "GitOps" },
-  { id: "helm", label: "Helm" },
-  { id: "configmaps", label: "ConfigMaps" },
-  { id: "secrets", label: "Secrets" },
-  { id: "serviceaccounts", label: "ServiceAccounts" },
-  { id: "externalsecrets", label: "ExternalSecrets" },
-  { id: "secretstores", label: "SecretStores" },
-  { id: "cost", label: "Cost" },
+/**
+ * The tabs, in eight groups. Too many to fit one row at 125% — they ran off
+ * the bar's edge — so the bar is two rows: the groups, then the active
+ * group's tabs. The groups are also the tab order: Left/Right steps through
+ * them group by group, and the switcher lists them in it.
+ */
+const TAB_GROUPS: { id: string; label: string; tabs: { id: TabId; label: string }[] }[] = [
+  { id: "overview", label: "Overview", tabs: [{ id: "overview", label: "Overview" }] },
+  {
+    id: "cluster",
+    label: "Cluster",
+    tabs: [
+      { id: "nodes", label: "Nodes" },
+      { id: "namespaces", label: "Namespaces" },
+      { id: "nap", label: "NAP" },
+      { id: "events", label: "Events" },
+    ],
+  },
+  {
+    id: "workloads",
+    label: "Workloads",
+    tabs: [
+      { id: "workloads", label: "Workloads" },
+      { id: "pods", label: "Pods" },
+      { id: "hpa", label: "HPA" },
+      { id: "keda", label: "KEDA" },
+      { id: "pdbs", label: "PDB" },
+    ],
+  },
+  {
+    id: "network",
+    label: "Network",
+    tabs: [
+      { id: "services", label: "Services" },
+      { id: "ingresses", label: "Ingress" },
+    ],
+  },
+  {
+    id: "storage",
+    label: "Storage",
+    tabs: [
+      { id: "pvcs", label: "PVC" },
+      { id: "pvs", label: "PV" },
+    ],
+  },
+  {
+    id: "config",
+    label: "Config",
+    tabs: [
+      { id: "configmaps", label: "ConfigMaps" },
+      { id: "secrets", label: "Secrets" },
+      { id: "serviceaccounts", label: "ServiceAccounts" },
+      { id: "externalsecrets", label: "ExternalSecrets" },
+      { id: "secretstores", label: "SecretStores" },
+    ],
+  },
+  {
+    id: "delivery",
+    label: "Delivery",
+    tabs: [
+      { id: "gitops", label: "GitOps" },
+      { id: "helm", label: "Helm" },
+    ],
+  },
+  {
+    id: "insights",
+    label: "Insights",
+    tabs: [
+      { id: "resources", label: "Resource Usage" },
+      { id: "metrics", label: "Metrics" },
+      { id: "cost", label: "Cost" },
+    ],
+  },
 ];
+
+const TABS: { id: TabId; label: string }[] = TAB_GROUPS.flatMap((g) => g.tabs);
+
+/** The group a tab sits in. Every tab is in exactly one. */
+function tabGroupOf(tab: TabId): (typeof TAB_GROUPS)[number] {
+  return TAB_GROUPS.find((g) => g.tabs.some((t) => t.id === tab)) ?? TAB_GROUPS[0];
+}
+
+/** The last tab used in each group, so going back to a group returns to it. */
+const lastTabInGroup = new Map<string, TabId>();
+
+/** A group's button: the tab last used in it, or its first. */
+function selectTabGroup(groupId: string) {
+  const group = TAB_GROUPS.find((g) => g.id === groupId);
+  if (!group) return;
+  selectTab(lastTabInGroup.get(group.id) ?? group.tabs[0].id);
+}
 
 function statusDot(healthy: boolean | undefined, unknown = false): string {
   const color = unknown ? "bg-ink-muted" : healthy ? "bg-status-good" : "bg-status-critical";
@@ -5540,6 +5605,7 @@ function setMetricsRange(minutes: number) {
   goToTabFromPalette,
   toggleClusterPaletteHighlighted,
   selectTab,
+  selectTabGroup,
   viewPodsForWorkload,
   viewPodsForNode,
   openPodDetail,
@@ -5896,6 +5962,9 @@ function render(carried?: PreRenderState) {
   // was: a tab reached by the keyboard, a drill-down or Back can be off the
   // visible end of it. Only on a change, so reading along the bar is never
   // yanked back to the active tab.
+  // Recorded here rather than in selectTab: a drill-down, Back and the
+  // switcher all set the tab directly, and every one of them renders.
+  lastTabInGroup.set(tabGroupOf(state.activeTab).id, state.activeTab);
   if (state.activeTab !== lastRenderedActiveTab) {
     lastRenderedActiveTab = state.activeTab;
     app.querySelector<HTMLElement>("[data-tab-active]")?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -6202,6 +6271,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     title: "Everywhere",
     items: [
       [withMod("K"), "Go to a tab"],
+      [`${withMod("1")}–${withMod(String(TAB_GROUPS.length))}`, "Switch tab group"],
       [withMod("F"), "Search — the panel's box, or this table's filter"],
       ["?", "This list"],
       ["Esc", "Back out a layer: the field, then what's open, then filters, then write mode"],
@@ -7015,30 +7085,67 @@ function renderTopbar(): string {
 }
 
 /**
- * The tab bar scrolls sideways rather than wrapping or clipping. At 125% UI
- * scale on an ordinary window there are more tabs than width: without this
- * the bar ran off its right edge with no way to reach the rest, and a
- * two-word label ("Resource Usage") broke onto two lines to make room.
+ * The tab bar: a row of groups, then the active group's tabs. Each row
+ * still scrolls sideways rather than wrapping should a narrow window need
+ * it, and `render` brings the active tab into view when it changes — see
+ * `lastRenderedActiveTab`.
  *
- * `data-scroll-id` keeps its offset across renders, and `render` brings the
- * active tab into view whenever it changes — see `lastRenderedActiveTab`.
+ * A group's badge adds up its tabs' problem counts, so something wrong in a
+ * tab that isn't showing is still visible from the top row.
  */
 function renderTabs(): string {
-  return `
-    <nav data-scroll-id="tab-bar" class="tab-bar flex gap-1 overflow-x-auto border-b border-gridline bg-surface-1 px-5">
-      ${TABS.map(
-        (t) => `
+  const activeGroup = tabGroupOf(state.activeTab);
+  const badge = (count: number, partial: boolean, critical: boolean, title: string) =>
+    count > 0
+      ? `<span title="${esc(title)}" class="rounded px-1 text-xs tabular ${critical ? "bg-status-critical/15 text-status-critical" : "bg-status-warning/15 text-status-warning"}">${count}${partial ? "+" : ""}</span>`
+      : "";
+  const groupButtons = TAB_GROUPS.map((g, i) => {
+    const problems = g.tabs.map((t) => ({ t, p: tabProblemCount(t.id) })).filter((x) => x.p && x.p.count > 0);
+    const count = problems.reduce((n, x) => n + x.p!.count, 0);
+    const title = problems.map((x) => `${x.t.label}: ${x.p!.count}${x.p!.loaded < x.p!.total ? "+" : ""} ${x.p!.label}`).join("\n");
+    const active = g.id === activeGroup.id;
+    return `
         <button
-          onclick="window.__app.selectTab(${jsArg(t.id)})"
-          ${state.activeTab === t.id ? "data-tab-active" : ""}
-          class="shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
-            state.activeTab === t.id
-              ? "border-series-blue text-ink-primary"
-              : "border-transparent text-ink-muted hover:text-ink-secondary"
+          type="button"
+          onclick="window.__app.selectTabGroup(${jsArg(g.id)})"
+          title="${esc(i < 9 ? `${g.label} (${withMod(String(i + 1))})` : g.label)}"
+          ${active ? "data-tab-group-active" : ""}
+          class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2.5 py-1 text-sm font-medium transition-colors ${
+            active ? "bg-surface-3 text-ink-primary" : "text-ink-muted hover:bg-surface-2 hover:text-ink-secondary"
           }"
-        >${t.label}</button>`,
-      ).join("")}
-    </nav>`;
+        >${esc(g.label)}${badge(
+          count,
+          problems.some((x) => x.p!.loaded < x.p!.total),
+          problems.some((x) => x.p!.tone === "critical"),
+          title,
+        )}</button>`;
+  }).join("");
+  // A group of one — Overview — has no second row to choose from.
+  const tabButtons =
+    activeGroup.tabs.length > 1
+      ? activeGroup.tabs
+          .map((t) => {
+            const p = tabProblemCount(t.id);
+            const active = state.activeTab === t.id;
+            return `
+        <button
+          type="button"
+          onclick="window.__app.selectTab(${jsArg(t.id)})"
+          ${active ? "data-tab-active" : ""}
+          class="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
+            active ? "border-series-blue text-ink-primary" : "border-transparent text-ink-muted hover:text-ink-secondary"
+          }"
+        >${esc(t.label)}${p ? badge(p.count, p.loaded < p.total, p.tone === "critical", `${p.count}${p.loaded < p.total ? "+" : ""} ${p.label}`) : ""}</button>`;
+          })
+          .join("")
+      : `<span data-tab-active class="sr-only">${esc(activeGroup.tabs[0].label)}</span>`;
+  return `
+    <nav aria-label="Tab groups" data-scroll-id="tab-groups" class="tab-bar flex gap-1 overflow-x-auto border-b border-gridline bg-surface-1 px-4 py-1.5">${groupButtons}</nav>
+    ${
+      activeGroup.tabs.length > 1
+        ? `<nav aria-label="${esc(activeGroup.label)} tabs" data-scroll-id="tab-bar" class="tab-bar flex gap-1 overflow-x-auto border-b border-gridline bg-surface-1 px-5">${tabButtons}</nav>`
+        : tabButtons
+    }`;
 }
 
 function renderEmptyState(): string {
@@ -15743,6 +15850,15 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     if (state.tabPalette) closeTabPalette();
     else openTabPalette();
+    return;
+  }
+
+  // Cmd+1 to Cmd+8 switch tab groups, in the bar's order. Not while anything
+  // sits over the table: a panel, palette or dialog belongs to the view it
+  // opened on, and switching the view under it would strand it.
+  if (/^[1-9]$/.test(e.key) && Number(e.key) <= TAB_GROUPS.length) {
+    e.preventDefault();
+    if (!isAnyOverlayOpen()) selectTabGroup(TAB_GROUPS[Number(e.key) - 1].id);
     return;
   }
 

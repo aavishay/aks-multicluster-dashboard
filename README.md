@@ -272,6 +272,12 @@ Output lands under `src-tauri/target/release/bundle/` — a `.app` plus a
 
 ## What each tab shows
 
+The tabs sit in eight groups — Overview, Cluster, Workloads, Network,
+Storage, Config, Delivery and Insights — with the active group's tabs on a
+second row. A group's badge adds up the problems in its tabs, ⌘1–⌘8 switch
+groups (each remembers the tab you last used in it), and ⌘K jumps straight
+to any tab.
+
 Overview gives per-cluster health at a glance: Kubernetes version, nodes
 ready, namespace count, pod health, warning event count. Nodes lists every
 node with CPU/memory (capacity, allocatable, and — if `metrics-server` is
