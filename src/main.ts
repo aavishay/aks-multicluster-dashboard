@@ -639,9 +639,7 @@ interface ExternalSecretDetailState {
   ctx: string;
   namespace: string;
   name: string;
-  /** The row as listed, for the status strip before the detail call returns. Null if opened for one the list has not loaded. */
-  row: ExternalSecretInfo | null;
-  view: "keys" | "yaml" | "events";
+  view: "overview" | "keys" | "yaml" | "events";
   detail: ExternalSecretDetail | null;
   detailError: string | null;
   showManagedFields: boolean;
@@ -657,6 +655,9 @@ interface ExternalSecretDetailState {
    * here is safe to search.
    */
   keySearch: string;
+  /** Tab lists the Overview reads — the store's and the target Secret's — being fetched because they never loaded. */
+  listsLoading: TabId[];
+  listErrors: Partial<Record<TabId, string>>;
 }
 
 /**
@@ -4504,13 +4505,11 @@ function openExternalSecretDetail(ctx: string, namespace: string, name: string) 
   closeHpaDetail();
   closeSecretDetail();
   const token = ++externalSecretDetailToken;
-  const row = state.externalSecrets.get(ctx)?.external_secrets.find((e) => e.namespace === namespace && e.name === name) ?? null;
   state.externalSecretDetail = {
     ctx,
     namespace,
     name,
-    row,
-    view: "keys",
+    view: "overview",
     detail: null,
     detailError: null,
     showManagedFields: false,
@@ -4520,7 +4519,25 @@ function openExternalSecretDetail(ctx: string, namespace: string, name: string) 
     eventsError: null,
     eventsLoading: false,
     keySearch: "",
+    listsLoading: [],
+    listErrors: {},
   };
+
+  // The Overview pairs the sync with its store's health and its target
+  // Secret, from those tabs' lists — fetched here if they never loaded.
+  for (const tab of ["secretstores", "secrets"] as const) {
+    if (tabHasDataForContext(tab, ctx)) continue;
+    state.externalSecretDetail.listsLoading.push(tab);
+    fetchTabDataForContext(tab, ctx)
+      .catch((e) => {
+        if (token === externalSecretDetailToken && state.externalSecretDetail) state.externalSecretDetail.listErrors[tab] = String(e);
+      })
+      .finally(() => {
+        if (token !== externalSecretDetailToken || !state.externalSecretDetail) return;
+        state.externalSecretDetail.listsLoading = state.externalSecretDetail.listsLoading.filter((t) => t !== tab);
+        render();
+      });
+  }
   render();
 
   api
@@ -11337,25 +11354,116 @@ function renderExternalSecretKeysView(ed: ExternalSecretDetailState): string {
     </div>`;
 }
 
-/** The sync status, always on screen above the tabs: it is the reason anyone opens an ExternalSecret. */
-function renderExternalSecretStatusStrip(ed: ExternalSecretDetailState): string {
-  const e = ed.row;
-  if (!e) return "";
-  const status = externalSecretStatus(e);
-  return `
-    <div class="border-b border-gridline px-4 py-3 text-xs">
-      <div class="flex flex-wrap items-center gap-2">
-        ${statusDot(e.ready)}
-        <span class="font-medium text-ink-primary">${esc(status)}</span>
-        <span class="text-ink-muted" title="${esc(timeTitle("Last synced", e.last_refresh))}">${e.last_refresh ? `last sync ${relativeTime(e.last_refresh)}` : "never synced"}</span>
-      </div>
-      ${!e.ready && e.message ? `<div class="mt-1 break-words text-status-critical">${esc(e.message)}</div>` : ""}
-      <div class="mt-1 text-ink-muted">
-        From ${esc(e.store_kind)} <button type="button" title="Open the store this reads from" onclick="window.__app.openResourceDetail(${jsArg(ed.ctx)},${jsArg(e.store_kind)},${jsArg(e.store_kind === "ClusterSecretStore" ? "" : ed.namespace)},${jsArg(e.store_name)})" class="text-ink-primary hover:text-series-blue hover:underline">${esc(e.store_name)}</button>
-        · refreshes ${e.refresh_interval ? `every ${esc(e.refresh_interval)}` : "on ESO's default"}
-        · writes Secret <button type="button" title="Open the Secret this writes" onclick="window.__app.openSecretDetail(${jsArg(ed.ctx)},${jsArg(ed.namespace)},${jsArg(e.target_name)},${jsArg(e.target_type)})" class="text-ink-primary hover:text-series-blue hover:underline">${esc(e.target_name)}</button>
-      </div>
-    </div>`;
+/** What each creation policy does to the target Secret. */
+const ES_CREATION_POLICY: Record<string, string> = {
+  Owner: "ESO creates it and owns it — deleted with this ExternalSecret",
+  Orphan: "ESO creates it but does not own it — it outlives this ExternalSecret",
+  Merge: "ESO only merges keys into a Secret that must already exist",
+  None: "ESO writes nothing — the sync is for reading only",
+};
+
+/** What each deletion policy does when the values are deleted in the store. */
+const ES_DELETION_POLICY: Record<string, string> = {
+  Retain: "the Secret keeps its last values",
+  Delete: "the Secret is deleted once every remote value is gone",
+  Merge: "keys whose remote value is gone are removed; the Secret stays",
+};
+
+/**
+ * The ExternalSecret panel's Overview: whether it syncs and if not why —
+ * alongside its store's own health, the usual cause — what it writes where
+ * and how, and its conditions. Facts come from the fetched object; the store
+ * and target Secret from their tabs' lists, fetched if never loaded.
+ */
+function renderExternalSecretOverviewView(ed: ExternalSecretDetailState): string {
+  if (ed.detailError) return `<div class="text-sm text-status-critical">${esc(ed.detailError)}</div>`;
+  if (!ed.detail) return `<div class="text-sm text-ink-muted">Loading…</div>`;
+  const o = ed.detail.overview;
+  const e = o.info;
+  const { ctx, namespace } = ed;
+  const storeNs = e.store_kind === "ClusterSecretStore" ? "" : namespace;
+  const store = state.secretStores.get(ctx)?.stores.find((s) => s.kind === e.store_kind && s.namespace === storeNs && s.name === e.store_name);
+  const secrets = state.secrets.get(ctx);
+  const target = secrets?.find((s) => s.namespace === namespace && s.name === e.target_name);
+  const loading = (tab: TabId) => ed.listsLoading.includes(tab);
+
+  const banners = [
+    ...(!e.ready
+      ? [`<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(externalSecretStatus(e))}${e.message ? ` · ${esc(e.message)}` : ""}</div>`]
+      : []),
+    ...(store && !store.ready
+      ? [
+          `<div class="rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">Its ${esc(e.store_kind)} ${esc(e.store_name)} is not ready${store.reason ? ` · ${esc(store.reason)}` : ""}${store.message ? `: ${esc(store.message)}` : ""}</div>`,
+        ]
+      : []),
+    // ESO creates the Secret for every policy but Merge and None, which expect it to exist.
+    ...(secrets && !target && (o.creation_policy === "Merge" || o.creation_policy === "None")
+      ? [`<div class="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">The Secret ${esc(e.target_name)} does not exist, and with creationPolicy ${esc(o.creation_policy)} ESO will not create it.</div>`]
+      : []),
+  ];
+  const banner = banners.length ? `<div class="mb-3 flex flex-col gap-2">${banners.join("")}</div>` : "";
+
+  const storeLink = `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},${jsArg(e.store_kind)},${jsArg(storeNs)},${jsArg(e.store_name)})" class="text-series-blue hover:underline">${esc(e.store_name)}</button>`;
+  const storeState = store
+    ? `<span class="${store.ready ? "text-ink-secondary" : "text-status-critical"}">${store.ready ? "ready" : "not ready"}</span>${store.provider ? ` · ${esc(store.provider)}` : ""}${store.target ? `<div class="break-all text-ink-muted">${esc(store.target)}</div>` : ""}`
+    : loading("secretstores")
+      ? "loading…"
+      : ed.listErrors.secretstores
+        ? `<span class="text-status-critical">${esc(ed.listErrors.secretstores)}</span>`
+        : // One store kind may have failed to list while the other succeeded:
+          // then absence proves nothing, so say why rather than "not found".
+          state.secretStores.get(ctx)?.error
+          ? `<span class="text-status-warning">not listed — ${esc(state.secretStores.get(ctx)!.error!)}</span>`
+          : state.secretStores.has(ctx)
+            ? '<span class="text-status-warning">not found on this cluster</span>'
+          : "";
+  const targetLink = `<button type="button" onclick="window.__app.openSecretDetail(${jsArg(ctx)},${jsArg(namespace)},${jsArg(e.target_name)},${jsArg(target?.secret_type ?? e.target_type)})" class="text-series-blue hover:underline">${esc(e.target_name)}</button>`;
+  const targetState = target
+    ? `${esc(target.secret_type)} · ${target.keys ? `${target.keys.length} key${target.keys.length === 1 ? "" : "s"}` : "keys not listed"}`
+    : loading("secrets")
+      ? "loading…"
+      : ed.listErrors.secrets
+        ? `<span class="text-ink-muted" title="${esc(ed.listErrors.secrets)}">Secrets cannot be listed here</span>`
+        : secrets
+          ? '<span class="text-status-warning">does not exist</span>'
+          : "";
+  const interval = e.refresh_interval.replace(/(\d+h)0m0s$/, "$1").replace(/(\d+m)0s$/, "$1");
+
+  const facts = [
+    overviewRow(
+      "Status",
+      `<span class="${e.ready ? "text-status-good" : "text-status-critical"}">${esc(externalSecretStatus(e))}</span> <span class="text-xs text-ink-muted" title="${esc(timeTitle("Last synced", e.last_refresh))}">${e.last_refresh ? `· last sync ${relativeTime(e.last_refresh)}` : "· never synced"}</span>`,
+    ),
+    overviewRow("Store", `${esc(e.store_kind)} ${storeLink}${storeState ? `<div class="text-xs">${storeState}</div>` : ""}`),
+    overviewRow("Target Secret", `${targetLink}${targetState ? `<div class="text-xs text-ink-secondary">${targetState}</div>` : ""}`),
+    overviewRow(
+      "Refresh",
+      o.refresh_policy === "Periodic"
+        ? interval === "0" || interval === "0s"
+          ? "once — refreshInterval is 0"
+          : `every ${esc(interval || "1h")}${e.refresh_interval ? "" : ' <span class="text-xs text-ink-muted">· ESO\'s default</span>'}`
+        : o.refresh_policy === "OnChange"
+          ? "only when this ExternalSecret changes"
+          : o.refresh_policy === "CreatedOnce"
+            ? "once, when the Secret is created"
+            : esc(o.refresh_policy),
+    ),
+    overviewRow("Keys", `<span class="tabular">${e.data_count}</span> mapped${e.data_from_count ? ` · <span class="tabular">${e.data_from_count}</span> dataFrom` : ""} <button type="button" onclick="window.__app.setExternalSecretDetailView('keys')" class="ml-1 text-xs text-series-blue hover:underline">Show</button>`),
+    overviewRow("Creation", `${esc(o.creation_policy)}${ES_CREATION_POLICY[o.creation_policy] ? `<div class="text-xs text-ink-secondary">${esc(ES_CREATION_POLICY[o.creation_policy])}</div>` : ""}`),
+    overviewRow("If remote values go", `${esc(o.deletion_policy)}${ES_DELETION_POLICY[o.deletion_policy] ? `<div class="text-xs text-ink-secondary">${esc(ES_DELETION_POLICY[o.deletion_policy])}</div>` : ""}`),
+    ...(o.template
+      ? [
+          overviewRow(
+            "Template",
+            `engine ${esc(o.template_engine)} · ${o.template_merge_policy === "Merge" ? "merged with the fetched keys" : "replaces the fetched keys"}${o.template_keys.length ? `<div class="mt-1">${overviewChips(o.template_keys)}</div>` : ""}`,
+          ),
+        ]
+      : []),
+    ...(o.target_immutable ? [overviewRow("Immutable", "yes — the Secret cannot change once written")] : []),
+    ...(e.created_at ? [overviewRow("Created", esc(exactTime(e.created_at).replace("\n", " · ")))] : []),
+  ].join("");
+
+  return `${banner}<div>${facts}</div>${renderConditionsSection(o.conditions)}`;
 }
 
 function renderExternalSecretDetailPanel(): string {
@@ -11363,13 +11471,16 @@ function renderExternalSecretDetailPanel(): string {
   if (!ed) return "";
 
   const tabs: { id: ExternalSecretDetailState["view"]; label: string }[] = [
+    { id: "overview", label: "Overview" },
     { id: "keys", label: "Keys" },
     { id: "yaml", label: "YAML" },
     { id: "events", label: "Events" },
   ];
 
   const body =
-    ed.view === "keys"
+    ed.view === "overview"
+      ? renderExternalSecretOverviewView(ed)
+      : ed.view === "keys"
       ? renderExternalSecretKeysView(ed)
       : ed.view === "yaml"
         ? renderYamlPane({
@@ -11402,7 +11513,6 @@ function renderExternalSecretDetailPanel(): string {
             <button type="button" onclick="window.__app.closeExternalSecretDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
         </div>
-        ${renderExternalSecretStatusStrip(ed)}
         <div class="flex items-center gap-1 border-b border-gridline px-4 py-2">
           ${tabs
             .map(
