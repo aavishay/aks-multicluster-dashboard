@@ -1588,13 +1588,14 @@ fn event_last_seen(e: &Event) -> Option<chrono::DateTime<Utc>> {
 }
 
 pub(crate) fn event_to_info(e: Event) -> EventInfo {
+    let o = &e.involved_object;
     EventInfo {
         namespace: e.metadata.namespace.clone().unwrap_or_default(),
-        involved_object: format!(
-            "{}/{}",
-            e.involved_object.kind.clone().unwrap_or_default(),
-            e.involved_object.name.clone().unwrap_or_default()
-        ),
+        involved_object: format!("{}/{}", o.kind.clone().unwrap_or_default(), o.name.clone().unwrap_or_default()),
+        object_api_version: o.api_version.clone().unwrap_or_default(),
+        object_kind: o.kind.clone().unwrap_or_default(),
+        object_namespace: o.namespace.clone().unwrap_or_default(),
+        object_name: o.name.clone().unwrap_or_default(),
         reason: e.reason.clone().unwrap_or_default(),
         message: e.message.clone().unwrap_or_default(),
         event_type: e.type_.clone().unwrap_or_default(),
@@ -5028,5 +5029,18 @@ mod tests {
 
         assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 40);
         assert_eq!(scan.examined, scan.candidates);
+    }
+
+    #[test]
+    fn an_event_carries_its_object_structured() {
+        let e: Event = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "x.1", "namespace": "prod" },
+            "involvedObject": { "apiVersion": "apps/v1", "kind": "Deployment", "namespace": "prod", "name": "api" },
+            "reason": "ScalingReplicaSet", "type": "Normal"
+        }))
+        .unwrap();
+        let i = event_to_info(e);
+        assert_eq!(i.involved_object, "Deployment/api");
+        assert_eq!((i.object_api_version.as_str(), i.object_kind.as_str(), i.object_namespace.as_str(), i.object_name.as_str()), ("apps/v1", "Deployment", "prod", "api"));
     }
 }
