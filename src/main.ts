@@ -2875,6 +2875,12 @@ interface ViewSnapshot {
   /** Every tab's filters and unhealthy-only switch, as a drill-down may set any of them. */
   filters: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
   unhealthyOnly: Partial<Record<TabId, boolean>>;
+  /**
+   * Tabs besides the one returned to whose filters Back puts back: those the
+   * navigation away from this view overwrote — a drill-down's Pods or Nodes.
+   * Empty for an ordinary move, so the reader's own edits elsewhere survive.
+   */
+  restoreTabs: TabId[];
   /** The detail panel open at the time, so Back can return into it. */
   panel: PanelSnapshot | null;
 }
@@ -2891,7 +2897,7 @@ interface PanelSnapshot {
   reopen: () => void;
   view: string;
   setView: (view: string) => void;
-  scroll: Map<string, number>;
+  scroll: Map<string, { top: number; left: number }>;
 }
 
 /** Set while Back or Forward reopens a panel, so that reopening is not itself recorded. */
@@ -2902,12 +2908,13 @@ let restoringView = false;
  * by `render` once each area is tall enough to take its offset, and dropped
  * after a few seconds should the content never get that tall.
  */
-let pendingPanelScroll: { positions: Map<string, number>; until: number } | null = null;
+let pendingPanelScroll: { positions: Map<string, { top: number; left: number }>; until: number } | null = null;
 
 function currentPanelSnapshot(): PanelSnapshot | null {
-  const scroll = new Map<string, number>();
+  // Both axes: an unwrapped YAML or log pane scrolls sideways too.
+  const scroll = new Map<string, { top: number; left: number }>();
   document.querySelectorAll<HTMLElement>("[data-detail-body], [data-detail-body] [data-scroll-id]").forEach((el) => {
-    if (el.dataset.scrollId && el.scrollTop > 0) scroll.set(el.dataset.scrollId, el.scrollTop);
+    if (el.dataset.scrollId && (el.scrollTop > 0 || el.scrollLeft > 0)) scroll.set(el.dataset.scrollId, { top: el.scrollTop, left: el.scrollLeft });
   });
   const make = <V extends string>(key: string, reopen: () => void, view: V, setView: (v: V) => void): PanelSnapshot => ({
     key,
@@ -2916,50 +2923,53 @@ function currentPanelSnapshot(): PanelSnapshot | null {
     setView: setView as (v: string) => void,
     scroll,
   });
+  // Only scalar identity fields are captured, never the panel state itself:
+  // a history entry must not keep a Secret panel's revealed values alive
+  // after the panel is closed and claims to have forgotten them.
   const s = state;
   if (s.podDetail) {
-    const d = s.podDetail;
-    return make(`pod:${d.ctx}:${d.namespace}:${d.name}`, () => openPodDetail(d.ctx, d.namespace, d.name), d.view, setPodDetailView);
+    const { ctx, namespace, name, view } = s.podDetail;
+    return make(`pod:${ctx}:${namespace}:${name}`, () => openPodDetail(ctx, namespace, name), view, setPodDetailView);
   }
   if (s.nodeDetail) {
-    const d = s.nodeDetail;
-    return make(`node:${d.ctx}:${d.name}`, () => openNodeDetail(d.ctx, d.name), d.view, setNodeDetailView);
+    const { ctx, name, view } = s.nodeDetail;
+    return make(`node:${ctx}:${name}`, () => openNodeDetail(ctx, name), view, setNodeDetailView);
   }
   if (s.workloadDetail) {
-    const d = s.workloadDetail;
-    return make(`workload:${d.ctx}:${d.kind}:${d.namespace}:${d.name}`, () => openWorkloadDetail(d.ctx, d.kind, d.namespace, d.name), d.view, setWorkloadDetailView);
+    const { ctx, kind, namespace, name, view } = s.workloadDetail;
+    return make(`workload:${ctx}:${kind}:${namespace}:${name}`, () => openWorkloadDetail(ctx, kind, namespace, name), view, setWorkloadDetailView);
   }
   if (s.gitOpsDetail) {
-    const d = s.gitOpsDetail;
-    return make(`gitops:${d.ctx}:${d.namespace}:${d.name}`, () => openGitOpsDetail(d.ctx, d.namespace, d.name), d.view, setGitOpsDetailView);
+    const { ctx, namespace, name, view } = s.gitOpsDetail;
+    return make(`gitops:${ctx}:${namespace}:${name}`, () => openGitOpsDetail(ctx, namespace, name), view, setGitOpsDetailView);
   }
   if (s.helmDetail) {
-    const d = s.helmDetail;
-    return make(`helm:${d.ctx}:${d.namespace}:${d.name}:${d.revision}`, () => openHelmDetail(d.ctx, d.namespace, d.name, d.revision), d.view, setHelmDetailView);
+    const { ctx, namespace, name, revision, view } = s.helmDetail;
+    return make(`helm:${ctx}:${namespace}:${name}:${revision}`, () => openHelmDetail(ctx, namespace, name, revision), view, setHelmDetailView);
   }
   if (s.napDetail) {
-    const d = s.napDetail;
-    return make(`nap:${d.ctx}:${d.name}`, () => openNapDetail(d.ctx, d.name), d.view, setNapDetailView);
+    const { ctx, name, view } = s.napDetail;
+    return make(`nap:${ctx}:${name}`, () => openNapDetail(ctx, name), view, setNapDetailView);
   }
   if (s.kedaDetail) {
-    const d = s.kedaDetail;
-    return make(`keda:${d.ctx}:${d.namespace}:${d.kind}:${d.name}`, () => openKedaDetail(d.ctx, d.namespace, d.kind, d.name), d.view, setKedaDetailView);
+    const { ctx, namespace, kind, name, view } = s.kedaDetail;
+    return make(`keda:${ctx}:${namespace}:${kind}:${name}`, () => openKedaDetail(ctx, namespace, kind, name), view, setKedaDetailView);
   }
   if (s.hpaDetail) {
-    const d = s.hpaDetail;
-    return make(`hpa:${d.ctx}:${d.namespace}:${d.name}`, () => openHpaDetail(d.ctx, d.namespace, d.name), d.view, setHpaDetailView);
+    const { ctx, namespace, name, view } = s.hpaDetail;
+    return make(`hpa:${ctx}:${namespace}:${name}`, () => openHpaDetail(ctx, namespace, name), view, setHpaDetailView);
   }
   if (s.secretDetail) {
-    const d = s.secretDetail;
-    return make(`secret:${d.ctx}:${d.namespace}:${d.name}`, () => openSecretDetail(d.ctx, d.namespace, d.name, d.secretType), d.view, setSecretDetailView);
+    const { ctx, namespace, name, secretType, view } = s.secretDetail;
+    return make(`secret:${ctx}:${namespace}:${name}`, () => openSecretDetail(ctx, namespace, name, secretType), view, setSecretDetailView);
   }
   if (s.externalSecretDetail) {
-    const d = s.externalSecretDetail;
-    return make(`externalsecret:${d.ctx}:${d.namespace}:${d.name}`, () => openExternalSecretDetail(d.ctx, d.namespace, d.name), d.view, setExternalSecretDetailView);
+    const { ctx, namespace, name, view } = s.externalSecretDetail;
+    return make(`externalsecret:${ctx}:${namespace}:${name}`, () => openExternalSecretDetail(ctx, namespace, name), view, setExternalSecretDetailView);
   }
   if (s.resourceDetail) {
-    const d = s.resourceDetail;
-    return make(`resource:${d.ctx}:${d.kind}:${d.namespace}:${d.name}`, () => openResourceDetail(d.ctx, d.kind, d.namespace, d.name), d.view, setResourceDetailView);
+    const { ctx, kind, namespace, name, view } = s.resourceDetail;
+    return make(`resource:${ctx}:${kind}:${namespace}:${name}`, () => openResourceDetail(ctx, kind, namespace, name), view, setResourceDetailView);
   }
   return null;
 }
@@ -2973,10 +2983,11 @@ function snapshotKey(v: ViewSnapshot): string {
 function applyPendingPanelScroll(app: HTMLElement) {
   const pending = pendingPanelScroll;
   if (!pending) return;
-  for (const [id, top] of [...pending.positions]) {
+  for (const [id, pos] of [...pending.positions]) {
     const el = [...app.querySelectorAll<HTMLElement>("[data-scroll-id]")].find((e) => e.dataset.scrollId === id);
-    if (el && el.scrollHeight - el.clientHeight >= top) {
-      el.scrollTop = top;
+    if (el && el.scrollHeight - el.clientHeight >= pos.top && el.scrollWidth - el.clientWidth >= pos.left) {
+      el.scrollTop = pos.top;
+      el.scrollLeft = pos.left;
       pending.positions.delete(id);
     }
   }
@@ -3014,19 +3025,23 @@ function currentViewSnapshot(): ViewSnapshot {
     tab: state.activeTab,
     filters: Object.fromEntries(Object.entries(state.filterState).map(([tab, rec]) => [tab, cloneColumnFilterRecord(rec)])),
     unhealthyOnly: { ...state.unhealthyOnly },
+    restoreTabs: [],
     panel: currentPanelSnapshot(),
   };
 }
 
 function applyViewSnapshot(snapshot: ViewSnapshot) {
   restoringView = true;
+  // Before anything reopens: a restore still pending from an earlier step
+  // must not land on a panel that happens to share a scroll ID.
+  pendingPanelScroll = null;
   try {
     closeOpenDetailPanel();
     state.activeTab = snapshot.tab;
-    // The tab returned to comes back exactly as it was, and so do Pods and
-    // Nodes, which drill-downs overwrite. Other tabs keep their filters:
-    // edits made on the tab being left are the reader's, not navigation's.
-    for (const tab of new Set<TabId>([snapshot.tab, "pods", "nodes"])) {
+    // The tab returned to comes back exactly as it was, and so does any tab
+    // the navigation away from it overwrote. Other tabs keep their filters:
+    // edits made since are the reader's, not navigation's.
+    for (const tab of new Set<TabId>([snapshot.tab, ...snapshot.restoreTabs])) {
       state.filterState[tab] = cloneColumnFilterRecord(snapshot.filters[tab]);
       state.unhealthyOnly[tab] = snapshot.unhealthyOnly[tab];
     }
@@ -3047,9 +3062,9 @@ function applyViewSnapshot(snapshot: ViewSnapshot) {
  * panel, right before it does so — so following a link from one panel to
  * another can be undone, back into the panel it came from.
  */
-function pushViewHistory() {
+function pushViewHistory(overwrites: TabId[] = []) {
   if (restoringView) return;
-  viewHistory.back.push(currentViewSnapshot());
+  viewHistory.back.push({ ...currentViewSnapshot(), restoreTabs: overwrites });
   // Navigating somewhere new abandons the forward trail, as in a browser.
   viewHistory.forward.length = 0;
 }
@@ -3086,7 +3101,7 @@ function selectTab(tab: TabId) {
 
 /** Drill down from a Workloads row into its pods, pre-filtered to just that workload. */
 function viewPodsForWorkload(ctx: string, kind: string, namespace: string, name: string) {
-  pushViewHistory();
+  pushViewHistory(["pods"]);
   state.filterState.pods = {
     cluster: { enumValues: new Set([ctx]) },
     namespace: { enumValues: new Set([namespace]) },
@@ -3100,7 +3115,7 @@ function viewPodsForWorkload(ctx: string, kind: string, namespace: string, name:
 
 /** Drill down from a Nodes row into its pods, pre-filtered to just that node. */
 function viewPodsForNode(ctx: string, nodeName: string) {
-  pushViewHistory();
+  pushViewHistory(["pods"]);
   state.filterState.pods = {
     cluster: { enumValues: new Set([ctx]) },
     node: { enumValues: new Set([nodeName]) },
@@ -3114,7 +3129,7 @@ function viewPodsForNode(ctx: string, nodeName: string) {
 /** Drill down from a NAP row into the nodes it actually provisioned. */
 function viewNodesForNodePool(ctx: string, poolName: string) {
   // Recorded before the NAP panel it is followed from closes, so Back returns into that panel.
-  pushViewHistory();
+  pushViewHistory(["nodes"]);
   closeOpenDetailPanel();
   state.filterState.nodes = {
     cluster: { enumValues: new Set([ctx]) },
@@ -7256,7 +7271,7 @@ function renderTabs(): string {
           type="button"
           onclick="window.__app.selectTabGroup(${jsArg(g.id)})"
           title="${esc(i < 9 ? `${g.label} (${withMod(String(i + 1))})` : g.label)}"
-          ${active ? "data-tab-group-active" : ""}
+          ${active ? 'data-tab-group-active aria-current="true"' : ""}
           class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2.5 py-1 text-sm font-medium transition-colors ${
             active ? "bg-surface-3 text-ink-primary" : "text-ink-muted hover:bg-surface-2 hover:text-ink-secondary"
           }"
@@ -7278,7 +7293,7 @@ function renderTabs(): string {
         <button
           type="button"
           onclick="window.__app.selectTab(${jsArg(t.id)})"
-          ${active ? "data-tab-active" : ""}
+          ${active ? 'data-tab-active aria-current="page"' : ""}
           class="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
             active ? "border-series-blue text-ink-primary" : "border-transparent text-ink-muted hover:text-ink-secondary"
           }"
