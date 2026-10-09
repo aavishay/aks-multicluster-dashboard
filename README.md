@@ -301,9 +301,11 @@ total size and whether it is immutable; its values are fetched only when you
 open one, where a Data view shows each key's value with a filter over names
 and values. Those six share one panel: an Overview of what the row means, the
 YAML, and the object's events.
-Events surfaces recent cluster events, defaulting to warnings only; each
-event's object opens its own panel (a ReplicaSet's opens the Deployment that
-owns it), and the funnel beside it narrows the table to that object. HPA lists
+Events surfaces recent cluster events, defaulting to warnings only; an
+event's object opens its own panel when the app has one for that kind (Jobs,
+CronJobs, policies and the like stay plain text), a ReplicaSet's opens the
+Deployment its name belongs to when the Workloads list has it, and the funnel
+beside it narrows the table to that object. HPA lists
 each autoscaler with its replicas and metrics; its panel opens on an Overview —
 why it is not scaling when it is not, each metric against its target, the
 scale-up and scale-down behavior (Kubernetes' defaults said as such), and the
