@@ -333,7 +333,14 @@ pub struct WorkloadRevisionInfo {
 #[derive(Serialize, Clone, Debug)]
 pub struct EventInfo {
     pub namespace: String,
+    /// `Kind/name`, as the table shows and filters it.
     pub involved_object: String,
+    /// The same object, structured, so the row can open its panel: the API
+    /// group decides which panel a kind belongs to.
+    pub object_api_version: String,
+    pub object_kind: String,
+    pub object_namespace: String,
+    pub object_name: String,
     pub reason: String,
     pub message: String,
     pub event_type: String,

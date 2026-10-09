@@ -244,7 +244,14 @@ export interface WorkloadRevisionInfo {
 
 export interface EventInfo {
   namespace: string;
+  /** `Kind/name`, as the table shows and filters it. */
   involved_object: string;
+  /** The same object, structured, so the row can open its panel. */
+  object_api_version: string;
+  object_kind: string;
+  /** Empty for a cluster-scoped object such as a Node. */
+  object_namespace: string;
+  object_name: string;
   reason: string;
   message: string;
   event_type: string;

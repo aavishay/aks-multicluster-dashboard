@@ -11901,6 +11901,9 @@ const PANEL_LINKABLE: Record<string, string> = {
   PodDisruptionBudget: "policy",
   SecretStore: "external-secrets.io",
   ClusterSecretStore: "external-secrets.io",
+  Node: "",
+  NodePool: "karpenter.sh",
+  Application: "argoproj.io",
 };
 
 /** The API group of an `apiVersion`: empty for the core group's bare `v1`. */
@@ -11909,28 +11912,45 @@ function apiGroup(apiVersion: string): string {
   return slash < 0 ? "" : apiVersion.slice(0, slash);
 }
 
+/** The panel call that opens an object, or null when its kind has no panel here. */
+function resourcePanelCall(ctx: string, r: { group: string; kind: string; namespace: string; name: string }): string | null {
+  if (PANEL_LINKABLE[r.kind] !== r.group) return null;
+  const [c, ns, n] = [jsArg(ctx), jsArg(r.namespace), jsArg(r.name)];
+  switch (r.kind) {
+    case "Deployment":
+    case "StatefulSet":
+    case "DaemonSet":
+      return `openWorkloadDetail(${c},${jsArg(r.kind)},${ns},${n})`;
+    case "Pod":
+      return `openPodDetail(${c},${ns},${n})`;
+    case "Node":
+      return `openNodeDetail(${c},${n})`;
+    case "NodePool":
+      return `openNapDetail(${c},${n})`;
+    case "Application":
+      return `openGitOpsDetail(${c},${ns},${n})`;
+    case "Secret":
+      return `openSecretDetail(${c},${ns},${n},${jsArg(state.secrets.get(ctx)?.find((s) => s.namespace === r.namespace && s.name === r.name)?.secret_type ?? "")})`;
+    case "HorizontalPodAutoscaler":
+      return `openHpaDetail(${c},${ns},${n})`;
+    case "ScaledObject":
+    case "ScaledJob":
+      return `openKedaDetail(${c},${ns},${jsArg(r.kind)},${n})`;
+    case "ExternalSecret":
+      return `openExternalSecretDetail(${c},${ns},${n})`;
+    default:
+      return `openResourceDetail(${c},${jsArg(r.kind)},${ns},${n})`;
+  }
+}
+
 /**
  * An object's name, linked to its own panel when it has one — and when
  * `inThisCluster`, since a GitOps app may deploy to another cluster entirely.
  */
 function resourcePanelLink(ctx: string, r: { group: string; kind: string; namespace: string; name: string }, inThisCluster = true): string {
   const label = `${r.namespace ? `<span class="text-ink-muted">${esc(r.namespace)}/</span>` : ""}${esc(r.name)}`;
-  if (!inThisCluster || PANEL_LINKABLE[r.kind] !== r.group) return `<span>${label}</span>`;
-  const [ns, n] = [jsArg(r.namespace), jsArg(r.name)];
-  const call =
-    r.kind === "Deployment" || r.kind === "StatefulSet" || r.kind === "DaemonSet"
-      ? `openWorkloadDetail(${jsArg(ctx)},${jsArg(r.kind)},${ns},${n})`
-      : r.kind === "Pod"
-        ? `openPodDetail(${jsArg(ctx)},${ns},${n})`
-        : r.kind === "Secret"
-          ? `openSecretDetail(${jsArg(ctx)},${ns},${n},${jsArg(state.secrets.get(ctx)?.find((s) => s.namespace === r.namespace && s.name === r.name)?.secret_type ?? "")})`
-          : r.kind === "HorizontalPodAutoscaler"
-            ? `openHpaDetail(${jsArg(ctx)},${ns},${n})`
-            : r.kind === "ScaledObject" || r.kind === "ScaledJob"
-              ? `openKedaDetail(${jsArg(ctx)},${ns},${jsArg(r.kind)},${n})`
-              : r.kind === "ExternalSecret"
-                ? `openExternalSecretDetail(${jsArg(ctx)},${ns},${n})`
-                : `openResourceDetail(${jsArg(ctx)},${jsArg(r.kind)},${ns},${n})`;
+  const call = inThisCluster ? resourcePanelCall(ctx, r) : null;
+  if (!call) return `<span>${label}</span>`;
   return `<button type="button" onclick="window.__app.${call}" class="text-left text-series-blue hover:underline">${label}</button>`;
 }
 
@@ -12214,14 +12234,7 @@ function renderEvents(): string {
                   class="hover:text-series-blue hover:underline"
                 >${esc(e.namespace)}</button>
               </td>
-              <td>
-                <button
-                  type="button"
-                  title="Filter events by this object"
-                  onclick="window.__app.setStringFilter('events','object',${jsArg(e.involved_object)})"
-                  class="hover:text-series-blue hover:underline"
-                >${esc(e.involved_object)}</button>
-              </td>
+              <td>${eventObjectCell(ctx, e)}</td>
               <td>${esc(e.reason)}</td>
               <td class="max-w-md truncate" title="${esc(e.message)}">${esc(e.message)}</td>
               <td class="tabular">${e.count}</td>
@@ -12235,6 +12248,51 @@ function renderEvents(): string {
       ${filtered.length === 0 && !state.tabLoading ? '<div class="p-4 text-sm text-ink-muted">No matching events.</div>' : ""}
     </div>
     ${renderPagination("events", sorted.length)}`;
+}
+
+/**
+ * `-` and a pod-template hash: the decimal text of a uint32, safe-encoded —
+ * 1 to 10 characters from an alphabet with no vowels, look-alikes or `-`.
+ */
+const REPLICASET_HASH = /^-[bcdfghjklmnpqrstvwxz2456789]{1,10}$/;
+
+/**
+ * The Events table's object: its name opens the object's panel when it has
+ * one, and the funnel beside it narrows the table to that object's events —
+ * what clicking the name used to do.
+ */
+function eventObjectCell(ctx: string, e: EventInfo): string {
+  // apiVersion is optional on an event's object; without it the group is
+  // unknown, and guessing the core group could route a same-named CRD into a
+  // built-in panel. Such an object stays unlinked.
+  const known = e.object_api_version !== "";
+  const group = apiGroup(e.object_api_version);
+  // A namespaced object's events live in its namespace; the event's own is the fallback.
+  const namespace = e.object_namespace || (CLUSTER_SCOPED_KINDS.has(e.object_kind) ? "" : e.namespace);
+  // A ReplicaSet has no panel, but it is named after its Deployment plus a
+  // pod-template hash in Kubernetes' safe alphabet; open that Deployment when
+  // the Workloads list confirms it exists, and never guess otherwise.
+  // The hash alphabet has no `-`, so at most one Deployment can match; the
+  // longest name is taken anyway, should two ever do.
+  const owner =
+    known && e.object_kind === "ReplicaSet" && group === "apps"
+      ? state.workloads
+          .get(ctx)
+          ?.filter((w) => w.kind === "Deployment" && w.namespace === namespace && e.object_name.startsWith(`${w.name}-`) && REPLICASET_HASH.test(e.object_name.slice(w.name.length)))
+          .sort((a, b) => b.name.length - a.name.length)[0]
+      : undefined;
+  const call = !known
+    ? null
+    : owner
+      ? resourcePanelCall(ctx, { group: "apps", kind: "Deployment", namespace, name: owner.name })
+      : resourcePanelCall(ctx, { group, kind: e.object_kind, namespace, name: e.object_name });
+  const label = `<span class="text-ink-muted">${esc(e.object_kind)}/</span>${esc(e.object_name)}`;
+  const filter = `<button type="button" title="Show only this object's events" aria-label="Show only this object's events" onclick="window.__app.setStringFilter('events','object',${jsArg(e.involved_object)})" class="ml-1 shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"><svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button>`;
+  return `<span class="inline-flex min-w-0 max-w-full items-center">${
+    call
+      ? `<button type="button" title="${owner ? `Open its Deployment ${esc(owner.name)}` : `Open this ${esc(e.object_kind)}`}" onclick="window.__app.${call}" class="min-w-0 truncate text-left hover:text-series-blue hover:underline">${label}</button>`
+      : `<span class="min-w-0 truncate" title="${esc(e.involved_object)}">${label}</span>`
+  }${filter}</span>`;
 }
 
 function gitOpsAppHealthy(a: GitOpsAppInfo): boolean {
@@ -14230,6 +14288,8 @@ function renderHelm(): string {
  */
 const CLUSTER_SCOPED_KINDS = new Set([
   "Namespace",
+  "Node",
+  "NodePool",
   "PersistentVolume",
   "StorageClass",
   "ClusterRole",
