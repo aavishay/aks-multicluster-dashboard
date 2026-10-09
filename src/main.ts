@@ -2872,8 +2872,115 @@ function toggleClusterPaletteHighlighted() {
 
 interface ViewSnapshot {
   tab: TabId;
-  podsFilter: Partial<Record<string, ColumnFilterState>> | undefined;
-  podsUnhealthyOnly: boolean | undefined;
+  /** Every tab's filters and unhealthy-only switch, as a drill-down may set any of them. */
+  filters: Partial<Record<TabId, Partial<Record<string, ColumnFilterState>>>>;
+  unhealthyOnly: Partial<Record<TabId, boolean>>;
+  /** The detail panel open at the time, so Back can return into it. */
+  panel: PanelSnapshot | null;
+}
+
+/**
+ * An open detail panel, as much as it takes to put it back exactly: which
+ * object, which of its views, and how far each of its scroll areas was
+ * scrolled. The object is refetched on return — a panel shows live state,
+ * and what it showed a minute ago may have changed.
+ */
+interface PanelSnapshot {
+  /** Which object, for telling two snapshots of the same view apart. */
+  key: string;
+  reopen: () => void;
+  view: string;
+  setView: (view: string) => void;
+  scroll: Map<string, number>;
+}
+
+/** Set while Back or Forward reopens a panel, so that reopening is not itself recorded. */
+let restoringView = false;
+
+/**
+ * Scroll offsets waiting for a reopened panel's content to arrive: applied
+ * by `render` once each area is tall enough to take its offset, and dropped
+ * after a few seconds should the content never get that tall.
+ */
+let pendingPanelScroll: { positions: Map<string, number>; until: number } | null = null;
+
+function currentPanelSnapshot(): PanelSnapshot | null {
+  const scroll = new Map<string, number>();
+  document.querySelectorAll<HTMLElement>("[data-detail-body], [data-detail-body] [data-scroll-id]").forEach((el) => {
+    if (el.dataset.scrollId && el.scrollTop > 0) scroll.set(el.dataset.scrollId, el.scrollTop);
+  });
+  const make = <V extends string>(key: string, reopen: () => void, view: V, setView: (v: V) => void): PanelSnapshot => ({
+    key,
+    reopen,
+    view,
+    setView: setView as (v: string) => void,
+    scroll,
+  });
+  const s = state;
+  if (s.podDetail) {
+    const d = s.podDetail;
+    return make(`pod:${d.ctx}:${d.namespace}:${d.name}`, () => openPodDetail(d.ctx, d.namespace, d.name), d.view, setPodDetailView);
+  }
+  if (s.nodeDetail) {
+    const d = s.nodeDetail;
+    return make(`node:${d.ctx}:${d.name}`, () => openNodeDetail(d.ctx, d.name), d.view, setNodeDetailView);
+  }
+  if (s.workloadDetail) {
+    const d = s.workloadDetail;
+    return make(`workload:${d.ctx}:${d.kind}:${d.namespace}:${d.name}`, () => openWorkloadDetail(d.ctx, d.kind, d.namespace, d.name), d.view, setWorkloadDetailView);
+  }
+  if (s.gitOpsDetail) {
+    const d = s.gitOpsDetail;
+    return make(`gitops:${d.ctx}:${d.namespace}:${d.name}`, () => openGitOpsDetail(d.ctx, d.namespace, d.name), d.view, setGitOpsDetailView);
+  }
+  if (s.helmDetail) {
+    const d = s.helmDetail;
+    return make(`helm:${d.ctx}:${d.namespace}:${d.name}:${d.revision}`, () => openHelmDetail(d.ctx, d.namespace, d.name, d.revision), d.view, setHelmDetailView);
+  }
+  if (s.napDetail) {
+    const d = s.napDetail;
+    return make(`nap:${d.ctx}:${d.name}`, () => openNapDetail(d.ctx, d.name), d.view, setNapDetailView);
+  }
+  if (s.kedaDetail) {
+    const d = s.kedaDetail;
+    return make(`keda:${d.ctx}:${d.namespace}:${d.kind}:${d.name}`, () => openKedaDetail(d.ctx, d.namespace, d.kind, d.name), d.view, setKedaDetailView);
+  }
+  if (s.hpaDetail) {
+    const d = s.hpaDetail;
+    return make(`hpa:${d.ctx}:${d.namespace}:${d.name}`, () => openHpaDetail(d.ctx, d.namespace, d.name), d.view, setHpaDetailView);
+  }
+  if (s.secretDetail) {
+    const d = s.secretDetail;
+    return make(`secret:${d.ctx}:${d.namespace}:${d.name}`, () => openSecretDetail(d.ctx, d.namespace, d.name, d.secretType), d.view, setSecretDetailView);
+  }
+  if (s.externalSecretDetail) {
+    const d = s.externalSecretDetail;
+    return make(`externalsecret:${d.ctx}:${d.namespace}:${d.name}`, () => openExternalSecretDetail(d.ctx, d.namespace, d.name), d.view, setExternalSecretDetailView);
+  }
+  if (s.resourceDetail) {
+    const d = s.resourceDetail;
+    return make(`resource:${d.ctx}:${d.kind}:${d.namespace}:${d.name}`, () => openResourceDetail(d.ctx, d.kind, d.namespace, d.name), d.view, setResourceDetailView);
+  }
+  return null;
+}
+
+/** Two snapshots of the same place — Back skips over those rather than doing nothing visible. */
+function snapshotKey(v: ViewSnapshot): string {
+  return `${v.tab}|${v.panel?.key ?? ""}|${JSON.stringify([v.filters, v.unhealthyOnly], (_k, x) => (x instanceof Set ? [...x] : x))}`;
+}
+
+/** After a render, puts a reopened panel's scroll areas back where they were, as their content arrives. */
+function applyPendingPanelScroll(app: HTMLElement) {
+  const pending = pendingPanelScroll;
+  if (!pending) return;
+  for (const [id, top] of [...pending.positions]) {
+    const el = [...app.querySelectorAll<HTMLElement>("[data-scroll-id]")].find((e) => e.dataset.scrollId === id);
+    if (el && el.scrollHeight - el.clientHeight >= top) {
+      el.scrollTop = top;
+      pending.positions.delete(id);
+    }
+  }
+  if (pending.positions.size === 0 || Date.now() > pending.until) pendingPanelScroll = null;
 }
 
 /**
@@ -2898,49 +3005,75 @@ function cloneColumnFilterRecord(
 }
 
 /**
- * The current tab plus whatever pods-tab filter/unhealthy state a drill-down
- * (`viewPodsForWorkload`/`viewPodsForNode`) is about to clobber — the only
- * state any navigation function in this file mutates besides `activeTab`. A
- * plain tab switch's pods fields just get written back unchanged, so this one
- * snapshot shape covers both cases.
+ * Where the reader is: the tab, its filters, and an open panel. Filters are
+ * captured for every tab but restored only for the tab being returned to and
+ * the two a drill-down overwrites — see `applyViewSnapshot`.
  */
 function currentViewSnapshot(): ViewSnapshot {
   return {
     tab: state.activeTab,
-    podsFilter: cloneColumnFilterRecord(state.filterState.pods),
-    podsUnhealthyOnly: state.unhealthyOnly.pods,
+    filters: Object.fromEntries(Object.entries(state.filterState).map(([tab, rec]) => [tab, cloneColumnFilterRecord(rec)])),
+    unhealthyOnly: { ...state.unhealthyOnly },
+    panel: currentPanelSnapshot(),
   };
 }
 
 function applyViewSnapshot(snapshot: ViewSnapshot) {
-  state.activeTab = snapshot.tab;
-  state.filterState.pods = snapshot.podsFilter;
-  state.unhealthyOnly.pods = snapshot.podsUnhealthyOnly;
+  restoringView = true;
+  try {
+    closeOpenDetailPanel();
+    state.activeTab = snapshot.tab;
+    // The tab returned to comes back exactly as it was, and so do Pods and
+    // Nodes, which drill-downs overwrite. Other tabs keep their filters:
+    // edits made on the tab being left are the reader's, not navigation's.
+    for (const tab of new Set<TabId>([snapshot.tab, "pods", "nodes"])) {
+      state.filterState[tab] = cloneColumnFilterRecord(snapshot.filters[tab]);
+      state.unhealthyOnly[tab] = snapshot.unhealthyOnly[tab];
+    }
+    if (snapshot.panel) {
+      snapshot.panel.reopen();
+      snapshot.panel.setView(snapshot.panel.view);
+      pendingPanelScroll = snapshot.panel.scroll.size ? { positions: new Map(snapshot.panel.scroll), until: Date.now() + 8000 } : null;
+    }
+  } finally {
+    restoringView = false;
+  }
   render();
   loadTabData();
 }
 
-/** Called by every function that changes `state.activeTab`, right before it does so. */
+/**
+ * Called by every function that changes `state.activeTab` or opens a detail
+ * panel, right before it does so — so following a link from one panel to
+ * another can be undone, back into the panel it came from.
+ */
 function pushViewHistory() {
+  if (restoringView) return;
   viewHistory.back.push(currentViewSnapshot());
   // Navigating somewhere new abandons the forward trail, as in a browser.
   viewHistory.forward.length = 0;
 }
 
-/** Cmd+Left. No-op at the start of history. */
-function goBackView() {
-  const previous = viewHistory.back.pop();
-  if (!previous) return;
-  viewHistory.forward.push(currentViewSnapshot());
+/** Cmd+Left. Returns false at the start of history. */
+function goBackView(): boolean {
+  const here = currentViewSnapshot();
+  let previous = viewHistory.back.pop();
+  // A panel closed by hand left its opening entry behind, pointing at the
+  // view already on screen; skip those rather than spend a keypress on them.
+  while (previous && snapshotKey(previous) === snapshotKey(here)) previous = viewHistory.back.pop();
+  if (!previous) return false;
+  viewHistory.forward.push(here);
   applyViewSnapshot(previous);
+  return true;
 }
 
-/** Cmd+Right. No-op unless a `goBackView` has left something to return to. */
-function goForwardView() {
+/** Cmd+Right. Returns false unless a `goBackView` has left something to return to. */
+function goForwardView(): boolean {
   const next = viewHistory.forward.pop();
-  if (!next) return;
+  if (!next) return false;
   viewHistory.back.push(currentViewSnapshot());
   applyViewSnapshot(next);
+  return true;
 }
 
 function selectTab(tab: TabId) {
@@ -2980,7 +3113,9 @@ function viewPodsForNode(ctx: string, nodeName: string) {
 
 /** Drill down from a NAP row into the nodes it actually provisioned. */
 function viewNodesForNodePool(ctx: string, poolName: string) {
+  // Recorded before the NAP panel it is followed from closes, so Back returns into that panel.
   pushViewHistory();
+  closeOpenDetailPanel();
   state.filterState.nodes = {
     cluster: { enumValues: new Set([ctx]) },
     node_pool: { enumValues: new Set([poolName]) },
@@ -2996,6 +3131,7 @@ function viewNodesForNodePool(ctx: string, poolName: string) {
 // ---------------------------------------------------------------------------
 
 function openNodeDetail(ctx: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeWorkloadDetail();
@@ -3139,6 +3275,7 @@ function moveNodeSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openHelmDetail(ctx: string, namespace: string, name: string, revision: number) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -3243,6 +3380,7 @@ function moveHelmSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openGitOpsDetail(ctx: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -3402,6 +3540,7 @@ function moveGitOpsSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openNapDetail(ctx: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4260,6 +4399,7 @@ function kedaTargetIsGraphable(targetKind: string, targetName: string): boolean 
 // a third view here would duplicate one of the two.
 
 function openHpaDetail(ctx: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4376,6 +4516,7 @@ function moveHpaSearch(_view: string, delta: number) {
 // Secret to an AI provider.
 
 function openSecretDetail(ctx: string, namespace: string, name: string, secretType: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4559,6 +4700,7 @@ async function copySecretKey(key: string) {
 // has been failing, which the Ready condition alone cannot.
 
 function openExternalSecretDetail(ctx: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4689,6 +4831,7 @@ function moveExternalSecretSearch(_view: string, delta: number) {
 }
 
 function openKedaDetail(ctx: string, namespace: string, kind: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -4850,6 +4993,7 @@ function moveKedaSearch(_view: string, delta: number) {
 // ---------------------------------------------------------------------------
 
 function openWorkloadDetail(ctx: string, kind: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closePodDetail();
   closeNodeDetail();
@@ -5252,6 +5396,7 @@ function manualRefresh() {
 // ---------------------------------------------------------------------------
 
 function openPodDetail(ctx: string, namespace: string, name: string) {
+  pushViewHistory();
   closeResourceDetail();
   closeNodeDetail();
   closeWorkloadDetail();
@@ -5956,6 +6101,8 @@ function render(carried?: PreRenderState) {
       el.scrollLeft = pos.left;
     }
   });
+  // After the ordinary restore, which knows nothing of a panel just reopened by Back.
+  applyPendingPanelScroll(app);
   restoreSelectionSnapshot(app, selectionSnapshot);
 
   // After the scroll restore, which would otherwise put the bar back where it
@@ -6252,7 +6399,7 @@ const SHORTCUT_GROUPS: { title: string; items: [keys: string, what: string][] }[
     items: [
       ["← →", "Previous or next tab"],
       ["↑ ↓ PgUp PgDn Home End", "Scroll a tab with no table, like Metrics or Cost"],
-      [`${withMod("←")} ${withMod("→")}`, "Back and forward through views"],
+      [`${withMod("←")} ${withMod("→")}`, "Back and forward through views — panels included, at the tab and scroll you left"],
       [withMod("B"), "Show or hide the cluster list"],
       [withMod("S"), "Switch cluster"],
       [withMod("R"), "Refresh now"],
@@ -10829,7 +10976,7 @@ function renderNapOverviewView(nd: NapDetailState): string {
             )
             .join("")}</tbody></table>${
             mine.length > NAP_NODES_SHOWN
-              ? `<button type="button" onclick="window.__app.closeNapDetail();window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(name)})" class="self-start text-xs text-series-blue hover:underline">All ${mine.length} in the Nodes tab</button>`
+              ? `<button type="button" onclick="window.__app.viewNodesForNodePool(${jsArg(ctx)},${jsArg(name)})" class="self-start text-xs text-series-blue hover:underline">All ${mine.length} in the Nodes tab</button>`
               : ""
           }`,
   );
@@ -13571,6 +13718,7 @@ const RESOURCE_KIND_TAB: Record<ResourceKind, TabId> = {
 };
 
 function openResourceDetail(ctx: string, kind: ResourceKind, namespace: string, name: string) {
+  pushViewHistory();
   // Every other panel, through the registry rather than by name.
   for (const p of DETAIL_PANEL_CLOSERS) if (p.isOpen() && p.close !== closeResourceDetail) p.close();
   const token = ++resourceDetailToken;
@@ -15920,16 +16068,16 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
+  // Cmd+Left / Cmd+Right walk the view history, panels included: from a
+  // panel reached by a link in another, Back returns to that panel on the
+  // same view and scroll position; from a panel opened off a table, to the
+  // table. With no history left, Back still closes an open panel.
   if (e.key === "ArrowLeft" && !isEditableTarget(e.target)) {
-    if (!closeOpenDetailPanel()) goBackView();
+    if (!goBackView()) closeOpenDetailPanel();
     return;
   }
-  // Deliberately no panel handling here: a detail panel is a full-screen
-  // overlay, so stepping the tab underneath it would change something the
-  // reader can't see. Cmd+Left closing a panel is an Escape-like convenience
-  // that costs no history, which is why it has no forward counterpart.
   if (e.key === "ArrowRight" && !isEditableTarget(e.target)) {
-    if (!isAnyDetailPanelOpen()) goForwardView();
+    goForwardView();
     return;
   }
   // "=" is the unshifted key that carries "+" on a US layout, and some layouts

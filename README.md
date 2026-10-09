@@ -276,7 +276,9 @@ The tabs sit in eight groups — Overview, Cluster, Workloads, Network,
 Storage, Config, Delivery and Insights — with the active group's tabs on a
 second row. A group's badge adds up the problems in its tabs, ⌘1–⌘8 switch
 groups (each remembers the tab you last used in it), and ⌘K jumps straight
-to any tab.
+to any tab. ⌘← and ⌘→ step back and forward through where you have been,
+panels included: follow a link from one panel to another and ⌘← returns to
+the first, on the same tab and scroll position.
 
 Overview gives per-cluster health at a glance: Kubernetes version, nodes
 ready, namespace count, pod health, warning event count. Nodes lists every
