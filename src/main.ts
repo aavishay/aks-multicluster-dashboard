@@ -12504,8 +12504,8 @@ function renderEvents(): string {
                 >${esc(e.namespace)}</button>
               </td>
               <td>${eventObjectCell(ctx, e)}</td>
-              <td>${esc(e.reason)}</td>
-              <td class="max-w-md truncate" title="${esc(e.message)}">${esc(e.message)}</td>
+              <td><button type="button" data-row-open title="Open this event" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Event',${jsArg(e.namespace)},${jsArg(e.name)})" class="text-left hover:text-series-blue hover:underline">${esc(e.reason)}</button></td>
+              <td class="max-w-md truncate" title="${esc(e.message)}"><button type="button" tabindex="-1" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Event',${jsArg(e.namespace)},${jsArg(e.name)})" class="max-w-full truncate text-left hover:text-ink-primary">${esc(e.message)}</button></td>
               <td class="tabular">${e.count}</td>
               <td class="tabular" title="${esc(timeTitle("Last seen", e.last_seen))}">${relativeTime(e.last_seen)}</td>
             </tr>`;
@@ -12525,12 +12525,8 @@ function renderEvents(): string {
  */
 const REPLICASET_HASH = /^-[bcdfghjklmnpqrstvwxz2456789]{1,10}$/;
 
-/**
- * The Events table's object: its name opens the object's panel when it has
- * one, and the funnel beside it narrows the table to that object's events —
- * what clicking the name used to do.
- */
-function eventObjectCell(ctx: string, e: EventInfo): string {
+/** The panel call that opens an event's object (a ReplicaSet's Deployment), or null. */
+function eventObjectCall(ctx: string, e: EventInfo): { call: string | null; owner: WorkloadInfo | undefined } {
   // apiVersion is optional on an event's object; without it the group is
   // unknown, and guessing the core group could route a same-named CRD into a
   // built-in panel. Such an object stays unlinked.
@@ -12555,6 +12551,16 @@ function eventObjectCell(ctx: string, e: EventInfo): string {
     : owner
       ? resourcePanelCall(ctx, { group: "apps", kind: "Deployment", namespace, name: owner.name })
       : resourcePanelCall(ctx, { group, kind: e.object_kind, namespace, name: e.object_name });
+  return { call, owner };
+}
+
+/**
+ * The Events table's object: its name opens the object's panel when it has
+ * one, and the funnel beside it narrows the table to that object's events —
+ * what clicking the name used to do.
+ */
+function eventObjectCell(ctx: string, e: EventInfo): string {
+  const { call, owner } = eventObjectCall(ctx, e);
   const label = `<span class="text-ink-muted">${esc(e.object_kind)}/</span>${esc(e.object_name)}`;
   const filter = `<button type="button" title="Show only this object's events" aria-label="Show only this object's events" onclick="window.__app.setStringFilter('events','object',${jsArg(e.involved_object)})" class="ml-1 shrink-0 rounded p-0.5 text-ink-muted hover:bg-surface-3 hover:text-ink-primary"><svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button>`;
   return `<span class="inline-flex min-w-0 max-w-full items-center">${
@@ -13730,6 +13736,7 @@ const RESOURCE_KIND_TAB: Record<ResourceKind, TabId> = {
   PodDisruptionBudget: "pdbs",
   SecretStore: "secretstores",
   ClusterSecretStore: "secretstores",
+  Event: "events",
 };
 
 function openResourceDetail(ctx: string, kind: ResourceKind, namespace: string, name: string) {
@@ -13773,9 +13780,12 @@ function openResourceDetail(ctx: string, kind: ResourceKind, namespace: string, 
       .finally(() => {
         if (token !== resourceDetailToken || !state.resourceDetail) return;
         state.resourceDetail.listsLoading = state.resourceDetail.listsLoading.filter((t) => t !== tab);
+        // An event's siblings need its row, which this list may just have brought.
+        fetchEventSiblings(token);
         render();
       });
   }
+  fetchEventSiblings(token);
   render();
 
   api
@@ -14001,6 +14011,8 @@ function renderResourceOverview(rd: ResourceDetailState): string {
         <div class="mt-2 text-xs text-ink-muted">The values are under Data.</div>`
       : "";
     return `<div>${rows.join("")}</div>${keys}`;
+  } else if (kind === "Event") {
+    return renderEventOverview(rd, gone);
   } else if (kind === "ServiceAccount") {
     const a = state.serviceAccounts.get(ctx)?.find((x) => x.namespace === namespace && x.name === name);
     if (!a) return gone;
@@ -14097,15 +14109,128 @@ function renderResourceOverview(rd: ResourceDetailState): string {
   return `<div>${rows.join("")}</div>`;
 }
 
+/**
+ * Events seen outside the Events tab's own list — the panel's "other events
+ * on this object", which includes Normal ones the tab's warnings-only list
+ * leaves out — so opening one of those finds its row too.
+ */
+const knownEvents = new Map<string, EventInfo>();
+const eventKey = (ctx: string, namespace: string, name: string) => `${ctx}|${namespace}|${name}`;
+
+function findEvent(ctx: string, namespace: string, name: string): EventInfo | undefined {
+  return state.events.get(ctx)?.find((e) => e.namespace === namespace && e.name === name) ?? knownEvents.get(eventKey(ctx, namespace, name));
+}
+
+/**
+ * Every event about the opened event's object, for its "other events"
+ * section — fetched once the event's own row is known, filtered by object
+ * before the cluster-wide cap rather than taken from the tab's list.
+ */
+function fetchEventSiblings(token: number) {
+  const rd = state.resourceDetail;
+  if (!rd || rd.kind !== "Event" || rd.events || rd.eventsLoading) return;
+  const e = findEvent(rd.ctx, rd.namespace, rd.name);
+  if (!e) return;
+  rd.eventsLoading = true;
+  api
+    .getObjectEvents(rd.ctx, e.object_kind, e.object_namespace, e.object_name)
+    .then((events) => {
+      for (const x of events) knownEvents.set(eventKey(rd.ctx, x.namespace, x.name), x);
+      if (token !== resourceDetailToken || !state.resourceDetail) return;
+      state.resourceDetail.events = events;
+    })
+    .catch((err) => {
+      if (token === resourceDetailToken && state.resourceDetail) state.resourceDetail.eventsError = String(err);
+    })
+    .finally(() => {
+      if (token !== resourceDetailToken || !state.resourceDetail) return;
+      state.resourceDetail.eventsLoading = false;
+      render();
+    });
+}
+
+/**
+ * An event's Overview: its whole message, which the table truncates; the
+ * object it is about, linked to that object's panel, and the field within
+ * it; how often and over what span it has fired; who reported it; and every
+ * other event about the same object, each opening its own panel.
+ */
+/** An event's object as a link to its panel, or plain text when it has none. */
+function eventObjectLink(ctx: string, e: EventInfo): string {
+  const { call, owner } = eventObjectCall(ctx, e);
+  const label = `<span class="text-ink-muted">${esc(e.object_kind)}/</span>${esc(e.object_name)}`;
+  if (!call) return `<span>${label}</span>`;
+  return `<button type="button" onclick="window.__app.${call}" class="text-left text-series-blue hover:underline">${label}</button>${
+    owner ? ` <span class="text-xs text-ink-muted">· opens its Deployment ${esc(owner.name)}</span>` : ""
+  }`;
+}
+
+function renderEventOverview(rd: ResourceDetailState, gone: string): string {
+  const { ctx } = rd;
+  const e = findEvent(ctx, rd.namespace, rd.name);
+  if (!e) return gone;
+  const warning = e.event_type === "Warning";
+  const when = (iso: string | null) => (iso ? `${relativeTime(iso)} <span class="text-xs text-ink-muted">· ${esc(exactTime(iso).replace("\n", " · "))}</span>` : "—");
+  const span = e.first_seen && e.last_seen && e.count > 1 ? Date.parse(e.last_seen) - Date.parse(e.first_seen) : 0;
+  const rows = [
+    overviewRow("Type", `<span class="${warning ? "text-status-warning" : "text-ink-secondary"}">${esc(e.event_type) || "—"}</span>`),
+    overviewRow("Reason", esc(e.reason) || "—"),
+    overviewRow("Message", `<div class="whitespace-pre-wrap break-words">${esc(e.message) || "—"}</div>`),
+    overviewRow("Object", `${eventObjectLink(ctx, e)}${e.field_path ? `<div class="font-mono text-xs text-ink-muted">${esc(e.field_path)}</div>` : ""}`),
+    overviewRow(
+      "Count",
+      `<span class="tabular">${e.count}</span>${span > 0 ? ` <span class="text-xs text-ink-muted">over ${esc(formatAgeDetailed(Math.floor(span / 86_400_000), Math.floor(span / 1000)))}</span>` : ""}`,
+    ),
+    overviewRow("First seen", when(e.first_seen)),
+    overviewRow("Last seen", when(e.last_seen)),
+    ...(e.source ? [overviewRow("Reported by", esc(e.source))] : []),
+    ...(e.action ? [overviewRow("Action", esc(e.action))] : []),
+    ...(e.related ? [overviewRow("Related", esc(e.related))] : []),
+    overviewRow("Namespace", esc(e.namespace) || "—"),
+  ];
+  const banner = warning
+    ? `<div class="mb-3 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-status-warning">${esc(e.reason)}${e.count > 1 ? ` · ${e.count} times` : ""}</div>`
+    : "";
+
+  const others = (rd.events ?? []).filter((x) => x.name !== e.name);
+  const siblings = overviewSection(
+    rd.events ? `Other events on this ${esc(e.object_kind)} (${others.length})` : `Other events on this ${esc(e.object_kind)}`,
+    rd.eventsError
+      ? `<div class="text-xs text-status-critical">${esc(rd.eventsError)}</div>`
+      : !rd.events
+        ? `<div class="text-xs text-ink-muted">Loading…</div>`
+        : others.length === 0
+          ? `<div class="text-xs text-ink-muted">None — this is the only event recorded for it.</div>`
+          : `<table class="w-full text-left text-sm"><tbody>${others
+              .map(
+                (x) => `
+        <tr class="border-t border-gridline/60 align-top first:border-t-0">
+          <td class="w-20 py-1.5 pr-3 text-xs ${x.event_type === "Warning" ? "text-status-warning" : "text-ink-muted"}">${esc(x.event_type)}</td>
+          <td class="py-1.5 pr-3"><button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Event',${jsArg(x.namespace)},${jsArg(x.name)})" class="text-left text-series-blue hover:underline">${esc(x.reason)}</button><div class="line-clamp-2 text-xs text-ink-secondary">${esc(x.message)}</div></td>
+          <td class="py-1.5 pr-3 text-right text-xs tabular text-ink-muted">${x.count > 1 ? `×${x.count}` : ""}</td>
+          <td class="whitespace-nowrap py-1.5 text-right text-xs text-ink-muted" title="${esc(timeTitle("Last seen", x.last_seen))}">${relativeTime(x.last_seen)}</td>
+        </tr>`,
+              )
+              .join("")}</tbody></table>`,
+  );
+  return `${banner}<div>${rows.join("")}</div>${siblings}`;
+}
+
 function renderResourceDetailPanel(): string {
   const rd = state.resourceDetail;
   if (!rd) return "";
   const id = `${rd.ctx}:${rd.kind}:${rd.namespace}:${rd.name}`;
+  // An Event's own name is generated (`api-x.17f3a2…`); its reason and the
+  // object it is about say what it is.
+  const ev = rd.kind === "Event" ? findEvent(rd.ctx, rd.namespace, rd.name) : undefined;
+  const title = ev ? ev.reason || "Event" : rd.name;
+  const subtitle = [rd.kind, ev?.involved_object, rd.namespace, rd.ctx].filter(Boolean).join(" · ");
   const tabs: { id: ResourceDetailState["view"]; label: string }[] = [
     { id: "overview", label: "Overview" },
     ...(rd.kind === "ConfigMap" ? [{ id: "data" as const, label: "Data" }] : []),
     { id: "yaml", label: "YAML" },
-    { id: "events", label: "Events" },
+    // Events about an Event are not a thing; its Overview lists its siblings instead.
+    ...(rd.kind === "Event" ? [] : [{ id: "events" as const, label: "Events" }]),
   ];
   const body =
     rd.view === "overview"
@@ -14133,8 +14258,8 @@ function renderResourceDetailPanel(): string {
       ${slideOverShell()}
         <div class="flex items-center justify-between border-b border-gridline px-4 py-3">
           <div class="min-w-0">
-            <div class="truncate text-sm font-medium text-ink-primary">${esc(rd.name)}</div>
-            <div class="truncate text-xs text-ink-muted">${esc([rd.kind, rd.namespace, rd.ctx].filter(Boolean).join(" · "))}</div>
+            <div class="truncate text-sm font-medium text-ink-primary">${esc(title)}</div>
+            <div class="truncate text-xs text-ink-muted">${esc(subtitle)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
             ${writeModeToggle(true)}

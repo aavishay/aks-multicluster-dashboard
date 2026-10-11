@@ -780,6 +780,11 @@ pub async fn get_configmaps(context_name: String) -> Result<Vec<ConfigMapInfo>, 
 }
 
 #[tauri::command]
+pub async fn get_object_events(context_name: String, kind: String, namespace: String, name: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || k8s::get_object_events(&context_name, &kind, &namespace, &name)).await
+}
+
+#[tauri::command]
 pub async fn get_service_accounts(context_name: String) -> Result<Vec<ServiceAccountInfo>, String> {
     with_retry(&context_name, || resources::get_service_accounts(&context_name)).await
 }
