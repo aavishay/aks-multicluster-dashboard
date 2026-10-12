@@ -341,6 +341,9 @@ pub struct EventInfo {
     pub object_kind: String,
     pub object_namespace: String,
     pub object_name: String,
+    /// The object's UID, telling it apart from a deleted and recreated
+    /// object of the same name whose events are still retained.
+    pub object_uid: String,
     /// The Event object's own name, for fetching it — not shown.
     pub name: String,
     /// When it was first observed; RFC 3339.

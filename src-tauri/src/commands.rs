@@ -780,8 +780,8 @@ pub async fn get_configmaps(context_name: String) -> Result<Vec<ConfigMapInfo>, 
 }
 
 #[tauri::command]
-pub async fn get_object_events(context_name: String, kind: String, namespace: String, name: String) -> Result<Vec<EventInfo>, String> {
-    with_retry(&context_name, || k8s::get_object_events(&context_name, &kind, &namespace, &name)).await
+pub async fn get_object_events(context_name: String, kind: String, namespace: String, name: String, uid: String) -> Result<Vec<EventInfo>, String> {
+    with_retry(&context_name, || k8s::get_object_events(&context_name, &kind, &namespace, &name, &uid)).await
 }
 
 #[tauri::command]

@@ -1611,6 +1611,7 @@ pub(crate) fn event_to_info(e: Event) -> EventInfo {
         object_kind: o.kind.clone().unwrap_or_default(),
         object_namespace: o.namespace.clone().unwrap_or_default(),
         object_name: o.name.clone().unwrap_or_default(),
+        object_uid: o.uid.clone().unwrap_or_default(),
         name: e.metadata.name.clone().unwrap_or_default(),
         first_seen: e.first_timestamp.as_ref().map(|t| t.0).or_else(|| e.event_time.as_ref().map(|t| t.0)).map(|t| t.to_rfc3339()),
         source: event_source(&e),
@@ -1663,15 +1664,22 @@ pub async fn get_events(context_name: &str, warnings_only: bool) -> Result<Vec<E
 
 /// Every event about one object, of any kind, newest first.
 ///
+/// Matched on the object's UID when it is known, as well as kind and name:
+/// a deleted and recreated object of the same name is a different object,
+/// and its predecessor's events can still be retained.
+///
 /// Filtered by the API server on `involvedObject` field selectors rather than
 /// by listing the whole cluster's events and matching here: on a busy
 /// private-link cluster that full list takes a quarter of a minute, and an
 /// event panel asks for this as soon as it opens. A namespaced object's events
 /// live in its namespace, so that list is namespaced too; a cluster-scoped
 /// object's events are recorded wherever the reporting component put them.
-pub async fn get_object_events(context_name: &str, kind: &str, namespace: &str, name: &str) -> Result<Vec<EventInfo>, String> {
+pub async fn get_object_events(context_name: &str, kind: &str, namespace: &str, name: &str, uid: &str) -> Result<Vec<EventInfo>, String> {
     let client = client_for_context(context_name).await?;
     let mut fields = format!("involvedObject.kind={kind},involvedObject.name={name}");
+    if !uid.is_empty() {
+        fields.push_str(&format!(",involvedObject.uid={uid}"));
+    }
     let api: Api<Event> = if namespace.is_empty() {
         Api::all(client)
     } else {
@@ -5084,6 +5092,9 @@ mod tests {
 
     /// Opens the newest events the way the panel does: each one's siblings
     /// and its own YAML. Prints counts only.
+    ///
+    ///   EVENT_DETAIL_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml event_detail_against_a_live_cluster -- --ignored --nocapture
     #[tokio::test]
     #[ignore = "needs a reachable cluster; set EVENT_DETAIL_TEST_CONTEXT to run"]
     async fn event_detail_against_a_live_cluster() {
@@ -5095,7 +5106,7 @@ mod tests {
         let (mut opened, mut with_source, mut with_field, mut siblings, mut gone, mut mismatched) = (0, 0, 0, 0, 0, 0);
         for e in events.iter().take(20) {
             assert!(!e.name.is_empty(), "every event carries its name");
-            let same = get_object_events(&ctx, &e.object_kind, &e.object_namespace, &e.object_name).await.expect("object events");
+            let same = get_object_events(&ctx, &e.object_kind, &e.object_namespace, &e.object_name, &e.object_uid).await.expect("object events");
             // An event can expire between the list and this call; that is not a failure.
             if !same.iter().any(|x| x.name == e.name) {
                 gone += 1;
@@ -5108,6 +5119,7 @@ mod tests {
                     let o = &x.involved_object;
                     o.kind.as_deref() == Some(e.object_kind.as_str())
                         && o.name.as_deref() == Some(e.object_name.as_str())
+                        && (e.object_uid.is_empty() || o.uid.as_deref() == Some(e.object_uid.as_str()))
                         && (e.object_namespace.is_empty() || o.namespace.as_deref().unwrap_or_default() == e.object_namespace)
                 })
                 .count();

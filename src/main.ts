@@ -14117,6 +14117,21 @@ function renderResourceOverview(rd: ResourceDetailState): string {
 const knownEvents = new Map<string, EventInfo>();
 const eventKey = (ctx: string, namespace: string, name: string) => `${ctx}|${namespace}|${name}`;
 
+/**
+ * A bound on `knownEvents`. A Map keeps insertion order, so re-inserting on
+ * every sighting and dropping from the front makes it least-recently-seen
+ * first out. Generous enough that panels in recent history still find their
+ * row; an evicted one says it is no longer listed, and its YAML still loads.
+ */
+const KNOWN_EVENTS_MAX = 2000;
+
+function rememberEvent(ctx: string, e: EventInfo) {
+  const key = eventKey(ctx, e.namespace, e.name);
+  knownEvents.delete(key);
+  knownEvents.set(key, e);
+  while (knownEvents.size > KNOWN_EVENTS_MAX) knownEvents.delete(knownEvents.keys().next().value!);
+}
+
 function findEvent(ctx: string, namespace: string, name: string): EventInfo | undefined {
   return state.events.get(ctx)?.find((e) => e.namespace === namespace && e.name === name) ?? knownEvents.get(eventKey(ctx, namespace, name));
 }
@@ -14133,9 +14148,9 @@ function fetchEventSiblings(token: number) {
   if (!e) return;
   rd.eventsLoading = true;
   api
-    .getObjectEvents(rd.ctx, e.object_kind, e.object_namespace, e.object_name)
+    .getObjectEvents(rd.ctx, e.object_kind, e.object_namespace, e.object_name, e.object_uid)
     .then((events) => {
-      for (const x of events) knownEvents.set(eventKey(rd.ctx, x.namespace, x.name), x);
+      for (const x of events) rememberEvent(rd.ctx, x);
       if (token !== resourceDetailToken || !state.resourceDetail) return;
       state.resourceDetail.events = events;
     })
@@ -14155,6 +14170,15 @@ function fetchEventSiblings(token: number) {
  * it; how often and over what span it has fired; who reported it; and every
  * other event about the same object, each opening its own panel.
  */
+/**
+ * A duration, not an age: seconds stay seconds, where the age formatter
+ * rounds anything under a minute up to "1m".
+ */
+function formatSpan(ms: number): string {
+  const sec = Math.round(ms / 1000);
+  return sec < 60 ? `${sec}s` : formatAgeDetailed(Math.floor(ms / 86_400_000), sec);
+}
+
 /** An event's object as a link to its panel, or plain text when it has none. */
 function eventObjectLink(ctx: string, e: EventInfo): string {
   const { call, owner } = eventObjectCall(ctx, e);
@@ -14179,7 +14203,7 @@ function renderEventOverview(rd: ResourceDetailState, gone: string): string {
     overviewRow("Object", `${eventObjectLink(ctx, e)}${e.field_path ? `<div class="font-mono text-xs text-ink-muted">${esc(e.field_path)}</div>` : ""}`),
     overviewRow(
       "Count",
-      `<span class="tabular">${e.count}</span>${span > 0 ? ` <span class="text-xs text-ink-muted">over ${esc(formatAgeDetailed(Math.floor(span / 86_400_000), Math.floor(span / 1000)))}</span>` : ""}`,
+      `<span class="tabular">${e.count}</span>${span > 0 ? ` <span class="text-xs text-ink-muted">over ${esc(formatSpan(span))}</span>` : ""}`,
     ),
     overviewRow("First seen", when(e.first_seen)),
     overviewRow("Last seen", when(e.last_seen)),

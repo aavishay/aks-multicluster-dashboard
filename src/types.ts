@@ -252,6 +252,8 @@ export interface EventInfo {
   /** Empty for a cluster-scoped object such as a Node. */
   object_namespace: string;
   object_name: string;
+  /** The object's UID, telling it apart from a recreated object of the same name. */
+  object_uid: string;
   /** The Event object's own name, for fetching it. */
   name: string;
   first_seen: string | null;
