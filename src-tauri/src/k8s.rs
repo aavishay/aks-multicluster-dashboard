@@ -965,6 +965,32 @@ pub async fn get_pod_manifest(context_name: &str, namespace: &str, pod_name: &st
 /// "head" has no server-side equivalent — the log API can only bound *bytes*
 /// from the start (`limitBytes`), not lines — so this over-fetches a capped
 /// byte window and truncates to `lines` client-side.
+/// The kubelet's reply when a container has no earlier instance to read: it
+/// has never restarted, or the earlier one was already garbage-collected.
+pub(crate) fn is_no_previous_instance(message: &str) -> bool {
+    message.contains("previous terminated container") && message.contains("not found")
+}
+
+/// The last `lines` lines of a container's *previous* instance — the one that
+/// last exited. For a crash loop this is where the crash itself is written;
+/// the current instance has often only just started. `Ok(None)` when there is
+/// no previous instance, which is a fact rather than a failure.
+pub async fn get_previous_pod_logs(context_name: &str, namespace: &str, pod_name: &str, container: &str, lines: i64) -> Result<Option<String>, String> {
+    let client = client_for_context(context_name).await?;
+    let pods_api: Api<Pod> = Api::namespaced(client, namespace);
+    let lp = LogParams {
+        container: Some(container.to_string()),
+        previous: true,
+        tail_lines: Some(lines.clamp(1, 5000)),
+        ..Default::default()
+    };
+    match pods_api.logs(pod_name, &lp).await {
+        Ok(text) => Ok(Some(text)),
+        Err(kube::Error::Api(resp)) if resp.code == 400 && is_no_previous_instance(&resp.message) => Ok(None),
+        Err(e) => Err(format!("Failed to fetch previous logs: {e}")),
+    }
+}
+
 pub async fn get_pod_logs(
     context_name: &str,
     namespace: &str,
