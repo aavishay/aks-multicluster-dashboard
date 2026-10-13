@@ -249,6 +249,8 @@ export const api = {
     invoke<EventInfo[]>("get_resource_events", { contextName, kind, namespace, name }),
   getExternalSecrets: (contextName: string) => invoke<ExternalSecretsResult>("get_external_secrets", { contextName }),
   getSecretStores: (contextName: string) => invoke<SecretStoresResult>("get_secret_stores", { contextName }),
+  getObjectEvents: (contextName: string, kind: string, namespace: string, name: string, uid: string) =>
+    invoke<EventInfo[]>("get_object_events", { contextName, kind, namespace, name, uid }),
   getServiceAccounts: (contextName: string) => invoke<ServiceAccountInfo[]>("get_service_accounts", { contextName }),
   getPdbs: (contextName: string) => invoke<PdbInfo[]>("get_pdbs", { contextName }),
   getExternalSecretDetail: (contextName: string, namespace: string, name: string) =>

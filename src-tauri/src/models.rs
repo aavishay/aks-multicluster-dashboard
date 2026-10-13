@@ -341,6 +341,21 @@ pub struct EventInfo {
     pub object_kind: String,
     pub object_namespace: String,
     pub object_name: String,
+    /// The object's UID, telling it apart from a deleted and recreated
+    /// object of the same name whose events are still retained.
+    pub object_uid: String,
+    /// The Event object's own name, for fetching it — not shown.
+    pub name: String,
+    /// When it was first observed; RFC 3339.
+    pub first_seen: Option<String>,
+    /// What reported it: `kubelet on aks-node-1`, `deployment-controller`.
+    pub source: String,
+    /// The part of the object it concerns, e.g. `spec.containers{api}`.
+    pub field_path: String,
+    /// `events.k8s.io` only: what was done, e.g. `Scheduling`.
+    pub action: String,
+    /// A second object it involves, as `Kind/name`.
+    pub related: String,
     pub reason: String,
     pub message: String,
     pub event_type: String,

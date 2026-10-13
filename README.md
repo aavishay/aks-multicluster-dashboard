@@ -313,7 +313,10 @@ Events surfaces recent cluster events, defaulting to warnings only; an
 event's object opens its own panel when the app has one for that kind (Jobs,
 CronJobs, policies and the like stay plain text), a ReplicaSet's opens the
 Deployment its name belongs to when the Workloads list has it, and the funnel
-beside it narrows the table to that object. HPA lists
+beside it narrows the table to that object. An event's reason or message opens
+its own panel — the full message, the object and the field within it, how often
+and over what span it fired, who reported it, every other event about the same
+object, and its YAML. HPA lists
 each autoscaler with its replicas and metrics; its panel opens on an Overview —
 why it is not scaling when it is not, each metric against its target, the
 scale-up and scale-down behavior (Kubernetes' defaults said as such), and the

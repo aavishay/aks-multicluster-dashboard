@@ -41,6 +41,7 @@ enum Kind {
     PodDisruptionBudget,
     SecretStore,
     ClusterSecretStore,
+    Event,
 }
 
 impl Kind {
@@ -56,6 +57,7 @@ impl Kind {
             "PodDisruptionBudget" => Ok(Self::PodDisruptionBudget),
             "SecretStore" => Ok(Self::SecretStore),
             "ClusterSecretStore" => Ok(Self::ClusterSecretStore),
+            "Event" => Ok(Self::Event),
             other => Err(format!("Unknown resource kind '{other}'")),
         }
     }
@@ -80,6 +82,7 @@ impl Kind {
             Self::PodDisruptionBudget => vec![ApiResource::erase::<PodDisruptionBudget>(&())],
             Self::SecretStore => eso("SecretStore", "secretstores"),
             Self::ClusterSecretStore => eso("ClusterSecretStore", "clustersecretstores"),
+            Self::Event => vec![ApiResource::erase::<k8s_openapi::api::core::v1::Event>(&())],
         }
     }
 

@@ -1587,6 +1587,21 @@ fn event_last_seen(e: &Event) -> Option<chrono::DateTime<Utc>> {
         .or_else(|| e.first_timestamp.as_ref().map(|t| t.0))
 }
 
+/// Who reported an event: `events.k8s.io`'s reporting controller and
+/// instance where set, else core/v1's source component and host.
+fn event_source(e: &Event) -> String {
+    let join = |component: Option<&String>, host: Option<&String>| match (component.filter(|c| !c.is_empty()), host.filter(|h| !h.is_empty())) {
+        (Some(c), Some(h)) => format!("{c} on {h}"),
+        (Some(c), None) => c.clone(),
+        (None, Some(h)) => h.clone(),
+        (None, None) => String::new(),
+    };
+    match join(e.reporting_component.as_ref(), e.reporting_instance.as_ref()) {
+        s if !s.is_empty() => s,
+        _ => join(e.source.as_ref().and_then(|s| s.component.as_ref()), e.source.as_ref().and_then(|s| s.host.as_ref())),
+    }
+}
+
 pub(crate) fn event_to_info(e: Event) -> EventInfo {
     let o = &e.involved_object;
     EventInfo {
@@ -1596,6 +1611,17 @@ pub(crate) fn event_to_info(e: Event) -> EventInfo {
         object_kind: o.kind.clone().unwrap_or_default(),
         object_namespace: o.namespace.clone().unwrap_or_default(),
         object_name: o.name.clone().unwrap_or_default(),
+        object_uid: o.uid.clone().unwrap_or_default(),
+        name: e.metadata.name.clone().unwrap_or_default(),
+        first_seen: e.first_timestamp.as_ref().map(|t| t.0).or_else(|| e.event_time.as_ref().map(|t| t.0)).map(|t| t.to_rfc3339()),
+        source: event_source(&e),
+        field_path: o.field_path.clone().unwrap_or_default(),
+        action: e.action.clone().unwrap_or_default(),
+        related: e
+            .related
+            .as_ref()
+            .map(|r| format!("{}/{}", r.kind.clone().unwrap_or_default(), r.name.clone().unwrap_or_default()))
+            .unwrap_or_default(),
         reason: e.reason.clone().unwrap_or_default(),
         message: e.message.clone().unwrap_or_default(),
         event_type: e.type_.clone().unwrap_or_default(),
@@ -1634,6 +1660,39 @@ pub async fn get_events(context_name: &str, warnings_only: bool) -> Result<Vec<E
         .take(300)
         .map(event_to_info)
         .collect())
+}
+
+/// Every event about one object, of any kind, newest first.
+///
+/// Matched on the object's UID when it is known, as well as kind and name:
+/// a deleted and recreated object of the same name is a different object,
+/// and its predecessor's events can still be retained.
+///
+/// Filtered by the API server on `involvedObject` field selectors rather than
+/// by listing the whole cluster's events and matching here: on a busy
+/// private-link cluster that full list takes a quarter of a minute, and an
+/// event panel asks for this as soon as it opens. A namespaced object's events
+/// live in its namespace, so that list is namespaced too; a cluster-scoped
+/// object's events are recorded wherever the reporting component put them.
+pub async fn get_object_events(context_name: &str, kind: &str, namespace: &str, name: &str, uid: &str) -> Result<Vec<EventInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    let mut fields = format!("involvedObject.kind={kind},involvedObject.name={name}");
+    if !uid.is_empty() {
+        fields.push_str(&format!(",involvedObject.uid={uid}"));
+    }
+    let api: Api<Event> = if namespace.is_empty() {
+        Api::all(client)
+    } else {
+        fields.push_str(&format!(",involvedObject.namespace={namespace}"));
+        Api::namespaced(client, namespace)
+    };
+    let mut items = api
+        .list(&ListParams::default().fields(&fields))
+        .await
+        .map_err(|e| format!("Failed to list events for {kind}/{name}: {e}"))?
+        .items;
+    items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+    Ok(items.into_iter().map(event_to_info).collect())
 }
 
 /// Unlike `get_events`, filters by involved-object *before* the top-300 cap
@@ -5031,6 +5090,83 @@ mod tests {
         assert_eq!(scan.examined, scan.candidates);
     }
 
+    /// Opens the newest events the way the panel does: each one's siblings
+    /// and its own YAML. Prints counts only.
+    ///
+    ///   EVENT_DETAIL_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml event_detail_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set EVENT_DETAIL_TEST_CONTEXT to run"]
+    async fn event_detail_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("EVENT_DETAIL_TEST_CONTEXT") else { return };
+        let events = get_events(&ctx, false).await.expect("events");
+        // One full list, to check the server-side object filter against a client-side match.
+        let client = client_for_context(&ctx).await.expect("client");
+        let all = list_events_sorted(&client).await.expect("all events");
+        let (mut opened, mut with_source, mut with_field, mut siblings, mut gone, mut mismatched) = (0, 0, 0, 0, 0, 0);
+        for e in events.iter().take(20) {
+            assert!(!e.name.is_empty(), "every event carries its name");
+            let same = get_object_events(&ctx, &e.object_kind, &e.object_namespace, &e.object_name, &e.object_uid).await.expect("object events");
+            // An event can expire between the list and this call; that is not a failure.
+            if !same.iter().any(|x| x.name == e.name) {
+                gone += 1;
+                continue;
+            }
+            siblings += same.len() - 1;
+            let expected = all
+                .iter()
+                .filter(|x| {
+                    let o = &x.involved_object;
+                    o.kind.as_deref() == Some(e.object_kind.as_str())
+                        && o.name.as_deref() == Some(e.object_name.as_str())
+                        && (e.object_uid.is_empty() || o.uid.as_deref() == Some(e.object_uid.as_str()))
+                        && (e.object_namespace.is_empty() || o.namespace.as_deref().unwrap_or_default() == e.object_namespace)
+                })
+                .count();
+            // Events keep arriving between the two lists, so a small drift is not a fault.
+            mismatched += usize::from(expected.abs_diff(same.len()) > 2);
+            match crate::resources::get_resource_manifest(&ctx, "Event", &e.namespace, &e.name).await {
+                Ok(_) => opened += 1,
+                Err(err) if err.contains("not found") => gone += 1,
+                Err(err) => panic!("manifest: {err}"),
+            }
+            with_source += usize::from(!e.source.is_empty());
+            with_field += usize::from(!e.field_path.is_empty());
+        }
+        println!(
+            "events={} opened={opened} with_source={with_source} with_field_path={with_field} siblings={siblings} expired_meanwhile={gone} filter_mismatches={mismatched}",
+            events.len()
+        );
+        assert_eq!(mismatched, 0, "the field-selector filter disagrees with a client-side match");
+    }
+
+    #[test]
+    fn an_event_names_its_source_field_and_first_sighting() {
+        let core: Event = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api-x.1", "namespace": "prod" },
+            "involvedObject": { "apiVersion": "v1", "kind": "Pod", "namespace": "prod", "name": "api-x", "fieldPath": "spec.containers{api}" },
+            "source": { "component": "kubelet", "host": "aks-node-1" },
+            "firstTimestamp": "2026-10-10T08:00:00Z", "lastTimestamp": "2026-10-10T09:00:00Z", "count": 12,
+            "reason": "BackOff", "type": "Warning"
+        }))
+        .unwrap();
+        let i = event_to_info(core);
+        assert_eq!((i.source.as_str(), i.field_path.as_str()), ("kubelet on aks-node-1", "spec.containers{api}"));
+        assert_eq!(i.first_seen.as_deref(), Some("2026-10-10T08:00:00+00:00"));
+        // events.k8s.io reports through reportingController/Instance and sets an action and related object.
+        let modern: Event = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api-x.2", "namespace": "prod" },
+            "involvedObject": { "kind": "Pod", "name": "api-x" },
+            "reportingComponent": "default-scheduler", "reportingInstance": "",
+            "action": "Scheduling", "related": { "kind": "Node", "name": "aks-node-2" },
+            "eventTime": "2026-10-10T08:30:00.000000Z", "reason": "Scheduled", "type": "Normal"
+        }))
+        .unwrap();
+        let m = event_to_info(modern);
+        assert_eq!((m.source.as_str(), m.action.as_str(), m.related.as_str()), ("default-scheduler", "Scheduling", "Node/aks-node-2"));
+        assert!(m.first_seen.as_deref().is_some_and(|t| t.starts_with("2026-10-10T08:30:00")));
+    }
+
     #[test]
     fn an_event_carries_its_object_structured() {
         let e: Event = serde_json::from_value(serde_json::json!({
@@ -5042,5 +5178,6 @@ mod tests {
         let i = event_to_info(e);
         assert_eq!(i.involved_object, "Deployment/api");
         assert_eq!((i.object_api_version.as_str(), i.object_kind.as_str(), i.object_namespace.as_str(), i.object_name.as_str()), ("apps/v1", "Deployment", "prod", "api"));
+        assert_eq!(i.name, "x.1");
     }
 }
