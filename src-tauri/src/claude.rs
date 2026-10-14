@@ -30,8 +30,10 @@ const DIAGNOSE_EFFORT: &str = "high";
 const DIAGNOSE_SYSTEM: &str = "\
 You diagnose failing Kubernetes pods for an experienced SRE.
 
-You are given a pod's status, its recent events, its manifest, and recent \
-container logs. Respond with:
+You are given a pod's status, its recent events, its manifest, recent \
+container logs, and — when the container has restarted — the logs of its \
+previous instance, which is usually where the crash itself is written. \
+Respond with:
 1. The most likely root cause, stated plainly.
 2. The specific evidence that points there — cite the event, log line, or \
 manifest field.
@@ -51,7 +53,8 @@ DaemonSets) for an experienced SRE.
 
 You are given the controller's replica counts, its recent events, its \
 manifest, a table of every pod it owns, and the events and recent logs of \
-the pod least likely to be healthy. Respond with:
+the pod least likely to be healthy — with its previous instance's logs when \
+it has restarted, usually where the crash itself is written. Respond with:
 1. The most likely root cause, stated plainly.
 2. The specific evidence that points there — cite the event, log line, pod \
 row, or manifest field.
@@ -849,7 +852,7 @@ pub async fn build_workload_diagnosis_payload(
         Err(e) => format!("(events unavailable: {e})"),
     };
 
-    let (manifest_text, container) = match manifest {
+    let (manifest_text, first_container) = match manifest {
         Ok(m) => {
             let container = m.containers.first().cloned().unwrap_or_default();
             (m.yaml_without_managed_fields, container)
@@ -874,10 +877,19 @@ pub async fn build_workload_diagnosis_payload(
     // the pod underneath carries "BackOff ×945" — the single most diagnostic
     // line available. Verified against a real crashlooping Deployment.
     let worst = owned.first();
-    let (logs, pod_events) = match worst {
+    // The worst pod's failing container, not the template's first: with a
+    // healthy sidecar listed first, its logs explain nothing and it has no
+    // previous instance, so a crash in the app container would read as "has
+    // not restarted". The first container only for a pod with nothing failing.
+    let container = worst
+        .and_then(|w| w.failure_container.clone())
+        .filter(|c| !c.is_empty())
+        .unwrap_or(first_container);
+    let (logs, previous, pod_events) = match worst {
         Some(worst) => {
-            // `container` is empty only when the manifest read failed, in which
-            // case there is nothing to ask the log endpoint for.
+            // `container` is empty only when the pod names no failing container
+            // and the manifest read failed, in which case there is nothing to
+            // ask the log endpoint for.
             let logs_fut = async {
                 if container.is_empty() {
                     None
@@ -895,14 +907,22 @@ pub async fn build_workload_diagnosis_payload(
                     )
                 }
             };
+            let previous_fut = async {
+                if container.is_empty() {
+                    None
+                } else {
+                    Some(k8s::get_previous_pod_logs(context_name, namespace, &worst.name, &container, DIAGNOSE_LOG_FETCH_LINES).await)
+                }
+            };
             let events_fut = k8s::get_pod_events(context_name, namespace, &worst.name);
-            let (logs, events) = tokio::join!(logs_fut, events_fut);
-            (logs, Some(events))
+            let (logs, previous, events) = tokio::join!(logs_fut, previous_fut, events_fut);
+            (logs, previous, Some(events))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
+    let previous_logs = previous.map(previous_logs_section);
 
-    let (logs_text, log_note, log_source) = match (worst, logs) {
+    let (logs_text, current_note, log_source) = match (worst, logs) {
         (Some(worst), Some(Ok(text))) if text.trim().is_empty() => {
             ("(container produced no log output)".to_string(), None, Some(worst.name.clone()))
         }
@@ -934,9 +954,12 @@ pub async fn build_workload_diagnosis_payload(
     let pod_events_r = redact::redact(&pod_events_text);
     let manifest_r = redact::redact(&manifest_text);
     let logs_r = redact::redact(&logs_text);
+    let previous_r = previous_logs.as_ref().map(|p| redact::redact(&p.text));
 
-    let redaction_summary =
-        redact::Redacted::merge([&status, &pods_r, &events_r, &pod_events_r, &manifest_r, &logs_r]).summary();
+    let mut parts = vec![&status, &pods_r, &events_r, &pod_events_r, &manifest_r, &logs_r];
+    parts.extend(previous_r.as_ref());
+    let redaction_summary = redact::Redacted::merge(parts).summary();
+    let log_note = combine_log_notes(current_note.clone(), previous_logs.as_ref());
 
     let log_heading = match (&log_source, &container) {
         (Some(pod), c) if !c.is_empty() => format!(" (pod {pod}, container {c})"),
@@ -950,7 +973,7 @@ pub async fn build_workload_diagnosis_payload(
          ## Events ({kind})\n{}\n\n\
          ## Events (worst pod{})\n{}\n\n\
          ## Manifest\n```yaml\n{}\n```\n\n\
-         ## Logs{}{}\n```\n{}\n```",
+         ## Logs{}{}\n```\n{}\n```{}",
         status.text,
         pods_r.text,
         events_r.text,
@@ -958,8 +981,13 @@ pub async fn build_workload_diagnosis_payload(
         pod_events_r.text,
         manifest_r.text,
         log_heading,
-        log_note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default(),
+        current_note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default(),
         logs_r.text,
+        previous_logs
+            .as_ref()
+            .zip(previous_r.as_ref())
+            .map(|(p, r)| previous_logs_markdown(p, r, None))
+            .unwrap_or_default(),
     );
 
     Ok(ClaudeDiagnosisPayload {
@@ -999,13 +1027,32 @@ pub async fn build_diagnosis_payload(
             Some(k8s::get_pod_logs(context_name, namespace, pod_name, container, true, DIAGNOSE_LOG_FETCH_LINES).await)
         }
     };
+    // Alongside, not after: whether there is a previous instance is only known
+    // by asking, and a crash loop's current instance may hold nothing yet.
+    let previous_fut = async {
+        if container.is_empty() {
+            None
+        } else {
+            Some(k8s::get_previous_pod_logs(context_name, namespace, pod_name, container, DIAGNOSE_LOG_FETCH_LINES).await)
+        }
+    };
 
-    let (pods, events, manifest, logs) = tokio::join!(
+    let (pods, events, manifest, logs, previous) = tokio::join!(
         k8s::get_pods(context_name, Some(namespace.to_string())),
         k8s::get_pod_events(context_name, namespace, pod_name),
         k8s::get_pod_manifest(context_name, namespace, pod_name),
         logs_fut,
+        previous_fut,
     );
+    // How the previous instance ended, for its section's heading.
+    let last_exit = manifest.as_ref().ok().and_then(|m| {
+        m.detail
+            .containers
+            .iter()
+            .chain(m.detail.init_containers.iter())
+            .find(|c| c.name == container)
+            .map(|c| last_exit_text(&c.last_reason, c.last_exit_code, c.last_finished.as_deref()))
+    });
 
     let status = pods
         .ok()
@@ -1044,8 +1091,9 @@ pub async fn build_diagnosis_payload(
         Ok(m) => m.yaml_without_managed_fields,
         Err(e) => format!("(manifest unavailable: {e})"),
     };
+    let previous_logs = previous.map(previous_logs_section);
 
-    let (logs_text, log_note) = match logs {
+    let (logs_text, current_note) = match logs {
         // An evicted pod belongs to no container, so nothing was asked for
         // logs. Saying so is not the same as saying a container was silent.
         None => (
@@ -1063,8 +1111,12 @@ pub async fn build_diagnosis_payload(
     let events_r = redact::redact(&events_text);
     let manifest_r = redact::redact(&manifest_text);
     let logs_r = redact::redact(&logs_text);
+    let previous_r = previous_logs.as_ref().map(|p| redact::redact(&p.text));
 
-    let redaction_summary = redact::Redacted::merge([&status, &events_r, &manifest_r, &logs_r]).summary();
+    let mut parts = vec![&status, &events_r, &manifest_r, &logs_r];
+    parts.extend(previous_r.as_ref());
+    let redaction_summary = redact::Redacted::merge(parts).summary();
+    let log_note = combine_log_notes(current_note.clone(), previous_logs.as_ref());
 
     let container_note = if container.is_empty() {
         String::new()
@@ -1077,12 +1129,17 @@ pub async fn build_diagnosis_payload(
          ## Status\n{}\n\n\
          ## Events\n{}\n\n\
          ## Manifest\n```yaml\n{}\n```\n\n\
-         ## Logs{}\n```\n{}\n```",
+         ## Logs{}\n```\n{}\n```{}",
         status.text,
         events_r.text,
         manifest_r.text,
-        log_note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default(),
+        current_note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default(),
         logs_r.text,
+        previous_logs
+            .as_ref()
+            .zip(previous_r.as_ref())
+            .map(|(p, r)| previous_logs_markdown(p, r, last_exit.as_deref()))
+            .unwrap_or_default(),
     );
 
     Ok(ClaudeDiagnosisPayload {
@@ -1091,6 +1148,58 @@ pub async fn build_diagnosis_payload(
         redaction_summary,
         log_note,
     })
+}
+
+/// How a container's previous instance ended: `OOMKilled, exit code 137, 2026-10-12T08:00:00Z`.
+fn last_exit_text(reason: &str, code: Option<i32>, finished: Option<&str>) -> String {
+    [
+        Some(reason.to_string()).filter(|r| !r.is_empty()),
+        code.map(|c| format!("exit code {c}")),
+        finished.map(|f| format!("finished {f}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// The previous instance's logs, trimmed like the current ones, or why there are none.
+struct PreviousLogs {
+    text: String,
+    /// The trim, when there was one.
+    note: Option<String>,
+    /// There was a previous instance to read.
+    present: bool,
+}
+
+fn previous_logs_section(fetched: Result<Option<String>, String>) -> PreviousLogs {
+    match fetched {
+        Ok(None) => PreviousLogs { text: "(no previous instance — the container has not restarted)".to_string(), note: None, present: false },
+        Ok(Some(t)) if t.trim().is_empty() => PreviousLogs { text: "(the previous instance produced no log output)".to_string(), note: None, present: true },
+        Ok(Some(t)) => {
+            let (text, note) = redact::tail_lines(&t, DIAGNOSE_LOG_LINES);
+            PreviousLogs { text, note, present: true }
+        }
+        Err(e) => PreviousLogs { text: format!("(previous logs unavailable: {e})"), note: None, present: false },
+    }
+}
+
+fn previous_logs_markdown(p: &PreviousLogs, redacted: &redact::Redacted, last_exit: Option<&str>) -> String {
+    let exit = last_exit.filter(|e| !e.is_empty()).map(|e| format!(" — it ended: {e}")).unwrap_or_default();
+    let trim = p.note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default();
+    format!("\n\n## Logs of the previous instance{exit}{trim}\n```\n{}\n```", redacted.text)
+}
+
+/// The preview's one line about logs, covering both instances.
+fn combine_log_notes(current: Option<String>, previous: Option<&PreviousLogs>) -> Option<String> {
+    let previous = previous.filter(|p| p.present).map(|p| match &p.note {
+        Some(n) => format!("previous instance included, {n}"),
+        None => "previous instance included".to_string(),
+    });
+    match (current, previous) {
+        (Some(c), Some(p)) => Some(format!("{c}; {p}")),
+        (c, p) => c.or(p),
+    }
 }
 
 /// Rough token estimate for the payload preview — ~4 characters per token.
@@ -1629,5 +1738,126 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.starts_with(&format!("{} pod(s), 1 not running cleanly", DIAGNOSE_NODE_PODS + 1)), "{out}");
         assert!(out.contains("ns/crashing  CrashLoopBackOff"), "{out}");
         assert!(out.contains("… and 1 more"), "{out}");
+    }
+
+    #[test]
+    fn the_kubelets_no_previous_instance_reply_is_recognised() {
+        assert!(k8s::is_no_previous_instance(r#"previous terminated container "api" in pod "api-x" not found"#));
+        assert!(!k8s::is_no_previous_instance("container \"api\" in pod \"api-x\" is waiting to start: ContainerCreating"));
+    }
+
+    #[test]
+    fn the_previous_instance_is_described_by_how_it_ended() {
+        assert_eq!(last_exit_text("OOMKilled", Some(137), Some("2026-10-12T08:00:00Z")), "OOMKilled, exit code 137, finished 2026-10-12T08:00:00Z");
+        assert_eq!(last_exit_text("", Some(1), None), "exit code 1");
+        assert_eq!(last_exit_text("", None, None), "");
+    }
+
+    #[test]
+    fn a_previous_instance_is_trimmed_and_disclosed_and_an_absent_one_said_so() {
+        let long: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+        let p = previous_logs_section(Ok(Some(long)));
+        assert!(p.present);
+        assert_eq!(p.text.lines().count(), DIAGNOSE_LOG_LINES);
+        assert!(p.text.ends_with("line 500"));
+        assert_eq!(combine_log_notes(None, Some(&p)).as_deref(), Some("previous instance included, showing the last 200 of 500 lines"));
+
+        let none = previous_logs_section(Ok(None));
+        assert!(!none.present);
+        assert!(none.text.contains("has not restarted"));
+        // No previous instance adds nothing to the preview's note.
+        assert_eq!(combine_log_notes(Some("showing the last 200 of 400 lines".into()), Some(&none)).as_deref(), Some("showing the last 200 of 400 lines"));
+
+        let md = previous_logs_markdown(&p, &redact::redact(&p.text), Some("OOMKilled, exit code 137"));
+        assert!(md.starts_with("\n\n## Logs of the previous instance — it ended: OOMKilled, exit code 137 (showing the last 200 of 500 lines)"), "{md}");
+    }
+
+    /// Builds real pod diagnoses for restarted and never-restarted pods and
+    /// checks the previous instance's section. Prints counts only — no
+    /// names, logs or prompt text.
+    ///
+    ///   POD_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml pod_diagnosis_previous_logs_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set POD_DIAG_TEST_CONTEXT to run"]
+    async fn pod_diagnosis_previous_logs_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("POD_DIAG_TEST_CONTEXT") else { return };
+        let pods = k8s::get_pods(&ctx, None).await.expect("pods");
+        let (mut restarted_with_section, mut restarted_without, mut fresh_said_so, mut fresh_wrong) = (0, 0, 0, 0);
+        let restarted = pods.iter().filter(|p| p.restarts > 0).take(5);
+        let fresh = pods.iter().filter(|p| p.restarts == 0 && p.phase == "Running").take(3);
+        for p in restarted.chain(fresh) {
+            let manifest = k8s::get_pod_manifest(&ctx, &p.namespace, &p.name).await.expect("manifest");
+            // The container that restarted, else the first.
+            let container = manifest
+                .detail
+                .containers
+                .iter()
+                .find(|c| c.restart_count > 0)
+                .or(manifest.detail.containers.first())
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let restarted = manifest.detail.containers.iter().any(|c| c.name == container && c.restart_count > 0);
+            let payload = build_diagnosis_payload(&ctx, &p.namespace, &p.name, &container).await.expect("payload");
+            // The header alone proves nothing: it is also written when there is
+            // no previous instance or the fetch failed. The note is set only
+            // when one was read.
+            let has_previous = payload.log_note.as_deref().is_some_and(|n| n.contains("previous instance included"));
+            let said_none = payload.prompt.contains("has not restarted");
+            if restarted {
+                if has_previous { restarted_with_section += 1 } else { restarted_without += 1 }
+            } else if said_none {
+                fresh_said_so += 1
+            } else {
+                fresh_wrong += 1
+            }
+        }
+        println!("restarted_with_previous_logs={restarted_with_section} restarted_without={restarted_without} fresh_said_none={fresh_said_so} fresh_wrong={fresh_wrong}");
+        assert!(restarted_with_section > 0, "no restarted pod to check");
+        assert!(fresh_said_so > 0, "no never-restarted pod to check");
+        assert_eq!(restarted_without, 0);
+        assert_eq!(fresh_wrong, 0);
+    }
+
+    /// Builds workload diagnoses for unhealthy workloads and checks the logs
+    /// come from the worst pod's failing container, not the template's first.
+    /// Prints counts only.
+    ///
+    ///   WORKLOAD_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml workload_diagnosis_reads_the_failing_container_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set WORKLOAD_DIAG_TEST_CONTEXT to run"]
+    async fn workload_diagnosis_reads_the_failing_container_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("WORKLOAD_DIAG_TEST_CONTEXT") else { return };
+        let (workloads, pods) = tokio::join!(k8s::get_workloads(&ctx), k8s::get_pods(&ctx, None));
+        let (workloads, pods) = (workloads.expect("workloads"), pods.expect("pods"));
+        let (mut checked, mut matched, mut not_first, mut wrong) = (0, 0, 0, 0);
+        for w in workloads.iter().filter(|w| !w.healthy).take(10) {
+            let payload = build_workload_diagnosis_payload(&ctx, &w.kind, &w.namespace, &w.name).await.expect("payload");
+            // "## Logs (pod <pod>, container <container>)"
+            let Some(heading) = payload.prompt.lines().find(|l| l.starts_with("## Logs (pod ")) else { continue };
+            let Some((pod, rest)) = heading["## Logs (pod ".len()..].split_once(", container ") else { continue };
+            let container = rest.split(')').next().unwrap_or_default();
+            let Some(failing) = pods
+                .iter()
+                .find(|p| p.namespace == w.namespace && p.name == pod)
+                .and_then(|p| p.failure_container.as_deref())
+            else {
+                continue;
+            };
+            checked += 1;
+            if container == failing {
+                matched += 1;
+                let manifest = k8s::get_workload_manifest(&ctx, &w.kind, &w.namespace, &w.name).await.expect("manifest");
+                if manifest.containers.first().map(String::as_str) != Some(failing) {
+                    not_first += 1
+                }
+            } else {
+                wrong += 1
+            }
+        }
+        println!("checked={checked} matched={matched} failing_was_not_first={not_first} wrong={wrong}");
+        assert!(checked > 0, "no unhealthy workload with a failing container to check");
+        assert_eq!(wrong, 0);
     }
 }
