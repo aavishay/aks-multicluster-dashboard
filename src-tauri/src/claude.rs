@@ -852,7 +852,7 @@ pub async fn build_workload_diagnosis_payload(
         Err(e) => format!("(events unavailable: {e})"),
     };
 
-    let (manifest_text, container) = match manifest {
+    let (manifest_text, first_container) = match manifest {
         Ok(m) => {
             let container = m.containers.first().cloned().unwrap_or_default();
             (m.yaml_without_managed_fields, container)
@@ -877,10 +877,19 @@ pub async fn build_workload_diagnosis_payload(
     // the pod underneath carries "BackOff ×945" — the single most diagnostic
     // line available. Verified against a real crashlooping Deployment.
     let worst = owned.first();
+    // The worst pod's failing container, not the template's first: with a
+    // healthy sidecar listed first, its logs explain nothing and it has no
+    // previous instance, so a crash in the app container would read as "has
+    // not restarted". The first container only for a pod with nothing failing.
+    let container = worst
+        .and_then(|w| w.failure_container.clone())
+        .filter(|c| !c.is_empty())
+        .unwrap_or(first_container);
     let (logs, previous, pod_events) = match worst {
         Some(worst) => {
-            // `container` is empty only when the manifest read failed, in which
-            // case there is nothing to ask the log endpoint for.
+            // `container` is empty only when the pod names no failing container
+            // and the manifest read failed, in which case there is nothing to
+            // ask the log endpoint for.
             let logs_fut = async {
                 if container.is_empty() {
                     None
@@ -1790,7 +1799,10 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
                 .unwrap_or_default();
             let restarted = manifest.detail.containers.iter().any(|c| c.name == container && c.restart_count > 0);
             let payload = build_diagnosis_payload(&ctx, &p.namespace, &p.name, &container).await.expect("payload");
-            let has_previous = payload.prompt.contains("## Logs of the previous instance");
+            // The header alone proves nothing: it is also written when there is
+            // no previous instance or the fetch failed. The note is set only
+            // when one was read.
+            let has_previous = payload.log_note.as_deref().is_some_and(|n| n.contains("previous instance included"));
             let said_none = payload.prompt.contains("has not restarted");
             if restarted {
                 if has_previous { restarted_with_section += 1 } else { restarted_without += 1 }
@@ -1801,6 +1813,51 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             }
         }
         println!("restarted_with_previous_logs={restarted_with_section} restarted_without={restarted_without} fresh_said_none={fresh_said_so} fresh_wrong={fresh_wrong}");
+        assert!(restarted_with_section > 0, "no restarted pod to check");
+        assert!(fresh_said_so > 0, "no never-restarted pod to check");
+        assert_eq!(restarted_without, 0);
         assert_eq!(fresh_wrong, 0);
+    }
+
+    /// Builds workload diagnoses for unhealthy workloads and checks the logs
+    /// come from the worst pod's failing container, not the template's first.
+    /// Prints counts only.
+    ///
+    ///   WORKLOAD_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml workload_diagnosis_reads_the_failing_container_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set WORKLOAD_DIAG_TEST_CONTEXT to run"]
+    async fn workload_diagnosis_reads_the_failing_container_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("WORKLOAD_DIAG_TEST_CONTEXT") else { return };
+        let (workloads, pods) = tokio::join!(k8s::get_workloads(&ctx), k8s::get_pods(&ctx, None));
+        let (workloads, pods) = (workloads.expect("workloads"), pods.expect("pods"));
+        let (mut checked, mut matched, mut not_first, mut wrong) = (0, 0, 0, 0);
+        for w in workloads.iter().filter(|w| !w.healthy).take(10) {
+            let payload = build_workload_diagnosis_payload(&ctx, &w.kind, &w.namespace, &w.name).await.expect("payload");
+            // "## Logs (pod <pod>, container <container>)"
+            let Some(heading) = payload.prompt.lines().find(|l| l.starts_with("## Logs (pod ")) else { continue };
+            let Some((pod, rest)) = heading["## Logs (pod ".len()..].split_once(", container ") else { continue };
+            let container = rest.split(')').next().unwrap_or_default();
+            let Some(failing) = pods
+                .iter()
+                .find(|p| p.namespace == w.namespace && p.name == pod)
+                .and_then(|p| p.failure_container.as_deref())
+            else {
+                continue;
+            };
+            checked += 1;
+            if container == failing {
+                matched += 1;
+                let manifest = k8s::get_workload_manifest(&ctx, &w.kind, &w.namespace, &w.name).await.expect("manifest");
+                if manifest.containers.first().map(String::as_str) != Some(failing) {
+                    not_first += 1
+                }
+            } else {
+                wrong += 1
+            }
+        }
+        println!("checked={checked} matched={matched} failing_was_not_first={not_first} wrong={wrong}");
+        assert!(checked > 0, "no unhealthy workload with a failing container to check");
+        assert_eq!(wrong, 0);
     }
 }
