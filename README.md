@@ -167,13 +167,16 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, workload, pod, Argo CD application or Helm release can be diagnosed
-by an AI model: open it and click **Diagnose** in its panel, or press `⌘D` on
-a focused row. The app gathers the status, events and manifest behind it —
-plus recent logs for a pod, and the logs of its previous instance when the
-container has restarted, which is usually where a crash loop's crash is
-written — and shows you exactly what will be sent, with a
-summary of what was redacted. Nothing leaves the machine until you confirm.
+Any node, NAP NodePool, workload, pod, Argo CD application or Helm release
+can be diagnosed by an AI model: open it and click **Diagnose** in its panel,
+or press `⌘D` on a focused row. The app gathers the status, events and
+manifest behind it — plus recent logs for a pod, and the logs of its previous
+instance when the container has restarted, which is usually where a crash
+loop's crash is written; for a NodePool, its NodeClaims worst first with the
+state of each one's node, the events on them, the pods Karpenter could not
+place on the pool and why, and its node class — and shows you exactly what
+will be sent, with a summary of what was redacted. Nothing leaves the machine
+until you confirm.
 
 It works with Claude, Gemini, or a local Ollama. Click the AI button in the
 top bar to choose one and, for Claude or Gemini, paste an API key (from

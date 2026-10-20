@@ -2042,10 +2042,20 @@ async fn list_karpenter(
     kind: &str,
     plural: &str,
 ) -> Result<Option<Vec<DynamicObject>>, String> {
+    list_karpenter_with(client, kind, plural, &ListParams::default()).await
+}
+
+/// `list_karpenter`, narrowed by the caller's selectors.
+async fn list_karpenter_with(
+    client: &Client,
+    kind: &str,
+    plural: &str,
+    params: &ListParams,
+) -> Result<Option<Vec<DynamicObject>>, String> {
     for version in KARPENTER_VERSIONS {
         let ar = karpenter_resource(version, kind, plural);
         let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
-        match api.list(&ListParams::default()).await {
+        match api.list(params).await {
             Ok(list) => return Ok(Some(list.items)),
             Err(kube::Error::Api(resp)) if resp.code == 404 => continue,
             Err(e) => return Err(format!("Failed to list Karpenter {plural}: {e}")),
@@ -2193,6 +2203,141 @@ pub async fn get_nap_node_pool_events(context_name: &str, name: &str) -> Result<
         .filter(|e| e.involved_object.kind.as_deref() == Some("NodePool") && e.involved_object.name.as_deref() == Some(name))
         .map(event_to_info)
         .collect())
+}
+
+/// Everything a NodePool diagnosis reads.
+///
+/// Only the pool itself is required. Each of the rest fails on its own, so a
+/// cluster that refuses one read — RBAC on NodeClaims, say — still gets a
+/// diagnosis that says what it could not see rather than none at all.
+pub struct NapDiagnostics {
+    pub pool: DynamicObject,
+    /// The node class the pool launches from; `None` when it names none.
+    pub node_class: Result<Option<DynamicObject>, String>,
+    pub claims: Result<Vec<DynamicObject>, String>,
+    pub nodes: Result<Vec<Node>, String>,
+    pub pool_events: Result<Vec<EventInfo>, String>,
+    /// Events on this pool's NodeClaims and nodes, newest first.
+    pub member_events: Result<Vec<EventInfo>, String>,
+    /// Scheduling failures whose message names this pool, newest first.
+    pub pod_events: Result<Vec<EventInfo>, String>,
+}
+
+/// Events matching an `involvedObject`/`reason` field selector, newest first.
+///
+/// Field selectors rather than the cluster-wide list `list_events_sorted`
+/// returns: on a busy private-link cluster that list takes a quarter of a
+/// minute, and a NodePool diagnosis needs four slices of it.
+async fn events_matching(client: &Client, fields: &str) -> Result<Vec<Event>, String> {
+    let api: Api<Event> = Api::all(client.clone());
+    let mut items = api
+        .list(&ListParams::default().fields(fields))
+        .await
+        .map_err(|e| format!("Failed to list events ({fields}): {e}"))?
+        .items;
+    items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+    Ok(items)
+}
+
+/// Whether a scheduling failure is about this pool.
+///
+/// Karpenter names the pool it tried in quotes — `incompatible with nodepool
+/// "gpu"`, `exceed limits for nodepool: "default"` — while the scheduler's own
+/// FailedScheduling events name no pool at all. Requiring both the word and
+/// the quoted name keeps a pool called `default` from matching every message
+/// that happens to contain the word.
+pub(crate) fn mentions_node_pool(message: &str, pool: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("nodepool") && message.contains(&format!("\"{pool}\""))
+}
+
+/// The node class a pool's template points at, found by discovery.
+///
+/// Discovered rather than pinned: AKSNodeClass has been served as v1alpha2,
+/// v1beta1 and v1 across the AKS releases this fleet spans, and the reference
+/// carries the group (v1) or an apiVersion (v1beta1) but never a version the
+/// cluster is guaranteed to serve.
+async fn get_node_class(client: &Client, pool: &DynamicObject) -> Result<Option<DynamicObject>, String> {
+    let Some(r) = pool.data.pointer("/spec/template/spec/nodeClassRef") else { return Ok(None) };
+    let (kind, name) = (json_str(Some(r), "kind"), json_str(Some(r), "name"));
+    if kind.is_empty() || name.is_empty() {
+        return Ok(None);
+    }
+    let group = match json_str(Some(r), "group") {
+        "" => json_str(Some(r), "apiVersion").split('/').next().unwrap_or_default(),
+        g => g,
+    };
+    let group = if group.is_empty() { "karpenter.azure.com" } else { group };
+    let served = kube::discovery::oneshot::group(client, group)
+        .await
+        .map_err(|e| format!("Failed to discover {group}: {e}"))?;
+    let (ar, _) = served.recommended_kind(kind).ok_or_else(|| format!("{kind} is not served by {group}"))?;
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+    api.get(name).await.map(Some).map_err(|e| format!("Failed to get {kind} '{name}': {e}"))
+}
+
+pub async fn get_nap_diagnostics(context_name: &str, name: &str) -> Result<NapDiagnostics, String> {
+    let client = client_for_context(context_name).await?;
+    let pool = get_karpenter(&client, "NodePool", "nodepools", name).await?;
+
+    // Karpenter labels every claim and node it launches with its pool, so the
+    // apiserver can narrow both lists rather than this side discarding the
+    // rest of the cluster.
+    let members = ListParams::default().labels(&format!("karpenter.sh/nodepool={name}"));
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let pool_fields = format!("involvedObject.kind=NodePool,involvedObject.name={name}");
+    let (node_class, claims, nodes, pool_events, claim_events, node_events, pod_events) = tokio::join!(
+        get_node_class(&client, &pool),
+        list_karpenter_with(&client, "NodeClaim", "nodeclaims", &members),
+        nodes_api.list(&members),
+        events_matching(&client, &pool_fields),
+        events_matching(&client, "involvedObject.kind=NodeClaim"),
+        events_matching(&client, "involvedObject.kind=Node"),
+        events_matching(&client, "involvedObject.kind=Pod,reason=FailedScheduling"),
+    );
+    let claims = claims.map(Option::unwrap_or_default);
+    let nodes = nodes.map(|l| l.items).map_err(|e| format!("Failed to list nodes of '{name}': {e}"));
+
+    // A claim's node is named on the claim too, so a failed node list still
+    // leaves the node events attributable.
+    let mut member_names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for c in claims.iter().flatten() {
+        member_names.insert(("NodeClaim".into(), c.name_any()));
+        if let Some(n) = c.data.pointer("/status/nodeName").and_then(|v| v.as_str()).filter(|n| !n.is_empty()) {
+            member_names.insert(("Node".into(), n.to_string()));
+        }
+    }
+    for n in nodes.iter().flatten() {
+        member_names.insert(("Node".into(), n.name_any()));
+    }
+    let is_member = |e: &Event| {
+        let o = &e.involved_object;
+        member_names.contains(&(o.kind.clone().unwrap_or_default(), o.name.clone().unwrap_or_default()))
+    };
+    let member_events = match (claim_events, node_events) {
+        (Ok(c), Ok(n)) => {
+            let mut all: Vec<Event> = c.into_iter().chain(n).filter(|e| is_member(e)).collect();
+            all.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+            Ok(all.into_iter().map(event_to_info).collect())
+        }
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    };
+    let pod_events = pod_events.map(|list| {
+        list.into_iter()
+            .filter(|e| mentions_node_pool(e.message.as_deref().unwrap_or_default(), name))
+            .map(event_to_info)
+            .collect()
+    });
+
+    Ok(NapDiagnostics {
+        pool,
+        node_class,
+        claims,
+        nodes,
+        pool_events: pool_events.map(|l| l.into_iter().map(event_to_info).collect()),
+        member_events,
+        pod_events,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3891,6 +4036,16 @@ mod tests {
 
         let app = dynamic_object_to_gitops_app(obj);
         assert_eq!(app.last_synced_at, None);
+    }
+
+    #[test]
+    fn a_scheduling_failure_is_matched_to_the_pool_it_names() {
+        assert!(mentions_node_pool(r#"Failed to schedule pod, incompatible with nodepool "gpu", daemonset overhead={}"#, "gpu"));
+        assert!(mentions_node_pool(r#"all available instance types exceed limits for nodepool: "gpu""#, "gpu"));
+        assert!(mentions_node_pool(r#"incompatible with NodePool "gpu""#, "gpu"));
+        assert!(!mentions_node_pool(r#"incompatible with nodepool "gpu-large""#, "gpu"));
+        assert!(!mentions_node_pool("0/12 nodes are available: 3 Insufficient cpu", "default"));
+        assert!(!mentions_node_pool(r#"volume "default" not found"#, "default"));
     }
 
     #[test]

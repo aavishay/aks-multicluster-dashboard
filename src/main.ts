@@ -5899,6 +5899,7 @@ function setMetricsRange(minutes: number) {
   diagnoseGitOpsApp,
   diagnoseHelmRelease,
   diagnoseNode,
+  diagnoseNapNodePool,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -7089,6 +7090,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Capacity and kubelet details, every condition the cluster reports on it, its taints and events, the pods it is holding, and its manifest without the image cache."
                   : d.kind === "Release"
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
+                  : d.kind === "NodePool"
+                  ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
                   : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
           }</div>
           <div class="${d.payload.redaction_summary.startsWith("Redacted") ? "text-status-warning" : ""}">${esc(d.payload.redaction_summary)}</div>
@@ -8551,6 +8554,14 @@ function diagnoseHelmRelease(ctx: string, namespace: string, name: string) {
  */
 function diagnoseNode(ctx: string, name: string) {
   startDiagnosis(ctx, "Node", "", name, "", () => api.aiBuildNodeDiagnosis(ctx, name));
+}
+
+/**
+ * A Karpenter NodePool. `kind` is "NodePool", which also selects the NAP
+ * system prompt on the Rust side. Cluster-scoped, like a node.
+ */
+function diagnoseNapNodePool(ctx: string, name: string) {
+  startDiagnosis(ctx, "NodePool", "", name, "", () => api.aiBuildNapDiagnosis(ctx, name));
 }
 
 /**
@@ -11031,6 +11042,7 @@ function renderNapDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(nd.ctx)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${claudeDiagnoseButton(`window.__app.diagnoseNapNodePool(${jsArg(nd.ctx)},${jsArg(nd.name)})`, "node pool")}
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeNapDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
@@ -12683,7 +12695,7 @@ function renderNap(): string {
             .map((row) => {
               const { ctx, p } = row;
               return `
-            <tr>
+            <tr data-diagnose-what="nodepool" data-diagnose-ctx="${esc(ctx)}" data-diagnose-name="${esc(p.name)}">
               ${rowCheckboxCell("nap", keyOf(row))}
               <td title="${esc(p.ready ? "Ready" : p.status_reason || "Not ready")}">${statusDot(p.ready)}</td>
               ${
@@ -15688,6 +15700,9 @@ function diagnoseFocusedRow(): boolean {
     case "node":
       diagnoseNode(ctx, name);
       return true;
+    case "nodepool":
+      diagnoseNapNodePool(ctx, name);
+      return true;
     case "pod":
       diagnosePod(ctx, ns, name, d.diagnoseContainer ?? "");
       return true;
@@ -15716,7 +15731,7 @@ function diagnoseFocusedRow(): boolean {
  * free, since a disabled button ignores a click.
  *
  * An open detail panel always wins over the row cursor, including one with
- * nothing to diagnose (NAP, HPA, KEDA): it covers the table, and diagnosing a
+ * nothing to diagnose (HPA, KEDA): it covers the table, and diagnosing a
  * row you cannot see, while a panel for something else is in front of you,
  * would be the wrong subject.
  */

@@ -330,7 +330,7 @@ pub struct WorkloadRevisionInfo {
     pub created_at: Option<String>,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 pub struct EventInfo {
     pub namespace: String,
     /// `Kind/name`, as the table shows and filters it.

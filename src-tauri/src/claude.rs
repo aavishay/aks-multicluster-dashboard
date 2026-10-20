@@ -185,6 +185,56 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_NAP_SYSTEM: &str = "\
+You diagnose Karpenter NodePools (AKS Node Auto Provisioning) for an \
+experienced SRE.
+
+You are given the pool's policy and status — requirements, limits and how \
+much of them is provisioned, disruption settings and budgets — its \
+conditions, every NodeClaim it owns with the state of each claim's node, the \
+events on the pool and on its claims and nodes, the scheduling failures \
+Karpenter reported against this pool, the node class it launches from, and \
+its manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition, the claim, \
+the event, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which failure you are looking at, because each has a different fix:
+- Not provisioning: pods stay pending. Karpenter's scheduling failures say \
+why — the requirements exclude what the pod asks for, a limit is reached \
+(compare provisioned with the limit), or no instance type fits. Azure \
+refusing the VM — quota, a size unavailable in the zone, a subnet out of \
+addresses — shows as a claim that never reaches Launched, and in its events.
+- Not becoming ready: a claim launched but never Registered or Initialized. \
+That is node bootstrap, networking or the image, and the claim's and the \
+node class's conditions usually say which.
+- Not disrupting: drift, expiry or consolidation is due but nodes are held — \
+a budget of zero for that reason, a do-not-disrupt annotation, or a \
+PodDisruptionBudget. Karpenter names the blocker in DisruptionBlocked and \
+Unconsolidatable events; name it too.
+- Churning: nodes replaced over and over — consolidation fighting a workload \
+that scales, or an expireAfter too short for what runs there.
+
+On the pool, its node class and its claims, True is healthy for Ready, \
+Launched, Registered, Initialized and the other *Ready and *Succeeded \
+conditions. Drifted, Empty, Consolidatable and Expired being True marks a \
+claim for replacement: routine on a healthy pool, a problem only when the \
+claim stays that way.
+
+Provisioned is the capacity of the nodes the pool owns, which is what its \
+limits bound — not utilisation. There are no CPU or memory readings here. \
+Pending pods whose failures do not name this pool are not listed, so an empty \
+scheduling section means Karpenter has not blamed this pool for any pod.
+
+Be direct; assume fluency with kubectl and Karpenter. Prefer one \
+well-supported cause over a list of possibilities. If the evidence is \
+genuinely insufficient, say so and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 /// How many drifted resources go into a diagnosis.
 ///
 /// An app with dozens of drifted resources is usually drifted the same way in
@@ -491,6 +541,391 @@ fn node_manifest_without_images(node: &k8s_openapi::api::core::v1::Node) -> Resu
         object.insert("kind".to_string(), serde_json::json!("Node"));
     }
     serde_yaml::to_string(&value).map_err(|e| format!("Failed to render node YAML: {e}"))
+}
+
+/// How many NodeClaims go into a NodePool diagnosis, worst first.
+///
+/// The healthy rest are counted, not listed: a pool of ninety Ready claims
+/// says the same thing in one line as in ninety.
+const DIAGNOSE_NAP_CLAIMS: usize = 30;
+
+/// How many events from the pool's claims and nodes go in, newest first.
+const DIAGNOSE_NAP_MEMBER_EVENTS: usize = 30;
+
+/// How many distinct scheduling failures go in.
+///
+/// Karpenter writes one per pending pod per attempt, near-identical, so they
+/// are collapsed on the message first and this caps the distinct ones.
+const DIAGNOSE_NAP_SCHEDULING: usize = 12;
+
+/// How much of one scheduling failure's message to send. Karpenter appends
+/// the pod's requests and every requirement it compared, which runs long.
+const DIAGNOSE_NAP_MESSAGE_CHARS: usize = 800;
+
+/// Karpenter conditions where True marks a claim for replacement rather than
+/// saying it is healthy. Every other condition — Ready, Launched,
+/// Registered, Initialized, the pool's and the node class's — is healthy
+/// when True, which is also the safer reading of one this list has not
+/// heard of.
+const KARPENTER_MARKING_CONDITIONS: [&str; 5] = ["Drifted", "Empty", "Consolidatable", "Expired", "Disrupting"];
+
+/// A Karpenter object's conditions, split into the ones to read and the ones
+/// that are clear — the same split as `split_node_conditions`, with
+/// Karpenter's polarity.
+fn split_karpenter_conditions(obj: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let mut notable = Vec::new();
+    let mut clear = Vec::new();
+    let conditions = obj.pointer("/status/conditions").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+    for c in &conditions {
+        let field = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+        let (kind, status) = (field("type"), field("status"));
+        let marks = KARPENTER_MARKING_CONDITIONS.contains(&kind);
+        if (marks && status != "True") || (!marks && status == "True") {
+            clear.push(kind.to_string());
+            continue;
+        }
+        let mut line = format!("{kind}={status}");
+        if !field("reason").is_empty() {
+            line.push_str(&format!(" ({})", field("reason")));
+        }
+        if !field("lastTransitionTime").is_empty() {
+            line.push_str(&format!(" since {}", field("lastTransitionTime")));
+        }
+        if !field("message").is_empty() {
+            line.push_str(&format!("\n  {}", field("message")));
+        }
+        notable.push(line);
+    }
+    (notable, clear)
+}
+
+fn render_karpenter_conditions(obj: &serde_json::Value) -> String {
+    let (notable, clear) = split_karpenter_conditions(obj);
+    let mut out = if notable.is_empty() { "(no condition reports a problem)".to_string() } else { notable.join("\n") };
+    if !clear.is_empty() {
+        out.push_str(&format!("\n\nchecked and clear: {}", clear.join(", ")));
+    }
+    out
+}
+
+/// A pool resource as a reader would say it: cores, GiB, or a count.
+fn render_nap_quantity(unit: &str, value: i64) -> String {
+    match unit {
+        "millicores" => format!("{} cores", trim_decimal(value as f64 / 1000.0)),
+        "ki" => format!("{} GiB", trim_decimal(value as f64 / 1_048_576.0)),
+        _ => value.to_string(),
+    }
+}
+
+fn trim_decimal(v: f64) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+}
+
+/// The pool's policy, as the facts a diagnosis turns on.
+fn render_nap_status(detail: &crate::models::NapDetail, nodes: i64) -> String {
+    let or_none = |v: &[String]| if v.is_empty() { "(none)".to_string() } else { v.join(", ") };
+    let mut lines = vec![format!("nodes owned: {nodes}")];
+    for r in &detail.resources {
+        let limit = r.limit.map(|l| render_nap_quantity(&r.unit, l)).unwrap_or_else(|| "no limit".to_string());
+        lines.push(format!("{} provisioned / limit: {} / {limit}", r.name, render_nap_quantity(&r.unit, r.used)));
+    }
+    lines.push(format!("weight: {}", detail.weight.map(|w| w.to_string()).unwrap_or_else(|| "(none)".to_string())));
+    lines.push(format!("node class: {} {}", detail.node_class_kind, detail.node_class_name));
+    lines.push("requirements:".to_string());
+    if detail.requirements.is_empty() {
+        lines.push("  (none)".to_string());
+    }
+    for r in &detail.requirements {
+        let min = r.min_values.map(|m| format!(" (at least {m} values)")).unwrap_or_default();
+        lines.push(format!("  {} {} [{}]{min}", r.key, r.operator, r.values.join(", ")));
+    }
+    lines.push(format!("taints: {}", or_none(&detail.taints)));
+    lines.push(format!("startup taints: {}", or_none(&detail.startup_taints)));
+    lines.push(format!("expire after: {}", detail.expire_after));
+    lines.push(format!(
+        "termination grace period: {}",
+        if detail.termination_grace_period.is_empty() { "(none — a drain may wait forever)" } else { &detail.termination_grace_period }
+    ));
+    lines.push(format!(
+        "consolidation: {}{}",
+        detail.consolidation_policy,
+        if detail.consolidate_after.is_empty() { String::new() } else { format!(" after {}", detail.consolidate_after) }
+    ));
+    lines.push(format!("disruption budgets{}:", if detail.budgets_default { " (none set; Karpenter's default)" } else { "" }));
+    for b in &detail.budgets {
+        let mut line = format!("  nodes {}", b.nodes);
+        if !b.reasons.is_empty() {
+            line.push_str(&format!(" for {}", b.reasons.join(", ")));
+        }
+        if !b.schedule.is_empty() {
+            line.push_str(&format!(", schedule {} for {}", b.schedule, b.duration));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// The pool's NodeClaims, worst first, each with the state of its node.
+///
+/// Pure, and separate, because the ordering is the point: a pool's one stuck
+/// claim must not sit below thirty healthy ones and fall off the cap.
+fn render_nap_claims(
+    claims: &Result<Vec<kube::api::DynamicObject>, String>,
+    nodes: &Result<Vec<k8s_openapi::api::core::v1::Node>, String>,
+) -> String {
+    let claims = match claims {
+        Ok(c) if c.is_empty() => return "(this pool owns no NodeClaims)".to_string(),
+        Ok(c) => c,
+        Err(e) => return format!("(NodeClaims unavailable: {e})"),
+    };
+    let node_state = |name: &str| -> String {
+        let nodes = match nodes {
+            Ok(n) => n,
+            Err(_) => return "node state unknown (nodes could not be listed)".to_string(),
+        };
+        let Some(node) = nodes.iter().find(|n| n.metadata.name.as_deref() == Some(name)) else {
+            return format!("node {name} not found");
+        };
+        let ready = node
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
+            .map(|c| c.status.as_str())
+            .unwrap_or("Unknown");
+        let mut parts = vec![format!("node {name} Ready={ready}")];
+        let spec = node.spec.as_ref();
+        if spec.and_then(|s| s.unschedulable).unwrap_or(false) {
+            parts.push("cordoned".to_string());
+        }
+        for t in spec.and_then(|s| s.taints.as_ref()).into_iter().flatten() {
+            if t.key.starts_with("karpenter.sh/") {
+                parts.push(format!("tainted {}:{}", t.key, t.effect));
+            }
+        }
+        parts.join(", ")
+    };
+
+    let mut rows: Vec<(u8, String)> = claims
+        .iter()
+        .map(|c| {
+            let v = serde_json::to_value(c).unwrap_or_default();
+            let label = |k: &str| c.metadata.labels.as_ref().and_then(|l| l.get(k)).cloned().unwrap_or_default();
+            let (notable, _) = split_karpenter_conditions(&v);
+            let ready = v
+                .pointer("/status/conditions")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.iter().find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready")))
+                .and_then(|c| c.get("status").and_then(|s| s.as_str()))
+                == Some("True");
+            let deleting = c.metadata.deletion_timestamp.as_ref().map(|t| t.0.to_rfc3339());
+            let mut line = format!(
+                "{}  {}  {}  {}",
+                c.metadata.name.clone().unwrap_or_default(),
+                label("node.kubernetes.io/instance-type"),
+                label("karpenter.sh/capacity-type"),
+                label("topology.kubernetes.io/zone"),
+            );
+            if let Some(created) = c.metadata.creation_timestamp.as_ref() {
+                line.push_str(&format!("  created {}", created.0.to_rfc3339()));
+            }
+            if let Some(at) = &deleting {
+                line.push_str(&format!("  TERMINATING since {at}"));
+            }
+            match v.pointer("/status/nodeName").and_then(|n| n.as_str()).filter(|n| !n.is_empty()) {
+                Some(n) => line.push_str(&format!("\n  {}", node_state(n))),
+                None => line.push_str("\n  no node registered"),
+            }
+            for n in &notable {
+                line.push_str(&format!("\n  {}", n.replace('\n', "\n  ")));
+            }
+            // Worst first: not Ready, then terminating, then marked, then fine.
+            let rank = if !ready { 0 } else if deleting.is_some() { 1 } else if !notable.is_empty() { 2 } else { 3 };
+            (rank, line)
+        })
+        .collect();
+    rows.sort_by_key(|(rank, _)| *rank);
+
+    let count = |r: u8| rows.iter().filter(|(rank, _)| *rank == r).count();
+    let mut out = format!(
+        "{} claim(s): {} not Ready, {} terminating, {} marked for replacement, {} Ready with nothing pending",
+        rows.len(),
+        count(0),
+        count(1),
+        count(2),
+        count(3)
+    );
+    for (_, line) in rows.iter().take(DIAGNOSE_NAP_CLAIMS) {
+        out.push_str(&format!("\n{line}"));
+    }
+    if rows.len() > DIAGNOSE_NAP_CLAIMS {
+        out.push_str(&format!("\n… and {} more, all Ready with nothing pending", rows.len() - DIAGNOSE_NAP_CLAIMS));
+    }
+    out
+}
+
+fn render_nap_events(events: &Result<Vec<crate::models::EventInfo>, String>, empty: &str, with_object: bool, cap: usize) -> String {
+    match events {
+        Ok(list) if list.is_empty() => empty.to_string(),
+        Ok(list) => {
+            let mut out = list
+                .iter()
+                .take(cap)
+                .map(|e| {
+                    let object = if with_object { format!(" {}", e.involved_object) } else { String::new() };
+                    format!("[{}] {}{object} — {} (×{})", e.event_type, e.reason, e.message, e.count)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if list.len() > cap {
+                out.push_str(&format!("\n… and {} older", list.len() - cap));
+            }
+            out
+        }
+        Err(e) => format!("(events unavailable: {e})"),
+    }
+}
+
+/// Karpenter's scheduling failures against this pool, collapsed on the message.
+///
+/// One pending pod produces one event per attempt and a scaled-out workload
+/// produces one per pod, all saying the same thing; listed as they come, the
+/// first dozen would be one failure repeated. Collapsed, they read as which
+/// failures there are and how many pods each holds back.
+fn render_nap_scheduling(events: &Result<Vec<crate::models::EventInfo>, String>) -> String {
+    let list = match events {
+        Ok(list) if list.is_empty() => return "(Karpenter reports no pod it could not place on this pool)".to_string(),
+        Ok(list) => list,
+        Err(e) => return format!("(scheduling failures unavailable: {e})"),
+    };
+    // (message, pods, latest, example pod), in order of first sighting — the
+    // list is newest first, so that is also newest first.
+    let mut groups: Vec<(String, std::collections::BTreeSet<String>, Option<String>, String)> = Vec::new();
+    for e in list {
+        let pod = format!("{}/{}", e.object_namespace, e.object_name);
+        match groups.iter_mut().find(|g| g.0 == e.message) {
+            Some(g) => {
+                g.1.insert(pod);
+            }
+            None => groups.push((e.message.clone(), std::iter::once(pod.clone()).collect(), e.last_seen.clone(), pod)),
+        }
+    }
+    let mut out = groups
+        .iter()
+        .take(DIAGNOSE_NAP_SCHEDULING)
+        .map(|(message, pods, latest, example)| {
+            let message = if message.len() > DIAGNOSE_NAP_MESSAGE_CHARS {
+                format!("{} …", truncate_on_char_boundary(message, DIAGNOSE_NAP_MESSAGE_CHARS))
+            } else {
+                message.clone()
+            };
+            format!(
+                "{} pod(s), e.g. {example}{}:\n  {message}",
+                pods.len(),
+                latest.as_ref().map(|t| format!(", latest {t}")).unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if groups.len() > DIAGNOSE_NAP_SCHEDULING {
+        out.push_str(&format!("\n… and {} more distinct failures", groups.len() - DIAGNOSE_NAP_SCHEDULING));
+    }
+    out
+}
+
+/// Assembles everything a NodePool diagnosis needs, redacted.
+///
+/// A pool's own status is the part least likely to explain anything: it
+/// stays Ready while every claim it launches fails to register, and its
+/// limits are reached silently. The claims and Karpenter's scheduling
+/// failures are where provisioning problems show, so they carry the weight.
+pub async fn build_nap_diagnosis_payload(context_name: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_nap_diagnostics(context_name, name).await?;
+    let detail = crate::nap_detail::nap_detail(&d.pool);
+    let pool_value = serde_json::to_value(&d.pool).map_err(|e| format!("Failed to serialise NodePool: {e}"))?;
+    let nodes_owned = pool_value
+        .pointer("/status/resources/nodes")
+        .and_then(|n| n.as_str())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let status = render_nap_status(&detail, nodes_owned);
+    let conditions = render_karpenter_conditions(&pool_value);
+    let claims = render_nap_claims(&d.claims, &d.nodes);
+    let pool_events = render_nap_events(&d.pool_events, "(no events for this NodePool)", false, 25);
+    let member_events = render_nap_events(
+        &d.member_events,
+        "(no events on this pool's claims or nodes)",
+        true,
+        DIAGNOSE_NAP_MEMBER_EVENTS,
+    );
+    let scheduling = render_nap_scheduling(&d.pod_events);
+    let (node_class_heading, node_class_text) = match d.node_class {
+        Ok(Some(nc)) => {
+            let value = serde_json::to_value(&nc).unwrap_or_default();
+            let heading = format!("{} {}", detail.node_class_kind, detail.node_class_name);
+            let yaml = k8s::object_manifest(nc)
+                .map(|m| m.yaml_without_managed_fields)
+                .unwrap_or_else(|e| format!("(could not be rendered: {e})"));
+            (heading, format!("{}\n\n```yaml\n{yaml}\n```", render_karpenter_conditions(&value)))
+        }
+        Ok(None) => ("".to_string(), "(the pool names no node class)".to_string()),
+        Err(e) => (
+            format!("{} {}", detail.node_class_kind, detail.node_class_name),
+            format!("(node class unavailable: {e})"),
+        ),
+    };
+    let manifest = k8s::object_manifest(d.pool)?.yaml_without_managed_fields;
+
+    let status = redact::redact(&status);
+    let conditions_r = redact::redact(&conditions);
+    let claims_r = redact::redact(&claims);
+    let pool_events_r = redact::redact(&pool_events);
+    let member_events_r = redact::redact(&member_events);
+    let scheduling_r = redact::redact(&scheduling);
+    let node_class_r = redact::redact(&node_class_text);
+    let manifest_r = redact::redact(&manifest);
+
+    let redaction_summary = redact::Redacted::merge([
+        &status,
+        &conditions_r,
+        &claims_r,
+        &pool_events_r,
+        &member_events_r,
+        &scheduling_r,
+        &node_class_r,
+        &manifest_r,
+    ])
+    .summary();
+
+    let prompt = format!(
+        "NodePool {name}.\n\n\
+         ## Policy and status\n{}\n\n\
+         ## Conditions\n{}\n\n\
+         ## NodeClaims (worst first)\n{}\n\n\
+         ## Events (NodePool)\n{}\n\n\
+         ## Events (its claims and nodes)\n{}\n\n\
+         ## Pods Karpenter could not place on this pool\n{}\n\n\
+         ## Node class{}\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        status.text,
+        conditions_r.text,
+        claims_r.text,
+        pool_events_r.text,
+        member_events_r.text,
+        scheduling_r.text,
+        if node_class_heading.is_empty() { String::new() } else { format!(" ({node_class_heading})") },
+        node_class_r.text,
+        manifest_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
 }
 
 /// How many resources from a release's inventory go into a diagnosis.
@@ -1225,6 +1660,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Application" => DIAGNOSE_GITOPS_SYSTEM,
         "Release" => DIAGNOSE_HELM_SYSTEM,
         "Node" => DIAGNOSE_NODE_SYSTEM,
+        "NodePool" => DIAGNOSE_NAP_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -1772,6 +2208,136 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(md.starts_with("\n\n## Logs of the previous instance — it ended: OOMKilled, exit code 137 (showing the last 200 of 500 lines)"), "{md}");
     }
 
+    fn claim(name: &str, conditions: serde_json::Value, node: Option<&str>, deleting: bool) -> kube::api::DynamicObject {
+        let mut obj: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "karpenter.sh/v1",
+            "kind": "NodeClaim",
+            "metadata": {
+                "name": name,
+                "labels": {
+                    "node.kubernetes.io/instance-type": "Standard_D4s_v5",
+                    "karpenter.sh/capacity-type": "spot",
+                    "topology.kubernetes.io/zone": "westeurope-1"
+                }
+            },
+            "status": { "conditions": conditions, "nodeName": node }
+        }))
+        .unwrap();
+        if deleting {
+            obj.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()));
+        }
+        obj
+    }
+
+    fn node(name: &str, ready: &str, cordoned: bool) -> k8s_openapi::api::core::v1::Node {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": name },
+            "spec": {
+                "unschedulable": cordoned,
+                "taints": [{ "key": "karpenter.sh/disrupted", "effect": "NoSchedule" }]
+            },
+            "status": { "conditions": [{ "type": "Ready", "status": ready }] }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn karpenter_conditions_read_marking_conditions_the_other_way_round() {
+        let (notable, clear) = split_karpenter_conditions(&serde_json::json!({ "status": { "conditions": [
+            { "type": "Ready", "status": "True" },
+            { "type": "Initialized", "status": "False", "reason": "NotInitialized", "message": "kubelet never reported" },
+            { "type": "Drifted", "status": "True", "reason": "NodeClassDrift" },
+            { "type": "Empty", "status": "False" },
+            { "type": "SomethingNew", "status": "True" },
+        ]}}));
+        assert_eq!(clear, ["Ready", "Empty", "SomethingNew"]);
+        assert_eq!(notable.len(), 2);
+        assert!(notable[0].starts_with("Initialized=False (NotInitialized)") && notable[0].ends_with("\n  kubelet never reported"));
+        assert!(notable[1].starts_with("Drifted=True (NodeClassDrift)"));
+    }
+
+    #[test]
+    fn a_pools_stuck_claim_is_listed_before_its_healthy_ones() {
+        let ready = serde_json::json!([{ "type": "Ready", "status": "True" }]);
+        let mut claims: Vec<_> = (0..DIAGNOSE_NAP_CLAIMS + 5).map(|i| claim(&format!("ok-{i}"), ready.clone(), Some(&format!("n-{i}")), false)).collect();
+        claims.push(claim("stuck", serde_json::json!([{ "type": "Launched", "status": "False", "reason": "LaunchFailed", "message": "SKU not available" }, { "type": "Ready", "status": "Unknown" }]), None, false));
+        claims.push(claim("leaving", ready.clone(), Some("n-leaving"), true));
+        let nodes = Ok(vec![node("n-leaving", "True", true)]);
+        let out = render_nap_claims(&Ok(claims), &nodes);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with(&format!("{} claim(s): 1 not Ready, 1 terminating, 0 marked", DIAGNOSE_NAP_CLAIMS + 7)), "{}", lines[0]);
+        assert!(lines[1].starts_with("stuck  Standard_D4s_v5  spot  westeurope-1"));
+        assert_eq!(lines[2], "  no node registered");
+        assert!(out.contains("Launched=False (LaunchFailed)\n    SKU not available"), "{out}");
+        let leaving = out.find("leaving").unwrap();
+        assert!(out[leaving..].contains("TERMINATING since"));
+        assert!(out.contains("node n-leaving Ready=True, cordoned, tainted karpenter.sh/disrupted:NoSchedule"));
+        assert!(out.contains("node n-0 not found"));
+        assert!(out.ends_with("… and 7 more, all Ready with nothing pending"), "{out}");
+    }
+
+    #[test]
+    fn claims_that_could_not_be_read_are_not_reported_as_none() {
+        assert_eq!(render_nap_claims(&Ok(vec![]), &Ok(vec![])), "(this pool owns no NodeClaims)");
+        assert_eq!(render_nap_claims(&Err("forbidden".into()), &Ok(vec![])), "(NodeClaims unavailable: forbidden)");
+        let ready = serde_json::json!([{ "type": "Ready", "status": "True" }]);
+        let out = render_nap_claims(&Ok(vec![claim("c", ready, Some("n"), false)]), &Err("forbidden".into()));
+        assert!(out.contains("node state unknown (nodes could not be listed)"));
+    }
+
+    #[test]
+    fn scheduling_failures_collapse_on_the_message_and_count_pods() {
+        let event = |ns: &str, pod: &str, message: &str, seen: &str| crate::models::EventInfo {
+            object_namespace: ns.into(),
+            object_name: pod.into(),
+            message: message.into(),
+            last_seen: Some(seen.into()),
+            ..Default::default()
+        };
+        let limit = "all available instance types exceed limits for nodepool: \"gpu\"";
+        let out = render_nap_scheduling(&Ok(vec![
+            event("ml", "train-1", limit, "2026-10-20T10:00:00Z"),
+            event("ml", "train-2", limit, "2026-10-20T09:59:00Z"),
+            event("ml", "train-1", limit, "2026-10-20T09:58:00Z"),
+            event("web", "api-1", &"x".repeat(DIAGNOSE_NAP_MESSAGE_CHARS + 50), "2026-10-20T09:00:00Z"),
+        ]));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "2 pod(s), e.g. ml/train-1, latest 2026-10-20T10:00:00Z:");
+        assert_eq!(lines[1], format!("  {limit}"));
+        assert_eq!(lines[2], "1 pod(s), e.g. web/api-1, latest 2026-10-20T09:00:00Z:");
+        assert!(lines[3].ends_with(" …") && lines[3].len() < DIAGNOSE_NAP_MESSAGE_CHARS + 10);
+        assert_eq!(render_nap_scheduling(&Ok(vec![])), "(Karpenter reports no pod it could not place on this pool)");
+    }
+
+    #[test]
+    fn a_pools_status_reads_in_cores_and_gib_and_says_when_a_drain_can_wait_forever() {
+        let detail = crate::models::NapDetail {
+            node_class_kind: "AKSNodeClass".into(),
+            node_class_name: "default".into(),
+            requirements: vec![crate::models::NapRequirement {
+                key: "karpenter.sh/capacity-type".into(),
+                operator: "In".into(),
+                values: vec!["spot".into(), "on-demand".into()],
+                min_values: None,
+            }],
+            expire_after: "720h".into(),
+            consolidation_policy: "WhenEmptyOrUnderutilized".into(),
+            consolidate_after: "0s".into(),
+            budgets: vec![crate::models::NapBudget { nodes: "0".into(), reasons: vec!["Drifted".into()], ..Default::default() }],
+            resources: vec![
+                crate::models::NapResourceUse { name: "cpu".into(), unit: "millicores".into(), used: 48_000, limit: Some(64_000) },
+                crate::models::NapResourceUse { name: "memory".into(), unit: "ki".into(), used: 201_326_592, limit: None },
+            ],
+            ..Default::default()
+        };
+        let out = render_nap_status(&detail, 12);
+        assert!(out.starts_with("nodes owned: 12\ncpu provisioned / limit: 48 cores / 64 cores\nmemory provisioned / limit: 192 GiB / no limit"), "{out}");
+        assert!(out.contains("  karpenter.sh/capacity-type In [spot, on-demand]"));
+        assert!(out.contains("termination grace period: (none — a drain may wait forever)"));
+        assert!(out.ends_with("disruption budgets:\n  nodes 0 for Drifted"), "{out}");
+    }
+
     /// Builds real pod diagnoses for restarted and never-restarted pods and
     /// checks the previous instance's section. Prints counts only — no
     /// names, logs or prompt text.
@@ -1817,6 +2383,43 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(fresh_said_so > 0, "no never-restarted pod to check");
         assert_eq!(restarted_without, 0);
         assert_eq!(fresh_wrong, 0);
+    }
+
+    /// Builds a diagnosis for every NodePool on a cluster and checks each
+    /// section was read rather than reported unavailable. Prints counts only —
+    /// no names, messages or prompt text.
+    ///
+    ///   NAP_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml nap_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster with NAP; set NAP_DIAG_TEST_CONTEXT to run"]
+    async fn nap_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("NAP_DIAG_TEST_CONTEXT") else { return };
+        let pools = k8s::get_nap_node_pools(&ctx).await.expect("pools").node_pools;
+        let (mut built, mut unavailable, mut claim_count_differs, mut with_scheduling, mut largest) = (0, 0, 0, 0, 0);
+        for p in &pools {
+            let payload = build_nap_diagnosis_payload(&ctx, &p.name).await.expect("payload");
+            built += 1;
+            unavailable += payload.prompt.matches("unavailable: ").count();
+            // The pool's own node count against the claims listed by label.
+            let claims = payload
+                .prompt
+                .split("## NodeClaims (worst first)\n")
+                .nth(1)
+                .and_then(|s| s.split(" claim(s)").next())
+                .and_then(|n| n.parse::<i64>().ok())
+                .unwrap_or(0);
+            if claims != p.nodes {
+                claim_count_differs += 1
+            }
+            if !payload.prompt.contains("(Karpenter reports no pod it could not place") {
+                with_scheduling += 1
+            }
+            largest = largest.max(payload.approx_tokens);
+        }
+        println!("pools={} built={built} unavailable_sections={unavailable} claim_count_differs={claim_count_differs} with_scheduling_failures={with_scheduling} largest_tokens={largest}", pools.len());
+        assert!(built > 0, "no NodePool to diagnose");
+        assert_eq!(unavailable, 0);
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs
