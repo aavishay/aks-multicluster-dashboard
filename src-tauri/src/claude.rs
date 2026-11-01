@@ -274,6 +274,47 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_KEDA_SYSTEM: &str = "\
+You diagnose KEDA ScaledObjects and ScaledJobs for an experienced SRE.
+
+You are given the object's settings and conditions, each trigger with KEDA's \
+health for it, where every credential a trigger uses comes from — checked \
+against the Secrets and ConfigMaps it names, by key name only — the KEDA \
+operator's own log lines about this object, its events, the HPA KEDA \
+generated (for a ScaledObject) or the Jobs it created (for a ScaledJob), the \
+workload it scales, the state of KEDA itself, and the manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the log line, the \
+condition, the credential, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+The operator's log is usually where the actual error is: a query that fails, \
+a connection refused, an authentication error from the event source. Quote \
+the error and say what it means for this trigger.
+
+Say which of these you are looking at:
+- The scaler cannot read its source: wrong address, query or metadata, the \
+source is down, or the credential is wrong or missing — a FromEnv variable \
+not defined on the container, a Secret or key that does not exist, or a pod \
+identity that is not federated or lacks the role.
+- KEDA itself is unwell: the operator or the metrics apiserver is not ready, \
+or external.metrics.k8s.io is unavailable — then every ScaledObject fails \
+alike, and fixing this one object will not help.
+- It works but scales wrongly: the threshold, activation threshold, min/max, \
+cooldown or polling interval, or the generated HPA's behavior, explain it.
+- It is paused, or in fallback because a scaler kept failing.
+
+Active=False is not a failure: it means no trigger is above its activation \
+threshold, so KEDA is holding the workload at its minimum (or zero).
+
+Be direct; assume fluency with kubectl and KEDA. Prefer one well-supported \
+cause over a list of possibilities. If the evidence is genuinely \
+insufficient, say so and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 /// How many drifted resources go into a diagnosis.
 ///
 /// An app with dozens of drifted resources is usually drifted the same way in
@@ -1187,7 +1228,7 @@ fn render_hpa_target(
             sc.spec.as_ref().and_then(|s| s.replicas).map(|n| n.to_string()).unwrap_or_else(|| "(unset)".to_string()),
             sc.status.as_ref().map(|s| s.replicas.to_string()).unwrap_or_else(|| "(unset)".to_string()),
         ),
-        Err(e) => format!("(scale unavailable: {e})"),
+        Err(e) => read_failure("scale", e),
     };
     match target {
         Ok(t) => {
@@ -1199,13 +1240,49 @@ fn render_hpa_target(
                 out.push_str(&format!("\nstatus: {}", detail.join(", ")));
             }
         }
-        Err(e) => out.push_str(&format!("\n(target unavailable: {e})")),
+        // Said once: when the object is missing, so is its scale and selector.
+        Err(e) if scale.as_ref().err() == Some(e) => {}
+        Err(e) => out.push_str(&format!("\n{}", read_failure("target", e))),
     }
     match selector {
         Ok(s) => out.push_str(&format!("\nselector (from its scale subresource): {s}")),
+        Err(_) if target.is_err() && scale.is_err() => {}
         Err(e) => out.push_str(&format!("\nselector unavailable: {e}")),
     }
     out
+}
+
+/// A read that failed, said as what it found: an object that does not exist
+/// is evidence — a ScaledObject pointing at a deleted Deployment — where any
+/// other failure is a gap in what could be seen.
+fn read_failure(what: &str, e: &str) -> String {
+    if e.ends_with(" does not exist") {
+        format!("({e})")
+    } else {
+        format!("({what} unavailable: {e})")
+    }
+}
+
+/// One APIService: available, or why not, and what serves it.
+fn render_api_service(s: &k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService) -> String {
+    let name = s.metadata.name.clone().unwrap_or_default();
+    let available = s.status.as_ref().and_then(|st| st.conditions.as_ref()).and_then(|c| c.iter().find(|c| c.type_ == "Available"));
+    let backend = s
+        .spec
+        .as_ref()
+        .and_then(|sp| sp.service.as_ref())
+        .map(|svc| format!(", served by {}/{}", svc.namespace.clone().unwrap_or_default(), svc.name.clone().unwrap_or_default()))
+        .unwrap_or_default();
+    match available {
+        Some(c) if c.status == "True" => format!("{name} Available{backend}"),
+        Some(c) => format!(
+            "{name} Available={} ({}){backend}\n  {}",
+            c.status,
+            c.reason.clone().unwrap_or_default(),
+            c.message.clone().unwrap_or_default()
+        ),
+        None => format!("{name} (no Available condition reported){backend}"),
+    }
 }
 
 /// Whether each metrics API this HPA reads from is registered and available.
@@ -1238,30 +1315,7 @@ fn render_hpa_metrics_apis(
             let registered: Vec<String> = services
                 .iter()
                 .filter(|s| s.spec.as_ref().and_then(|sp| sp.group.as_deref()) == Some(*group))
-                .map(|s| {
-                    let available = s
-                        .status
-                        .as_ref()
-                        .and_then(|st| st.conditions.as_ref())
-                        .and_then(|c| c.iter().find(|c| c.type_ == "Available"));
-                    let backend = s
-                        .spec
-                        .as_ref()
-                        .and_then(|sp| sp.service.as_ref())
-                        .map(|svc| format!(", served by {}/{}", svc.namespace.clone().unwrap_or_default(), svc.name.clone().unwrap_or_default()))
-                        .unwrap_or_default();
-                    match available {
-                        Some(c) if c.status == "True" => format!("{} Available{backend}", s.metadata.name.clone().unwrap_or_default()),
-                        Some(c) => format!(
-                            "{} Available={} ({}){backend}\n  {}",
-                            s.metadata.name.clone().unwrap_or_default(),
-                            c.status,
-                            c.reason.clone().unwrap_or_default(),
-                            c.message.clone().unwrap_or_default()
-                        ),
-                        None => format!("{} (no Available condition reported){backend}", s.metadata.name.clone().unwrap_or_default()),
-                    }
-                })
+                .map(render_api_service)
                 .collect();
             let state = if registered.is_empty() { "NOT REGISTERED — nothing on the cluster serves it".to_string() } else { registered.join("\n  ") };
             format!("{group} (for {} metrics): {state}", kinds.join(", "))
@@ -1412,6 +1466,477 @@ pub async fn build_hpa_diagnosis_payload(
         containers_r.text,
         apis_r.text,
         manifest_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
+}
+
+/// How many distinct operator log entries go into a KEDA diagnosis.
+const DIAGNOSE_KEDA_LOG_ENTRIES: usize = 15;
+
+/// How much of one operator error to send; Go errors wrap and repeat.
+const DIAGNOSE_KEDA_ERROR_CHARS: usize = 600;
+
+/// How many of a ScaledJob's Jobs are listed one by one.
+const DIAGNOSE_KEDA_JOBS: usize = 8;
+
+/// A KEDA object's settings and triggers.
+fn render_keda_status(d: &crate::models::KedaDetail, kind: &str) -> String {
+    let mut lines = Vec::new();
+    if kind == "ScaledJob" {
+        lines.push(format!("runs: Jobs from its jobTargetRef template, scaling strategy {}", d.scaling_strategy));
+    } else {
+        lines.push(format!("scales: {}/{}", d.target_kind, d.target_name));
+    }
+    let idle = d.idle_replicas.map(|i| format!(", idle {i}")).unwrap_or_default();
+    lines.push(format!("replicas: min {}, max {}{idle}", d.min_replicas, d.max_replicas));
+    lines.push(format!("polling interval: {}s", d.polling_interval));
+    if let Some(c) = d.cooldown_period {
+        lines.push(format!("cooldown period: {c}s"));
+    }
+    lines.push(format!("fallback: {}", if d.fallback.is_empty() { "(none)" } else { &d.fallback }));
+    if d.paused {
+        lines.push(format!(
+            "PAUSED{}",
+            d.paused_replicas.as_ref().map(|r| format!(" at {r} replicas")).unwrap_or_default()
+        ));
+    }
+    lines.push(format!("last active: {}", d.last_active.as_deref().unwrap_or("never")));
+    if !d.hpa_name.is_empty() {
+        lines.push(format!("generated HPA: {}", d.hpa_name));
+    }
+    lines.push("triggers:".to_string());
+    if d.triggers.is_empty() {
+        lines.push("  (none)".to_string());
+    }
+    for (i, t) in d.triggers.iter().enumerate() {
+        let mut line = format!("  {i}. {}", t.trigger_type);
+        if !t.name.is_empty() {
+            line.push_str(&format!(" \"{}\"", t.name));
+        }
+        if !t.metric_type.is_empty() {
+            line.push_str(&format!(", metric type {}", t.metric_type));
+        }
+        match (t.health.as_str(), t.failures) {
+            ("", _) => line.push_str(", no health reported"),
+            (h, Some(n)) => line.push_str(&format!(", health {h} ({n} failures in a row)")),
+            (h, None) => line.push_str(&format!(", health {h}")),
+        }
+        if !t.auth_ref.is_empty() {
+            line.push_str(&format!(", authentication {}", t.auth_ref));
+        }
+        for m in &t.metadata {
+            line.push_str(&format!("\n     {m}"));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// KEDA's conditions, every one with its message: Ready reports a problem
+/// when False, Fallback and Paused when True, and Active is information.
+fn render_keda_conditions(conditions: &[crate::models::PodConditionInfo]) -> String {
+    if conditions.is_empty() {
+        return "(none reported yet)".to_string();
+    }
+    conditions
+        .iter()
+        .map(|c| {
+            let mut line = format!("{}={}", c.condition_type, c.status);
+            if !c.reason.is_empty() {
+                line.push_str(&format!(" ({})", c.reason));
+            }
+            if !c.message.is_empty() {
+                line.push_str(&format!(": {}", c.message));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+type KeySets = std::collections::HashMap<(String, String, String), Result<Vec<String>, String>>;
+
+/// Whether `key` is in a Secret or ConfigMap, said without its value.
+fn key_presence(key_sets: &KeySets, kind: &str, namespace: &str, name: &str, key: &str) -> String {
+    match key_sets.get(&(kind.to_string(), namespace.to_string(), name.to_string())) {
+        Some(Ok(keys)) if keys.iter().any(|k| k == key) => format!("{kind} {name} key {key} — present"),
+        Some(Ok(keys)) => {
+            let mut have: Vec<&str> = keys.iter().map(String::as_str).take(10).collect();
+            have.sort_unstable();
+            format!("{kind} {name} key {key} — MISSING; it has: {}", if have.is_empty() { "(no keys)".to_string() } else { have.join(", ") })
+        }
+        Some(Err(e)) => format!("{kind} {name} {e}"),
+        None => format!("{kind} {name} (not checked)"),
+    }
+}
+
+/// Where one environment variable comes from on the container KEDA reads.
+///
+/// That is the container `only` names or, by KEDA's default, the first one.
+/// The kubelet's precedence decides between sources: `env` over `envFrom`,
+/// and a later entry over an earlier one, so both are searched last first. A
+/// source that could not be read leaves the answer open, and is said to.
+fn resolve_env_var(var: &str, containers: &[serde_json::Value], only: Option<&str>, namespace: &str, key_sets: &KeySets) -> String {
+    let field = |v: Option<&serde_json::Value>, k: &str| v.and_then(|v| v.get(k)).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let container = match only {
+        Some(o) => containers.iter().find(|c| c.get("name").and_then(|n| n.as_str()) == Some(o)),
+        None => containers.first(),
+    };
+    let Some(c) = container else {
+        return match only {
+            Some(o) => format!("NOT RESOLVABLE — the target has no container {o}"),
+            None => "NOT RESOLVABLE — no container to read it from".to_string(),
+        };
+    };
+    let cname = field(Some(c), "name");
+    let list = |k: &str| c.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if let Some(e) = list("env").iter().rev().find(|e| e.get("name").and_then(|n| n.as_str()) == Some(var)) {
+        let from = e.get("valueFrom");
+        if let Some(r) = from.and_then(|f| f.get("secretKeyRef")) {
+            return format!("on container {cname}, from {}", key_presence(key_sets, "Secret", namespace, &field(Some(r), "name"), &field(Some(r), "key")));
+        }
+        if let Some(r) = from.and_then(|f| f.get("configMapKeyRef")) {
+            return format!("on container {cname}, from {}", key_presence(key_sets, "ConfigMap", namespace, &field(Some(r), "name"), &field(Some(r), "key")));
+        }
+        if from.is_some() {
+            return format!("on container {cname}, from a field reference");
+        }
+        return format!("on container {cname}, set inline in the manifest");
+    }
+    // Later sources that could not be read, and those that do not exist.
+    let (mut unread, mut missing) = (Vec::new(), Vec::new());
+    for e in list("envFrom").iter().rev() {
+        let prefix = field(Some(e), "prefix");
+        let Some(key) = var.strip_prefix(prefix.as_str()) else { continue };
+        for (kind, at) in [("Secret", "secretRef"), ("ConfigMap", "configMapRef")] {
+            let name = field(e.get(at), "name");
+            if name.is_empty() {
+                continue;
+            }
+            match key_sets.get(&(kind.to_string(), namespace.to_string(), name.clone())) {
+                Some(Ok(keys)) if keys.iter().any(|k| k == key) => {
+                    let mut line = format!("on container {cname}, from all of {kind} {name} (envFrom), key {key} — present");
+                    if !unread.is_empty() {
+                        line.push_str(&format!(", unless {} (later, so taking precedence) defines it", unread.join(" or ")));
+                    }
+                    return line;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(e)) if e == "does not exist" => missing.push(format!("{kind} {name}")),
+                Some(Err(e)) => unread.push(format!("{kind} {name} ({e})")),
+                None => unread.push(format!("{kind} {name} (not checked)")),
+            }
+        }
+    }
+    let mut line = if unread.is_empty() {
+        format!("NOT DEFINED on container {cname} — KEDA cannot resolve it")
+    } else {
+        format!("not found on container {cname} in what could be read; it may come from {}", unread.join(" or "))
+    };
+    if !missing.is_empty() {
+        let verb = if missing.len() == 1 { "does" } else { "do" };
+        line.push_str(&format!(" (its envFrom names {}, which {verb} not exist)", missing.join(" and ")));
+    }
+    line
+}
+
+/// Where every credential the triggers use comes from, and whether it is there.
+///
+/// The failures this catches are the common ones and are invisible from the
+/// trigger alone: a `connectionFromEnv` naming a variable the container does
+/// not have, a Secret that was never created in this namespace, a key spelled
+/// differently from the one the reference names. Checked by key name; no value
+/// is read into the payload.
+fn render_keda_credentials(
+    d: &crate::models::KedaDetail,
+    object: &serde_json::Value,
+    containers: &[serde_json::Value],
+    auths: &[(String, Result<kube::api::DynamicObject, String>)],
+    key_sets: &KeySets,
+    namespace: &str,
+    operator_namespace: Option<&str>,
+) -> String {
+    let only = object
+        .pointer("/spec/scaleTargetRef/envSourceContainerName")
+        .or_else(|| object.pointer("/spec/envSourceContainerName"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let mut lines = Vec::new();
+    for (i, t) in d.triggers.iter().enumerate() {
+        for m in &t.metadata {
+            let Some((key, var)) = m.split_once('=') else { continue };
+            if key.ends_with("FromEnv") {
+                lines.push(format!("trigger {i} {key} → env {var}: {}", resolve_env_var(var, containers, only, namespace, key_sets)));
+            }
+        }
+    }
+    for (r, auth) in auths {
+        let auth = match auth {
+            Ok(a) => serde_json::to_value(a).unwrap_or_default(),
+            Err(e) => {
+                lines.push(format!("{r}: unavailable: {e}"));
+                continue;
+            }
+        };
+        let ns = if r.starts_with("ClusterTriggerAuthentication/") { operator_namespace.unwrap_or("keda") } else { namespace };
+        let field = |v: &serde_json::Value, k: &str| v.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let spec = auth.get("spec").cloned().unwrap_or_default();
+        lines.push(format!("{r}:"));
+        if let Some(pi) = spec.get("podIdentity") {
+            let id = field(pi, "identityId");
+            lines.push(format!(
+                "  pod identity: {}{}",
+                field(pi, "provider"),
+                if id.is_empty() { String::new() } else { format!(", identity {id}") }
+            ));
+        }
+        for t in spec.get("secretTargetRef").and_then(|v| v.as_array()).into_iter().flatten() {
+            lines.push(format!("  {} from {}", field(t, "parameter"), key_presence(key_sets, "Secret", ns, &field(t, "name"), &field(t, "key"))));
+        }
+        for t in spec.get("configMapTargetRef").and_then(|v| v.as_array()).into_iter().flatten() {
+            lines.push(format!("  {} from {}", field(t, "parameter"), key_presence(key_sets, "ConfigMap", ns, &field(t, "name"), &field(t, "key"))));
+        }
+        for t in spec.get("env").and_then(|v| v.as_array()).into_iter().flatten() {
+            let only = t.get("containerName").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).or(only);
+            lines.push(format!("  {} from env {}: {}", field(t, "parameter"), field(t, "name"), resolve_env_var(&field(t, "name"), containers, only, namespace, key_sets)));
+        }
+        if let Some(kv) = spec.get("azureKeyVault") {
+            let secrets: Vec<String> = kv
+                .get("secrets")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .map(|s| format!("{} ← {}", field(s, "parameter"), field(s, "name")))
+                .collect();
+            lines.push(format!("  Azure Key Vault {}: {}", field(kv, "vaultUri"), secrets.join(", ")));
+        }
+        if let Some(hv) = spec.get("hashiCorpVault") {
+            lines.push(format!("  HashiCorp Vault {} ({} auth)", field(hv, "address"), field(hv, "authentication")));
+        }
+    }
+    if lines.is_empty() {
+        "(the triggers name no credentials: no *FromEnv metadata and no authenticationRef)".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// The operator's log lines about this object, collapsed on what they say.
+///
+/// A failing scaler logs the same error on every poll — every 30 seconds by
+/// default, so a few thousand lines are mostly one error. Collapsed on level,
+/// component, message and error, they read as which errors there are, how
+/// often, and when last.
+fn render_keda_operator_logs(lines: &Result<Vec<String>, String>) -> String {
+    let lines = match lines {
+        Ok(l) if l.is_empty() => return "(the operator logged nothing about this object in its recent log)".to_string(),
+        Ok(l) => l,
+        Err(e) => return format!("(operator log unavailable: {e})"),
+    };
+    // (level, component, message, error) → (count, last time)
+    let mut groups: Vec<((String, String, String, String), usize, String)> = Vec::new();
+    for line in lines {
+        // `time\tLEVEL\t[component\t]message\t{json}`: the controller's own
+        // lines carry no component.
+        let (head, json) = match line.find("\t{") {
+            Some(i) => (&line[..i], &line[i + 1..]),
+            None => (line.as_str(), ""),
+        };
+        let fields: Vec<&str> = head.split('\t').collect();
+        let time = fields.first().copied().unwrap_or_default();
+        let level = fields.get(1).copied().unwrap_or_default();
+        let (component, message) = match fields.len() {
+            n if n >= 4 => (fields[2], fields[3..].join(" ")),
+            3 => ("", fields[2].to_string()),
+            _ => ("", String::new()),
+        };
+        let error = serde_json::from_str::<serde_json::Value>(json.trim_end())
+            .ok()
+            .and_then(|j| j.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        let key = (level.to_string(), component.to_string(), message, error);
+        match groups.iter_mut().find(|g| g.0 == key) {
+            Some(g) => {
+                g.1 += 1;
+                g.2 = time.to_string();
+            }
+            None => groups.push((key, 1, time.to_string())),
+        }
+    }
+    groups.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut out = groups
+        .iter()
+        .take(DIAGNOSE_KEDA_LOG_ENTRIES)
+        .map(|((level, component, message, error), count, last)| {
+            let from = if component.is_empty() { String::new() } else { format!(" {component}") };
+            let mut line = format!("{level}{from}: {message} (×{count}, last {last})");
+            if !error.is_empty() {
+                let e = if error.len() > DIAGNOSE_KEDA_ERROR_CHARS {
+                    format!("{} …", truncate_on_char_boundary(error, DIAGNOSE_KEDA_ERROR_CHARS))
+                } else {
+                    error.clone()
+                };
+                line.push_str(&format!("\n  {e}"));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if groups.len() > DIAGNOSE_KEDA_LOG_ENTRIES {
+        out.push_str(&format!("\n… and {} older distinct entries", groups.len() - DIAGNOSE_KEDA_LOG_ENTRIES));
+    }
+    out
+}
+
+/// KEDA itself: its two Deployments and the external metrics API they serve.
+fn render_keda_health(
+    operator: &Result<Vec<k8s_openapi::api::apps::v1::Deployment>, String>,
+    apis: &Result<Vec<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService>, String>,
+) -> String {
+    let mut lines = match operator {
+        Ok(d) if d.is_empty() => vec!["no keda-operator or keda-operator-metrics-apiserver Deployment found".to_string()],
+        Ok(d) => d
+            .iter()
+            .map(|d| {
+                let status = d.status.clone().unwrap_or_default();
+                format!(
+                    "{}/{}: ready {}/{}",
+                    d.metadata.namespace.clone().unwrap_or_default(),
+                    d.metadata.name.clone().unwrap_or_default(),
+                    status.ready_replicas.unwrap_or(0),
+                    d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1)
+                )
+            })
+            .collect(),
+        Err(e) => vec![format!("(KEDA's Deployments unavailable: {e})")],
+    };
+    lines.push(match apis {
+        Ok(s) if s.is_empty() => "external.metrics.k8s.io: NOT REGISTERED — no HPA can read KEDA's metrics".to_string(),
+        Ok(s) => format!("external.metrics.k8s.io: {}", s.iter().map(render_api_service).collect::<Vec<_>>().join("\n  ")),
+        Err(e) => format!("(APIServices unavailable: {e})"),
+    });
+    lines.join("\n")
+}
+
+/// A ScaledJob's Jobs: counts, then the most recent ones with how they ended.
+fn render_keda_jobs(jobs: &Result<Vec<k8s_openapi::api::batch::v1::Job>, String>) -> String {
+    let jobs = match jobs {
+        Ok(j) if j.is_empty() => return "(it has created no Jobs that still exist)".to_string(),
+        Ok(j) => j,
+        Err(e) => return format!("(Jobs unavailable: {e})"),
+    };
+    let finished = |j: &k8s_openapi::api::batch::v1::Job, t: &str| {
+        j.status.as_ref().and_then(|s| s.conditions.as_ref()).and_then(|c| c.iter().find(|c| c.type_ == t && c.status == "True")).cloned()
+    };
+    let (failed, complete) = (jobs.iter().filter(|j| finished(j, "Failed").is_some()).count(), jobs.iter().filter(|j| finished(j, "Complete").is_some()).count());
+    let mut out = format!("{} Job(s): {complete} complete, {failed} failed, {} running", jobs.len(), jobs.len() - complete - failed);
+    for j in jobs.iter().take(DIAGNOSE_KEDA_JOBS) {
+        let created = j.metadata.creation_timestamp.as_ref().map(|t| t.0.to_rfc3339()).unwrap_or_default();
+        let state = match (finished(j, "Failed"), finished(j, "Complete")) {
+            (Some(c), _) => format!("Failed ({}): {}", c.reason.unwrap_or_default(), c.message.unwrap_or_default()),
+            (_, Some(_)) => "Complete".to_string(),
+            _ => format!("running, {} active pod(s)", j.status.as_ref().and_then(|s| s.active).unwrap_or(0)),
+        };
+        out.push_str(&format!("\n{}  created {created}  {state}", j.metadata.name.clone().unwrap_or_default()));
+    }
+    out
+}
+
+/// The HPA KEDA generated: what the HPA controller itself makes of the metrics.
+fn render_keda_hpa(hpa: &Result<crate::models::HpaDetail, String>) -> String {
+    match hpa {
+        Ok(h) => {
+            let mut out = format!(
+                "replicas: min {}, max {}, current {}, desired {}\nmetrics (current / target):",
+                h.min_replicas, h.max_replicas, h.current_replicas, h.desired_replicas
+            );
+            for m in &h.metrics {
+                out.push_str(&format!("\n  {} {}: {} / {}", m.kind, m.name, m.current, m.target));
+            }
+            out.push_str(&format!("\nconditions:\n{}", render_hpa_conditions(&h.conditions)));
+            out
+        }
+        Err(e) => read_failure("generated HPA", e),
+    }
+}
+
+/// Assembles everything a KEDA diagnosis needs, redacted.
+///
+/// The object's own status says *that* a trigger failed and little more; the
+/// operator's log says what the event source answered, and the credential
+/// check says whether what the trigger needs to authenticate is even there.
+pub async fn build_keda_diagnosis_payload(
+    context_name: &str,
+    namespace: &str,
+    kind: &str,
+    name: &str,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_keda_diagnostics(context_name, namespace, kind, name).await?;
+    let object_value = serde_json::to_value(&d.object).unwrap_or_default();
+
+    let status = render_keda_status(&d.detail, kind);
+    let conditions = render_keda_conditions(&d.detail.conditions);
+    let credentials = render_keda_credentials(
+        &d.detail,
+        &object_value,
+        &d.env_containers,
+        &d.auths,
+        &d.key_sets,
+        namespace,
+        d.operator_namespace.as_deref(),
+    );
+    let logs = render_keda_operator_logs(&d.operator_logs);
+    let events = render_nap_events(&d.events, &format!("(no events for this {kind})"), false, 25);
+    let (scaling_heading, scaling) = match (&d.hpa, &d.jobs) {
+        (_, Some(jobs)) => ("Jobs it created".to_string(), render_keda_jobs(jobs)),
+        (Some(hpa), _) => (format!("Generated HPA ({})", d.detail.hpa_name), render_keda_hpa(hpa)),
+        _ => ("Generated HPA".to_string(), "(KEDA has not reported an HPA for it — status.hpaName is empty)".to_string()),
+    };
+    let target = match &d.target {
+        Some((target, scale)) => {
+            let selector = scale.clone().and_then(|s| s.status.and_then(|st| st.selector).ok_or_else(|| "none reported".to_string()));
+            Some(render_hpa_target(target, scale, &selector))
+        }
+        None => None,
+    };
+    let health = render_keda_health(&d.operator, &d.external_metrics_api);
+
+    let status = redact::redact(&status);
+    let conditions_r = redact::redact(&conditions);
+    let credentials_r = redact::redact(&credentials);
+    let logs_r = redact::redact(&logs);
+    let events_r = redact::redact(&events);
+    let scaling_r = redact::redact(&scaling);
+    let target_r = target.as_deref().map(redact::redact);
+    let health_r = redact::redact(&health);
+    let manifest_r = redact::redact(&d.manifest);
+
+    let mut parts = vec![&status, &conditions_r, &credentials_r, &logs_r, &events_r, &scaling_r, &health_r, &manifest_r];
+    parts.extend(target_r.as_ref());
+    let redaction_summary = redact::Redacted::merge(parts).summary();
+
+    let target_section = target_r
+        .as_ref()
+        .map(|t| format!("## Target ({}/{})\n{}\n\n", d.detail.target_kind, d.detail.target_name, t.text))
+        .unwrap_or_default();
+    let prompt = format!(
+        "{kind} {namespace}/{name}.\n\n\
+         ## Settings and triggers\n{}\n\n\
+         ## Conditions\n{}\n\n\
+         ## Credentials\n{}\n\n\
+         ## KEDA operator log about this object\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## {scaling_heading}\n{}\n\n\
+         {target_section}\
+         ## KEDA itself\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        status.text, conditions_r.text, credentials_r.text, logs_r.text, events_r.text, scaling_r.text, health_r.text, manifest_r.text,
     );
 
     Ok(ClaudeDiagnosisPayload {
@@ -2156,6 +2681,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Node" => DIAGNOSE_NODE_SYSTEM,
         "NodePool" => DIAGNOSE_NAP_SYSTEM,
         "HorizontalPodAutoscaler" => DIAGNOSE_HPA_SYSTEM,
+        "ScaledObject" | "ScaledJob" => DIAGNOSE_KEDA_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -2976,6 +3502,223 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(render_hpa_conditions(&[]), "(none reported yet)");
     }
 
+    fn keys(entries: &[(&str, &str, &str, Result<&[&str], &str>)]) -> KeySets {
+        entries
+            .iter()
+            .map(|(k, ns, n, r)| {
+                (
+                    (k.to_string(), ns.to_string(), n.to_string()),
+                    r.map(|ks| ks.iter().map(|s| s.to_string()).collect()).map_err(|e| e.to_string()),
+                )
+            })
+            .collect()
+    }
+
+    fn keda_detail_with(triggers: Vec<crate::models::KedaTriggerInfo>) -> crate::models::KedaDetail {
+        crate::models::KedaDetail { triggers, ..Default::default() }
+    }
+
+    fn trigger(metadata: &[&str], auth_ref: &str) -> crate::models::KedaTriggerInfo {
+        crate::models::KedaTriggerInfo {
+            trigger_type: "azure-eventhub".into(),
+            metadata: metadata.iter().map(|m| m.to_string()).collect(),
+            auth_ref: auth_ref.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_from_env_credential_is_traced_to_its_secret_key_or_said_to_be_missing() {
+        let containers = vec![serde_json::json!({
+            "name": "app",
+            "env": [
+                { "name": "HUB", "valueFrom": { "secretKeyRef": { "name": "hub", "key": "conn" } } },
+                { "name": "WRONG", "valueFrom": { "secretKeyRef": { "name": "hub", "key": "connection" } } },
+                { "name": "PLAIN", "value": "Endpoint=sb://secret" },
+            ],
+            "envFrom": [{ "secretRef": { "name": "bulk" }, "prefix": "APP_" }],
+        })];
+        let ks = keys(&[
+            ("Secret", "ns", "hub", Ok(&["conn", "other"][..])),
+            ("Secret", "ns", "bulk", Ok(&["STORAGE"][..])),
+        ]);
+        let d = keda_detail_with(vec![trigger(
+            &["connectionFromEnv=HUB", "storageConnectionFromEnv=APP_STORAGE", "x1FromEnv=WRONG", "x2FromEnv=PLAIN", "x3FromEnv=NOPE", "eventHubName=orders"],
+            "",
+        )]);
+        let out = render_keda_credentials(&d, &serde_json::json!({}), &containers, &[], &ks, "ns", None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "trigger 0 connectionFromEnv → env HUB: on container app, from Secret hub key conn — present");
+        assert_eq!(lines[1], "trigger 0 storageConnectionFromEnv → env APP_STORAGE: on container app, from all of Secret bulk (envFrom), key STORAGE — present");
+        assert_eq!(lines[2], "trigger 0 x1FromEnv → env WRONG: on container app, from Secret hub key connection — MISSING; it has: conn, other");
+        assert_eq!(lines[3], "trigger 0 x2FromEnv → env PLAIN: on container app, set inline in the manifest");
+        assert_eq!(lines[4], "trigger 0 x3FromEnv → env NOPE: NOT DEFINED on container app — KEDA cannot resolve it");
+        assert_eq!(lines.len(), 5);
+        assert!(!out.contains("Endpoint="), "an inline value must never be copied: {out}");
+    }
+
+    #[test]
+    fn env_source_container_name_narrows_where_keda_looks() {
+        let containers = vec![
+            serde_json::json!({ "name": "app", "env": [{ "name": "HUB", "value": "x" }] }),
+            serde_json::json!({ "name": "sidecar" }),
+        ];
+        let d = keda_detail_with(vec![trigger(&["connectionFromEnv=HUB"], "")]);
+        let object = serde_json::json!({ "spec": { "scaleTargetRef": { "envSourceContainerName": "sidecar" } } });
+        let out = render_keda_credentials(&d, &object, &containers, &[], &KeySets::new(), "ns", None);
+        assert_eq!(out, "trigger 0 connectionFromEnv → env HUB: NOT DEFINED on container sidecar — KEDA cannot resolve it");
+    }
+
+    #[test]
+    fn keda_reads_the_first_container_unless_told_otherwise() {
+        let containers = vec![
+            serde_json::json!({ "name": "app" }),
+            serde_json::json!({ "name": "sidecar", "env": [{ "name": "HUB", "value": "x" }] }),
+        ];
+        let d = keda_detail_with(vec![trigger(&["connectionFromEnv=HUB"], "")]);
+        let out = render_keda_credentials(&d, &serde_json::json!({}), &containers, &[], &KeySets::new(), "ns", None);
+        assert_eq!(out, "trigger 0 connectionFromEnv → env HUB: NOT DEFINED on container app — KEDA cannot resolve it");
+        let object = serde_json::json!({ "spec": { "envSourceContainerName": "gone" } });
+        let out = render_keda_credentials(&d, &object, &containers, &[], &KeySets::new(), "ns", None);
+        assert_eq!(out, "trigger 0 connectionFromEnv → env HUB: NOT RESOLVABLE — the target has no container gone");
+    }
+
+    #[test]
+    fn the_env_from_source_that_wins_is_the_one_reported() {
+        let containers = vec![serde_json::json!({
+            "name": "app",
+            "envFrom": [{ "secretRef": { "name": "a" } }, { "secretRef": { "name": "b" } }, { "secretRef": { "name": "c" } }],
+        })];
+        let d = keda_detail_with(vec![trigger(&["connectionFromEnv=HUB"], "")]);
+        let run = |ks: &KeySets| render_keda_credentials(&d, &serde_json::json!({}), &containers, &[], ks, "ns", None);
+
+        let ks = keys(&[("Secret", "ns", "a", Ok(&["HUB"][..])), ("Secret", "ns", "b", Ok(&["HUB"][..])), ("Secret", "ns", "c", Ok(&[][..]))]);
+        assert_eq!(run(&ks), "trigger 0 connectionFromEnv → env HUB: on container app, from all of Secret b (envFrom), key HUB — present");
+
+        let ks = keys(&[("Secret", "ns", "a", Ok(&["HUB"][..])), ("Secret", "ns", "b", Ok(&[][..])), ("Secret", "ns", "c", Err("could not be read: forbidden"))]);
+        assert_eq!(
+            run(&ks),
+            "trigger 0 connectionFromEnv → env HUB: on container app, from all of Secret a (envFrom), key HUB — present, unless Secret c (could not be read: forbidden) (later, so taking precedence) defines it"
+        );
+
+        let ks = keys(&[("Secret", "ns", "a", Err("does not exist")), ("Secret", "ns", "b", Ok(&[][..])), ("Secret", "ns", "c", Err("could not be read: forbidden"))]);
+        assert_eq!(
+            run(&ks),
+            "trigger 0 connectionFromEnv → env HUB: not found on container app in what could be read; it may come from Secret c (could not be read: forbidden) (its envFrom names Secret a, which does not exist)"
+        );
+
+        let ks = keys(&[("Secret", "ns", "a", Err("does not exist")), ("Secret", "ns", "b", Ok(&[][..])), ("Secret", "ns", "c", Ok(&[][..]))]);
+        assert_eq!(
+            run(&ks),
+            "trigger 0 connectionFromEnv → env HUB: NOT DEFINED on container app — KEDA cannot resolve it (its envFrom names Secret a, which does not exist)"
+        );
+    }
+
+    #[test]
+    fn a_scaled_job_manifest_carries_no_inline_env_value() {
+        let object: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "keda.sh/v1alpha1", "kind": "ScaledJob",
+            "metadata": { "name": "j", "annotations": { "kubectl.kubernetes.io/last-applied-configuration": "{\"opaque\":\"s3cr3t\"}", "team": "x" } },
+            "spec": { "jobTargetRef": { "template": { "spec": {
+                "containers": [{ "name": "app", "env": [{ "name": "TOKEN", "value": "s3cr3t" }, { "name": "REF", "valueFrom": { "secretKeyRef": { "name": "s", "key": "k" } } }] }],
+                "initContainers": [{ "name": "init", "env": [{ "name": "TOKEN", "value": "s3cr3t" }] }]
+            } } } }
+        }))
+        .unwrap();
+        let yaml = k8s::object_manifest(k8s::keda_manifest_for_diagnosis(object)).unwrap().yaml_without_managed_fields;
+        assert!(!yaml.contains("s3cr3t"), "{yaml}");
+        assert!(!yaml.contains("last-applied"), "{yaml}");
+        assert_eq!(yaml.matches("(value omitted)").count(), 2, "{yaml}");
+        assert!(yaml.contains("team: x") && yaml.contains("secretKeyRef"), "{yaml}");
+    }
+
+    #[test]
+    fn a_missing_scale_means_a_missing_target_only_when_the_target_is_missing_too() {
+        let not_found = || {
+            kube::Error::Api(kube::core::ErrorResponse { status: "Failure".into(), message: "not found".into(), reason: "NotFound".into(), code: 404 })
+        };
+        let gone: Result<kube::api::DynamicObject, String> = Err("Rollout 'r' does not exist".into());
+        assert_eq!(k8s::scale_error("Rollout", "r", &gone, not_found()), "Rollout 'r' does not exist");
+        let there: Result<kube::api::DynamicObject, String> = Err("Failed to get Rollout 'r': forbidden".into());
+        assert_eq!(k8s::scale_error("Rollout", "r", &there, not_found()), "Failed to read the scale of Rollout 'r': it has no scale subresource");
+    }
+
+    #[test]
+    fn a_trigger_authentication_is_traced_parameter_by_parameter() {
+        let auth: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "keda.sh/v1alpha1", "kind": "ClusterTriggerAuthentication", "metadata": { "name": "hub" },
+            "spec": {
+                "podIdentity": { "provider": "azure-workload", "identityId": "1111" },
+                "secretTargetRef": [{ "parameter": "connection", "name": "hub-conn", "key": "conn" }],
+                "azureKeyVault": { "vaultUri": "https://kv.vault.azure.net", "secrets": [{ "parameter": "password", "name": "db-pass" }] }
+            }
+        }))
+        .unwrap();
+        let auths = vec![
+            ("ClusterTriggerAuthentication/hub".to_string(), Ok(auth)),
+            ("TriggerAuthentication/gone".to_string(), Err("TriggerAuthentication 'gone' does not exist".to_string())),
+        ];
+        let ks = keys(&[("Secret", "kube-system", "hub-conn", Err("does not exist"))]);
+        let out = render_keda_credentials(&keda_detail_with(vec![]), &serde_json::json!({}), &[], &auths, &ks, "ns", Some("kube-system"));
+        assert_eq!(
+            out,
+            "ClusterTriggerAuthentication/hub:\n  pod identity: azure-workload, identity 1111\n  connection from Secret hub-conn does not exist\n  Azure Key Vault https://kv.vault.azure.net: password ← db-pass\nTriggerAuthentication/gone: unavailable: TriggerAuthentication 'gone' does not exist"
+        );
+    }
+
+    #[test]
+    fn operator_lines_are_matched_to_their_object_in_every_shape_keda_writes() {
+        let handler = "2026-11-01T10:00:00Z\tERROR\tscale_handler\terror getting scale decision\t{\"scaledObject.Namespace\": \"ns\", \"scaledObject.Name\": \"so\", \"scaler\": \"prometheusScaler\", \"error\": \"boom\"}";
+        let scaler = "2026-11-01T10:00:01Z\tERROR\tprometheus_scaler\terror executing prometheus query\t{\"type\": \"ScaledObject\", \"namespace\": \"ns\", \"name\": \"so\", \"error\": \"dial tcp: refused\"}";
+        let controller = "2026-11-01T10:00:02Z\tERROR\tReconciler error\t{\"controller\": \"scaledobject\", \"ScaledObject\": {\"name\": \"so\", \"namespace\": \"ns\"}, \"namespace\": \"ns\", \"name\": \"so\", \"error\": \"failed to ensure HPA is correctly created for ScaledObject\"}";
+        assert!(k8s::keda_log_line_is_about(handler, "ScaledObject", "ns", "so"));
+        assert!(k8s::keda_log_line_is_about(scaler, "ScaledObject", "ns", "so"));
+        assert!(k8s::keda_log_line_is_about(controller, "ScaledObject", "ns", "so"));
+        assert!(!k8s::keda_log_line_is_about(scaler, "ScaledObject", "ns", "other"));
+        assert!(!k8s::keda_log_line_is_about(scaler, "ScaledJob", "ns", "so"), "a ScaledJob of the same name is a different object");
+        assert!(!k8s::keda_log_line_is_about(controller, "ScaledJob", "ns", "so"), "nor is its controller's line about the ScaledJob");
+        let job_controller = "2026-11-01T10:00:03Z\tERROR\tReconciler error\t{\"controller\": \"scaledjob\", \"controllerKind\": \"ScaledJob\", \"ScaledJob\": {\"name\": \"so\", \"namespace\": \"ns\"}, \"namespace\": \"ns\", \"name\": \"so\", \"error\": \"x\"}";
+        assert!(k8s::keda_log_line_is_about(job_controller, "ScaledJob", "ns", "so"));
+        assert!(!k8s::keda_log_line_is_about(job_controller, "ScaledObject", "ns", "so"));
+        assert!(!k8s::keda_log_line_is_about("\tgithub.com/kedacore/keda/v2/pkg/scaling.(*scaleHandler).getScaledObjectState", "ScaledObject", "ns", "so"));
+
+        let lines = Ok(vec![handler.to_string(), scaler.to_string(), scaler.replace("10:00:01", "10:00:31"), controller.to_string()]);
+        let out = render_keda_operator_logs(&lines);
+        assert_eq!(
+            out,
+            "ERROR prometheus_scaler: error executing prometheus query (×2, last 2026-11-01T10:00:31Z)\n  dial tcp: refused\n\
+             ERROR: Reconciler error (×1, last 2026-11-01T10:00:02Z)\n  failed to ensure HPA is correctly created for ScaledObject\n\
+             ERROR scale_handler: error getting scale decision (×1, last 2026-11-01T10:00:00Z)\n  boom"
+        );
+        assert_eq!(render_keda_operator_logs(&Ok(vec![])), "(the operator logged nothing about this object in its recent log)");
+    }
+
+    #[test]
+    fn credential_sources_are_collected_from_the_container_and_the_authentication() {
+        let containers = vec![serde_json::json!({
+            "env": [{ "name": "A", "valueFrom": { "secretKeyRef": { "name": "s1", "key": "a" } } },
+                    { "name": "B", "valueFrom": { "configMapKeyRef": { "name": "c1", "key": "b" } } }],
+            "envFrom": [{ "secretRef": { "name": "s1" } }, { "configMapRef": { "name": "c2" } }],
+        })];
+        let auth: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "keda.sh/v1alpha1", "kind": "ClusterTriggerAuthentication", "metadata": { "name": "x" },
+            "spec": { "secretTargetRef": [{ "parameter": "p", "name": "s2", "key": "k" }], "configMapTargetRef": [{ "parameter": "q", "name": "c3", "key": "k" }] }
+        }))
+        .unwrap();
+        let refs = k8s::keda_key_set_refs(&containers, &[("ClusterTriggerAuthentication/x".into(), Ok(auth))], "ns", Some("keda"));
+        let got: Vec<String> = refs.iter().map(|(k, ns, n)| format!("{k} {ns}/{n}")).collect();
+        assert_eq!(got, ["Secret ns/s1", "ConfigMap ns/c1", "ConfigMap ns/c2", "Secret keda/s2", "ConfigMap keda/c3"]);
+    }
+
+    #[test]
+    fn a_missing_target_is_said_once_as_a_fact() {
+        let e = "Deployment 'api' does not exist".to_string();
+        let out = render_hpa_target(&Err(e.clone()), &Err(e), &Err("x".into()));
+        assert_eq!(out, "(Deployment 'api' does not exist)");
+        assert_eq!(read_failure("generated HPA", "HorizontalPodAutoscaler 'keda-hpa-x' does not exist"), "(HorizontalPodAutoscaler 'keda-hpa-x' does not exist)");
+        assert_eq!(read_failure("generated HPA", "forbidden"), "(generated HPA unavailable: forbidden)");
+    }
+
     /// Builds real pod diagnoses for restarted and never-restarted pods and
     /// checks the previous instance's section. Prints counts only — no
     /// names, logs or prompt text.
@@ -3116,6 +3859,51 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         // `no_metrics` is printed, not asserted: the HPA's condition is from its
         // last sync and the usage from this read, so a pod whose metrics come
         // and go between the two makes the pair disagree for a moment.
+    }
+
+    /// Builds a diagnosis for every ScaledObject and ScaledJob on a cluster and
+    /// checks each section was read, every FromEnv credential was resolved one
+    /// way or the other, and a not-Ready object's operator log was found.
+    /// Prints counts only — no names, log lines or values.
+    ///
+    ///   KEDA_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml keda_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster with KEDA; set KEDA_DIAG_TEST_CONTEXT to run"]
+    async fn keda_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("KEDA_DIAG_TEST_CONTEXT") else { return };
+        let objects = k8s::get_keda_scaled_objects(&ctx).await.expect("keda").scaled_objects;
+        let (mut built, mut unavailable, mut largest) = (0, 0, 0);
+        let (mut present, mut missing, mut undefined, mut unresolved) = (0, 0, 0, 0);
+        let (mut not_ready, mut not_ready_with_log) = (0, 0);
+        for o in &objects {
+            let payload = build_keda_diagnosis_payload(&ctx, &o.namespace, &o.kind, &o.name).await.expect("payload");
+            built += 1;
+            unavailable += payload.prompt.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            let creds = payload.prompt.split("## Credentials\n").nth(1).and_then(|s| s.split("\n\n## ").next()).unwrap_or_default();
+            for line in creds.lines().filter(|l| l.starts_with("trigger ")) {
+                if line.contains("— present") {
+                    present += 1
+                } else if line.contains("MISSING") {
+                    missing += 1
+                } else if line.contains("NOT DEFINED") {
+                    undefined += 1
+                } else {
+                    unresolved += 1
+                }
+            }
+            if !o.ready {
+                not_ready += 1;
+                not_ready_with_log += !payload.prompt.contains("(the operator logged nothing about this object") as usize;
+            }
+        }
+        println!(
+            "objects={} built={built} unavailable_sections={unavailable} largest_tokens={largest} from_env: present={present} missing_key={missing} not_defined={undefined} other={unresolved} not_ready={not_ready} not_ready_with_operator_log={not_ready_with_log}",
+            objects.len()
+        );
+        assert!(built > 0, "no KEDA object to diagnose");
+        assert_eq!(unavailable, 0);
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs

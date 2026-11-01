@@ -646,6 +646,16 @@ pub async fn ai_build_hpa_diagnosis(context_name: String, namespace: String, nam
 }
 
 #[tauri::command]
+pub async fn ai_build_keda_diagnosis(
+    context_name: String,
+    namespace: String,
+    kind: String,
+    name: String,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    with_retry(&context_name, || claude::build_keda_diagnosis_payload(&context_name, &namespace, &kind, &name)).await
+}
+
+#[tauri::command]
 pub async fn ai_diagnose(
     prompt: String,
     kind: String,

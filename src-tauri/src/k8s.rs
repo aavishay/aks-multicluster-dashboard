@@ -2722,10 +2722,33 @@ async fn get_hpa_target(
     };
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
     let (target, scale) = tokio::join!(api.get(name), api.get_scale(name));
-    (
-        target.map_err(|e| format!("Failed to get {kind} '{name}': {e}")),
-        scale.map_err(|e| format!("Failed to read the scale of {kind} '{name}': {e}")),
-    )
+    let target = target.map_err(|e| get_error(kind, name, e));
+    let scale = scale.map_err(|e| scale_error(kind, name, &target, e));
+    (target, scale)
+}
+
+/// A failed `/scale` read, given how the object's own read went.
+///
+/// A 404 from `/scale` alone says only that there is no scale to read: a
+/// custom resource without the scale subresource answers the same way. The
+/// object is missing only when its own read says so too.
+pub(crate) fn scale_error(kind: &str, name: &str, target: &Result<DynamicObject, String>, e: kube::Error) -> String {
+    let missing = format!("{kind} '{name}' does not exist");
+    match (target, e) {
+        (Err(t), _) if *t == missing => missing,
+        (_, kube::Error::Api(ref resp)) if resp.code == 404 => {
+            format!("Failed to read the scale of {kind} '{name}': it has no scale subresource")
+        }
+        (_, e) => format!("Failed to read the scale of {kind} '{name}': {e}"),
+    }
+}
+
+/// A failed get, said plainly when the object is simply not there.
+pub(crate) fn get_error(kind: &str, name: &str, e: kube::Error) -> String {
+    match e {
+        kube::Error::Api(ref resp) if resp.code == 404 => format!("{kind} '{name}' does not exist"),
+        e => format!("Failed to get {kind} '{name}': {e}"),
+    }
 }
 
 pub async fn get_hpa_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<HpaDiagnostics, String> {
@@ -2954,6 +2977,356 @@ pub async fn get_keda_manifest(context_name: &str, namespace: &str, kind: &str, 
     let detail = crate::keda_detail::keda_detail(&obj, kind);
     let ObjectManifest { yaml_full, yaml_without_managed_fields } = object_manifest(obj)?;
     Ok(KedaManifest { yaml_full, yaml_without_managed_fields, detail })
+}
+
+/// Everything a KEDA diagnosis reads.
+///
+/// Only the ScaledObject or ScaledJob itself is required; each of the rest
+/// fails on its own and the payload says so.
+pub struct KedaDiagnostics {
+    pub detail: KedaDetail,
+    pub object: DynamicObject,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// ScaledObject only: the workload it scales, and its scale subresource.
+    pub target: Option<(Result<DynamicObject, String>, Result<k8s_openapi::api::autoscaling::v1::Scale, String>)>,
+    /// ScaledObject only: the HPA KEDA generated to do the scaling.
+    pub hpa: Option<Result<HpaDetail, String>>,
+    /// ScaledJob only: the Jobs it has created, newest first.
+    pub jobs: Option<Result<Vec<k8s_openapi::api::batch::v1::Job>, String>>,
+    /// Each TriggerAuthentication or ClusterTriggerAuthentication a trigger
+    /// names, keyed by `Kind/name`.
+    pub auths: Vec<(String, Result<DynamicObject, String>)>,
+    /// The containers a trigger's `*FromEnv` metadata is resolved against.
+    pub env_containers: Vec<serde_json::Value>,
+    /// The keys — never the values — of every Secret and ConfigMap the
+    /// credentials resolve through, keyed by (kind, namespace, name).
+    pub key_sets: HashMap<(String, String, String), Result<Vec<String>, String>>,
+    /// The namespace KEDA's operator runs in, where a
+    /// ClusterTriggerAuthentication's secrets are read from.
+    pub operator_namespace: Option<String>,
+    /// KEDA's own Deployments: operator and metrics apiserver.
+    pub operator: Result<Vec<k8s_openapi::api::apps::v1::Deployment>, String>,
+    /// The operator's structured log lines about this object, newest last.
+    pub operator_logs: Result<Vec<String>, String>,
+    pub external_metrics_api: Result<Vec<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService>, String>,
+}
+
+/// How far back into the operator's log to look for this object: an hour.
+///
+/// By time rather than lines, because the two kinds of error that matter are
+/// logged at very different rates. A failing scaler logs on every poll, with a
+/// Go stack trace under each line — 3000 lines covered six minutes of one real
+/// operator — while a reconcile error ("failed to ensure HPA") backs off to
+/// once every quarter of an hour and fell outside those six minutes entirely.
+const KEDA_OPERATOR_LOG_SECONDS: i64 = 3600;
+
+/// The most of the operator's log to read for that hour; a busy operator
+/// wrote 2 MB in 37 minutes.
+const KEDA_OPERATOR_LOG_BYTES: i64 = 8 * 1024 * 1024;
+
+/// Whether one KEDA operator log line is about this object.
+///
+/// The operator logs as `time\tLEVEL\tcomponent\tmessage\t{json}` — or without
+/// the component, for the controller's own lines — and names
+/// the object in the JSON two ways: scale_handler as `scaledObject.Namespace`
+/// and `scaledObject.Name` (or `scaledJob.…`), the scalers and the controller
+/// as `namespace` and `name` (with `type` for the scalers). Lines without the JSON — Go stack traces under an
+/// error — are skipped; the error line above them already says what failed.
+pub(crate) fn keda_log_line_is_about(line: &str, kind: &str, namespace: &str, name: &str) -> bool {
+    let Some(start) = line.find("\t{") else { return false };
+    let Ok(fields) = serde_json::from_str::<serde_json::Value>(line[start + 1..].trim_end()) else { return false };
+    let field = |k: &str| fields.get(k).and_then(|v| v.as_str());
+    let prefix = if kind == "ScaledJob" { "scaledJob" } else { "scaledObject" };
+    let handler = field(&format!("{prefix}.Namespace")) == Some(namespace) && field(&format!("{prefix}.Name")) == Some(name);
+    // A bare namespace and name can belong to either kind, so whatever the
+    // line says about its kind must agree: the scalers' `type`, the
+    // controller's `controllerKind` or `controller`, or the object it keys by
+    // its kind. Only a line that says nothing of its kind is taken on name.
+    let other = if kind == "ScaledJob" { "ScaledObject" } else { "ScaledJob" };
+    let of_kind = field("type").is_none_or(|t| t == kind)
+        && field("controllerKind").is_none_or(|k| k == kind)
+        && field("controller").is_none_or(|c| c.eq_ignore_ascii_case(kind))
+        && fields.get(other).is_none();
+    let scaler = field("namespace") == Some(namespace) && field("name") == Some(name) && of_kind;
+    handler || scaler
+}
+
+/// The Secrets and ConfigMaps a KEDA object's credentials resolve through.
+///
+/// Two routes: a trigger's `*FromEnv` metadata names an environment variable
+/// on the target's container, which may come from a Secret or ConfigMap; a
+/// TriggerAuthentication's `secretTargetRef` or `configMapTargetRef` names a
+/// Secret or ConfigMap and key directly.
+pub(crate) fn keda_key_set_refs(
+    containers: &[serde_json::Value],
+    auths: &[(String, Result<DynamicObject, String>)],
+    namespace: &str,
+    operator_namespace: Option<&str>,
+) -> Vec<(String, String, String)> {
+    let mut refs: Vec<(String, String, String)> = Vec::new();
+    let mut add = |kind: &str, ns: &str, name: &str| {
+        let r = (kind.to_string(), ns.to_string(), name.to_string());
+        if !name.is_empty() && !refs.contains(&r) {
+            refs.push(r);
+        }
+    };
+    for c in containers {
+        for e in c.get("env").and_then(|v| v.as_array()).into_iter().flatten() {
+            let from = e.get("valueFrom");
+            add("Secret", namespace, json_str(from.and_then(|f| f.get("secretKeyRef")), "name"));
+            add("ConfigMap", namespace, json_str(from.and_then(|f| f.get("configMapKeyRef")), "name"));
+        }
+        for e in c.get("envFrom").and_then(|v| v.as_array()).into_iter().flatten() {
+            add("Secret", namespace, json_str(e.get("secretRef"), "name"));
+            add("ConfigMap", namespace, json_str(e.get("configMapRef"), "name"));
+        }
+    }
+    for (r, auth) in auths {
+        let Ok(auth) = auth else { continue };
+        let ns = if r.starts_with("ClusterTriggerAuthentication/") { operator_namespace.unwrap_or("keda") } else { namespace };
+        for (kind, at) in [("Secret", "/spec/secretTargetRef"), ("ConfigMap", "/spec/configMapTargetRef")] {
+            for t in auth.data.pointer(at).and_then(|v| v.as_array()).into_iter().flatten() {
+                add(kind, ns, json_str(Some(t), "name"));
+            }
+        }
+    }
+    refs
+}
+
+/// The containers KEDA reads `*FromEnv` from: a ScaledJob's own Job
+/// template, or the pod template of the workload a ScaledObject scales.
+fn keda_env_containers(object: &DynamicObject, target: Option<&DynamicObject>) -> Vec<serde_json::Value> {
+    let from = match target {
+        Some(t) => t.data.pointer("/spec/template/spec/containers"),
+        None => object.data.pointer("/spec/jobTargetRef/template/spec/containers"),
+    };
+    from.and_then(|c| c.as_array()).cloned().unwrap_or_default()
+}
+
+/// The manifest as the diagnosis sends it.
+///
+/// A ScaledJob carries a whole Job template, and its containers' inline `env`
+/// values can be credentials no pattern recognises, so each is replaced
+/// outright. `last-applied-configuration` would hold a second copy of them,
+/// so it goes too.
+pub(crate) fn keda_manifest_for_diagnosis(mut object: DynamicObject) -> DynamicObject {
+    if let Some(a) = object.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    for list in ["containers", "initContainers"] {
+        let at = format!("/spec/jobTargetRef/template/spec/{list}");
+        for c in object.data.pointer_mut(&at).and_then(|v| v.as_array_mut()).into_iter().flatten() {
+            for e in c.get_mut("env").and_then(|v| v.as_array_mut()).into_iter().flatten() {
+                if let Some(v) = e.get_mut("value") {
+                    *v = serde_json::Value::String("(value omitted)".to_string());
+                }
+            }
+        }
+    }
+    object
+}
+
+pub async fn get_keda_diagnostics(context_name: &str, namespace: &str, kind: &str, name: &str) -> Result<KedaDiagnostics, String> {
+    let client = client_for_context(context_name).await?;
+    let ar = keda_resource(kind, keda_plural(kind)?);
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+    let object = api.get(name).await.map_err(|e| format!("Failed to get {kind} '{name}': {e}"))?;
+    let detail = crate::keda_detail::keda_detail(&object, kind);
+    let manifest = object_manifest(keda_manifest_for_diagnosis(object.clone()))?.yaml_without_managed_fields;
+    let is_job = kind == "ScaledJob";
+
+    let target_ref = object.data.pointer("/spec/scaleTargetRef").cloned().unwrap_or_default();
+    let auth_refs: Vec<String> = {
+        let mut v: Vec<String> = detail.triggers.iter().map(|t| t.auth_ref.clone()).filter(|r| !r.is_empty()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    let event_fields = format!("involvedObject.kind={kind},involvedObject.name={name},involvedObject.namespace={namespace}");
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let deployments_api: Api<k8s_openapi::api::apps::v1::Deployment> = Api::all(client.clone());
+    let services_api: Api<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService> = Api::all(client.clone());
+    let (event_params, all) = (ListParams::default().fields(&event_fields), ListParams::default());
+
+    let target_fut = async {
+        if is_job {
+            return None;
+        }
+        Some(
+            get_hpa_target(
+                &client,
+                namespace,
+                match json_str(Some(&target_ref), "apiVersion") {
+                    "" => "apps/v1",
+                    v => v,
+                },
+                match json_str(Some(&target_ref), "kind") {
+                    "" => "Deployment",
+                    k => k,
+                },
+                json_str(Some(&target_ref), "name"),
+            )
+            .await,
+        )
+    };
+    let hpa_fut = async {
+        if is_job || detail.hpa_name.is_empty() {
+            return None;
+        }
+        let api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
+        Some(
+            api.get(&detail.hpa_name)
+                .await
+                .map(|h| crate::hpa_detail::hpa_detail(&h))
+                .map_err(|e| get_error("HorizontalPodAutoscaler", &detail.hpa_name, e)),
+        )
+    };
+    let jobs_fut = async {
+        if !is_job {
+            return None;
+        }
+        let api: Api<k8s_openapi::api::batch::v1::Job> = Api::namespaced(client.clone(), namespace);
+        Some(
+            api.list(&ListParams::default().labels(&format!("scaledjob.keda.sh/name={name}")))
+                .await
+                .map(|l| {
+                    let mut jobs = l.items;
+                    jobs.sort_by(|a, b| b.metadata.creation_timestamp.cmp(&a.metadata.creation_timestamp));
+                    jobs
+                })
+                .map_err(|e| format!("Failed to list the Jobs of '{name}': {e}")),
+        )
+    };
+    let auths_fut = futures::future::join_all(auth_refs.iter().map(|r| {
+        let client = client.clone();
+        async move {
+            let (auth_kind, auth_name) = r.split_once('/').unwrap_or(("TriggerAuthentication", r));
+            let (plural, scoped) = match auth_kind {
+                "ClusterTriggerAuthentication" => ("clustertriggerauthentications", false),
+                _ => ("triggerauthentications", true),
+            };
+            let ar = keda_resource(auth_kind, plural);
+            let api: Api<DynamicObject> = if scoped { Api::namespaced_with(client, namespace, &ar) } else { Api::all_with(client, &ar) };
+            (r.clone(), api.get(auth_name).await.map_err(|e| format!("Failed to get {r}: {e}")))
+        }
+    }));
+    // KEDA's Deployments by name, wherever it was installed: `keda` for Helm,
+    // `kube-system` for the AKS add-on.
+    let operator_fut = async {
+        let mut out = Vec::new();
+        for n in ["keda-operator", "keda-operator-metrics-apiserver"] {
+            let params = ListParams::default().fields(&format!("metadata.name={n}"));
+            out.extend(deployments_api.list(&params).await.map_err(|e| format!("Failed to find {n}: {e}"))?.items);
+        }
+        Ok::<_, String>(out)
+    };
+
+    let (events, target, hpa, jobs, auths, operator, apis) = tokio::join!(
+        events_api.list(&event_params),
+        target_fut,
+        hpa_fut,
+        jobs_fut,
+        auths_fut,
+        operator_fut,
+        services_api.list(&all),
+    );
+
+    let operator_namespace = operator
+        .as_ref()
+        .ok()
+        .and_then(|d| d.iter().find(|d| d.metadata.name.as_deref() == Some("keda-operator")))
+        .and_then(|d| d.metadata.namespace.clone());
+
+    let env_containers = keda_env_containers(&object, target.as_ref().and_then(|(t, _)| t.as_ref().ok()));
+    let containers = &env_containers;
+    let refs = keda_key_set_refs(containers, &auths, namespace, operator_namespace.as_deref());
+    let key_sets_fut = futures::future::join_all(refs.into_iter().map(|(k, ns, n)| {
+        let client = client.clone();
+        async move {
+            // Keys only: the values are dropped here and never leave this function.
+            let keys = if k == "Secret" {
+                let api: Api<k8s_openapi::api::core::v1::Secret> = Api::namespaced(client, &ns);
+                api.get(&n).await.map(|s| s.data.unwrap_or_default().into_keys().chain(s.string_data.unwrap_or_default().into_keys()).collect())
+            } else {
+                let api: Api<k8s_openapi::api::core::v1::ConfigMap> = Api::namespaced(client, &ns);
+                api.get(&n).await.map(|c| c.data.unwrap_or_default().into_keys().chain(c.binary_data.unwrap_or_default().into_keys()).collect())
+            };
+            let keys = match keys {
+                Ok(k) => Ok(k),
+                Err(kube::Error::Api(resp)) if resp.code == 404 => Err("does not exist".to_string()),
+                Err(e) => Err(format!("could not be read: {e}")),
+            };
+            ((k, ns, n), keys)
+        }
+    }));
+    let operator_selector = operator
+        .as_ref()
+        .ok()
+        .and_then(|d| d.iter().find(|d| d.metadata.name.as_deref() == Some("keda-operator")))
+        .and_then(|d| d.spec.as_ref())
+        .and_then(|s| s.selector.match_labels.as_ref())
+        .map(|m| m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","))
+        .filter(|s| !s.is_empty());
+    let logs_fut = async {
+        let ns = operator_namespace.clone().ok_or_else(|| "the KEDA operator was not found".to_string())?;
+        // The Deployment's own selector, rather than a label this side assumes:
+        // the Helm chart and the AKS add-on label their pods differently.
+        let selector = operator_selector.clone().ok_or_else(|| "the KEDA operator's Deployment has no selector".to_string())?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+        let operator_pods = pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| format!("Failed to list the operator's pods: {e}"))?
+            .items;
+        let mut lines = Vec::new();
+        for p in &operator_pods {
+            let params = LogParams {
+                since_seconds: Some(KEDA_OPERATOR_LOG_SECONDS),
+                limit_bytes: Some(KEDA_OPERATOR_LOG_BYTES),
+                ..Default::default()
+            };
+            match pods.logs(&p.name_any(), &params).await {
+                Ok(text) => lines.extend(text.lines().filter(|l| keda_log_line_is_about(l, kind, namespace, name)).map(str::to_string)),
+                Err(e) => return Err(format!("Failed to read the operator's log: {e}")),
+            }
+        }
+        // Lines start with an RFC 3339 time, so sorting orders replicas together.
+        lines.sort();
+        Ok(lines)
+    };
+    let (key_sets, operator_logs) = tokio::join!(key_sets_fut, logs_fut);
+
+    Ok(KedaDiagnostics {
+        detail,
+        object,
+        manifest,
+        events: events
+            .map(|l| {
+                let mut items = l.items;
+                items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+                items.into_iter().map(event_to_info).collect()
+            })
+            .map_err(|e| format!("Failed to list events for '{name}': {e}")),
+        target,
+        hpa,
+        jobs,
+        auths,
+        env_containers,
+        key_sets: key_sets.into_iter().collect(),
+        operator_namespace,
+        operator,
+        operator_logs,
+        external_metrics_api: apis
+            .map(|l| {
+                l.items
+                    .into_iter()
+                    .filter(|s| s.spec.as_ref().and_then(|sp| sp.group.as_deref()) == Some("external.metrics.k8s.io"))
+                    .collect()
+            })
+            .map_err(|e| format!("Failed to list APIServices: {e}")),
+    })
 }
 
 /// Same reasoning as `get_workload_events` (filter by involved object before

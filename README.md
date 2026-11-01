@@ -167,9 +167,9 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, NAP NodePool, workload, pod, HPA, Argo CD application or Helm
-release can be diagnosed by an AI model: open it and click **Diagnose** in its
-panel, or press `⌘D` on a focused row. The app gathers the status, events and
+Any node, NAP NodePool, workload, pod, HPA, KEDA ScaledObject or ScaledJob,
+Argo CD application or Helm release can be diagnosed by an AI model: open it
+and click **Diagnose** in its panel, or press `⌘D` on a focused row. The app gathers the status, events and
 manifest behind it, plus what that kind of object needs:
 
 - a pod: its recent logs, and the logs of its previous instance when the
@@ -180,7 +180,12 @@ manifest behind it, plus what that kind of object needs:
 - an HPA: the requests and usage of every container in the pods it scales —
   sidecars injected by a webhook included, the usual reason a utilization
   target cannot be computed — any other HPA on the same target, and whether
-  the metrics APIs it reads are available.
+  the metrics APIs it reads are available;
+- a KEDA ScaledObject or ScaledJob: the KEDA operator's own log lines about
+  it, where the actual scaler error usually is; where each credential its
+  triggers use comes from — a `connectionFromEnv` variable traced to its
+  Secret and key, checked by key name and never by value; the HPA it
+  generated or the Jobs it ran; and whether KEDA itself is healthy.
 
 It shows you exactly what will be sent, with a summary of what was redacted.
 Nothing leaves the machine until you confirm.
