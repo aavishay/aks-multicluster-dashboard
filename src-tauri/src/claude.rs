@@ -315,6 +315,48 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_SERVICE_SYSTEM: &str = "\
+You diagnose Kubernetes Services for an experienced SRE.
+
+You are given the Service's spec, its endpoints as the EndpointSlices \
+report them, the pods its selector matches — or, when it matches none, the \
+pods and workloads that nearly match and the label that keeps each out — \
+whether its target ports exist on those pods, the events of a matching pod \
+that is not ready, the Ingresses routing to it, its events, and its \
+manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the pod, the label, the \
+port, the event, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- The selector matches no pods: a label that differs from the pods' (read \
+the near misses), a workload scaled to zero or deleted, or a selector for \
+something that does not run in this cluster at all — on a managed control \
+plane such as AKS, etcd, kube-scheduler and kube-controller-manager have no \
+pods, so a Service selecting them (often created by a monitoring chart) is \
+empty by design and the fix is to stop creating it, not to fix the cluster.
+- Pods match but are not ready: the readiness probe is failing, the \
+container is crashing or still starting, or the pod is not scheduled. The \
+pod's events usually say which.
+- Endpoints are ready but traffic still fails: a target port that is not \
+the one the process listens on, or a named target port no container \
+declares.
+- A LoadBalancer with no address: the cloud provider could not create it; \
+its events and the service.beta.kubernetes.io annotations say why.
+- No selector: its endpoints are written by hand or by another controller, \
+and that is where to look.
+
+If the Service is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 /// How many drifted resources go into a diagnosis.
 ///
 /// An app with dozens of drifted resources is usually drifted the same way in
@@ -1947,6 +1989,523 @@ pub async fn build_keda_diagnosis_payload(
     })
 }
 
+/// How many endpoints, matching pods and near misses are listed one by one.
+const DIAGNOSE_SERVICE_ENDPOINTS: usize = 20;
+const DIAGNOSE_SERVICE_PODS: usize = 15;
+const DIAGNOSE_SERVICE_NEAR_MISSES: usize = 5;
+
+fn int_or_string(v: &k8s_openapi::apimachinery::pkg::util::intstr::IntOrString) -> String {
+    match v {
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(n) => n.to_string(),
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(s) => s.clone(),
+    }
+}
+
+/// The Service's own spec: what it selects, the ports it maps, and how it is
+/// reached.
+fn render_service_spec(svc: &k8s_openapi::api::core::v1::Service) -> String {
+    let spec = svc.spec.clone().unwrap_or_default();
+    let service_type = spec.type_.clone().unwrap_or_else(|| "ClusterIP".to_string());
+    let mut lines = vec![format!("type: {service_type}")];
+    if service_type == "ExternalName" {
+        lines.push(format!(
+            "external name: {} (a DNS CNAME; it has no selector, endpoints or ports of its own by design)",
+            spec.external_name.unwrap_or_default()
+        ));
+        return lines.join("\n");
+    }
+    lines.push(match spec.cluster_ip.as_deref() {
+        Some("None") => "cluster IP: None (headless: DNS returns the ready pods' addresses directly)".to_string(),
+        Some(ip) => format!("cluster IP: {ip}"),
+        None => "cluster IP: (unassigned)".to_string(),
+    });
+    let selector = spec.selector.clone().unwrap_or_default();
+    lines.push(if selector.is_empty() {
+        "selector: none — its endpoints are not managed by Kubernetes; they are written by hand or by another controller".to_string()
+    } else {
+        format!("selector: {}", selector.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", "))
+    });
+    lines.push("ports:".to_string());
+    for p in spec.ports.iter().flatten() {
+        let target = p.target_port.as_ref().map(int_or_string).unwrap_or_else(|| format!("{} (defaulted to the port)", p.port));
+        let name = p.name.as_deref().map(|n| format!("{n} ")).unwrap_or_default();
+        let node_port = p.node_port.map(|n| format!(", node port {n}")).unwrap_or_default();
+        let app = p.app_protocol.as_deref().map(|a| format!(", appProtocol {a}")).unwrap_or_default();
+        lines.push(format!("  {name}{} → target port {target}/{}{node_port}{app}", p.port, p.protocol.as_deref().unwrap_or("TCP")));
+    }
+    if spec.publish_not_ready_addresses == Some(true) {
+        lines.push("publishNotReadyAddresses: true (pods are published before they are ready)".to_string());
+    }
+    if let Some(a) = spec.session_affinity.as_deref().filter(|a| *a != "None") {
+        lines.push(format!("session affinity: {a}"));
+    }
+    if let Some(p) = &spec.external_traffic_policy {
+        lines.push(format!("external traffic policy: {p}"));
+    }
+    if let Some(p) = spec.internal_traffic_policy.as_deref().filter(|p| *p != "Cluster") {
+        lines.push(format!("internal traffic policy: {p}"));
+    }
+    if service_type == "LoadBalancer" {
+        if let Some(c) = &spec.load_balancer_class {
+            lines.push(format!("load balancer class: {c}"));
+        }
+        let ingress: Vec<String> = svc
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|lb| lb.ingress.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.ip.clone().or_else(|| i.hostname.clone()))
+            .collect();
+        lines.push(if ingress.is_empty() {
+            "load balancer address: PENDING — none assigned yet".to_string()
+        } else {
+            format!("load balancer address: {}", ingress.join(", "))
+        });
+    }
+    if let Some(ips) = spec.external_ips.filter(|i| !i.is_empty()) {
+        lines.push(format!("external IPs: {}", ips.join(", ")));
+    }
+    lines.join("\n")
+}
+
+/// What the EndpointSlices say is behind it, address by address.
+fn render_service_endpoints(slices: &Result<Vec<k8s_openapi::api::discovery::v1::EndpointSlice>, String>, has_selector: bool) -> String {
+    let slices = match slices {
+        Ok(s) => s,
+        Err(e) => return format!("(EndpointSlices unavailable: {e})"),
+    };
+    let endpoints: Vec<&k8s_openapi::api::discovery::v1::Endpoint> = slices.iter().flat_map(|s| s.endpoints.iter()).collect();
+    if endpoints.is_empty() {
+        return if slices.is_empty() && !has_selector {
+            "(no EndpointSlices: nothing has written any for this selector-less Service, so it routes nowhere)".to_string()
+        } else {
+            "(no endpoints: nothing is behind it)".to_string()
+        };
+    }
+    let condition = |e: &k8s_openapi::api::discovery::v1::Endpoint, f: fn(&k8s_openapi::api::discovery::v1::EndpointConditions) -> Option<bool>| {
+        e.conditions.as_ref().and_then(f)
+    };
+    let ready = endpoints.iter().filter(|e| condition(e, |c| c.ready).unwrap_or(true)).count();
+    let terminating = endpoints.iter().filter(|e| condition(e, |c| c.terminating) == Some(true)).count();
+    let ports: Vec<String> = slices
+        .iter()
+        .flat_map(|s| s.ports.iter().flatten())
+        .map(|p| {
+            let name = p.name.as_deref().filter(|n| !n.is_empty()).map(|n| format!("{n} ")).unwrap_or_default();
+            format!("{name}{}/{}", p.port.map(|n| n.to_string()).unwrap_or_else(|| "(none)".to_string()), p.protocol.as_deref().unwrap_or("TCP"))
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut out = format!("{ready} of {} ready, {terminating} terminating; resolved ports: {}", endpoints.len(), if ports.is_empty() { "(none)".to_string() } else { ports.join(", ") });
+    for e in endpoints.iter().take(DIAGNOSE_SERVICE_ENDPOINTS) {
+        let state = match (condition(e, |c| c.ready), condition(e, |c| c.terminating)) {
+            (_, Some(true)) => "terminating",
+            (Some(false), _) => "NOT READY",
+            _ => "ready",
+        };
+        let target = e
+            .target_ref
+            .as_ref()
+            .map(|t| format!(" ({} {})", t.kind.as_deref().unwrap_or("object"), t.name.as_deref().unwrap_or_default()))
+            .unwrap_or_default();
+        let node = e.node_name.as_deref().map(|n| format!(" on {n}")).unwrap_or_default();
+        out.push_str(&format!("\n  {} {state}{target}{node}", e.addresses.join(",")));
+    }
+    if endpoints.len() > DIAGNOSE_SERVICE_ENDPOINTS {
+        out.push_str(&format!("\n  … and {} more", endpoints.len() - DIAGNOSE_SERVICE_ENDPOINTS));
+    }
+    out
+}
+
+fn pod_is_ready(p: &k8s_openapi::api::core::v1::Pod) -> bool {
+    p.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+}
+
+/// A probe, said as what it checks: never an exec command, which can carry
+/// anything.
+fn render_probe(p: &k8s_openapi::api::core::v1::Probe) -> String {
+    let what = if let Some(h) = &p.http_get {
+        format!("httpGet {}:{}{}", h.scheme.as_deref().unwrap_or("HTTP").to_lowercase(), int_or_string(&h.port), h.path.as_deref().unwrap_or("/"))
+    } else if let Some(t) = &p.tcp_socket {
+        format!("tcpSocket {}", int_or_string(&t.port))
+    } else if let Some(g) = &p.grpc {
+        format!("grpc {}", g.port)
+    } else if p.exec.is_some() {
+        "exec (a command)".to_string()
+    } else {
+        "(no handler)".to_string()
+    };
+    format!(
+        "{what}, every {}s, fails after {}, first after {}s",
+        p.period_seconds.unwrap_or(10),
+        p.failure_threshold.unwrap_or(3),
+        p.initial_delay_seconds.unwrap_or(0)
+    )
+}
+
+/// The containers that serve a pod's traffic and count towards its
+/// readiness: its containers and its native sidecars — init containers that
+/// keep running — but not one-shot init containers.
+fn serving_containers(p: &k8s_openapi::api::core::v1::Pod) -> impl Iterator<Item = &k8s_openapi::api::core::v1::Container> {
+    p.spec.iter().flat_map(|s| {
+        s.containers
+            .iter()
+            .chain(s.init_containers.iter().flatten().filter(|c| c.restart_policy.as_deref() == Some("Always")))
+    })
+}
+
+/// One matching pod in a line: whether it is ready and, if not, why.
+fn render_service_pod(p: &k8s_openapi::api::core::v1::Pod) -> String {
+    let status = p.status.clone().unwrap_or_default();
+    let mut line = format!("{}: {}", p.metadata.name.as_deref().unwrap_or_default(), status.phase.as_deref().unwrap_or("Unknown"));
+    if p.metadata.deletion_timestamp.is_some() {
+        line.push_str(", being deleted");
+    }
+    match status.conditions.iter().flatten().find(|c| c.type_ == "Ready") {
+        Some(c) if c.status == "True" => line.push_str(", ready"),
+        Some(c) => {
+            line.push_str(", NOT READY");
+            if let Some(r) = c.reason.as_deref() {
+                line.push_str(&format!(" ({r})"));
+            }
+        }
+        None => line.push_str(", NOT READY (no Ready condition yet)"),
+    }
+    // Init containers first: one stuck there holds every other container in
+    // PodInitializing, which says nothing of why. A one-shot init container
+    // that exited 0 is done, not failed; a native sidecar is judged like any
+    // container.
+    let sidecars: Vec<&str> = p
+        .spec
+        .iter()
+        .flat_map(|s| s.init_containers.iter().flatten())
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"))
+        .map(|c| c.name.as_str())
+        .collect();
+    let statuses: Vec<(&k8s_openapi::api::core::v1::ContainerStatus, String, bool)> = status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .map(|c| {
+            let sidecar = sidecars.contains(&c.name.as_str());
+            (c, format!("{} {}", if sidecar { "sidecar" } else { "init" }, c.name), !sidecar)
+        })
+        .chain(status.container_statuses.iter().flatten().map(|c| (c, c.name.clone(), false)))
+        .collect();
+    let restarts: i32 = statuses.iter().map(|(c, _, _)| c.restart_count).sum();
+    if restarts > 0 {
+        line.push_str(&format!(", {restarts} restarts"));
+    }
+    for (c, name, one_shot) in &statuses {
+        let state = c.state.as_ref();
+        if let Some(w) = state.and_then(|s| s.waiting.as_ref()) {
+            line.push_str(&format!("; {name} waiting: {}", w.reason.as_deref().unwrap_or("?")));
+        } else if let Some(t) = state.and_then(|s| s.terminated.as_ref()) {
+            if !(*one_shot && t.exit_code == 0) {
+                line.push_str(&format!("; {name} terminated: {} (exit {})", t.reason.as_deref().unwrap_or("?"), t.exit_code));
+            }
+        } else if !c.ready && !one_shot {
+            line.push_str(&format!("; {name} running, not ready"));
+        }
+    }
+    if let Some(n) = p.spec.as_ref().and_then(|s| s.node_name.as_deref()) {
+        line.push_str(&format!("; on {n}"));
+    }
+    line
+}
+
+/// The pods behind the Service — or, when the selector matches none, the
+/// pods that nearly match and the label that keeps each out.
+fn render_service_pods(
+    selector: &std::collections::BTreeMap<String, String>,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+    namespace: &str,
+) -> String {
+    if selector.is_empty() {
+        return "(no selector, so no pods are matched by label)".to_string();
+    }
+    let pods = match pods {
+        Ok(p) => p,
+        Err(e) => return format!("(pods unavailable: {e})"),
+    };
+    let matching: Vec<&k8s_openapi::api::core::v1::Pod> =
+        pods.iter().filter(|p| k8s::selector_terms_met(selector, p.metadata.labels.as_ref()) == selector.len()).collect();
+    if !matching.is_empty() {
+        let ready = matching.iter().filter(|p| pod_is_ready(p)).count();
+        let mut out = format!("{} pods match, {ready} ready", matching.len());
+        // Unready first: they are the ones the diagnosis is about.
+        let mut ordered = matching.clone();
+        ordered.sort_by_key(|p| pod_is_ready(p));
+        for p in ordered.iter().take(DIAGNOSE_SERVICE_PODS) {
+            out.push_str(&format!("\n  {}", render_service_pod(p)));
+        }
+        if matching.len() > DIAGNOSE_SERVICE_PODS {
+            out.push_str(&format!("\n  … and {} more", matching.len() - DIAGNOSE_SERVICE_PODS));
+        }
+        // Readiness probes, each distinct one once: the pods of one workload
+        // repeat each other, but mid-rollout, or across two workloads, one
+        // container name can carry two probes. Unready pods first, so theirs lead.
+        let mut probes: Vec<(String, String)> = Vec::new();
+        for p in &ordered {
+            for c in serving_containers(p) {
+                let probe = c.readiness_probe.as_ref().map(render_probe).unwrap_or_else(|| "none (ready as soon as it starts)".to_string());
+                let entry = (c.name.clone(), probe);
+                if !probes.contains(&entry) {
+                    probes.push(entry);
+                }
+            }
+        }
+        out.push_str("\nreadiness probes:");
+        for (n, probe) in probes {
+            out.push_str(&format!("\n  {n}: {probe}"));
+        }
+        return out;
+    }
+
+    let mut out = format!("NO POD in namespace {namespace} matches the selector ({} pods in the namespace)", pods.len());
+    // Near misses, grouped on what keeps them out: the same mistake usually
+    // repeats across every replica of one workload.
+    let mut groups: Vec<(String, usize, String)> = Vec::new();
+    for p in pods {
+        let labels = p.metadata.labels.as_ref();
+        if k8s::selector_terms_met(selector, labels) == 0 {
+            continue;
+        }
+        let why: Vec<String> = selector
+            .iter()
+            .filter_map(|(k, v)| match labels.and_then(|l| l.get(k)) {
+                Some(have) if have == v => None,
+                Some(have) => Some(format!("{k}={have} where the selector wants {k}={v}")),
+                None => Some(format!("no {k} label")),
+            })
+            .collect();
+        let why = why.join("; ");
+        match groups.iter_mut().find(|g| g.0 == why) {
+            Some(g) => g.1 += 1,
+            None => groups.push((why, 1, p.metadata.name.clone().unwrap_or_default())),
+        }
+    }
+    if groups.is_empty() {
+        out.push_str("\nno pod in the namespace carries any of the selector's labels");
+    } else {
+        out.push_str("\nnear misses (pods with some of the selector's labels):");
+        for (why, n, example) in groups.iter().take(DIAGNOSE_SERVICE_NEAR_MISSES) {
+            out.push_str(&format!("\n  {n} pod(s), e.g. {example}: {why}"));
+        }
+    }
+    out
+}
+
+/// Whether each target port exists on the pods: a named one must be declared
+/// by a container, or the Service has no port to send to on that pod.
+fn render_service_port_check(svc: &k8s_openapi::api::core::v1::Service, pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>) -> String {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    let spec = svc.spec.clone().unwrap_or_default();
+    let selector = spec.selector.clone().unwrap_or_default();
+    let Ok(pods) = pods else { return "(not checked: pods unavailable)".to_string() };
+    let matching: Vec<&k8s_openapi::api::core::v1::Pod> =
+        pods.iter().filter(|p| !selector.is_empty() && k8s::selector_terms_met(&selector, p.metadata.labels.as_ref()) == selector.len()).collect();
+    if matching.is_empty() {
+        return "(not checked: no matching pods)".to_string();
+    }
+    // Native sidecars declare ports a Service can target, as containers do.
+    let declared = |p: &k8s_openapi::api::core::v1::Pod| -> Vec<k8s_openapi::api::core::v1::ContainerPort> {
+        serving_containers(p).flat_map(|c| c.ports.iter().flatten()).cloned().collect()
+    };
+    let mut lines = Vec::new();
+    for port in spec.ports.iter().flatten() {
+        let target = port.target_port.clone().unwrap_or(IntOrString::Int(port.port));
+        let protocol = port.protocol.as_deref().unwrap_or("TCP");
+        let label = format!("port {} → {}", port.port, int_or_string(&target));
+        match &target {
+            IntOrString::String(name) => {
+                // A named port resolves on its name and the Service port's
+                // protocol together: `dns` declared for UDP is no target for TCP.
+                let resolves = |cp: &k8s_openapi::api::core::v1::ContainerPort| {
+                    cp.name.as_deref() == Some(name.as_str()) && cp.protocol.as_deref().unwrap_or("TCP") == protocol
+                };
+                let missing: Vec<&str> = matching
+                    .iter()
+                    .filter(|p| !declared(p).iter().any(resolves))
+                    .filter_map(|p| p.metadata.name.as_deref())
+                    .collect();
+                if missing.is_empty() {
+                    let numbers: std::collections::BTreeSet<i32> =
+                        matching.iter().flat_map(|p| declared(p)).filter(resolves).map(|cp| cp.container_port).collect();
+                    lines.push(format!("{label}: named port declared on every matching pod, as {}", numbers.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")));
+                } else {
+                    lines.push(format!(
+                        "{label}: NAMED PORT NOT DECLARED for {protocol} on {} of {} matching pods (e.g. {}) — those endpoints get no port",
+                        missing.len(),
+                        matching.len(),
+                        missing[0]
+                    ));
+                }
+            }
+            IntOrString::Int(n) => {
+                let any = matching.iter().any(|p| declared(p).iter().any(|cp| cp.container_port == *n));
+                lines.push(if any {
+                    format!("{label}: declared by a container")
+                } else {
+                    let have: std::collections::BTreeSet<i32> = matching.iter().flat_map(|p| declared(p)).map(|cp| cp.container_port).collect();
+                    format!(
+                        "{label}: no container declares it (harmless if the process listens there anyway; declared: {})",
+                        if have.is_empty() { "none".to_string() } else { have.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ") }
+                    )
+                });
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// The workloads whose pods the selector would match, and how many they run:
+/// a Deployment scaled to zero is a selector that is right and a Service
+/// with nothing behind it all the same.
+fn render_service_workloads(selector: &std::collections::BTreeMap<String, String>, workloads: &[k8s::ServiceWorkload], errors: &[String]) -> String {
+    if selector.is_empty() {
+        return "(no selector)".to_string();
+    }
+    let unread: String = errors.iter().map(|e| format!("\n(unavailable: {e})")).collect();
+    if workloads.is_empty() {
+        return format!("(no Deployment, StatefulSet or DaemonSet that could be read has any of the selector's labels on its pod template){unread}");
+    }
+    let mut full: Vec<String> = Vec::new();
+    let mut near: Vec<String> = Vec::new();
+    for w in workloads {
+        let met = k8s::selector_terms_met(selector, Some(&w.labels));
+        if met == 0 {
+            continue;
+        }
+        let line = format!("{}/{}: {} desired, {} ready", w.kind, w.name, w.desired, w.ready);
+        if met == selector.len() {
+            full.push(line);
+        } else {
+            let missing: Vec<String> = selector
+                .iter()
+                .filter(|(k, v)| w.labels.get(*k) != Some(*v))
+                .map(|(k, v)| match w.labels.get(k) {
+                    Some(have) => format!("{k}={have} not {v}"),
+                    None => format!("no {k}"),
+                })
+                .collect();
+            near.push(format!("{line} — template has {}", missing.join(", ")));
+        }
+    }
+    let mut out = if full.is_empty() { "no workload's pod template matches the selector".to_string() } else { format!("matching:\n  {}", full.join("\n  ")) };
+    if !near.is_empty() {
+        out.push_str(&format!("\nnear misses:\n  {}", near.iter().take(DIAGNOSE_SERVICE_NEAR_MISSES).cloned().collect::<Vec<_>>().join("\n  ")));
+    }
+    out.push_str(&unread);
+    out
+}
+
+/// What the nodes say about the control plane, without claiming more: a
+/// self-managed cluster may label no node with a role, so only AKS's own
+/// node labels settle that etcd and the scheduler run no pods here.
+fn render_service_cluster(control_plane: &Result<k8s::ControlPlane, String>) -> String {
+    match control_plane {
+        Ok(c) if c.aks => format!(
+            "AKS: yes — the control plane is managed by Azure, and its components (etcd, kube-scheduler, kube-controller-manager, kube-apiserver) run no pods in this cluster\nnodes labelled control-plane or master: {}",
+            c.role_nodes
+        ),
+        Ok(c) => format!("AKS: no\nnodes labelled control-plane or master: {}", c.role_nodes),
+        Err(e) => format!("(nodes unavailable: {e})"),
+    }
+}
+
+/// The Ingresses that send traffic here, and on which of its ports.
+fn render_service_ingresses(name: &str, ingresses: &Result<Vec<k8s_openapi::api::networking::v1::Ingress>, String>) -> String {
+    let ingresses = match ingresses {
+        Ok(i) if i.is_empty() => return "(no Ingress in the namespace routes to it)".to_string(),
+        Ok(i) => i,
+        Err(e) => return format!("(Ingresses unavailable: {e})"),
+    };
+    let port = |b: &k8s_openapi::api::networking::v1::IngressBackend| {
+        b.service
+            .as_ref()
+            .and_then(|s| s.port.as_ref())
+            .map(|p| p.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| p.number.map(|n| n.to_string()).unwrap_or_default()))
+            .unwrap_or_default()
+    };
+    let mut lines = Vec::new();
+    for i in ingresses {
+        let spec = i.spec.clone().unwrap_or_default();
+        let iname = i.metadata.name.clone().unwrap_or_default();
+        if let Some(b) = spec.default_backend.as_ref().filter(|b| b.service.as_ref().is_some_and(|s| s.name == name)) {
+            lines.push(format!("{iname}: default backend → port {}", port(b)));
+        }
+        for r in spec.rules.iter().flatten() {
+            for p in r.http.iter().flat_map(|h| h.paths.iter()) {
+                if p.backend.service.as_ref().is_some_and(|s| s.name == name) {
+                    lines.push(format!("{iname}: {}{} → port {}", r.host.as_deref().unwrap_or("*"), p.path.as_deref().unwrap_or("/"), port(&p.backend)));
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Assembles everything a Service diagnosis needs, redacted.
+///
+/// A Service rarely fails in its own status; it fails in what is behind it.
+/// So most of this is the pods: the ones the selector matches and why they
+/// are not ready, or — when it matches none — the ones that nearly match and
+/// the workloads that would supply them.
+pub async fn build_service_diagnosis_payload(context_name: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_service_diagnostics(context_name, namespace, name).await?;
+    let selector = d.service.spec.as_ref().and_then(|s| s.selector.clone()).unwrap_or_default();
+
+    let spec = redact::redact(&render_service_spec(&d.service));
+    let external_name = d.service.spec.as_ref().and_then(|s| s.type_.as_deref()) == Some("ExternalName");
+    let endpoints = redact::redact(&if external_name {
+        "(none, by design: an ExternalName resolves through a DNS CNAME and has no endpoints)".to_string()
+    } else {
+        render_service_endpoints(&d.slices, !selector.is_empty())
+    });
+    let pods = redact::redact(&render_service_pods(&selector, &d.pods, namespace));
+    let ports = redact::redact(&render_service_port_check(&d.service, &d.pods));
+    let workloads = redact::redact(&render_service_workloads(&selector, &d.workloads.0, &d.workloads.1));
+    let unready = redact::redact(&match &d.unready_pod_events {
+        Some((pod, events)) => format!("pod {pod}:\n{}", render_nap_events(events, "(no events for it)", false, 15)),
+        None => "(every matching pod is ready, or none matches)".to_string(),
+    });
+    let ingresses = redact::redact(&render_service_ingresses(name, &d.ingresses));
+    let events = redact::redact(&render_nap_events(&d.events, "(no events for this Service)", false, 25));
+    let cluster = redact::redact(&render_service_cluster(&d.control_plane));
+    let manifest = redact::redact(&d.manifest);
+
+    let redaction_summary = redact::Redacted::merge([&spec, &endpoints, &pods, &ports, &workloads, &unready, &ingresses, &events, &cluster, &manifest]).summary();
+
+    let prompt = format!(
+        "Service {namespace}/{name}.\n\n\
+         ## Spec\n{}\n\n\
+         ## Endpoints\n{}\n\n\
+         ## Pods\n{}\n\n\
+         ## Target ports\n{}\n\n\
+         ## Workloads\n{}\n\n\
+         ## Events of an unready matching pod\n{}\n\n\
+         ## Ingresses routing to it\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Cluster\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        spec.text, endpoints.text, pods.text, ports.text, workloads.text, unready.text, ingresses.text, events.text, cluster.text, manifest.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
+}
+
 /// How many resources from a release's inventory go into a diagnosis.
 ///
 /// The inventory is cheap — one short line each, 66 for the largest release
@@ -2682,6 +3241,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "NodePool" => DIAGNOSE_NAP_SYSTEM,
         "HorizontalPodAutoscaler" => DIAGNOSE_HPA_SYSTEM,
         "ScaledObject" | "ScaledJob" => DIAGNOSE_KEDA_SYSTEM,
+        "Service" => DIAGNOSE_SERVICE_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -3710,6 +4270,222 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(got, ["Secret ns/s1", "ConfigMap ns/c1", "ConfigMap ns/c2", "Secret keda/s2", "ConfigMap keda/c3"]);
     }
 
+    fn labelled_pod(name: &str, labels: serde_json::Value, ready: bool, extra: serde_json::Value) -> k8s_openapi::api::core::v1::Pod {
+        let mut v = serde_json::json!({
+            "metadata": { "name": name, "labels": labels },
+            "spec": { "containers": [{ "name": "app" }], "nodeName": "n1" },
+            "status": { "phase": "Running", "conditions": [{ "type": "Ready", "status": if ready { "True" } else { "False" } }] }
+        });
+        json_merge(&mut v, extra);
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn json_merge(a: &mut serde_json::Value, b: serde_json::Value) {
+        match (a, b) {
+            (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+                for (k, v) in b {
+                    json_merge(a.entry(k).or_insert(serde_json::Value::Null), v);
+                }
+            }
+            (a, b) => *a = b,
+        }
+    }
+
+    fn selector(terms: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        terms.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn a_selector_that_matches_nothing_shows_what_nearly_does() {
+        let sel = selector(&[("app", "api"), ("tier", "web")]);
+        let pods = Ok(vec![
+            labelled_pod("api-1", serde_json::json!({ "app": "api", "tier": "backend" }), true, serde_json::json!({})),
+            labelled_pod("api-2", serde_json::json!({ "app": "api", "tier": "backend" }), true, serde_json::json!({})),
+            labelled_pod("api-3", serde_json::json!({ "app": "api" }), true, serde_json::json!({})),
+            labelled_pod("other", serde_json::json!({ "app": "db" }), true, serde_json::json!({})),
+        ]);
+        let out = render_service_pods(&sel, &pods, "ns");
+        assert_eq!(
+            out,
+            "NO POD in namespace ns matches the selector (4 pods in the namespace)\n\
+             near misses (pods with some of the selector's labels):\n  \
+             2 pod(s), e.g. api-1: tier=backend where the selector wants tier=web\n  \
+             1 pod(s), e.g. api-3: no tier label"
+        );
+        let none = render_service_pods(&selector(&[("component", "etcd")]), &pods, "kube-system");
+        assert!(none.ends_with("no pod in the namespace carries any of the selector's labels"), "{none}");
+    }
+
+    #[test]
+    fn a_workload_scaled_to_zero_is_named_as_the_supplier() {
+        let sel = selector(&[("app", "api")]);
+        let w = |kind: &str, name: &str, labels: &[(&str, &str)], desired, ready| k8s::ServiceWorkload {
+            kind: kind.into(),
+            name: name.into(),
+            labels: selector(labels),
+            desired,
+            ready,
+        };
+        let out = render_service_workloads(
+            &sel,
+            &[w("Deployment", "api", &[("app", "api")], 0, 0), w("Deployment", "api-v2", &[("app", "api-v2")], 3, 3)],
+            &["Failed to list StatefulSets in 'ns': forbidden".to_string()],
+        );
+        assert_eq!(out, "matching:\n  Deployment/api: 0 desired, 0 ready\n(unavailable: Failed to list StatefulSets in 'ns': forbidden)");
+        let sel = selector(&[("app", "api"), ("tier", "web")]);
+        let out = render_service_workloads(&sel, &[w("StatefulSet", "api", &[("app", "api")], 2, 2)], &[]);
+        assert_eq!(out, "no workload's pod template matches the selector\nnear misses:\n  StatefulSet/api: 2 desired, 2 ready — template has no tier");
+    }
+
+    #[test]
+    fn matching_pods_list_the_unready_first_with_their_probe() {
+        let sel = selector(&[("app", "api")]);
+        let probe = serde_json::json!({ "spec": { "containers": [{ "name": "app",
+            "readinessProbe": { "httpGet": { "port": "http", "path": "/healthz" }, "periodSeconds": 5 } },
+            { "name": "auth", "readinessProbe": { "exec": { "command": ["sh", "-c", "curl -H 'Authorization: s3cr3t'"] } } }] } });
+        let crashing = serde_json::json!({ "status": { "containerStatuses": [{ "name": "app", "ready": false, "restartCount": 4, "image": "i", "imageID": "",
+            "state": { "waiting": { "reason": "CrashLoopBackOff" } } }] } });
+        let pods = Ok(vec![
+            labelled_pod("api-ok", serde_json::json!({ "app": "api" }), true, probe.clone()),
+            labelled_pod("api-bad", serde_json::json!({ "app": "api" }), false, {
+                let mut p = probe.clone();
+                json_merge(&mut p, crashing);
+                p
+            }),
+        ]);
+        let out = render_service_pods(&sel, &pods, "ns");
+        assert_eq!(
+            out,
+            "2 pods match, 1 ready\n  \
+             api-bad: Running, NOT READY, 4 restarts; app waiting: CrashLoopBackOff; on n1\n  \
+             api-ok: Running, ready; on n1\n\
+             readiness probes:\n  \
+             app: httpGet http:http/healthz, every 5s, fails after 3, first after 0s\n  \
+             auth: exec (a command), every 10s, fails after 3, first after 0s"
+        );
+        assert!(!out.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn a_named_target_port_must_be_declared_on_the_pods() {
+        let svc: k8s_openapi::api::core::v1::Service = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api" },
+            "spec": { "selector": { "app": "api" }, "ports": [{ "port": 80, "targetPort": "http" }, { "port": 9090, "targetPort": 9090 }] }
+        }))
+        .unwrap();
+        let declares = serde_json::json!({ "spec": { "containers": [{ "name": "app", "ports": [{ "name": "http", "containerPort": 8080 }] }] } });
+        let pods = Ok(vec![
+            labelled_pod("api-1", serde_json::json!({ "app": "api" }), true, declares),
+            labelled_pod("api-2", serde_json::json!({ "app": "api" }), true, serde_json::json!({})),
+        ]);
+        assert_eq!(
+            render_service_port_check(&svc, &pods),
+            "port 80 → http: NAMED PORT NOT DECLARED for TCP on 1 of 2 matching pods (e.g. api-2) — those endpoints get no port\n\
+             port 9090 → 9090: no container declares it (harmless if the process listens there anyway; declared: 8080)"
+        );
+    }
+
+    #[test]
+    fn a_pod_stuck_in_init_names_the_init_container() {
+        let extra = serde_json::json!({
+            "spec": { "initContainers": [{ "name": "migrate" }, { "name": "setup" }, { "name": "proxy", "restartPolicy": "Always" }] },
+            "status": {
+                "phase": "Pending",
+                "initContainerStatuses": [
+                    { "name": "setup", "ready": false, "restartCount": 0, "image": "i", "imageID": "", "state": { "terminated": { "exitCode": 0, "reason": "Completed" } } },
+                    { "name": "migrate", "ready": false, "restartCount": 2, "image": "i", "imageID": "", "state": { "waiting": { "reason": "ImagePullBackOff" } } },
+                    { "name": "proxy", "ready": false, "restartCount": 0, "image": "i", "imageID": "", "state": { "running": {} } }
+                ],
+                "containerStatuses": [{ "name": "app", "ready": false, "restartCount": 0, "image": "i", "imageID": "", "state": { "waiting": { "reason": "PodInitializing" } } }]
+            }
+        });
+        let p = labelled_pod("api-1", serde_json::json!({ "app": "api" }), false, extra);
+        assert_eq!(
+            render_service_pod(&p),
+            "api-1: Pending, NOT READY, 2 restarts; init migrate waiting: ImagePullBackOff; sidecar proxy running, not ready; app waiting: PodInitializing; on n1"
+        );
+    }
+
+    #[test]
+    fn a_native_sidecar_counts_for_probes_and_ports() {
+        let sel = selector(&[("app", "api")]);
+        let sidecar = |probe_path: &str| {
+            serde_json::json!({ "spec": { "initContainers": [{ "name": "proxy", "restartPolicy": "Always",
+                "ports": [{ "name": "mesh", "containerPort": 15001 }, { "name": "dns", "containerPort": 53, "protocol": "UDP" }],
+                "readinessProbe": { "httpGet": { "port": 15021, "path": probe_path } } },
+                { "name": "migrate", "ports": [{ "name": "once", "containerPort": 9 }] }] } })
+        };
+        // Mid-rollout: the same container name with two probes, the unready pod's first.
+        let pods = Ok(vec![
+            labelled_pod("api-old", serde_json::json!({ "app": "api" }), true, sidecar("/ready")),
+            labelled_pod("api-new", serde_json::json!({ "app": "api" }), false, sidecar("/healthz/ready")),
+        ]);
+        let out = render_service_pods(&sel, &pods, "ns");
+        let probes = out.split("readiness probes:\n").nth(1).unwrap();
+        assert_eq!(
+            probes,
+            "  app: none (ready as soon as it starts)\n  \
+             proxy: httpGet http:15021/healthz/ready, every 10s, fails after 3, first after 0s\n  \
+             proxy: httpGet http:15021/ready, every 10s, fails after 3, first after 0s"
+        );
+
+        let svc: k8s_openapi::api::core::v1::Service = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api" },
+            "spec": { "selector": { "app": "api" }, "ports": [
+                { "port": 15001, "targetPort": "mesh" }, { "port": 53, "targetPort": "dns", "protocol": "TCP" }, { "port": 9, "targetPort": "once" }] }
+        }))
+        .unwrap();
+        assert_eq!(
+            render_service_port_check(&svc, &pods),
+            "port 15001 → mesh: named port declared on every matching pod, as 15001\n\
+             port 53 → dns: NAMED PORT NOT DECLARED for TCP on 2 of 2 matching pods (e.g. api-old) — those endpoints get no port\n\
+             port 9 → once: NAMED PORT NOT DECLARED for TCP on 2 of 2 matching pods (e.g. api-old) — those endpoints get no port"
+        );
+    }
+
+    #[test]
+    fn only_aks_settles_that_the_control_plane_runs_no_pods() {
+        let aks = render_service_cluster(&Ok(k8s::ControlPlane { role_nodes: 0, aks: true }));
+        assert!(aks.starts_with("AKS: yes — the control plane is managed by Azure"), "{aks}");
+        assert_eq!(render_service_cluster(&Ok(k8s::ControlPlane { role_nodes: 0, aks: false })), "AKS: no\nnodes labelled control-plane or master: 0");
+    }
+
+    #[test]
+    fn endpoints_and_spec_say_what_is_behind_the_service() {
+        let slice: k8s_openapi::api::discovery::v1::EndpointSlice = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api-x" }, "addressType": "IPv4",
+            "ports": [{ "name": "http", "port": 8080, "protocol": "TCP" }],
+            "endpoints": [
+                { "addresses": ["10.0.0.1"], "conditions": { "ready": true }, "targetRef": { "kind": "Pod", "name": "api-1" }, "nodeName": "n1" },
+                { "addresses": ["10.0.0.2"], "conditions": { "ready": false }, "targetRef": { "kind": "Pod", "name": "api-2" } },
+                { "addresses": ["10.0.0.3"], "conditions": { "ready": false, "terminating": true } }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            render_service_endpoints(&Ok(vec![slice]), true),
+            "1 of 3 ready, 1 terminating; resolved ports: http 8080/TCP\n  \
+             10.0.0.1 ready (Pod api-1) on n1\n  10.0.0.2 NOT READY (Pod api-2)\n  10.0.0.3 terminating"
+        );
+        assert_eq!(render_service_endpoints(&Ok(vec![]), true), "(no endpoints: nothing is behind it)");
+
+        let lb: k8s_openapi::api::core::v1::Service = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "web" },
+            "spec": { "type": "LoadBalancer", "clusterIP": "10.3.0.9", "selector": { "app": "web" },
+                      "ports": [{ "name": "https", "port": 443, "targetPort": 8443, "nodePort": 31443, "protocol": "TCP" }], "externalTrafficPolicy": "Local" },
+            "status": { "loadBalancer": {} }
+        }))
+        .unwrap();
+        assert_eq!(
+            render_service_spec(&lb),
+            "type: LoadBalancer\ncluster IP: 10.3.0.9\nselector: app=web\nports:\n  https 443 → target port 8443/TCP, node port 31443\n\
+             external traffic policy: Local\nload balancer address: PENDING — none assigned yet"
+        );
+        let ext: k8s_openapi::api::core::v1::Service =
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": "x" }, "spec": { "type": "ExternalName", "externalName": "db.example.com" } })).unwrap();
+        assert_eq!(render_service_spec(&ext), "type: ExternalName\nexternal name: db.example.com (a DNS CNAME; it has no selector, endpoints or ports of its own by design)");
+    }
+
     #[test]
     fn a_missing_target_is_said_once_as_a_fact() {
         let e = "Deployment 'api' does not exist".to_string();
@@ -3859,6 +4635,53 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         // `no_metrics` is printed, not asserted: the HPA's condition is from its
         // last sync and the usage from this read, so a pod whose metrics come
         // and go between the two makes the pair disagree for a moment.
+    }
+
+    /// Builds a diagnosis for every Service with no ready endpoint, and for a
+    /// sample of healthy ones, and checks that each empty one is explained: no
+    /// pod matches, or the ones that do are not ready. Prints counts only.
+    ///
+    ///   SERVICE_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml service_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set SERVICE_DIAG_TEST_CONTEXT to run"]
+    async fn service_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("SERVICE_DIAG_TEST_CONTEXT") else { return };
+        let services = crate::resources::get_services(&ctx).await.expect("services");
+        let empty: Vec<_> = services.iter().filter(|s| s.endpoints_ready == Some(0)).collect();
+        let healthy: Vec<_> = services.iter().filter(|s| s.endpoints_ready.is_some_and(|n| n > 0)).take(20).collect();
+        let (mut built, mut unavailable, mut largest) = (0, 0, 0);
+        let (mut no_pod, mut near_miss, mut not_ready, mut scaled_to_zero, mut unexplained) = (0, 0, 0, 0, 0);
+        let (mut healthy_ready, mut managed_plane) = (0, 0);
+        for s in &empty {
+            let payload = build_service_diagnosis_payload(&ctx, &s.namespace, &s.name).await.expect("payload");
+            built += 1;
+            unavailable += payload.prompt.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            let p = &payload.prompt;
+            no_pod += p.contains("NO POD in namespace") as usize;
+            near_miss += p.contains("near misses (pods") as usize;
+            not_ready += p.contains(", NOT READY") as usize;
+            scaled_to_zero += p.contains(": 0 desired,") as usize;
+            managed_plane += p.contains("AKS: yes") as usize;
+            unexplained += !(p.contains("NO POD in namespace") || p.contains(", NOT READY")) as usize;
+        }
+        for s in &healthy {
+            let payload = build_service_diagnosis_payload(&ctx, &s.namespace, &s.name).await.expect("payload");
+            built += 1;
+            unavailable += payload.prompt.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            healthy_ready += payload.prompt.contains(" ready\n") as usize;
+        }
+        println!(
+            "services={} empty={} built={built} unavailable_sections={unavailable} largest_tokens={largest} no_pod={no_pod} near_miss={near_miss} not_ready={not_ready} scaled_to_zero={scaled_to_zero} unexplained={unexplained} managed_plane={managed_plane} healthy_with_ready_pod={healthy_ready}/{}",
+            services.len(),
+            empty.len(),
+            healthy.len()
+        );
+        assert!(built > 0, "no Service to diagnose");
+        assert_eq!(unavailable, 0);
+        assert_eq!(unexplained, 0);
     }
 
     /// Builds a diagnosis for every ScaledObject and ScaledJob on a cluster and
