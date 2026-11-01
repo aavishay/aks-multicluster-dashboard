@@ -191,6 +191,8 @@ pub fn run() {
             commands::ai_build_gitops_diagnosis,
             commands::ai_build_helm_diagnosis,
             commands::ai_build_node_diagnosis,
+            commands::ai_build_nap_diagnosis,
+            commands::ai_build_hpa_diagnosis,
             commands::ai_diagnose,
             commands::kubeconfig_path,
             commands::get_write_enabled,

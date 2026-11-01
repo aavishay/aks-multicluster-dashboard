@@ -2042,10 +2042,20 @@ async fn list_karpenter(
     kind: &str,
     plural: &str,
 ) -> Result<Option<Vec<DynamicObject>>, String> {
+    list_karpenter_with(client, kind, plural, &ListParams::default()).await
+}
+
+/// `list_karpenter`, narrowed by the caller's selectors.
+async fn list_karpenter_with(
+    client: &Client,
+    kind: &str,
+    plural: &str,
+    params: &ListParams,
+) -> Result<Option<Vec<DynamicObject>>, String> {
     for version in KARPENTER_VERSIONS {
         let ar = karpenter_resource(version, kind, plural);
         let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
-        match api.list(&ListParams::default()).await {
+        match api.list(params).await {
             Ok(list) => return Ok(Some(list.items)),
             Err(kube::Error::Api(resp)) if resp.code == 404 => continue,
             Err(e) => return Err(format!("Failed to list Karpenter {plural}: {e}")),
@@ -2193,6 +2203,152 @@ pub async fn get_nap_node_pool_events(context_name: &str, name: &str) -> Result<
         .filter(|e| e.involved_object.kind.as_deref() == Some("NodePool") && e.involved_object.name.as_deref() == Some(name))
         .map(event_to_info)
         .collect())
+}
+
+/// Everything a NodePool diagnosis reads.
+///
+/// Only the pool itself is required. Each of the rest fails on its own, so a
+/// cluster that refuses one read — RBAC on NodeClaims, say — still gets a
+/// diagnosis that says what it could not see rather than none at all.
+pub struct NapDiagnostics {
+    pub pool: DynamicObject,
+    /// The node class the pool launches from; `None` when it names none.
+    pub node_class: Result<Option<DynamicObject>, String>,
+    pub claims: Result<Vec<DynamicObject>, String>,
+    pub nodes: Result<Vec<Node>, String>,
+    pub pool_events: Result<Vec<EventInfo>, String>,
+    /// Events on this pool's NodeClaims and nodes, newest first.
+    pub member_events: Result<Vec<EventInfo>, String>,
+    /// Scheduling failures whose message names this pool, newest first.
+    pub pod_events: Result<Vec<EventInfo>, String>,
+}
+
+/// Events matching an `involvedObject`/`reason` field selector, newest first.
+///
+/// Field selectors rather than the cluster-wide list `list_events_sorted`
+/// returns: on a busy private-link cluster that list takes a quarter of a
+/// minute, and a NodePool diagnosis needs four slices of it.
+async fn events_matching(client: &Client, fields: &str) -> Result<Vec<Event>, String> {
+    let api: Api<Event> = Api::all(client.clone());
+    let mut items = api
+        .list(&ListParams::default().fields(fields))
+        .await
+        .map_err(|e| format!("Failed to list events ({fields}): {e}"))?
+        .items;
+    items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+    Ok(items)
+}
+
+/// Whether a scheduling failure is about this pool.
+///
+/// Karpenter names the pool it tried in quotes — `incompatible with nodepool
+/// "gpu"`, `exceed limits for nodepool: "default"` — while the scheduler's own
+/// FailedScheduling events name no pool at all.
+pub(crate) fn mentions_node_pool(message: &str, pool: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let quoted = format!("\"{}\"", pool.to_ascii_lowercase());
+    // The quoted name must follow the word itself, as `nodepool "x"` or
+    // `nodepool: "x"`: elsewhere in the message a quoted string is a label or
+    // requirement key, and a pool named after one would claim every failure.
+    lower.match_indices("nodepool").any(|(i, word)| {
+        let rest = lower[i + word.len()..].trim_start_matches(':').trim_start();
+        rest.starts_with(&quoted)
+    })
+}
+
+/// The node class a pool's template points at, found by discovery.
+///
+/// Discovered rather than pinned: AKSNodeClass has been served as v1alpha2,
+/// v1beta1 and v1 across the AKS releases this fleet spans, and the reference
+/// carries the group (v1) or an apiVersion (v1beta1) but never a version the
+/// cluster is guaranteed to serve.
+async fn get_node_class(client: &Client, pool: &DynamicObject) -> Result<Option<DynamicObject>, String> {
+    let Some(r) = pool.data.pointer("/spec/template/spec/nodeClassRef") else { return Ok(None) };
+    let (kind, name) = (json_str(Some(r), "kind"), json_str(Some(r), "name"));
+    if kind.is_empty() || name.is_empty() {
+        return Ok(None);
+    }
+    let group = match json_str(Some(r), "group") {
+        "" => json_str(Some(r), "apiVersion").split('/').next().unwrap_or_default(),
+        g => g,
+    };
+    let group = if group.is_empty() { "karpenter.azure.com" } else { group };
+    let served = kube::discovery::oneshot::group(client, group)
+        .await
+        .map_err(|e| format!("Failed to discover {group}: {e}"))?;
+    let (ar, _) = served.recommended_kind(kind).ok_or_else(|| format!("{kind} is not served by {group}"))?;
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+    api.get(name).await.map(Some).map_err(|e| format!("Failed to get {kind} '{name}': {e}"))
+}
+
+pub async fn get_nap_diagnostics(context_name: &str, name: &str) -> Result<NapDiagnostics, String> {
+    let client = client_for_context(context_name).await?;
+    let pool = get_karpenter(&client, "NodePool", "nodepools", name).await?;
+
+    // Karpenter labels every claim and node it launches with its pool, so the
+    // apiserver can narrow both lists rather than this side discarding the
+    // rest of the cluster.
+    let members = ListParams::default().labels(&format!("karpenter.sh/nodepool={name}"));
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let pool_fields = format!("involvedObject.kind=NodePool,involvedObject.name={name}");
+    let (node_class, claims, nodes, pool_events, claim_events, node_events, pod_events) = tokio::join!(
+        get_node_class(&client, &pool),
+        list_karpenter_with(&client, "NodeClaim", "nodeclaims", &members),
+        nodes_api.list(&members),
+        events_matching(&client, &pool_fields),
+        events_matching(&client, "involvedObject.kind=NodeClaim"),
+        events_matching(&client, "involvedObject.kind=Node"),
+        events_matching(&client, "involvedObject.kind=Pod,reason=FailedScheduling"),
+    );
+    let claims = claims.map(Option::unwrap_or_default);
+    let nodes = nodes.map(|l| l.items).map_err(|e| format!("Failed to list nodes of '{name}': {e}"));
+
+    // A claim's node is named on the claim too, so a failed node list still
+    // leaves the node events attributable.
+    let mut member_names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for c in claims.iter().flatten() {
+        member_names.insert(("NodeClaim".into(), c.name_any()));
+        if let Some(n) = c.data.pointer("/status/nodeName").and_then(|v| v.as_str()).filter(|n| !n.is_empty()) {
+            member_names.insert(("Node".into(), n.to_string()));
+        }
+    }
+    for n in nodes.iter().flatten() {
+        member_names.insert(("Node".into(), n.name_any()));
+    }
+    let is_member = |e: &Event| {
+        let o = &e.involved_object;
+        member_names.contains(&(o.kind.clone().unwrap_or_default(), o.name.clone().unwrap_or_default()))
+    };
+    let member_events = match (claim_events, node_events) {
+        // Without the claims there is no knowing which claim events are this
+        // pool's, and an empty list would read as "none".
+        _ if claims.is_err() => Err(format!(
+            "this pool's NodeClaims could not be listed, so their events cannot be attributed ({})",
+            claims.as_ref().err().cloned().unwrap_or_default()
+        )),
+        (Ok(c), Ok(n)) => {
+            let mut all: Vec<Event> = c.into_iter().chain(n).filter(|e| is_member(e)).collect();
+            all.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+            Ok(all.into_iter().map(event_to_info).collect())
+        }
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    };
+    let pod_events = pod_events.map(|list| {
+        list.into_iter()
+            .filter(|e| mentions_node_pool(e.message.as_deref().unwrap_or_default(), name))
+            .map(event_to_info)
+            .collect()
+    });
+
+    Ok(NapDiagnostics {
+        pool,
+        node_class,
+        claims,
+        nodes,
+        pool_events: pool_events.map(|l| l.into_iter().map(event_to_info).collect()),
+        member_events,
+        pod_events,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2476,6 +2632,203 @@ pub async fn get_hpa_manifest(context_name: &str, namespace: &str, name: &str) -
         .map_err(|e| format!("Failed to read HorizontalPodAutoscaler '{name}': {e}"))?;
     let ObjectManifest { yaml_full, yaml_without_managed_fields } = object_manifest(obj)?;
     Ok(HpaManifest { yaml_full, yaml_without_managed_fields, detail: crate::hpa_detail::hpa_detail(&typed) })
+}
+
+/// Everything an HPA diagnosis reads.
+///
+/// Only the HPA itself is required; the rest each fail on their own, so a
+/// target that cannot be read still leaves the conditions and events — which
+/// usually carry the error verbatim — to diagnose from.
+pub struct HpaDiagnostics {
+    pub detail: HpaDetail,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// The object it scales, as read through discovery.
+    pub target: Result<DynamicObject, String>,
+    /// The target's scale subresource: its replica counts as every scalable
+    /// kind reports them.
+    pub scale: Result<k8s_openapi::api::autoscaling::v1::Scale, String>,
+    /// The selector the HPA itself reads, from that scale subresource.
+    pub selector: Result<String, String>,
+    /// The pods that selector matches — the ones whose metrics the HPA averages.
+    pub pods: Result<Vec<Pod>, String>,
+    /// Per-container usage from metrics-server, keyed by (pod, container).
+    pub usage: Result<HashMap<(String, String), (i64, i64)>, String>,
+    /// The metrics APIs registered on the cluster, for the groups this HPA's
+    /// metric types are served by.
+    pub metrics_apis: Result<Vec<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService>, String>,
+    /// Other HPAs in the namespace scaling the same object: (name, owner as `Kind/name`).
+    pub siblings: Result<Vec<(String, String)>, String>,
+}
+
+/// The metrics API group each HPA metric type is read from.
+pub(crate) fn metrics_api_group(kind: &str) -> &'static str {
+    match kind {
+        "Resource" | "ContainerResource" => "metrics.k8s.io",
+        "External" => "external.metrics.k8s.io",
+        _ => "custom.metrics.k8s.io",
+    }
+}
+
+/// Per-container usage in a namespace, from metrics-server.
+///
+/// Unlike `fetch_pod_metrics`, an absent or failing metrics-server is an
+/// error here rather than "no data": for an HPA on resource metrics it is
+/// very likely the answer.
+async fn fetch_container_usage(client: &Client, namespace: &str) -> Result<HashMap<(String, String), (i64, i64)>, String> {
+    let req = http::Request::builder()
+        .uri(format!("/apis/metrics.k8s.io/v1beta1/namespaces/{namespace}/pods"))
+        .body(Vec::new())
+        .map_err(|e| e.to_string())?;
+    let value: serde_json::Value = tokio::time::timeout(METRICS_REQUEST_TIMEOUT, client.request(req))
+        .await
+        .map_err(|_| "metrics.k8s.io did not answer in time".to_string())?
+        .map_err(|e| format!("metrics.k8s.io: {e}"))?;
+    let mut out = HashMap::new();
+    for item in value.get("items").and_then(|v| v.as_array()).into_iter().flatten() {
+        let pod = item.pointer("/metadata/name").and_then(|n| n.as_str()).unwrap_or_default();
+        for c in item.get("containers").and_then(|v| v.as_array()).into_iter().flatten() {
+            let usage = |k: &str| c.pointer(&format!("/usage/{k}")).and_then(|v| v.as_str());
+            out.insert(
+                (pod.to_string(), json_str(Some(c), "name").to_string()),
+                (usage("cpu").map(parse_cpu_millicores).unwrap_or(0), usage("memory").map(parse_memory_ki).unwrap_or(0)),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// The HPA's target and its scale subresource, found by discovery: the
+/// reference carries an apiVersion, and a target can be any kind that
+/// implements `/scale` — an Argo Rollout as readily as a Deployment.
+async fn get_hpa_target(
+    client: &Client,
+    namespace: &str,
+    api_version: &str,
+    kind: &str,
+    name: &str,
+) -> (Result<DynamicObject, String>, Result<k8s_openapi::api::autoscaling::v1::Scale, String>) {
+    let (group, version) = match api_version.split_once('/') {
+        Some((g, v)) => (g, v),
+        None => ("", api_version),
+    };
+    let gvk = GroupVersionKind::gvk(group, version, kind);
+    let ar = match kube::discovery::oneshot::pinned_kind(client, &gvk).await {
+        Ok((ar, _)) => ar,
+        Err(e) => {
+            let e = format!("Failed to discover {kind} in {api_version}: {e}");
+            return (Err(e.clone()), Err(e));
+        }
+    };
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+    let (target, scale) = tokio::join!(api.get(name), api.get_scale(name));
+    (
+        target.map_err(|e| format!("Failed to get {kind} '{name}': {e}")),
+        scale.map_err(|e| format!("Failed to read the scale of {kind} '{name}': {e}")),
+    )
+}
+
+pub async fn get_hpa_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<HpaDiagnostics, String> {
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &hpa_resource());
+    let obj = api.get(name).await.map_err(|e| format!("Failed to get HorizontalPodAutoscaler '{name}': {e}"))?;
+    let typed: HorizontalPodAutoscaler = serde_json::to_value(&obj)
+        .and_then(serde_json::from_value)
+        .map_err(|e| format!("Failed to read HorizontalPodAutoscaler '{name}': {e}"))?;
+    let detail = crate::hpa_detail::hpa_detail(&typed);
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+    let target_ref = typed.spec.as_ref().map(|s| s.scale_target_ref.clone()).unwrap_or_default();
+
+    let event_fields = format!(
+        "involvedObject.kind=HorizontalPodAutoscaler,involvedObject.name={name},involvedObject.namespace={namespace}"
+    );
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let services_api: Api<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService> =
+        Api::all(client.clone());
+    let (event_params, all) = (ListParams::default().fields(&event_fields), ListParams::default());
+    let hpas_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
+    let ((target, scale), events, usage, metrics_apis, siblings) = tokio::join!(
+        get_hpa_target(
+            &client,
+            namespace,
+            target_ref.api_version.as_deref().unwrap_or("apps/v1"),
+            &target_ref.kind,
+            &target_ref.name,
+        ),
+        events_api.list(&event_params),
+        fetch_container_usage(&client, namespace),
+        services_api.list(&all),
+        hpas_api.list(&all),
+    );
+    let siblings = siblings
+        .map(|l| {
+            l.items
+                .into_iter()
+                .filter(|h| h.metadata.name.as_deref() != Some(name))
+                .filter(|h| {
+                    h.spec.as_ref().is_some_and(|s| s.scale_target_ref.kind == target_ref.kind && s.scale_target_ref.name == target_ref.name)
+                })
+                .map(|h| {
+                    let owner = h
+                        .metadata
+                        .owner_references
+                        .iter()
+                        .flatten()
+                        .find(|o| o.controller == Some(true))
+                        .map(|o| format!("{}/{}", o.kind, o.name))
+                        .unwrap_or_default();
+                    (h.metadata.name.unwrap_or_default(), owner)
+                })
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list HPAs in '{namespace}': {e}"));
+
+    let selector = scale.clone().and_then(|s| {
+        s.status
+            .and_then(|st| st.selector)
+            .filter(|sel| !sel.is_empty())
+            .ok_or_else(|| format!("{} '{}' reports no selector on its scale subresource", target_ref.kind, target_ref.name))
+    });
+    let pods = match &selector {
+        Ok(sel) => {
+            let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+            pods_api
+                .list(&ListParams::default().labels(sel))
+                .await
+                .map(|l| l.items)
+                .map_err(|e| format!("Failed to list the target's pods: {e}"))
+        }
+        Err(e) => Err(format!("no selector to find the pods by ({e})")),
+    };
+
+    let groups: Vec<&str> = detail.metrics.iter().map(|m| metrics_api_group(&m.kind)).collect();
+    let metrics_apis = metrics_apis
+        .map(|l| {
+            l.items
+                .into_iter()
+                .filter(|s| s.spec.as_ref().and_then(|sp| sp.group.as_deref()).is_some_and(|g| groups.contains(&g)))
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list APIServices: {e}"));
+
+    Ok(HpaDiagnostics {
+        detail,
+        manifest,
+        events: events
+            .map(|l| {
+                let mut items = l.items;
+                items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+                items.into_iter().map(event_to_info).collect()
+            })
+            .map_err(|e| format!("Failed to list events for '{name}': {e}")),
+        target,
+        scale,
+        selector,
+        pods,
+        usage,
+        metrics_apis,
+        siblings,
+    })
 }
 
 /// Same reasoning as `get_keda_events` (filter before the cap).
@@ -3891,6 +4244,17 @@ mod tests {
 
         let app = dynamic_object_to_gitops_app(obj);
         assert_eq!(app.last_synced_at, None);
+    }
+
+    #[test]
+    fn a_scheduling_failure_is_matched_to_the_pool_it_names() {
+        assert!(mentions_node_pool(r#"Failed to schedule pod, incompatible with nodepool "gpu", daemonset overhead={}"#, "gpu"));
+        assert!(mentions_node_pool(r#"all available instance types exceed limits for nodepool: "gpu""#, "gpu"));
+        assert!(mentions_node_pool(r#"incompatible with NodePool "gpu""#, "gpu"));
+        assert!(!mentions_node_pool(r#"incompatible with nodepool "gpu-large""#, "gpu"));
+        assert!(!mentions_node_pool("0/12 nodes are available: 3 Insufficient cpu", "default"));
+        assert!(!mentions_node_pool(r#"volume "default" not found"#, "default"));
+        assert!(!mentions_node_pool(r#"incompatible with nodepool "gpu", incompatible requirements, label "team" does not have known values"#, "team"));
     }
 
     #[test]

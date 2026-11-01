@@ -185,6 +185,95 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_NAP_SYSTEM: &str = "\
+You diagnose Karpenter NodePools (AKS Node Auto Provisioning) for an \
+experienced SRE.
+
+You are given the pool's policy and status — requirements, limits and how \
+much of them is provisioned, disruption settings and budgets — its \
+conditions, every NodeClaim it owns with the state of each claim's node, the \
+events on the pool and on its claims and nodes, the scheduling failures \
+Karpenter reported against this pool, the node class it launches from, and \
+its manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition, the claim, \
+the event, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which failure you are looking at, because each has a different fix:
+- Not provisioning: pods stay pending. Karpenter's scheduling failures say \
+why — the requirements exclude what the pod asks for, a limit is reached \
+(compare provisioned with the limit), or no instance type fits. Azure \
+refusing the VM — quota, a size unavailable in the zone, a subnet out of \
+addresses — shows as a claim that never reaches Launched, and in its events.
+- Not becoming ready: a claim launched but never Registered or Initialized. \
+That is node bootstrap, networking or the image, and the claim's and the \
+node class's conditions usually say which.
+- Not disrupting: drift, expiry or consolidation is due but nodes are held — \
+a budget of zero for that reason, a do-not-disrupt annotation, or a \
+PodDisruptionBudget. Karpenter names the blocker in DisruptionBlocked and \
+Unconsolidatable events; name it too.
+- Churning: nodes replaced over and over — consolidation fighting a workload \
+that scales, or an expireAfter too short for what runs there.
+
+On the pool, its node class and its claims, True is healthy for Ready, \
+Launched, Registered, Initialized and the other *Ready and *Succeeded \
+conditions. Drifted, Empty, Consolidatable and Expired being True marks a \
+claim for replacement: routine on a healthy pool, a problem only when the \
+claim stays that way.
+
+Provisioned is the capacity of the nodes the pool owns, which is what its \
+limits bound — not utilisation. There are no CPU or memory readings here. \
+Pending pods whose failures do not name this pool are not listed, so an empty \
+scheduling section means Karpenter has not blamed this pool for any pod.
+
+Be direct; assume fluency with kubectl and Karpenter. Prefer one \
+well-supported cause over a list of possibilities. If the evidence is \
+genuinely insufficient, say so and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
+const DIAGNOSE_HPA_SYSTEM: &str = "\
+You diagnose Kubernetes HorizontalPodAutoscalers for an experienced SRE.
+
+You are given the HPA's replica bounds and counts, its conditions, each \
+metric against its target, its scaling behavior, its events, the object it \
+scales, the requests and live usage of every container in the pods it \
+averages over, whether the metrics APIs it reads from are available, and its \
+manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition message, the \
+event, the container, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- Cannot read a metric (ScalingActive False, a metric with no reading): a \
+utilization target needs a request for that resource on every container in \
+every pod, sidecars included — one injected by a webhook is not in the \
+workload's template, so the template looking right does not settle it; read \
+the container table. Otherwise the metrics API serving it is unavailable or \
+the metric does not exist under that name or selector.
+- At a bound (ScalingLimited True): it wants more or fewer replicas than \
+min or max allow. Say which, and whether the bound or the load is wrong.
+- Scaling, but not as expected: the behavior's stabilization windows and \
+policies are slowing or capping it, or the target is computed over pods that \
+are not ready.
+- Fighting something: another controller — a second HPA, KEDA, or a \
+GitOps tool resetting replicas — writes the same field.
+
+An HPA owned by a KEDA ScaledObject is generated from it; the fix belongs in \
+the ScaledObject, not the HPA.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 /// How many drifted resources go into a diagnosis.
 ///
 /// An app with dozens of drifted resources is usually drifted the same way in
@@ -491,6 +580,846 @@ fn node_manifest_without_images(node: &k8s_openapi::api::core::v1::Node) -> Resu
         object.insert("kind".to_string(), serde_json::json!("Node"));
     }
     serde_yaml::to_string(&value).map_err(|e| format!("Failed to render node YAML: {e}"))
+}
+
+/// How many NodeClaims go into a NodePool diagnosis, worst first.
+///
+/// The healthy rest are counted, not listed: a pool of ninety Ready claims
+/// says the same thing in one line as in ninety.
+const DIAGNOSE_NAP_CLAIMS: usize = 30;
+
+/// How many events from the pool's claims and nodes go in, newest first.
+const DIAGNOSE_NAP_MEMBER_EVENTS: usize = 30;
+
+/// How many distinct scheduling failures go in.
+///
+/// Karpenter writes one per pending pod per attempt, near-identical, so they
+/// are collapsed on the message first and this caps the distinct ones.
+const DIAGNOSE_NAP_SCHEDULING: usize = 12;
+
+/// How much of one scheduling failure's message to send. Karpenter appends
+/// the pod's requests and every requirement it compared, which runs long.
+const DIAGNOSE_NAP_MESSAGE_CHARS: usize = 800;
+
+/// Karpenter conditions where True marks a claim for replacement rather than
+/// saying it is healthy. Every other condition — Ready, Launched,
+/// Registered, Initialized, the pool's and the node class's — is healthy
+/// when True, which is also the safer reading of one this list has not
+/// heard of.
+const KARPENTER_MARKING_CONDITIONS: [&str; 5] = ["Drifted", "Empty", "Consolidatable", "Expired", "Disrupting"];
+
+/// A Karpenter object's conditions, split into the ones to read and the ones
+/// that are clear — the same split as `split_node_conditions`, with
+/// Karpenter's polarity.
+fn split_karpenter_conditions(obj: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let mut notable = Vec::new();
+    let mut clear = Vec::new();
+    let conditions = obj.pointer("/status/conditions").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+    for c in &conditions {
+        let field = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+        let (kind, status) = (field("type"), field("status"));
+        let marks = KARPENTER_MARKING_CONDITIONS.contains(&kind);
+        if (marks && status != "True") || (!marks && status == "True") {
+            clear.push(kind.to_string());
+            continue;
+        }
+        let mut line = format!("{kind}={status}");
+        if !field("reason").is_empty() {
+            line.push_str(&format!(" ({})", field("reason")));
+        }
+        if !field("lastTransitionTime").is_empty() {
+            line.push_str(&format!(" since {}", field("lastTransitionTime")));
+        }
+        if !field("message").is_empty() {
+            line.push_str(&format!("\n  {}", field("message")));
+        }
+        notable.push(line);
+    }
+    (notable, clear)
+}
+
+fn render_karpenter_conditions(obj: &serde_json::Value) -> String {
+    let (notable, clear) = split_karpenter_conditions(obj);
+    let mut out = if notable.is_empty() { "(no condition reports a problem)".to_string() } else { notable.join("\n") };
+    if !clear.is_empty() {
+        out.push_str(&format!("\n\nchecked and clear: {}", clear.join(", ")));
+    }
+    out
+}
+
+/// A pool resource as a reader would say it: cores, GiB, or a count.
+fn render_nap_quantity(unit: &str, value: i64) -> String {
+    match unit {
+        "millicores" => format!("{} cores", trim_decimal(value as f64 / 1000.0)),
+        "ki" => format!("{} GiB", trim_decimal(value as f64 / 1_048_576.0)),
+        _ => value.to_string(),
+    }
+}
+
+fn trim_decimal(v: f64) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+}
+
+/// The pool's policy, as the facts a diagnosis turns on.
+fn render_nap_status(detail: &crate::models::NapDetail, nodes: i64) -> String {
+    let or_none = |v: &[String]| if v.is_empty() { "(none)".to_string() } else { v.join(", ") };
+    let mut lines = vec![format!("nodes owned: {nodes}")];
+    for r in &detail.resources {
+        let limit = r.limit.map(|l| render_nap_quantity(&r.unit, l)).unwrap_or_else(|| "no limit".to_string());
+        lines.push(format!("{} provisioned / limit: {} / {limit}", r.name, render_nap_quantity(&r.unit, r.used)));
+    }
+    lines.push(format!("weight: {}", detail.weight.map(|w| w.to_string()).unwrap_or_else(|| "(none)".to_string())));
+    lines.push(format!("node class: {} {}", detail.node_class_kind, detail.node_class_name));
+    lines.push("requirements:".to_string());
+    if detail.requirements.is_empty() {
+        lines.push("  (none)".to_string());
+    }
+    for r in &detail.requirements {
+        let min = r.min_values.map(|m| format!(" (at least {m} values)")).unwrap_or_default();
+        lines.push(format!("  {} {} [{}]{min}", r.key, r.operator, r.values.join(", ")));
+    }
+    lines.push(format!("taints: {}", or_none(&detail.taints)));
+    lines.push(format!("startup taints: {}", or_none(&detail.startup_taints)));
+    lines.push(format!("expire after: {}", detail.expire_after));
+    lines.push(format!(
+        "termination grace period: {}",
+        if detail.termination_grace_period.is_empty() { "(none — a drain may wait forever)" } else { &detail.termination_grace_period }
+    ));
+    lines.push(format!(
+        "consolidation: {}{}",
+        detail.consolidation_policy,
+        if detail.consolidate_after.is_empty() { String::new() } else { format!(" after {}", detail.consolidate_after) }
+    ));
+    lines.push(format!("disruption budgets{}:", if detail.budgets_default { " (none set; Karpenter's default)" } else { "" }));
+    for b in &detail.budgets {
+        let mut line = format!("  nodes {}", b.nodes);
+        if !b.reasons.is_empty() {
+            line.push_str(&format!(" for {}", b.reasons.join(", ")));
+        }
+        if !b.schedule.is_empty() {
+            line.push_str(&format!(", schedule {} for {}", b.schedule, b.duration));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// The pool's NodeClaims, worst first, each with the state of its node.
+///
+/// Pure, and separate, because the ordering is the point: a pool's one stuck
+/// claim must not sit below thirty healthy ones and fall off the cap.
+fn render_nap_claims(
+    claims: &Result<Vec<kube::api::DynamicObject>, String>,
+    nodes: &Result<Vec<k8s_openapi::api::core::v1::Node>, String>,
+) -> String {
+    let claims = match claims {
+        Ok(c) if c.is_empty() => return "(this pool owns no NodeClaims)".to_string(),
+        Ok(c) => c,
+        Err(e) => return format!("(NodeClaims unavailable: {e})"),
+    };
+    let node_state = |name: &str| -> String {
+        let nodes = match nodes {
+            Ok(n) => n,
+            Err(_) => return "node state unknown (nodes could not be listed)".to_string(),
+        };
+        let Some(node) = nodes.iter().find(|n| n.metadata.name.as_deref() == Some(name)) else {
+            return format!("node {name} not found");
+        };
+        let ready = node
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
+            .map(|c| c.status.as_str())
+            .unwrap_or("Unknown");
+        let mut parts = vec![format!("node {name} Ready={ready}")];
+        let spec = node.spec.as_ref();
+        if spec.and_then(|s| s.unschedulable).unwrap_or(false) {
+            parts.push("cordoned".to_string());
+        }
+        for t in spec.and_then(|s| s.taints.as_ref()).into_iter().flatten() {
+            if t.key.starts_with("karpenter.sh/") {
+                parts.push(format!("tainted {}:{}", t.key, t.effect));
+            }
+        }
+        parts.join(", ")
+    };
+
+    let mut rows: Vec<(u8, String)> = claims
+        .iter()
+        .map(|c| {
+            let v = serde_json::to_value(c).unwrap_or_default();
+            let label = |k: &str| c.metadata.labels.as_ref().and_then(|l| l.get(k)).cloned().unwrap_or_default();
+            let (notable, _) = split_karpenter_conditions(&v);
+            let ready = v
+                .pointer("/status/conditions")
+                .and_then(|c| c.as_array())
+                .and_then(|c| c.iter().find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready")))
+                .and_then(|c| c.get("status").and_then(|s| s.as_str()))
+                == Some("True");
+            let deleting = c.metadata.deletion_timestamp.as_ref().map(|t| t.0.to_rfc3339());
+            let mut line = format!(
+                "{}  {}  {}  {}",
+                c.metadata.name.clone().unwrap_or_default(),
+                label("node.kubernetes.io/instance-type"),
+                label("karpenter.sh/capacity-type"),
+                label("topology.kubernetes.io/zone"),
+            );
+            if let Some(created) = c.metadata.creation_timestamp.as_ref() {
+                line.push_str(&format!("  created {}", created.0.to_rfc3339()));
+            }
+            if let Some(at) = &deleting {
+                line.push_str(&format!("  TERMINATING since {at}"));
+            }
+            match v.pointer("/status/nodeName").and_then(|n| n.as_str()).filter(|n| !n.is_empty()) {
+                Some(n) => line.push_str(&format!("\n  {}", node_state(n))),
+                None => line.push_str("\n  no node registered"),
+            }
+            for n in &notable {
+                line.push_str(&format!("\n  {}", n.replace('\n', "\n  ")));
+            }
+            // Worst first: not Ready, then terminating, then marked, then fine.
+            let rank = if !ready { 0 } else if deleting.is_some() { 1 } else if !notable.is_empty() { 2 } else { 3 };
+            (rank, line)
+        })
+        .collect();
+    rows.sort_by_key(|(rank, _)| *rank);
+
+    let count = |r: u8| rows.iter().filter(|(rank, _)| *rank == r).count();
+    let mut out = format!(
+        "{} claim(s): {} not Ready, {} terminating, {} marked for replacement, {} Ready with nothing pending",
+        rows.len(),
+        count(0),
+        count(1),
+        count(2),
+        count(3)
+    );
+    for (_, line) in rows.iter().take(DIAGNOSE_NAP_CLAIMS) {
+        out.push_str(&format!("\n{line}"));
+    }
+    if rows.len() > DIAGNOSE_NAP_CLAIMS {
+        // Said from what was cut, not assumed healthy: with more than the cap
+        // of stuck claims, the cut includes stuck ones too.
+        let omitted = &rows[DIAGNOSE_NAP_CLAIMS..];
+        let of = |r: u8| omitted.iter().filter(|(rank, _)| *rank == r).count();
+        let parts: Vec<String> = [(0, "not Ready"), (1, "terminating"), (2, "marked for replacement"), (3, "Ready with nothing pending")]
+            .into_iter()
+            .filter(|(r, _)| of(*r) > 0)
+            .map(|(r, label)| format!("{} {label}", of(r)))
+            .collect();
+        out.push_str(&format!("\n… and {} more: {}", omitted.len(), parts.join(", ")));
+    }
+    out
+}
+
+fn render_nap_events(events: &Result<Vec<crate::models::EventInfo>, String>, empty: &str, with_object: bool, cap: usize) -> String {
+    match events {
+        Ok(list) if list.is_empty() => empty.to_string(),
+        Ok(list) => {
+            let mut out = list
+                .iter()
+                .take(cap)
+                .map(|e| {
+                    let object = if with_object { format!(" {}", e.involved_object) } else { String::new() };
+                    format!("[{}] {}{object} — {} (×{})", e.event_type, e.reason, e.message, e.count)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if list.len() > cap {
+                out.push_str(&format!("\n… and {} older", list.len() - cap));
+            }
+            out
+        }
+        Err(e) => format!("(events unavailable: {e})"),
+    }
+}
+
+/// Karpenter's scheduling failures against this pool, collapsed on the message.
+///
+/// One pending pod produces one event per attempt and a scaled-out workload
+/// produces one per pod, all saying the same thing; listed as they come, the
+/// first dozen would be one failure repeated. Collapsed, they read as which
+/// failures there are and how many pods each holds back.
+fn render_nap_scheduling(events: &Result<Vec<crate::models::EventInfo>, String>) -> String {
+    let list = match events {
+        Ok(list) if list.is_empty() => return "(Karpenter reports no pod it could not place on this pool)".to_string(),
+        Ok(list) => list,
+        Err(e) => return format!("(scheduling failures unavailable: {e})"),
+    };
+    // (message, pods, latest, example pod), in order of first sighting — the
+    // list is newest first, so that is also newest first.
+    let mut groups: Vec<(String, std::collections::BTreeSet<String>, Option<String>, String)> = Vec::new();
+    for e in list {
+        let pod = format!("{}/{}", e.object_namespace, e.object_name);
+        match groups.iter_mut().find(|g| g.0 == e.message) {
+            Some(g) => {
+                g.1.insert(pod);
+            }
+            None => groups.push((e.message.clone(), std::iter::once(pod.clone()).collect(), e.last_seen.clone(), pod)),
+        }
+    }
+    let mut out = groups
+        .iter()
+        .take(DIAGNOSE_NAP_SCHEDULING)
+        .map(|(message, pods, latest, example)| {
+            let message = if message.len() > DIAGNOSE_NAP_MESSAGE_CHARS {
+                format!("{} …", truncate_on_char_boundary(message, DIAGNOSE_NAP_MESSAGE_CHARS))
+            } else {
+                message.clone()
+            };
+            format!(
+                "{} pod(s), e.g. {example}{}:\n  {message}",
+                pods.len(),
+                latest.as_ref().map(|t| format!(", latest {t}")).unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if groups.len() > DIAGNOSE_NAP_SCHEDULING {
+        out.push_str(&format!("\n… and {} more distinct failures", groups.len() - DIAGNOSE_NAP_SCHEDULING));
+    }
+    out
+}
+
+/// Assembles everything a NodePool diagnosis needs, redacted.
+///
+/// A pool's own status is the part least likely to explain anything: it
+/// stays Ready while every claim it launches fails to register, and its
+/// limits are reached silently. The claims and Karpenter's scheduling
+/// failures are where provisioning problems show, so they carry the weight.
+pub async fn build_nap_diagnosis_payload(context_name: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_nap_diagnostics(context_name, name).await?;
+    let detail = crate::nap_detail::nap_detail(&d.pool);
+    let pool_value = serde_json::to_value(&d.pool).map_err(|e| format!("Failed to serialise NodePool: {e}"))?;
+    let nodes_owned = pool_value
+        .pointer("/status/resources/nodes")
+        .and_then(|n| n.as_str())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let status = render_nap_status(&detail, nodes_owned);
+    let conditions = render_karpenter_conditions(&pool_value);
+    let claims = render_nap_claims(&d.claims, &d.nodes);
+    let pool_events = render_nap_events(&d.pool_events, "(no events for this NodePool)", false, 25);
+    let member_events = render_nap_events(
+        &d.member_events,
+        "(no events on this pool's claims or nodes)",
+        true,
+        DIAGNOSE_NAP_MEMBER_EVENTS,
+    );
+    let scheduling = render_nap_scheduling(&d.pod_events);
+    let (node_class_heading, node_class_text) = match d.node_class {
+        Ok(Some(nc)) => {
+            let value = serde_json::to_value(&nc).unwrap_or_default();
+            let heading = format!("{} {}", detail.node_class_kind, detail.node_class_name);
+            let yaml = k8s::object_manifest(nc)
+                .map(|m| m.yaml_without_managed_fields)
+                .unwrap_or_else(|e| format!("(could not be rendered: {e})"));
+            (heading, format!("{}\n\n```yaml\n{yaml}\n```", render_karpenter_conditions(&value)))
+        }
+        Ok(None) => ("".to_string(), "(the pool names no node class)".to_string()),
+        Err(e) => (
+            format!("{} {}", detail.node_class_kind, detail.node_class_name),
+            format!("(node class unavailable: {e})"),
+        ),
+    };
+    let manifest = k8s::object_manifest(d.pool)?.yaml_without_managed_fields;
+
+    let status = redact::redact(&status);
+    let conditions_r = redact::redact(&conditions);
+    let claims_r = redact::redact(&claims);
+    let pool_events_r = redact::redact(&pool_events);
+    let member_events_r = redact::redact(&member_events);
+    let scheduling_r = redact::redact(&scheduling);
+    let node_class_r = redact::redact(&node_class_text);
+    let manifest_r = redact::redact(&manifest);
+
+    let redaction_summary = redact::Redacted::merge([
+        &status,
+        &conditions_r,
+        &claims_r,
+        &pool_events_r,
+        &member_events_r,
+        &scheduling_r,
+        &node_class_r,
+        &manifest_r,
+    ])
+    .summary();
+
+    let prompt = format!(
+        "NodePool {name}.\n\n\
+         ## Policy and status\n{}\n\n\
+         ## Conditions\n{}\n\n\
+         ## NodeClaims (worst first)\n{}\n\n\
+         ## Events (NodePool)\n{}\n\n\
+         ## Events (its claims and nodes)\n{}\n\n\
+         ## Pods Karpenter could not place on this pool\n{}\n\n\
+         ## Node class{}\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        status.text,
+        conditions_r.text,
+        claims_r.text,
+        pool_events_r.text,
+        member_events_r.text,
+        scheduling_r.text,
+        if node_class_heading.is_empty() { String::new() } else { format!(" ({node_class_heading})") },
+        node_class_r.text,
+        manifest_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
+}
+
+/// How many pods of an HPA's target go into its container table.
+///
+/// The table is per container across pods, so this only bounds the work; a
+/// webhook-injected sidecar is on every pod, and the first few show it.
+const DIAGNOSE_HPA_PODS: usize = 50;
+
+/// One utilization target's need for a request: on every container, or on
+/// the one a ContainerResource metric names.
+struct RequestNeed {
+    resource: String,
+    container: Option<String>,
+    metric: String,
+}
+
+/// The requests the HPA's utilization targets need.
+///
+/// Only a percentage target needs one: utilization is usage over request, and
+/// the HPA refuses to compute it for a pod missing the request on any
+/// container. An AverageValue target compares raw usage and needs none.
+fn hpa_request_needs(metrics: &[crate::models::HpaMetricRow]) -> Vec<RequestNeed> {
+    metrics
+        .iter()
+        .filter(|m| m.target.ends_with('%'))
+        .filter_map(|m| match m.kind.as_str() {
+            "Resource" => Some(RequestNeed { resource: m.name.clone(), container: None, metric: format!("{} {}", m.name, m.target) }),
+            "ContainerResource" => m.name.split_once('/').map(|(c, r)| RequestNeed {
+                resource: r.to_string(),
+                container: Some(c.to_string()),
+                metric: format!("{} {}", m.name, m.target),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every container in the HPA's pods, with its requests and usage, and which
+/// ones lack a request a utilization target needs.
+///
+/// Read from the pods, not the workload's template, because the two differ
+/// exactly where it matters: a sidecar injected by a mutating webhook — a
+/// service mesh proxy, a config reloader — is on every pod and in no
+/// template, and the HPA fails on it all the same. Per container across pods
+/// rather than per pod, since the pods of one workload repeat each other.
+fn render_hpa_containers(
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+    usage: &Result<std::collections::HashMap<(String, String), (i64, i64)>, String>,
+    needs: &[RequestNeed],
+) -> String {
+    let pods = match pods {
+        Ok(p) if p.is_empty() => return "(the target's selector matches no pods)".to_string(),
+        Ok(p) => p,
+        Err(e) => return format!("(pods unavailable: {e})"),
+    };
+    let ready = pods
+        .iter()
+        .filter(|p| {
+            p.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+        })
+        .count();
+
+    // (name, sidecar, pods seen in, cpu requests, memory requests, usage samples)
+    struct Row {
+        name: String,
+        sidecar: bool,
+        pods: usize,
+        cpu: Vec<String>,
+        memory: Vec<String>,
+        usage: Vec<(i64, i64)>,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for pod in pods.iter().take(DIAGNOSE_HPA_PODS) {
+        let pod_name = pod.metadata.name.clone().unwrap_or_default();
+        let spec = pod.spec.clone().unwrap_or_default();
+        // Native sidecars — init containers that keep running — count towards
+        // the HPA's requests like any container; one-shot init containers do not.
+        let sidecars = spec.init_containers.unwrap_or_default().into_iter().filter(|c| c.restart_policy.as_deref() == Some("Always"));
+        let all = spec.containers.into_iter().map(|c| (c, false)).chain(sidecars.map(|c| (c, true)));
+        for (c, sidecar) in all {
+            let request = |k: &str| {
+                c.resources
+                    .as_ref()
+                    .and_then(|r| r.requests.as_ref())
+                    .and_then(|r| r.get(k))
+                    .map(|q| q.0.clone())
+                    .unwrap_or_else(|| "none".to_string())
+            };
+            let row = match rows.iter_mut().position(|r| r.name == c.name) {
+                Some(i) => &mut rows[i],
+                None => {
+                    rows.push(Row { name: c.name.clone(), sidecar, pods: 0, cpu: vec![], memory: vec![], usage: vec![] });
+                    rows.last_mut().unwrap()
+                }
+            };
+            row.pods += 1;
+            row.cpu.push(request("cpu"));
+            row.memory.push(request("memory"));
+            if let Ok(u) = usage {
+                if let Some(sample) = u.get(&(pod_name.clone(), c.name.clone())) {
+                    row.usage.push(*sample);
+                }
+            }
+        }
+    }
+    let sampled = pods.len().min(DIAGNOSE_HPA_PODS);
+
+    // "50m", or "50m in 2, none in 1" when the pods disagree mid-rollout.
+    let tally = |values: &[String]| -> String {
+        let mut distinct: Vec<(String, usize)> = Vec::new();
+        for v in values {
+            match distinct.iter_mut().find(|d| &d.0 == v) {
+                Some(d) => d.1 += 1,
+                None => distinct.push((v.clone(), 1)),
+            }
+        }
+        if distinct.len() == 1 {
+            distinct[0].0.clone()
+        } else {
+            distinct.iter().map(|(v, n)| format!("{v} in {n}")).collect::<Vec<_>>().join(", ")
+        }
+    };
+
+    let mut out = format!("{} pod(s) matched, {ready} Ready", pods.len());
+    if pods.len() > sampled {
+        out.push_str(&format!("; containers read from the first {sampled}"));
+    }
+    if !needs.is_empty() {
+        let list = needs
+            .iter()
+            .map(|n| match &n.container {
+                Some(c) => format!("{} on {c} ({})", n.resource, n.metric),
+                None => format!("{} on every container ({})", n.resource, n.metric),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push_str(&format!("\nutilization targets need a request for: {list}"));
+    }
+    if let Err(e) = usage {
+        out.push_str(&format!("\nusage unavailable: {e}"));
+    }
+    for r in &rows {
+        let mut line = format!(
+            "\n{}{} — in {}/{sampled} pods; requests cpu {}, memory {}",
+            r.name,
+            if r.sidecar { " (native sidecar)" } else { "" },
+            r.pods,
+            tally(&r.cpu),
+            tally(&r.memory)
+        );
+        if r.usage.is_empty() && usage.is_ok() {
+            line.push_str("; metrics-server reports no usage for it in any pod");
+        } else if !r.usage.is_empty() {
+            let n = r.usage.len() as i64;
+            let (cpu, mem) = r.usage.iter().fold((0, 0), |(a, b), (c, m)| (a + c, b + m));
+            line.push_str(&format!(
+                "; average usage cpu {}m, memory {}Mi over {n} pod(s)",
+                cpu / n,
+                mem / n / 1024
+            ));
+        }
+        for need in needs.iter().filter(|n| n.container.as_ref().is_none_or(|c| c == &r.name)) {
+            let values = if need.resource == "cpu" { &r.cpu } else if need.resource == "memory" { &r.memory } else { continue };
+            let missing = values.iter().filter(|v| *v == "none").count();
+            if missing > 0 {
+                line.push_str(&format!(
+                    "\n  MISSING {} request in {missing}/{} pods — the {} target cannot be computed",
+                    need.resource, r.pods, need.metric
+                ));
+            }
+        }
+        out.push_str(&line);
+    }
+    // A ContainerResource metric naming a container no pod has fails too.
+    // Checked over every pod, not just the ones read above: mid-rename, the
+    // new name may only be on pods past the sample.
+    let present = |name: &str| {
+        pods.iter().any(|p| {
+            p.spec.as_ref().is_some_and(|s| {
+                s.containers.iter().any(|c| c.name == name)
+                    || s.init_containers.iter().flatten().any(|c| c.name == name && c.restart_policy.as_deref() == Some("Always"))
+            })
+        })
+    };
+    for need in needs {
+        if let Some(c) = &need.container {
+            if !present(c) {
+                out.push_str(&format!("\nno pod has a container named {c}, which the {} target reads", need.metric));
+            }
+        }
+    }
+    out
+}
+
+/// The object the HPA scales: its replica counts as the controller reports them.
+///
+/// The counts come from its scale subresource, which every scalable kind
+/// reports the same way — a CRD may keep its own in `spec.size` — and the
+/// readiness detail from the object, where a workload kind has it.
+fn render_hpa_target(
+    target: &Result<kube::api::DynamicObject, String>,
+    scale: &Result<k8s_openapi::api::autoscaling::v1::Scale, String>,
+    selector: &Result<String, String>,
+) -> String {
+    let mut out = match scale {
+        Ok(sc) => format!(
+            "replicas (from its scale subresource): desired {}, current {}",
+            sc.spec.as_ref().and_then(|s| s.replicas).map(|n| n.to_string()).unwrap_or_else(|| "(unset)".to_string()),
+            sc.status.as_ref().map(|s| s.replicas.to_string()).unwrap_or_else(|| "(unset)".to_string()),
+        ),
+        Err(e) => format!("(scale unavailable: {e})"),
+    };
+    match target {
+        Ok(t) => {
+            let detail: Vec<String> = [("ready", "/status/readyReplicas"), ("updated", "/status/updatedReplicas"), ("available", "/status/availableReplicas")]
+                .into_iter()
+                .filter_map(|(label, path)| t.data.pointer(path).and_then(|v| v.as_i64()).map(|n| format!("{label} {n}")))
+                .collect();
+            if !detail.is_empty() {
+                out.push_str(&format!("\nstatus: {}", detail.join(", ")));
+            }
+        }
+        Err(e) => out.push_str(&format!("\n(target unavailable: {e})")),
+    }
+    match selector {
+        Ok(s) => out.push_str(&format!("\nselector (from its scale subresource): {s}")),
+        Err(e) => out.push_str(&format!("\nselector unavailable: {e}")),
+    }
+    out
+}
+
+/// Whether each metrics API this HPA reads from is registered and available.
+fn render_hpa_metrics_apis(
+    metrics: &[crate::models::HpaMetricRow],
+    services: &Result<Vec<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService>, String>,
+) -> String {
+    let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
+    for m in metrics {
+        let g = k8s::metrics_api_group(&m.kind);
+        match groups.iter_mut().find(|(group, _)| *group == g) {
+            Some((_, kinds)) => {
+                if !kinds.contains(&m.kind) {
+                    kinds.push(m.kind.clone())
+                }
+            }
+            None => groups.push((g, vec![m.kind.clone()])),
+        }
+    }
+    if groups.is_empty() {
+        return "(the HPA declares no metrics)".to_string();
+    }
+    let services = match services {
+        Ok(s) => s,
+        Err(e) => return format!("(APIServices unavailable: {e})"),
+    };
+    groups
+        .iter()
+        .map(|(group, kinds)| {
+            let registered: Vec<String> = services
+                .iter()
+                .filter(|s| s.spec.as_ref().and_then(|sp| sp.group.as_deref()) == Some(*group))
+                .map(|s| {
+                    let available = s
+                        .status
+                        .as_ref()
+                        .and_then(|st| st.conditions.as_ref())
+                        .and_then(|c| c.iter().find(|c| c.type_ == "Available"));
+                    let backend = s
+                        .spec
+                        .as_ref()
+                        .and_then(|sp| sp.service.as_ref())
+                        .map(|svc| format!(", served by {}/{}", svc.namespace.clone().unwrap_or_default(), svc.name.clone().unwrap_or_default()))
+                        .unwrap_or_default();
+                    match available {
+                        Some(c) if c.status == "True" => format!("{} Available{backend}", s.metadata.name.clone().unwrap_or_default()),
+                        Some(c) => format!(
+                            "{} Available={} ({}){backend}\n  {}",
+                            s.metadata.name.clone().unwrap_or_default(),
+                            c.status,
+                            c.reason.clone().unwrap_or_default(),
+                            c.message.clone().unwrap_or_default()
+                        ),
+                        None => format!("{} (no Available condition reported){backend}", s.metadata.name.clone().unwrap_or_default()),
+                    }
+                })
+                .collect();
+            let state = if registered.is_empty() { "NOT REGISTERED — nothing on the cluster serves it".to_string() } else { registered.join("\n  ") };
+            format!("{group} (for {} metrics): {state}", kinds.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Other HPAs scaling the same object. Two controllers writing one replica
+/// count is its own failure — the HPA controller reports it as
+/// AmbiguousSelector and stops — and the usual pair is a KEDA-generated HPA
+/// beside a hand-written one.
+fn render_hpa_siblings(siblings: &Result<Vec<(String, String)>, String>) -> String {
+    match siblings {
+        Ok(list) if list.is_empty() => "(none — this is the only HPA scaling it)".to_string(),
+        Ok(list) => list
+            .iter()
+            .map(|(name, owner)| if owner.is_empty() { name.clone() } else { format!("{name} (owned by {owner})") })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("(other HPAs unavailable: {e})"),
+    }
+}
+
+/// The HPA's own state: bounds, counts, owner, conditions, metrics, behavior.
+fn render_hpa_status(d: &crate::models::HpaDetail) -> String {
+    let mut lines = vec![
+        format!("scales: {}/{}", d.target_kind, d.target_name),
+        format!(
+            "replicas: min {}, max {}, current {}, desired {}",
+            d.min_replicas, d.max_replicas, d.current_replicas, d.desired_replicas
+        ),
+        format!("last scaled: {}", d.last_scale_at.as_deref().unwrap_or("never")),
+    ];
+    if !d.owner_kind.is_empty() {
+        lines.push(format!("owned by: {}/{}", d.owner_kind, d.owner_name));
+    }
+    lines.push("metrics (current / target):".to_string());
+    if d.metrics.is_empty() {
+        lines.push("  (none declared)".to_string());
+    }
+    for m in &d.metrics {
+        lines.push(format!("  {} {}: {} / {}", m.kind, m.name, m.current, m.target));
+    }
+    lines.push(format!("behavior{}:", if d.behavior_is_default { " (not set; Kubernetes' defaults)" } else { "" }));
+    lines.push(format!("  scale up: {}", d.scale_up.join("; ")));
+    lines.push(format!("  scale down: {}", d.scale_down.join("; ")));
+    lines.join("\n")
+}
+
+/// An HPA's conditions: AbleToScale and ScalingActive report a problem when
+/// False, ScalingLimited when True.
+fn render_hpa_conditions(conditions: &[crate::models::PodConditionInfo]) -> String {
+    let mut notable = Vec::new();
+    let mut clear = Vec::new();
+    for c in conditions {
+        let problem = if c.condition_type == "ScalingLimited" { c.status == "True" } else { c.status != "True" };
+        if !problem {
+            clear.push(c.condition_type.clone());
+            continue;
+        }
+        let mut line = format!("{}={}", c.condition_type, c.status);
+        if !c.reason.is_empty() {
+            line.push_str(&format!(" ({})", c.reason));
+        }
+        if let Some(at) = &c.last_transition {
+            line.push_str(&format!(" since {at}"));
+        }
+        if !c.message.is_empty() {
+            line.push_str(&format!("\n  {}", c.message));
+        }
+        notable.push(line);
+    }
+    let mut out = if conditions.is_empty() {
+        "(none reported yet)".to_string()
+    } else if notable.is_empty() {
+        "(no condition reports a problem)".to_string()
+    } else {
+        notable.join("\n")
+    };
+    if !clear.is_empty() {
+        out.push_str(&format!("\n\nchecked and clear: {}", clear.join(", ")));
+    }
+    out
+}
+
+/// Assembles everything an HPA diagnosis needs, redacted.
+///
+/// The HPA's own message usually names the failure — "missing request for
+/// memory in container X" — but not why that container has no request or
+/// whether every pod is affected. The container table answers that from the
+/// pods themselves, and the metrics APIs answer the other common case: the
+/// API the metric comes from is down.
+pub async fn build_hpa_diagnosis_payload(
+    context_name: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_hpa_diagnostics(context_name, namespace, name).await?;
+    let needs = hpa_request_needs(&d.detail.metrics);
+
+    let status = render_hpa_status(&d.detail);
+    let conditions = render_hpa_conditions(&d.detail.conditions);
+    let events = render_nap_events(&d.events, "(no events for this HPA)", false, 25);
+    let target = render_hpa_target(&d.target, &d.scale, &d.selector);
+    let containers = render_hpa_containers(&d.pods, &d.usage, &needs);
+    let apis = render_hpa_metrics_apis(&d.detail.metrics, &d.metrics_apis);
+    let siblings = render_hpa_siblings(&d.siblings);
+
+    let status = redact::redact(&status);
+    let conditions_r = redact::redact(&conditions);
+    let events_r = redact::redact(&events);
+    let target_r = redact::redact(&target);
+    let containers_r = redact::redact(&containers);
+    let apis_r = redact::redact(&apis);
+    let siblings_r = redact::redact(&siblings);
+    let manifest_r = redact::redact(&d.manifest);
+
+    let redaction_summary = redact::Redacted::merge([
+        &status,
+        &conditions_r,
+        &events_r,
+        &target_r,
+        &siblings_r,
+        &containers_r,
+        &apis_r,
+        &manifest_r,
+    ])
+    .summary();
+
+    let prompt = format!(
+        "HorizontalPodAutoscaler {namespace}/{name}.\n\n\
+         ## Status\n{}\n\n\
+         ## Conditions\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Target ({}/{})\n{}\n\n\
+         ## Other HPAs scaling the same target\n{}\n\n\
+         ## Containers in the target's pods\n{}\n\n\
+         ## Metrics APIs\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        status.text,
+        conditions_r.text,
+        events_r.text,
+        d.detail.target_kind,
+        d.detail.target_name,
+        target_r.text,
+        siblings_r.text,
+        containers_r.text,
+        apis_r.text,
+        manifest_r.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
 }
 
 /// How many resources from a release's inventory go into a diagnosis.
@@ -1225,6 +2154,8 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Application" => DIAGNOSE_GITOPS_SYSTEM,
         "Release" => DIAGNOSE_HELM_SYSTEM,
         "Node" => DIAGNOSE_NODE_SYSTEM,
+        "NodePool" => DIAGNOSE_NAP_SYSTEM,
+        "HorizontalPodAutoscaler" => DIAGNOSE_HPA_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -1772,6 +2703,279 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(md.starts_with("\n\n## Logs of the previous instance — it ended: OOMKilled, exit code 137 (showing the last 200 of 500 lines)"), "{md}");
     }
 
+    fn claim(name: &str, conditions: serde_json::Value, node: Option<&str>, deleting: bool) -> kube::api::DynamicObject {
+        let mut obj: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "karpenter.sh/v1",
+            "kind": "NodeClaim",
+            "metadata": {
+                "name": name,
+                "labels": {
+                    "node.kubernetes.io/instance-type": "Standard_D4s_v5",
+                    "karpenter.sh/capacity-type": "spot",
+                    "topology.kubernetes.io/zone": "westeurope-1"
+                }
+            },
+            "status": { "conditions": conditions, "nodeName": node }
+        }))
+        .unwrap();
+        if deleting {
+            obj.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()));
+        }
+        obj
+    }
+
+    fn node(name: &str, ready: &str, cordoned: bool) -> k8s_openapi::api::core::v1::Node {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": name },
+            "spec": {
+                "unschedulable": cordoned,
+                "taints": [{ "key": "karpenter.sh/disrupted", "effect": "NoSchedule" }]
+            },
+            "status": { "conditions": [{ "type": "Ready", "status": ready }] }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn karpenter_conditions_read_marking_conditions_the_other_way_round() {
+        let (notable, clear) = split_karpenter_conditions(&serde_json::json!({ "status": { "conditions": [
+            { "type": "Ready", "status": "True" },
+            { "type": "Initialized", "status": "False", "reason": "NotInitialized", "message": "kubelet never reported" },
+            { "type": "Drifted", "status": "True", "reason": "NodeClassDrift" },
+            { "type": "Empty", "status": "False" },
+            { "type": "SomethingNew", "status": "True" },
+        ]}}));
+        assert_eq!(clear, ["Ready", "Empty", "SomethingNew"]);
+        assert_eq!(notable.len(), 2);
+        assert!(notable[0].starts_with("Initialized=False (NotInitialized)") && notable[0].ends_with("\n  kubelet never reported"));
+        assert!(notable[1].starts_with("Drifted=True (NodeClassDrift)"));
+    }
+
+    #[test]
+    fn a_pools_stuck_claim_is_listed_before_its_healthy_ones() {
+        let ready = serde_json::json!([{ "type": "Ready", "status": "True" }]);
+        let mut claims: Vec<_> = (0..DIAGNOSE_NAP_CLAIMS + 5).map(|i| claim(&format!("ok-{i}"), ready.clone(), Some(&format!("n-{i}")), false)).collect();
+        claims.push(claim("stuck", serde_json::json!([{ "type": "Launched", "status": "False", "reason": "LaunchFailed", "message": "SKU not available" }, { "type": "Ready", "status": "Unknown" }]), None, false));
+        claims.push(claim("leaving", ready.clone(), Some("n-leaving"), true));
+        let nodes = Ok(vec![node("n-leaving", "True", true)]);
+        let out = render_nap_claims(&Ok(claims), &nodes);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with(&format!("{} claim(s): 1 not Ready, 1 terminating, 0 marked", DIAGNOSE_NAP_CLAIMS + 7)), "{}", lines[0]);
+        assert!(lines[1].starts_with("stuck  Standard_D4s_v5  spot  westeurope-1"));
+        assert_eq!(lines[2], "  no node registered");
+        assert!(out.contains("Launched=False (LaunchFailed)\n    SKU not available"), "{out}");
+        let leaving = out.find("leaving").unwrap();
+        assert!(out[leaving..].contains("TERMINATING since"));
+        assert!(out.contains("node n-leaving Ready=True, cordoned, tainted karpenter.sh/disrupted:NoSchedule"));
+        assert!(out.contains("node n-0 not found"));
+        assert!(out.ends_with("… and 7 more: 7 Ready with nothing pending"), "{out}");
+    }
+
+    #[test]
+    fn stuck_claims_past_the_cap_are_counted_as_stuck() {
+        let stuck = serde_json::json!([{ "type": "Ready", "status": "False" }]);
+        let claims: Vec<_> = (0..DIAGNOSE_NAP_CLAIMS + 2).map(|i| claim(&format!("s-{i}"), stuck.clone(), None, false)).collect();
+        let out = render_nap_claims(&Ok(claims), &Ok(vec![]));
+        assert!(out.ends_with("… and 2 more: 2 not Ready"), "{out}");
+    }
+
+    #[test]
+    fn a_target_is_read_through_its_scale_subresource() {
+        let scale: k8s_openapi::api::autoscaling::v1::Scale =
+            serde_json::from_value(serde_json::json!({ "spec": { "replicas": 4 }, "status": { "replicas": 3, "selector": "app=x" } })).unwrap();
+        let crd: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "example.com/v1", "kind": "Pool", "metadata": { "name": "p" }, "spec": { "size": 4 }, "status": { "currentSize": 3 }
+        }))
+        .unwrap();
+        let out = render_hpa_target(&Ok(crd), &Ok(scale), &Ok("app=x".into()));
+        assert_eq!(out, "replicas (from its scale subresource): desired 4, current 3\nselector (from its scale subresource): app=x");
+        let deployment: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "d" }, "status": { "readyReplicas": 2, "availableReplicas": 2 }
+        }))
+        .unwrap();
+        let out = render_hpa_target(&Ok(deployment), &Err("forbidden".into()), &Err("forbidden".into()));
+        assert_eq!(out, "(scale unavailable: forbidden)\nstatus: ready 2, available 2\nselector unavailable: forbidden");
+    }
+
+    #[test]
+    fn claims_that_could_not_be_read_are_not_reported_as_none() {
+        assert_eq!(render_nap_claims(&Ok(vec![]), &Ok(vec![])), "(this pool owns no NodeClaims)");
+        assert_eq!(render_nap_claims(&Err("forbidden".into()), &Ok(vec![])), "(NodeClaims unavailable: forbidden)");
+        let ready = serde_json::json!([{ "type": "Ready", "status": "True" }]);
+        let out = render_nap_claims(&Ok(vec![claim("c", ready, Some("n"), false)]), &Err("forbidden".into()));
+        assert!(out.contains("node state unknown (nodes could not be listed)"));
+    }
+
+    #[test]
+    fn scheduling_failures_collapse_on_the_message_and_count_pods() {
+        let event = |ns: &str, pod: &str, message: &str, seen: &str| crate::models::EventInfo {
+            object_namespace: ns.into(),
+            object_name: pod.into(),
+            message: message.into(),
+            last_seen: Some(seen.into()),
+            ..Default::default()
+        };
+        let limit = "all available instance types exceed limits for nodepool: \"gpu\"";
+        let out = render_nap_scheduling(&Ok(vec![
+            event("ml", "train-1", limit, "2026-10-20T10:00:00Z"),
+            event("ml", "train-2", limit, "2026-10-20T09:59:00Z"),
+            event("ml", "train-1", limit, "2026-10-20T09:58:00Z"),
+            event("web", "api-1", &"x".repeat(DIAGNOSE_NAP_MESSAGE_CHARS + 50), "2026-10-20T09:00:00Z"),
+        ]));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "2 pod(s), e.g. ml/train-1, latest 2026-10-20T10:00:00Z:");
+        assert_eq!(lines[1], format!("  {limit}"));
+        assert_eq!(lines[2], "1 pod(s), e.g. web/api-1, latest 2026-10-20T09:00:00Z:");
+        assert!(lines[3].ends_with(" …") && lines[3].len() < DIAGNOSE_NAP_MESSAGE_CHARS + 10);
+        assert_eq!(render_nap_scheduling(&Ok(vec![])), "(Karpenter reports no pod it could not place on this pool)");
+    }
+
+    #[test]
+    fn a_pools_status_reads_in_cores_and_gib_and_says_when_a_drain_can_wait_forever() {
+        let detail = crate::models::NapDetail {
+            node_class_kind: "AKSNodeClass".into(),
+            node_class_name: "default".into(),
+            requirements: vec![crate::models::NapRequirement {
+                key: "karpenter.sh/capacity-type".into(),
+                operator: "In".into(),
+                values: vec!["spot".into(), "on-demand".into()],
+                min_values: None,
+            }],
+            expire_after: "720h".into(),
+            consolidation_policy: "WhenEmptyOrUnderutilized".into(),
+            consolidate_after: "0s".into(),
+            budgets: vec![crate::models::NapBudget { nodes: "0".into(), reasons: vec!["Drifted".into()], ..Default::default() }],
+            resources: vec![
+                crate::models::NapResourceUse { name: "cpu".into(), unit: "millicores".into(), used: 48_000, limit: Some(64_000) },
+                crate::models::NapResourceUse { name: "memory".into(), unit: "ki".into(), used: 201_326_592, limit: None },
+            ],
+            ..Default::default()
+        };
+        let out = render_nap_status(&detail, 12);
+        assert!(out.starts_with("nodes owned: 12\ncpu provisioned / limit: 48 cores / 64 cores\nmemory provisioned / limit: 192 GiB / no limit"), "{out}");
+        assert!(out.contains("  karpenter.sh/capacity-type In [spot, on-demand]"));
+        assert!(out.contains("termination grace period: (none — a drain may wait forever)"));
+        assert!(out.ends_with("disruption budgets:\n  nodes 0 for Drifted"), "{out}");
+    }
+
+    fn hpa_metric(kind: &str, name: &str, target: &str) -> crate::models::HpaMetricRow {
+        crate::models::HpaMetricRow { kind: kind.into(), name: name.into(), target: target.into(), current: "<unknown>".into() }
+    }
+
+    fn hpa_pod(name: &str, containers: serde_json::Value, sidecars: serde_json::Value, ready: bool) -> k8s_openapi::api::core::v1::Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": name },
+            "spec": { "containers": containers, "initContainers": sidecars },
+            "status": { "conditions": [{ "type": "Ready", "status": if ready { "True" } else { "False" } }] }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_utilization_targets_need_requests() {
+        let needs = hpa_request_needs(&[
+            hpa_metric("Resource", "memory", "80%"),
+            hpa_metric("Resource", "cpu", "500m"),
+            hpa_metric("ContainerResource", "app/cpu", "60%"),
+            hpa_metric("External", "queue_length", "30"),
+        ]);
+        let got: Vec<_> = needs.iter().map(|n| (n.resource.as_str(), n.container.as_deref(), n.metric.as_str())).collect();
+        assert_eq!(got, [("memory", None, "memory 80%"), ("cpu", Some("app"), "app/cpu 60%")]);
+    }
+
+    #[test]
+    fn a_sidecar_without_a_memory_request_is_named_as_the_reason_memory_cannot_be_computed() {
+        let containers = serde_json::json!([
+            { "name": "grafana", "resources": { "requests": { "cpu": "100m", "memory": "256Mi" } } },
+            { "name": "grafana-sc-alerts", "resources": { "requests": { "cpu": "50m" } } },
+        ]);
+        let sidecars = serde_json::json!([
+            { "name": "proxy", "restartPolicy": "Always", "resources": { "requests": { "cpu": "10m", "memory": "64Mi" } } },
+            { "name": "migrate" },
+        ]);
+        let pods = Ok(vec![
+            hpa_pod("g-1", containers.clone(), sidecars.clone(), true),
+            hpa_pod("g-2", containers.clone(), sidecars.clone(), true),
+            hpa_pod("g-3", containers, sidecars, false),
+        ]);
+        let usage = Ok([(("g-1".to_string(), "grafana".to_string()), (40, 204_800)), (("g-2".to_string(), "grafana".to_string()), (20, 102_400))]
+            .into_iter()
+            .collect());
+        let needs = hpa_request_needs(&[hpa_metric("Resource", "memory", "80%"), hpa_metric("Resource", "cpu", "60%")]);
+        let out = render_hpa_containers(&pods, &usage, &needs);
+        assert!(out.starts_with("3 pod(s) matched, 2 Ready\nutilization targets need a request for: memory on every container (memory 80%); cpu on every container (cpu 60%)"), "{out}");
+        assert!(out.contains("\ngrafana — in 3/3 pods; requests cpu 100m, memory 256Mi; average usage cpu 30m, memory 150Mi over 2 pod(s)"), "{out}");
+        assert!(out.contains("\ngrafana-sc-alerts — in 3/3 pods; requests cpu 50m, memory none; metrics-server reports no usage for it in any pod\n  MISSING memory request in 3/3 pods — the memory 80% target cannot be computed"), "{out}");
+        assert!(out.contains("\nproxy (native sidecar) — in 3/3 pods"));
+        assert!(!out.contains("migrate"), "a one-shot init container does not count: {out}");
+        assert_eq!(out.matches("MISSING").count(), 1);
+    }
+
+    #[test]
+    fn requests_that_differ_mid_rollout_are_tallied_and_a_missing_named_container_is_said() {
+        let pods = Ok(vec![
+            hpa_pod("a", serde_json::json!([{ "name": "app", "resources": { "requests": { "cpu": "100m" } } }]), serde_json::json!([]), true),
+            hpa_pod("b", serde_json::json!([{ "name": "app" }]), serde_json::json!([]), true),
+        ]);
+        let needs = hpa_request_needs(&[hpa_metric("ContainerResource", "app/cpu", "60%"), hpa_metric("ContainerResource", "worker/cpu", "60%")]);
+        let out = render_hpa_containers(&pods, &Err("metrics.k8s.io: 503".into()), &needs);
+        assert!(out.contains("usage unavailable: metrics.k8s.io: 503"));
+        assert!(out.contains("requests cpu 100m in 1, none in 1"), "{out}");
+        assert!(out.contains("MISSING cpu request in 1/2 pods — the app/cpu 60% target cannot be computed"));
+        assert!(out.ends_with("no pod has a container named worker, which the worker/cpu 60% target reads"), "{out}");
+        // A container only on pods past the sample is not absent.
+        let mut many: Vec<_> = (0..DIAGNOSE_HPA_PODS).map(|i| hpa_pod(&format!("old-{i}"), serde_json::json!([{ "name": "app" }]), serde_json::json!([]), true)).collect();
+        many.push(hpa_pod("new", serde_json::json!([{ "name": "app-v2" }]), serde_json::json!([]), true));
+        let out = render_hpa_containers(&Ok(many), &Ok(Default::default()), &hpa_request_needs(&[hpa_metric("ContainerResource", "app-v2/cpu", "60%")]));
+        assert!(!out.contains("no pod has a container named app-v2"), "{out}");
+        assert_eq!(render_hpa_containers(&Ok(vec![]), &Ok(Default::default()), &[]), "(the target's selector matches no pods)");
+        let quiet = render_hpa_containers(
+            &Ok(vec![hpa_pod("a", serde_json::json!([{ "name": "app" }]), serde_json::json!([]), true)]),
+            &Ok(Default::default()),
+            &[],
+        );
+        assert!(quiet.ends_with("app — in 1/1 pods; requests cpu none, memory none; metrics-server reports no usage for it in any pod"), "{quiet}");
+        assert_eq!(
+            render_hpa_siblings(&Ok(vec![("api-hpa".into(), String::new()), ("keda-hpa-api".into(), "ScaledObject/api".into())])),
+            "api-hpa\nkeda-hpa-api (owned by ScaledObject/api)"
+        );
+    }
+
+    #[test]
+    fn a_metrics_api_that_is_missing_or_down_is_said_per_metric_type() {
+        let svc: k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "v1beta1.metrics.k8s.io" },
+            "spec": { "group": "metrics.k8s.io", "version": "v1beta1", "groupPriorityMinimum": 100, "versionPriority": 100,
+                      "service": { "namespace": "kube-system", "name": "metrics-server" } },
+            "status": { "conditions": [{ "type": "Available", "status": "False", "reason": "FailedDiscoveryCheck", "message": "no response" }] }
+        }))
+        .unwrap();
+        let out = render_hpa_metrics_apis(
+            &[hpa_metric("Resource", "cpu", "60%"), hpa_metric("ContainerResource", "app/cpu", "60%"), hpa_metric("External", "q", "5")],
+            &Ok(vec![svc]),
+        );
+        assert_eq!(
+            out,
+            "metrics.k8s.io (for Resource, ContainerResource metrics): v1beta1.metrics.k8s.io Available=False (FailedDiscoveryCheck), served by kube-system/metrics-server\n  no response\n\
+             external.metrics.k8s.io (for External metrics): NOT REGISTERED — nothing on the cluster serves it"
+        );
+    }
+
+    #[test]
+    fn hpa_conditions_read_scaling_limited_the_other_way_round() {
+        let c = |t: &str, s: &str, m: &str| crate::models::PodConditionInfo {
+            condition_type: t.into(),
+            status: s.into(),
+            reason: String::new(),
+            message: m.into(),
+            last_transition: None,
+        };
+        let out = render_hpa_conditions(&[c("AbleToScale", "True", ""), c("ScalingActive", "False", "missing request"), c("ScalingLimited", "True", "at max")]);
+        assert_eq!(out, "ScalingActive=False\n  missing request\nScalingLimited=True\n  at max\n\nchecked and clear: AbleToScale");
+        assert_eq!(render_hpa_conditions(&[]), "(none reported yet)");
+    }
+
     /// Builds real pod diagnoses for restarted and never-restarted pods and
     /// checks the previous instance's section. Prints counts only — no
     /// names, logs or prompt text.
@@ -1817,6 +3021,101 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(fresh_said_so > 0, "no never-restarted pod to check");
         assert_eq!(restarted_without, 0);
         assert_eq!(fresh_wrong, 0);
+    }
+
+    /// Builds a diagnosis for every NodePool on a cluster and checks each
+    /// section was read rather than reported unavailable. Prints counts only —
+    /// no names, messages or prompt text.
+    ///
+    ///   NAP_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml nap_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster with NAP; set NAP_DIAG_TEST_CONTEXT to run"]
+    async fn nap_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("NAP_DIAG_TEST_CONTEXT") else { return };
+        let pools = k8s::get_nap_node_pools(&ctx).await.expect("pools").node_pools;
+        let (mut built, mut unavailable, mut claim_count_differs, mut with_scheduling, mut largest) = (0, 0, 0, 0, 0);
+        for p in &pools {
+            let payload = build_nap_diagnosis_payload(&ctx, &p.name).await.expect("payload");
+            built += 1;
+            unavailable += payload.prompt.matches("unavailable: ").count();
+            // The pool's own node count against the claims listed by label.
+            let claims = payload
+                .prompt
+                .split("## NodeClaims (worst first)\n")
+                .nth(1)
+                .and_then(|s| s.split(" claim(s)").next())
+                .and_then(|n| n.parse::<i64>().ok())
+                .unwrap_or(0);
+            if claims != p.nodes {
+                claim_count_differs += 1
+            }
+            if !payload.prompt.contains("(Karpenter reports no pod it could not place") {
+                with_scheduling += 1
+            }
+            largest = largest.max(payload.approx_tokens);
+        }
+        println!("pools={} built={built} unavailable_sections={unavailable} claim_count_differs={claim_count_differs} with_scheduling_failures={with_scheduling} largest_tokens={largest}", pools.len());
+        assert!(built > 0, "no NodePool to diagnose");
+        assert_eq!(unavailable, 0);
+    }
+
+    /// Builds a diagnosis for every HPA on a cluster, and checks that each one
+    /// whose own message blames a missing request has that container flagged
+    /// in the payload. Prints counts only.
+    ///
+    ///   HPA_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml hpa_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set HPA_DIAG_TEST_CONTEXT to run"]
+    async fn hpa_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("HPA_DIAG_TEST_CONTEXT") else { return };
+        let hpas = k8s::get_hpas(&ctx).await.expect("hpas");
+        let (mut built, mut unavailable, mut missing_request, mut flagged, mut largest) = (0, 0, 0, 0, 0);
+        let (mut with_usage, mut flagged_any, mut apis_not_available, mut not_active) = (0, 0, 0, 0);
+        let (mut ambiguous, mut ambiguous_listed, mut no_metrics, mut no_metrics_said) = (0, 0, 0, 0);
+        for h in &hpas {
+            let payload = build_hpa_diagnosis_payload(&ctx, &h.namespace, &h.name).await.expect("payload");
+            built += 1;
+            unavailable += payload.prompt.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            with_usage += payload.prompt.contains("average usage cpu") as usize;
+            flagged_any += payload.prompt.contains("MISSING ") as usize;
+            apis_not_available += (payload.prompt.contains("NOT REGISTERED") || payload.prompt.contains("Available=False")) as usize;
+            not_active += !h.scaling_active as usize;
+            // Two HPAs on one target: the payload should name the other one.
+            if h.condition_reason.starts_with("AmbiguousSelector") {
+                ambiguous += 1;
+                ambiguous_listed += !payload.prompt.contains("(none — this is the only HPA scaling it)") as usize;
+            }
+            // metrics-server returned nothing: some container should say so.
+            if h.condition_reason.contains("no metrics returned") {
+                no_metrics += 1;
+                no_metrics_said += (payload.prompt.contains("reports no usage for it")
+                    || payload.prompt.contains("usage unavailable")
+                    || payload.prompt.contains("matches no pods")) as usize;
+            }
+            // "missing request for memory in container X of Pod Y"
+            if let Some(rest) = h.condition_reason.split("missing request for ").nth(1) {
+                missing_request += 1;
+                let resource = rest.split_whitespace().next().unwrap_or_default();
+                let container = rest.split("in container ").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or_default();
+                let section = payload.prompt.split("## Containers in the target's pods\n").nth(1).unwrap_or_default();
+                let row = section.split("\n").position(|l| l.starts_with(&format!("{container} ")) || l.starts_with(&format!("{container} (")));
+                let lines: Vec<&str> = section.lines().collect();
+                let notes = row.map(|i| lines.iter().skip(i + 1).take_while(|l| l.starts_with("  ")).copied().collect::<Vec<_>>()).unwrap_or_default();
+                if notes.iter().any(|l| l.contains(&format!("MISSING {resource} request"))) {
+                    flagged += 1
+                }
+            }
+        }
+        println!("hpas={} built={built} unavailable_sections={unavailable} blamed_missing_request={missing_request} flagged={flagged} largest_tokens={largest} with_usage={with_usage} any_missing_flag={flagged_any} metrics_api_down={apis_not_available} not_scaling_active={not_active} ambiguous={ambiguous}/{ambiguous_listed} no_metrics={no_metrics}/{no_metrics_said}", hpas.len());
+        assert!(built > 0, "no HPA to diagnose");
+        assert_eq!(flagged, missing_request);
+        assert_eq!(ambiguous_listed, ambiguous);
+        // `no_metrics` is printed, not asserted: the HPA's condition is from its
+        // last sync and the usage from this read, so a pod whose metrics come
+        // and go between the two makes the pair disagree for a moment.
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs
