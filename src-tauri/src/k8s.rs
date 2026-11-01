@@ -2722,13 +2722,25 @@ async fn get_hpa_target(
     };
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
     let (target, scale) = tokio::join!(api.get(name), api.get_scale(name));
-    (
-        target.map_err(|e| get_error(kind, name, e)),
-        scale.map_err(|e| match e {
-            kube::Error::Api(ref resp) if resp.code == 404 => format!("{kind} '{name}' does not exist"),
-            e => format!("Failed to read the scale of {kind} '{name}': {e}"),
-        }),
-    )
+    let target = target.map_err(|e| get_error(kind, name, e));
+    let scale = scale.map_err(|e| scale_error(kind, name, &target, e));
+    (target, scale)
+}
+
+/// A failed `/scale` read, given how the object's own read went.
+///
+/// A 404 from `/scale` alone says only that there is no scale to read: a
+/// custom resource without the scale subresource answers the same way. The
+/// object is missing only when its own read says so too.
+pub(crate) fn scale_error(kind: &str, name: &str, target: &Result<DynamicObject, String>, e: kube::Error) -> String {
+    let missing = format!("{kind} '{name}' does not exist");
+    match (target, e) {
+        (Err(t), _) if *t == missing => missing,
+        (_, kube::Error::Api(ref resp)) if resp.code == 404 => {
+            format!("Failed to read the scale of {kind} '{name}': it has no scale subresource")
+        }
+        (_, e) => format!("Failed to read the scale of {kind} '{name}': {e}"),
+    }
 }
 
 /// A failed get, said plainly when the object is simply not there.
@@ -3027,7 +3039,16 @@ pub(crate) fn keda_log_line_is_about(line: &str, kind: &str, namespace: &str, na
     let field = |k: &str| fields.get(k).and_then(|v| v.as_str());
     let prefix = if kind == "ScaledJob" { "scaledJob" } else { "scaledObject" };
     let handler = field(&format!("{prefix}.Namespace")) == Some(namespace) && field(&format!("{prefix}.Name")) == Some(name);
-    let scaler = field("namespace") == Some(namespace) && field("name") == Some(name) && field("type").is_none_or(|t| t == kind);
+    // A bare namespace and name can belong to either kind, so whatever the
+    // line says about its kind must agree: the scalers' `type`, the
+    // controller's `controllerKind` or `controller`, or the object it keys by
+    // its kind. Only a line that says nothing of its kind is taken on name.
+    let other = if kind == "ScaledJob" { "ScaledObject" } else { "ScaledJob" };
+    let of_kind = field("type").is_none_or(|t| t == kind)
+        && field("controllerKind").is_none_or(|k| k == kind)
+        && field("controller").is_none_or(|c| c.eq_ignore_ascii_case(kind))
+        && fields.get(other).is_none();
+    let scaler = field("namespace") == Some(namespace) && field("name") == Some(name) && of_kind;
     handler || scaler
 }
 
@@ -3035,7 +3056,8 @@ pub(crate) fn keda_log_line_is_about(line: &str, kind: &str, namespace: &str, na
 ///
 /// Two routes: a trigger's `*FromEnv` metadata names an environment variable
 /// on the target's container, which may come from a Secret or ConfigMap; a
-/// TriggerAuthentication's `secretTargetRef` names a Secret and key directly.
+/// TriggerAuthentication's `secretTargetRef` or `configMapTargetRef` names a
+/// Secret or ConfigMap and key directly.
 pub(crate) fn keda_key_set_refs(
     containers: &[serde_json::Value],
     auths: &[(String, Result<DynamicObject, String>)],
@@ -3063,8 +3085,10 @@ pub(crate) fn keda_key_set_refs(
     for (r, auth) in auths {
         let Ok(auth) = auth else { continue };
         let ns = if r.starts_with("ClusterTriggerAuthentication/") { operator_namespace.unwrap_or("keda") } else { namespace };
-        for t in auth.data.pointer("/spec/secretTargetRef").and_then(|v| v.as_array()).into_iter().flatten() {
-            add("Secret", ns, json_str(Some(t), "name"));
+        for (kind, at) in [("Secret", "/spec/secretTargetRef"), ("ConfigMap", "/spec/configMapTargetRef")] {
+            for t in auth.data.pointer(at).and_then(|v| v.as_array()).into_iter().flatten() {
+                add(kind, ns, json_str(Some(t), "name"));
+            }
         }
     }
     refs
@@ -3080,13 +3104,36 @@ fn keda_env_containers(object: &DynamicObject, target: Option<&DynamicObject>) -
     from.and_then(|c| c.as_array()).cloned().unwrap_or_default()
 }
 
+/// The manifest as the diagnosis sends it.
+///
+/// A ScaledJob carries a whole Job template, and its containers' inline `env`
+/// values can be credentials no pattern recognises, so each is replaced
+/// outright. `last-applied-configuration` would hold a second copy of them,
+/// so it goes too.
+pub(crate) fn keda_manifest_for_diagnosis(mut object: DynamicObject) -> DynamicObject {
+    if let Some(a) = object.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    for list in ["containers", "initContainers"] {
+        let at = format!("/spec/jobTargetRef/template/spec/{list}");
+        for c in object.data.pointer_mut(&at).and_then(|v| v.as_array_mut()).into_iter().flatten() {
+            for e in c.get_mut("env").and_then(|v| v.as_array_mut()).into_iter().flatten() {
+                if let Some(v) = e.get_mut("value") {
+                    *v = serde_json::Value::String("(value omitted)".to_string());
+                }
+            }
+        }
+    }
+    object
+}
+
 pub async fn get_keda_diagnostics(context_name: &str, namespace: &str, kind: &str, name: &str) -> Result<KedaDiagnostics, String> {
     let client = client_for_context(context_name).await?;
     let ar = keda_resource(kind, keda_plural(kind)?);
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
     let object = api.get(name).await.map_err(|e| format!("Failed to get {kind} '{name}': {e}"))?;
     let detail = crate::keda_detail::keda_detail(&object, kind);
-    let manifest = object_manifest(object.clone())?.yaml_without_managed_fields;
+    let manifest = object_manifest(keda_manifest_for_diagnosis(object.clone()))?.yaml_without_managed_fields;
     let is_job = kind == "ScaledJob";
 
     let target_ref = object.data.pointer("/spec/scaleTargetRef").cloned().unwrap_or_default();

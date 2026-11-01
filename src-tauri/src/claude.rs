@@ -1576,52 +1576,74 @@ fn key_presence(key_sets: &KeySets, kind: &str, namespace: &str, name: &str, key
     }
 }
 
-/// Where one environment variable comes from on the containers KEDA reads.
+/// Where one environment variable comes from on the container KEDA reads.
+///
+/// That is the container `only` names or, by KEDA's default, the first one.
+/// The kubelet's precedence decides between sources: `env` over `envFrom`,
+/// and a later entry over an earlier one, so both are searched last first. A
+/// source that could not be read leaves the answer open, and is said to.
 fn resolve_env_var(var: &str, containers: &[serde_json::Value], only: Option<&str>, namespace: &str, key_sets: &KeySets) -> String {
     let field = |v: Option<&serde_json::Value>, k: &str| v.and_then(|v| v.get(k)).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let chosen: Vec<&serde_json::Value> = containers
-        .iter()
-        .filter(|c| only.is_none_or(|o| c.get("name").and_then(|n| n.as_str()) == Some(o)))
-        .collect();
-    for c in &chosen {
-        let cname = field(Some(c), "name");
-        for e in c.get("env").and_then(|v| v.as_array()).into_iter().flatten() {
-            if e.get("name").and_then(|n| n.as_str()) != Some(var) {
+    let container = match only {
+        Some(o) => containers.iter().find(|c| c.get("name").and_then(|n| n.as_str()) == Some(o)),
+        None => containers.first(),
+    };
+    let Some(c) = container else {
+        return match only {
+            Some(o) => format!("NOT RESOLVABLE — the target has no container {o}"),
+            None => "NOT RESOLVABLE — no container to read it from".to_string(),
+        };
+    };
+    let cname = field(Some(c), "name");
+    let list = |k: &str| c.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if let Some(e) = list("env").iter().rev().find(|e| e.get("name").and_then(|n| n.as_str()) == Some(var)) {
+        let from = e.get("valueFrom");
+        if let Some(r) = from.and_then(|f| f.get("secretKeyRef")) {
+            return format!("on container {cname}, from {}", key_presence(key_sets, "Secret", namespace, &field(Some(r), "name"), &field(Some(r), "key")));
+        }
+        if let Some(r) = from.and_then(|f| f.get("configMapKeyRef")) {
+            return format!("on container {cname}, from {}", key_presence(key_sets, "ConfigMap", namespace, &field(Some(r), "name"), &field(Some(r), "key")));
+        }
+        if from.is_some() {
+            return format!("on container {cname}, from a field reference");
+        }
+        return format!("on container {cname}, set inline in the manifest");
+    }
+    // Later sources that could not be read, and those that do not exist.
+    let (mut unread, mut missing) = (Vec::new(), Vec::new());
+    for e in list("envFrom").iter().rev() {
+        let prefix = field(Some(e), "prefix");
+        let Some(key) = var.strip_prefix(prefix.as_str()) else { continue };
+        for (kind, at) in [("Secret", "secretRef"), ("ConfigMap", "configMapRef")] {
+            let name = field(e.get(at), "name");
+            if name.is_empty() {
                 continue;
             }
-            let from = e.get("valueFrom");
-            if let Some(r) = from.and_then(|f| f.get("secretKeyRef")) {
-                return format!("on container {cname}, from {}", key_presence(key_sets, "Secret", namespace, &field(Some(r), "name"), &field(Some(r), "key")));
-            }
-            if let Some(r) = from.and_then(|f| f.get("configMapKeyRef")) {
-                return format!("on container {cname}, from {}", key_presence(key_sets, "ConfigMap", namespace, &field(Some(r), "name"), &field(Some(r), "key")));
-            }
-            if from.is_some() {
-                return format!("on container {cname}, from a field reference");
-            }
-            return format!("on container {cname}, set inline in the manifest");
-        }
-        for e in c.get("envFrom").and_then(|v| v.as_array()).into_iter().flatten() {
-            let prefix = field(Some(e), "prefix");
-            let Some(key) = var.strip_prefix(prefix.as_str()) else { continue };
-            for (kind, at) in [("Secret", "secretRef"), ("ConfigMap", "configMapRef")] {
-                let name = field(e.get(at), "name");
-                if name.is_empty() {
-                    continue;
-                }
-                if let Some(Ok(keys)) = key_sets.get(&(kind.to_string(), namespace.to_string(), name.clone())) {
-                    if keys.iter().any(|k| k == key) {
-                        return format!("on container {cname}, from all of {kind} {name} (envFrom), key {key} — present");
+            match key_sets.get(&(kind.to_string(), namespace.to_string(), name.clone())) {
+                Some(Ok(keys)) if keys.iter().any(|k| k == key) => {
+                    let mut line = format!("on container {cname}, from all of {kind} {name} (envFrom), key {key} — present");
+                    if !unread.is_empty() {
+                        line.push_str(&format!(", unless {} (later, so taking precedence) defines it", unread.join(" or ")));
                     }
+                    return line;
                 }
+                Some(Ok(_)) => {}
+                Some(Err(e)) if e == "does not exist" => missing.push(format!("{kind} {name}")),
+                Some(Err(e)) => unread.push(format!("{kind} {name} ({e})")),
+                None => unread.push(format!("{kind} {name} (not checked)")),
             }
         }
     }
-    let names: Vec<String> = chosen.iter().map(|c| field(Some(c), "name")).collect();
-    if names.is_empty() {
-        return "NOT RESOLVABLE — no container to read it from".to_string();
+    let mut line = if unread.is_empty() {
+        format!("NOT DEFINED on container {cname} — KEDA cannot resolve it")
+    } else {
+        format!("not found on container {cname} in what could be read; it may come from {}", unread.join(" or "))
+    };
+    if !missing.is_empty() {
+        let verb = if missing.len() == 1 { "does" } else { "do" };
+        line.push_str(&format!(" (its envFrom names {}, which {verb} not exist)", missing.join(" and ")));
     }
-    format!("NOT DEFINED on container {} — KEDA cannot resolve it", names.join(", "))
+    line
 }
 
 /// Where every credential the triggers use comes from, and whether it is there.
@@ -3548,6 +3570,80 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
     }
 
     #[test]
+    fn keda_reads_the_first_container_unless_told_otherwise() {
+        let containers = vec![
+            serde_json::json!({ "name": "app" }),
+            serde_json::json!({ "name": "sidecar", "env": [{ "name": "HUB", "value": "x" }] }),
+        ];
+        let d = keda_detail_with(vec![trigger(&["connectionFromEnv=HUB"], "")]);
+        let out = render_keda_credentials(&d, &serde_json::json!({}), &containers, &[], &KeySets::new(), "ns", None);
+        assert_eq!(out, "trigger 0 connectionFromEnv → env HUB: NOT DEFINED on container app — KEDA cannot resolve it");
+        let object = serde_json::json!({ "spec": { "envSourceContainerName": "gone" } });
+        let out = render_keda_credentials(&d, &object, &containers, &[], &KeySets::new(), "ns", None);
+        assert_eq!(out, "trigger 0 connectionFromEnv → env HUB: NOT RESOLVABLE — the target has no container gone");
+    }
+
+    #[test]
+    fn the_env_from_source_that_wins_is_the_one_reported() {
+        let containers = vec![serde_json::json!({
+            "name": "app",
+            "envFrom": [{ "secretRef": { "name": "a" } }, { "secretRef": { "name": "b" } }, { "secretRef": { "name": "c" } }],
+        })];
+        let d = keda_detail_with(vec![trigger(&["connectionFromEnv=HUB"], "")]);
+        let run = |ks: &KeySets| render_keda_credentials(&d, &serde_json::json!({}), &containers, &[], ks, "ns", None);
+
+        let ks = keys(&[("Secret", "ns", "a", Ok(&["HUB"][..])), ("Secret", "ns", "b", Ok(&["HUB"][..])), ("Secret", "ns", "c", Ok(&[][..]))]);
+        assert_eq!(run(&ks), "trigger 0 connectionFromEnv → env HUB: on container app, from all of Secret b (envFrom), key HUB — present");
+
+        let ks = keys(&[("Secret", "ns", "a", Ok(&["HUB"][..])), ("Secret", "ns", "b", Ok(&[][..])), ("Secret", "ns", "c", Err("could not be read: forbidden"))]);
+        assert_eq!(
+            run(&ks),
+            "trigger 0 connectionFromEnv → env HUB: on container app, from all of Secret a (envFrom), key HUB — present, unless Secret c (could not be read: forbidden) (later, so taking precedence) defines it"
+        );
+
+        let ks = keys(&[("Secret", "ns", "a", Err("does not exist")), ("Secret", "ns", "b", Ok(&[][..])), ("Secret", "ns", "c", Err("could not be read: forbidden"))]);
+        assert_eq!(
+            run(&ks),
+            "trigger 0 connectionFromEnv → env HUB: not found on container app in what could be read; it may come from Secret c (could not be read: forbidden) (its envFrom names Secret a, which does not exist)"
+        );
+
+        let ks = keys(&[("Secret", "ns", "a", Err("does not exist")), ("Secret", "ns", "b", Ok(&[][..])), ("Secret", "ns", "c", Ok(&[][..]))]);
+        assert_eq!(
+            run(&ks),
+            "trigger 0 connectionFromEnv → env HUB: NOT DEFINED on container app — KEDA cannot resolve it (its envFrom names Secret a, which does not exist)"
+        );
+    }
+
+    #[test]
+    fn a_scaled_job_manifest_carries_no_inline_env_value() {
+        let object: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "keda.sh/v1alpha1", "kind": "ScaledJob",
+            "metadata": { "name": "j", "annotations": { "kubectl.kubernetes.io/last-applied-configuration": "{\"opaque\":\"s3cr3t\"}", "team": "x" } },
+            "spec": { "jobTargetRef": { "template": { "spec": {
+                "containers": [{ "name": "app", "env": [{ "name": "TOKEN", "value": "s3cr3t" }, { "name": "REF", "valueFrom": { "secretKeyRef": { "name": "s", "key": "k" } } }] }],
+                "initContainers": [{ "name": "init", "env": [{ "name": "TOKEN", "value": "s3cr3t" }] }]
+            } } } }
+        }))
+        .unwrap();
+        let yaml = k8s::object_manifest(k8s::keda_manifest_for_diagnosis(object)).unwrap().yaml_without_managed_fields;
+        assert!(!yaml.contains("s3cr3t"), "{yaml}");
+        assert!(!yaml.contains("last-applied"), "{yaml}");
+        assert_eq!(yaml.matches("(value omitted)").count(), 2, "{yaml}");
+        assert!(yaml.contains("team: x") && yaml.contains("secretKeyRef"), "{yaml}");
+    }
+
+    #[test]
+    fn a_missing_scale_means_a_missing_target_only_when_the_target_is_missing_too() {
+        let not_found = || {
+            kube::Error::Api(kube::core::ErrorResponse { status: "Failure".into(), message: "not found".into(), reason: "NotFound".into(), code: 404 })
+        };
+        let gone: Result<kube::api::DynamicObject, String> = Err("Rollout 'r' does not exist".into());
+        assert_eq!(k8s::scale_error("Rollout", "r", &gone, not_found()), "Rollout 'r' does not exist");
+        let there: Result<kube::api::DynamicObject, String> = Err("Failed to get Rollout 'r': forbidden".into());
+        assert_eq!(k8s::scale_error("Rollout", "r", &there, not_found()), "Failed to read the scale of Rollout 'r': it has no scale subresource");
+    }
+
+    #[test]
     fn a_trigger_authentication_is_traced_parameter_by_parameter() {
         let auth: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "keda.sh/v1alpha1", "kind": "ClusterTriggerAuthentication", "metadata": { "name": "hub" },
@@ -3580,6 +3676,10 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(k8s::keda_log_line_is_about(controller, "ScaledObject", "ns", "so"));
         assert!(!k8s::keda_log_line_is_about(scaler, "ScaledObject", "ns", "other"));
         assert!(!k8s::keda_log_line_is_about(scaler, "ScaledJob", "ns", "so"), "a ScaledJob of the same name is a different object");
+        assert!(!k8s::keda_log_line_is_about(controller, "ScaledJob", "ns", "so"), "nor is its controller's line about the ScaledJob");
+        let job_controller = "2026-11-01T10:00:03Z\tERROR\tReconciler error\t{\"controller\": \"scaledjob\", \"controllerKind\": \"ScaledJob\", \"ScaledJob\": {\"name\": \"so\", \"namespace\": \"ns\"}, \"namespace\": \"ns\", \"name\": \"so\", \"error\": \"x\"}";
+        assert!(k8s::keda_log_line_is_about(job_controller, "ScaledJob", "ns", "so"));
+        assert!(!k8s::keda_log_line_is_about(job_controller, "ScaledObject", "ns", "so"));
         assert!(!k8s::keda_log_line_is_about("\tgithub.com/kedacore/keda/v2/pkg/scaling.(*scaleHandler).getScaledObjectState", "ScaledObject", "ns", "so"));
 
         let lines = Ok(vec![handler.to_string(), scaler.to_string(), scaler.replace("10:00:01", "10:00:31"), controller.to_string()]);
@@ -3602,12 +3702,12 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         })];
         let auth: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "keda.sh/v1alpha1", "kind": "ClusterTriggerAuthentication", "metadata": { "name": "x" },
-            "spec": { "secretTargetRef": [{ "parameter": "p", "name": "s2", "key": "k" }] }
+            "spec": { "secretTargetRef": [{ "parameter": "p", "name": "s2", "key": "k" }], "configMapTargetRef": [{ "parameter": "q", "name": "c3", "key": "k" }] }
         }))
         .unwrap();
         let refs = k8s::keda_key_set_refs(&containers, &[("ClusterTriggerAuthentication/x".into(), Ok(auth))], "ns", Some("keda"));
         let got: Vec<String> = refs.iter().map(|(k, ns, n)| format!("{k} {ns}/{n}")).collect();
-        assert_eq!(got, ["Secret ns/s1", "ConfigMap ns/c1", "ConfigMap ns/c2", "Secret keda/s2"]);
+        assert_eq!(got, ["Secret ns/s1", "ConfigMap ns/c1", "ConfigMap ns/c2", "Secret keda/s2", "ConfigMap keda/c3"]);
     }
 
     #[test]
