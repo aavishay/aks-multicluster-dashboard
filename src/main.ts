@@ -5901,6 +5901,7 @@ function setMetricsRange(minutes: number) {
   diagnoseNode,
   diagnoseNapNodePool,
   diagnoseHpa,
+  diagnoseService,
   diagnoseKeda,
   confirmDiagnose,
   closeClaudeDiagnose,
@@ -7094,6 +7095,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
                   : d.kind === "ScaledObject" || d.kind === "ScaledJob"
                   ? "Settings, conditions and triggers, where each credential comes from (checked by key name, never value), the KEDA operator's log lines about it, its events, the HPA it generated or the Jobs it ran, KEDA's own health, and its manifest."
+                  : d.kind === "Service"
+                  ? "Its spec and endpoints, the pods its selector matches with their readiness and probes — or, when it matches none, the pods and workloads that nearly match — whether its target ports exist on them, the events of an unready pod, the Ingresses routing to it, its events, and its manifest."
                   : d.kind === "HorizontalPodAutoscaler"
                   ? "Replica bounds, conditions, each metric against its target, behavior and events, the object it scales and any other HPA on it, the requests and usage of every container in its pods, whether its metrics APIs are available, and its manifest."
                   : d.kind === "NodePool"
@@ -8576,6 +8579,13 @@ function diagnoseNapNodePool(ctx: string, name: string) {
  */
 function diagnoseHpa(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "HorizontalPodAutoscaler", namespace, name, "", () => api.aiBuildHpaDiagnosis(ctx, namespace, name));
+}
+
+/**
+ * A Service. `kind` selects the Service system prompt on the Rust side.
+ */
+function diagnoseService(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "Service", namespace, name, "", () => api.aiBuildServiceDiagnosis(ctx, namespace, name));
 }
 
 /**
@@ -13333,7 +13343,7 @@ function renderServices(): string {
     keyOf: (r) => `${r.ctx}:${r.s.namespace}:${r.s.name}`,
     health: { healthy: (r) => serviceIsHealthy(r.s), unhealthyLabel: "unhealthy", statusText: (r) => serviceStatus(r.s) },
     renderRow: ({ ctx, s }) => `
-      <tr>
+      <tr data-diagnose-what="service" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(s.namespace)}" data-diagnose-name="${esc(s.name)}">
         ${rowCheckboxCell("services", `${ctx}:${s.namespace}:${s.name}`)}
         <td title="${esc(serviceStatus(s))}">${statusDot(serviceIsHealthy(s))}</td>
         ${multi ? resourceClusterCell("services", ctx) : ""}
@@ -14325,6 +14335,7 @@ function renderResourceDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(subtitle)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${rd.kind === "Service" ? claudeDiagnoseButton(`window.__app.diagnoseService(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service") : ""}
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeResourceDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
@@ -15732,6 +15743,9 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "hpa":
       diagnoseHpa(ctx, ns, name);
+      return true;
+    case "service":
+      diagnoseService(ctx, ns, name);
       return true;
     case "keda":
       diagnoseKeda(ctx, ns, d.diagnoseKind ?? "ScaledObject", name);

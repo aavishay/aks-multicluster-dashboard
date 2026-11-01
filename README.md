@@ -167,8 +167,8 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, NAP NodePool, workload, pod, HPA, KEDA ScaledObject or ScaledJob,
-Argo CD application or Helm release can be diagnosed by an AI model: open it
+Any node, NAP NodePool, workload, pod, Service, HPA, KEDA ScaledObject or
+ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
 and click **Diagnose** in its panel, or press `⌘D` on a focused row. The app gathers the status, events and
 manifest behind it, plus what that kind of object needs:
 
@@ -177,6 +177,10 @@ manifest behind it, plus what that kind of object needs:
 - a NodePool: its NodeClaims worst first with the state of each one's node,
   the events on them, the pods Karpenter could not place on the pool and why,
   and its node class;
+- a Service: its endpoints, the pods its selector matches with their
+  readiness and probes — or, when it matches none, the pods and workloads
+  that nearly match and the label that keeps each out — whether its target
+  ports exist on those pods, and the Ingresses routing to it;
 - an HPA: the requests and usage of every container in the pods it scales —
   sidecars injected by a webhook included, the usual reason a utilization
   target cannot be computed — any other HPA on the same target, and whether
