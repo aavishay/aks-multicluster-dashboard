@@ -3358,13 +3358,22 @@ pub struct ServiceDiagnostics {
     /// The events of one matching pod that is not ready, which is where a
     /// failing readiness probe says what it got.
     pub unready_pod_events: Option<(String, Result<Vec<EventInfo>, String>)>,
-    /// The workloads whose pod template shares at least one label with the selector.
-    pub workloads: Result<Vec<ServiceWorkload>, String>,
+    /// The workloads whose pod template shares at least one label with the
+    /// selector, and the kinds that could not be listed: each kind is read on
+    /// its own, so a forbidden one does not hide the others.
+    pub workloads: (Vec<ServiceWorkload>, Vec<String>),
     /// The Ingresses in the namespace that route to it.
     pub ingresses: Result<Vec<k8s_openapi::api::networking::v1::Ingress>, String>,
-    /// How many nodes carry the control-plane role: none on a managed control
-    /// plane such as AKS, where a selector for etcd or the scheduler can match nothing.
-    pub control_plane_nodes: Result<usize, String>,
+    pub control_plane: Result<ControlPlane, String>,
+}
+
+/// What the nodes say about where the control plane runs.
+pub struct ControlPlane {
+    /// Nodes labelled with the control-plane role, or its older name `master`.
+    pub role_nodes: usize,
+    /// Whether the nodes are AKS's: then the control plane is Azure's, and
+    /// etcd, the scheduler and the controller manager run no pods here.
+    pub aks: bool,
 }
 
 /// How many of a selector's terms a set of labels satisfies.
@@ -3403,6 +3412,8 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
     let event_params = ListParams::default().fields(&event_fields);
     let slice_params = ListParams::default().labels(&format!("kubernetes.io/service-name={name}"));
     let control_plane = ListParams::default().labels("node-role.kubernetes.io/control-plane");
+    let master = ListParams::default().labels("node-role.kubernetes.io/master");
+    let aks = ListParams::default().labels("kubernetes.azure.com/cluster").limit(1);
     let all = ListParams::default();
 
     let pods_fut = async {
@@ -3413,17 +3424,30 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
     };
     let workloads_fut = async {
         if selector.is_empty() || external_name {
-            return Ok(Vec::new());
+            return (Vec::new(), Vec::new());
         }
         let deployments_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
         let statefulsets_api: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
         let daemonsets_api: Api<DaemonSet> = Api::namespaced(client.clone(), namespace);
         let (deployments, statefulsets, daemonsets) =
             tokio::join!(deployments_api.list(&all), statefulsets_api.list(&all), daemonsets_api.list(&all));
-        let failed = |kind: &str, e: kube::Error| format!("Failed to list {kind}s in '{namespace}': {e}");
+        let mut errors = Vec::new();
+        let mut failed = |kind: &str, e: kube::Error| errors.push(format!("Failed to list {kind}s in '{namespace}': {e}"));
         let template_labels = |t: &k8s_openapi::api::core::v1::PodTemplateSpec| t.metadata.as_ref().and_then(|m| m.labels.clone()).unwrap_or_default();
+        let deployments = deployments.map(|l| l.items).unwrap_or_else(|e| {
+            failed("Deployment", e);
+            Vec::new()
+        });
+        let statefulsets = statefulsets.map(|l| l.items).unwrap_or_else(|e| {
+            failed("StatefulSet", e);
+            Vec::new()
+        });
+        let daemonsets = daemonsets.map(|l| l.items).unwrap_or_else(|e| {
+            failed("DaemonSet", e);
+            Vec::new()
+        });
         let mut out = Vec::new();
-        for d in deployments.map_err(|e| failed("Deployment", e))?.items {
+        for d in deployments {
             let spec = d.spec.unwrap_or_default();
             out.push(ServiceWorkload {
                 kind: "Deployment".into(),
@@ -3433,7 +3457,7 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
                 ready: d.status.and_then(|s| s.ready_replicas).unwrap_or(0),
             });
         }
-        for d in statefulsets.map_err(|e| failed("StatefulSet", e))?.items {
+        for d in statefulsets {
             let spec = d.spec.unwrap_or_default();
             out.push(ServiceWorkload {
                 kind: "StatefulSet".into(),
@@ -3443,7 +3467,7 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
                 ready: d.status.and_then(|s| s.ready_replicas).unwrap_or(0),
             });
         }
-        for d in daemonsets.map_err(|e| failed("DaemonSet", e))?.items {
+        for d in daemonsets {
             let spec = d.spec.unwrap_or_default();
             let status = d.status.unwrap_or_default();
             out.push(ServiceWorkload {
@@ -3455,16 +3479,25 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
             });
         }
         out.retain(|w| selector_terms_met(&selector, Some(&w.labels)) > 0);
-        Ok::<_, String>(out)
+        (out, errors)
+    };
+    let control_plane_fut = async {
+        let (role, master, aks) =
+            tokio::join!(nodes_api.list_metadata(&control_plane), nodes_api.list_metadata(&master), nodes_api.list_metadata(&aks));
+        let failed = |e: kube::Error| format!("Failed to list nodes: {e}");
+        let mut names: Vec<String> = role.map_err(failed)?.items.into_iter().chain(master.map_err(failed)?.items).map(|n| n.name_any()).collect();
+        names.sort();
+        names.dedup();
+        Ok::<_, String>(ControlPlane { role_nodes: names.len(), aks: !aks.map_err(failed)?.items.is_empty() })
     };
 
-    let (events, slices, pods, workloads, ingresses, control_plane_nodes) = tokio::join!(
+    let (events, slices, pods, workloads, ingresses, control_plane) = tokio::join!(
         events_api.list(&event_params),
         slices_api.list(&slice_params),
         pods_fut,
         workloads_fut,
         ingresses_api.list(&all),
-        nodes_api.list_metadata(&control_plane),
+        control_plane_fut,
     );
 
     // One unready matching pod's events: a failing readiness probe reports
@@ -3532,7 +3565,7 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
                     .collect()
             })
             .map_err(|e| format!("Failed to list Ingresses in '{namespace}': {e}")),
-        control_plane_nodes: control_plane_nodes.map(|l| l.items.len()).map_err(|e| format!("Failed to list nodes: {e}")),
+        control_plane,
     })
 }
 
