@@ -5901,6 +5901,7 @@ function setMetricsRange(minutes: number) {
   diagnoseNode,
   diagnoseNapNodePool,
   diagnoseHpa,
+  diagnoseKeda,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -7091,6 +7092,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Capacity and kubelet details, every condition the cluster reports on it, its taints and events, the pods it is holding, and its manifest without the image cache."
                   : d.kind === "Release"
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
+                  : d.kind === "ScaledObject" || d.kind === "ScaledJob"
+                  ? "Settings, conditions and triggers, where each credential comes from (checked by key name, never value), the KEDA operator's log lines about it, its events, the HPA it generated or the Jobs it ran, KEDA's own health, and its manifest."
                   : d.kind === "HorizontalPodAutoscaler"
                   ? "Replica bounds, conditions, each metric against its target, behavior and events, the object it scales and any other HPA on it, the requests and usage of every container in its pods, whether its metrics APIs are available, and its manifest."
                   : d.kind === "NodePool"
@@ -8573,6 +8576,14 @@ function diagnoseNapNodePool(ctx: string, name: string) {
  */
 function diagnoseHpa(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "HorizontalPodAutoscaler", namespace, name, "", () => api.aiBuildHpaDiagnosis(ctx, namespace, name));
+}
+
+/**
+ * A KEDA ScaledObject or ScaledJob. `kind` is passed through as is, and
+ * selects the KEDA system prompt on the Rust side.
+ */
+function diagnoseKeda(ctx: string, namespace: string, kind: string, name: string) {
+  startDiagnosis(ctx, kind, namespace, name, "", () => api.aiBuildKedaDiagnosis(ctx, namespace, kind, name));
 }
 
 /**
@@ -11954,6 +11965,10 @@ function renderKedaDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(kd.kind)} · ${esc(kd.namespace)} · ${esc(kd.ctx)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${claudeDiagnoseButton(
+              `window.__app.diagnoseKeda(${jsArg(kd.ctx)},${jsArg(kd.namespace)},${jsArg(kd.kind)},${jsArg(kd.name)})`,
+              kd.kind === "ScaledJob" ? "ScaledJob" : "ScaledObject",
+            )}
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeKedaDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
@@ -14405,7 +14420,7 @@ function renderKeda(): string {
               const { ctx, s: so } = row;
               const status = so.paused ? "Paused" : so.ready ? "Ready" : "Not ready";
               return `
-            <tr>
+            <tr data-diagnose-what="keda" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="${esc(so.kind)}" data-diagnose-ns="${esc(so.namespace)}" data-diagnose-name="${esc(so.name)}">
               ${rowCheckboxCell("keda", keyOf(row))}
               <td title="${esc(status)}">${statusDot(so.ready, so.paused)}</td>
               ${
@@ -15718,6 +15733,9 @@ function diagnoseFocusedRow(): boolean {
     case "hpa":
       diagnoseHpa(ctx, ns, name);
       return true;
+    case "keda":
+      diagnoseKeda(ctx, ns, d.diagnoseKind ?? "ScaledObject", name);
+      return true;
     case "pod":
       diagnosePod(ctx, ns, name, d.diagnoseContainer ?? "");
       return true;
@@ -15746,7 +15764,7 @@ function diagnoseFocusedRow(): boolean {
  * free, since a disabled button ignores a click.
  *
  * An open detail panel always wins over the row cursor, including one with
- * nothing to diagnose (KEDA): it covers the table, and diagnosing a
+ * nothing to diagnose (a Secret, a Service): it covers the table, and diagnosing a
  * row you cannot see, while a panel for something else is in front of you,
  * would be the wrong subject.
  */
