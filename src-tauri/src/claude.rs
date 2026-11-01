@@ -799,7 +799,16 @@ fn render_nap_claims(
         out.push_str(&format!("\n{line}"));
     }
     if rows.len() > DIAGNOSE_NAP_CLAIMS {
-        out.push_str(&format!("\n… and {} more, all Ready with nothing pending", rows.len() - DIAGNOSE_NAP_CLAIMS));
+        // Said from what was cut, not assumed healthy: with more than the cap
+        // of stuck claims, the cut includes stuck ones too.
+        let omitted = &rows[DIAGNOSE_NAP_CLAIMS..];
+        let of = |r: u8| omitted.iter().filter(|(rank, _)| *rank == r).count();
+        let parts: Vec<String> = [(0, "not Ready"), (1, "terminating"), (2, "marked for replacement"), (3, "Ready with nothing pending")]
+            .into_iter()
+            .filter(|(r, _)| of(*r) > 0)
+            .map(|(r, label)| format!("{} {label}", of(r)))
+            .collect();
+        out.push_str(&format!("\n… and {} more: {}", omitted.len(), parts.join(", ")));
     }
     out
 }
@@ -1142,9 +1151,19 @@ fn render_hpa_containers(
         out.push_str(&line);
     }
     // A ContainerResource metric naming a container no pod has fails too.
+    // Checked over every pod, not just the ones read above: mid-rename, the
+    // new name may only be on pods past the sample.
+    let present = |name: &str| {
+        pods.iter().any(|p| {
+            p.spec.as_ref().is_some_and(|s| {
+                s.containers.iter().any(|c| c.name == name)
+                    || s.init_containers.iter().flatten().any(|c| c.name == name && c.restart_policy.as_deref() == Some("Always"))
+            })
+        })
+    };
     for need in needs {
         if let Some(c) = &need.container {
-            if !rows.iter().any(|r| &r.name == c) {
+            if !present(c) {
                 out.push_str(&format!("\nno pod has a container named {c}, which the {} target reads", need.metric));
             }
         }
@@ -1153,21 +1172,35 @@ fn render_hpa_containers(
 }
 
 /// The object the HPA scales: its replica counts as the controller reports them.
-fn render_hpa_target(target: &Result<kube::api::DynamicObject, String>, selector: &Result<String, String>) -> String {
-    let mut out = match target {
-        Ok(t) => {
-            let v = |p: &str| t.data.pointer(p).and_then(|v| v.as_i64()).map(|n| n.to_string()).unwrap_or_else(|| "(unset)".to_string());
-            format!(
-                "spec.replicas {}; status: replicas {}, ready {}, updated {}, available {}",
-                v("/spec/replicas"),
-                v("/status/replicas"),
-                v("/status/readyReplicas"),
-                v("/status/updatedReplicas"),
-                v("/status/availableReplicas"),
-            )
-        }
-        Err(e) => format!("(target unavailable: {e})"),
+///
+/// The counts come from its scale subresource, which every scalable kind
+/// reports the same way — a CRD may keep its own in `spec.size` — and the
+/// readiness detail from the object, where a workload kind has it.
+fn render_hpa_target(
+    target: &Result<kube::api::DynamicObject, String>,
+    scale: &Result<k8s_openapi::api::autoscaling::v1::Scale, String>,
+    selector: &Result<String, String>,
+) -> String {
+    let mut out = match scale {
+        Ok(sc) => format!(
+            "replicas (from its scale subresource): desired {}, current {}",
+            sc.spec.as_ref().and_then(|s| s.replicas).map(|n| n.to_string()).unwrap_or_else(|| "(unset)".to_string()),
+            sc.status.as_ref().map(|s| s.replicas.to_string()).unwrap_or_else(|| "(unset)".to_string()),
+        ),
+        Err(e) => format!("(scale unavailable: {e})"),
     };
+    match target {
+        Ok(t) => {
+            let detail: Vec<String> = [("ready", "/status/readyReplicas"), ("updated", "/status/updatedReplicas"), ("available", "/status/availableReplicas")]
+                .into_iter()
+                .filter_map(|(label, path)| t.data.pointer(path).and_then(|v| v.as_i64()).map(|n| format!("{label} {n}")))
+                .collect();
+            if !detail.is_empty() {
+                out.push_str(&format!("\nstatus: {}", detail.join(", ")));
+            }
+        }
+        Err(e) => out.push_str(&format!("\n(target unavailable: {e})")),
+    }
     match selector {
         Ok(s) => out.push_str(&format!("\nselector (from its scale subresource): {s}")),
         Err(e) => out.push_str(&format!("\nselector unavailable: {e}")),
@@ -1333,7 +1366,7 @@ pub async fn build_hpa_diagnosis_payload(
     let status = render_hpa_status(&d.detail);
     let conditions = render_hpa_conditions(&d.detail.conditions);
     let events = render_nap_events(&d.events, "(no events for this HPA)", false, 25);
-    let target = render_hpa_target(&d.target, &d.selector);
+    let target = render_hpa_target(&d.target, &d.scale, &d.selector);
     let containers = render_hpa_containers(&d.pods, &d.usage, &needs);
     let apis = render_hpa_metrics_apis(&d.detail.metrics, &d.metrics_apis);
     let siblings = render_hpa_siblings(&d.siblings);
@@ -2736,7 +2769,33 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out[leaving..].contains("TERMINATING since"));
         assert!(out.contains("node n-leaving Ready=True, cordoned, tainted karpenter.sh/disrupted:NoSchedule"));
         assert!(out.contains("node n-0 not found"));
-        assert!(out.ends_with("… and 7 more, all Ready with nothing pending"), "{out}");
+        assert!(out.ends_with("… and 7 more: 7 Ready with nothing pending"), "{out}");
+    }
+
+    #[test]
+    fn stuck_claims_past_the_cap_are_counted_as_stuck() {
+        let stuck = serde_json::json!([{ "type": "Ready", "status": "False" }]);
+        let claims: Vec<_> = (0..DIAGNOSE_NAP_CLAIMS + 2).map(|i| claim(&format!("s-{i}"), stuck.clone(), None, false)).collect();
+        let out = render_nap_claims(&Ok(claims), &Ok(vec![]));
+        assert!(out.ends_with("… and 2 more: 2 not Ready"), "{out}");
+    }
+
+    #[test]
+    fn a_target_is_read_through_its_scale_subresource() {
+        let scale: k8s_openapi::api::autoscaling::v1::Scale =
+            serde_json::from_value(serde_json::json!({ "spec": { "replicas": 4 }, "status": { "replicas": 3, "selector": "app=x" } })).unwrap();
+        let crd: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "example.com/v1", "kind": "Pool", "metadata": { "name": "p" }, "spec": { "size": 4 }, "status": { "currentSize": 3 }
+        }))
+        .unwrap();
+        let out = render_hpa_target(&Ok(crd), &Ok(scale), &Ok("app=x".into()));
+        assert_eq!(out, "replicas (from its scale subresource): desired 4, current 3\nselector (from its scale subresource): app=x");
+        let deployment: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "d" }, "status": { "readyReplicas": 2, "availableReplicas": 2 }
+        }))
+        .unwrap();
+        let out = render_hpa_target(&Ok(deployment), &Err("forbidden".into()), &Err("forbidden".into()));
+        assert_eq!(out, "(scale unavailable: forbidden)\nstatus: ready 2, available 2\nselector unavailable: forbidden");
     }
 
     #[test]
@@ -2865,6 +2924,11 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.contains("requests cpu 100m in 1, none in 1"), "{out}");
         assert!(out.contains("MISSING cpu request in 1/2 pods — the app/cpu 60% target cannot be computed"));
         assert!(out.ends_with("no pod has a container named worker, which the worker/cpu 60% target reads"), "{out}");
+        // A container only on pods past the sample is not absent.
+        let mut many: Vec<_> = (0..DIAGNOSE_HPA_PODS).map(|i| hpa_pod(&format!("old-{i}"), serde_json::json!([{ "name": "app" }]), serde_json::json!([]), true)).collect();
+        many.push(hpa_pod("new", serde_json::json!([{ "name": "app-v2" }]), serde_json::json!([]), true));
+        let out = render_hpa_containers(&Ok(many), &Ok(Default::default()), &hpa_request_needs(&[hpa_metric("ContainerResource", "app-v2/cpu", "60%")]));
+        assert!(!out.contains("no pod has a container named app-v2"), "{out}");
         assert_eq!(render_hpa_containers(&Ok(vec![]), &Ok(Default::default()), &[]), "(the target's selector matches no pods)");
         let quiet = render_hpa_containers(
             &Ok(vec![hpa_pod("a", serde_json::json!([{ "name": "app" }]), serde_json::json!([]), true)]),

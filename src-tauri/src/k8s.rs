@@ -2243,12 +2243,17 @@ async fn events_matching(client: &Client, fields: &str) -> Result<Vec<Event>, St
 ///
 /// Karpenter names the pool it tried in quotes — `incompatible with nodepool
 /// "gpu"`, `exceed limits for nodepool: "default"` — while the scheduler's own
-/// FailedScheduling events name no pool at all. Requiring both the word and
-/// the quoted name keeps a pool called `default` from matching every message
-/// that happens to contain the word.
+/// FailedScheduling events name no pool at all.
 pub(crate) fn mentions_node_pool(message: &str, pool: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("nodepool") && message.contains(&format!("\"{pool}\""))
+    let quoted = format!("\"{}\"", pool.to_ascii_lowercase());
+    // The quoted name must follow the word itself, as `nodepool "x"` or
+    // `nodepool: "x"`: elsewhere in the message a quoted string is a label or
+    // requirement key, and a pool named after one would claim every failure.
+    lower.match_indices("nodepool").any(|(i, word)| {
+        let rest = lower[i + word.len()..].trim_start_matches(':').trim_start();
+        rest.starts_with(&quoted)
+    })
 }
 
 /// The node class a pool's template points at, found by discovery.
@@ -2315,6 +2320,12 @@ pub async fn get_nap_diagnostics(context_name: &str, name: &str) -> Result<NapDi
         member_names.contains(&(o.kind.clone().unwrap_or_default(), o.name.clone().unwrap_or_default()))
     };
     let member_events = match (claim_events, node_events) {
+        // Without the claims there is no knowing which claim events are this
+        // pool's, and an empty list would read as "none".
+        _ if claims.is_err() => Err(format!(
+            "this pool's NodeClaims could not be listed, so their events cannot be attributed ({})",
+            claims.as_ref().err().cloned().unwrap_or_default()
+        )),
         (Ok(c), Ok(n)) => {
             let mut all: Vec<Event> = c.into_iter().chain(n).filter(|e| is_member(e)).collect();
             all.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
@@ -2634,7 +2645,10 @@ pub struct HpaDiagnostics {
     pub events: Result<Vec<EventInfo>, String>,
     /// The object it scales, as read through discovery.
     pub target: Result<DynamicObject, String>,
-    /// The selector the HPA itself reads, from the target's scale subresource.
+    /// The target's scale subresource: its replica counts as every scalable
+    /// kind reports them.
+    pub scale: Result<k8s_openapi::api::autoscaling::v1::Scale, String>,
+    /// The selector the HPA itself reads, from that scale subresource.
     pub selector: Result<String, String>,
     /// The pods that selector matches — the ones whose metrics the HPA averages.
     pub pods: Result<Vec<Pod>, String>,
@@ -2693,7 +2707,7 @@ async fn get_hpa_target(
     api_version: &str,
     kind: &str,
     name: &str,
-) -> (Result<DynamicObject, String>, Result<String, String>) {
+) -> (Result<DynamicObject, String>, Result<k8s_openapi::api::autoscaling::v1::Scale, String>) {
     let (group, version) = match api_version.split_once('/') {
         Some((g, v)) => (g, v),
         None => ("", api_version),
@@ -2710,14 +2724,7 @@ async fn get_hpa_target(
     let (target, scale) = tokio::join!(api.get(name), api.get_scale(name));
     (
         target.map_err(|e| format!("Failed to get {kind} '{name}': {e}")),
-        scale
-            .map_err(|e| format!("Failed to read the scale of {kind} '{name}': {e}"))
-            .and_then(|s| {
-                s.status
-                    .and_then(|st| st.selector)
-                    .filter(|sel| !sel.is_empty())
-                    .ok_or_else(|| format!("{kind} '{name}' reports no selector on its scale subresource"))
-            }),
+        scale.map_err(|e| format!("Failed to read the scale of {kind} '{name}': {e}")),
     )
 }
 
@@ -2740,7 +2747,7 @@ pub async fn get_hpa_diagnostics(context_name: &str, namespace: &str, name: &str
         Api::all(client.clone());
     let (event_params, all) = (ListParams::default().fields(&event_fields), ListParams::default());
     let hpas_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
-    let ((target, selector), events, usage, metrics_apis, siblings) = tokio::join!(
+    let ((target, scale), events, usage, metrics_apis, siblings) = tokio::join!(
         get_hpa_target(
             &client,
             namespace,
@@ -2776,6 +2783,12 @@ pub async fn get_hpa_diagnostics(context_name: &str, namespace: &str, name: &str
         })
         .map_err(|e| format!("Failed to list HPAs in '{namespace}': {e}"));
 
+    let selector = scale.clone().and_then(|s| {
+        s.status
+            .and_then(|st| st.selector)
+            .filter(|sel| !sel.is_empty())
+            .ok_or_else(|| format!("{} '{}' reports no selector on its scale subresource", target_ref.kind, target_ref.name))
+    });
     let pods = match &selector {
         Ok(sel) => {
             let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
@@ -2809,6 +2822,7 @@ pub async fn get_hpa_diagnostics(context_name: &str, namespace: &str, name: &str
             })
             .map_err(|e| format!("Failed to list events for '{name}': {e}")),
         target,
+        scale,
         selector,
         pods,
         usage,
@@ -4240,6 +4254,7 @@ mod tests {
         assert!(!mentions_node_pool(r#"incompatible with nodepool "gpu-large""#, "gpu"));
         assert!(!mentions_node_pool("0/12 nodes are available: 3 Insufficient cpu", "default"));
         assert!(!mentions_node_pool(r#"volume "default" not found"#, "default"));
+        assert!(!mentions_node_pool(r#"incompatible with nodepool "gpu", incompatible requirements, label "team" does not have known values"#, "team"));
     }
 
     #[test]
