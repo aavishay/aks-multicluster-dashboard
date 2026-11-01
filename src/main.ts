@@ -5900,6 +5900,7 @@ function setMetricsRange(minutes: number) {
   diagnoseHelmRelease,
   diagnoseNode,
   diagnoseNapNodePool,
+  diagnoseHpa,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -7090,6 +7091,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Capacity and kubelet details, every condition the cluster reports on it, its taints and events, the pods it is holding, and its manifest without the image cache."
                   : d.kind === "Release"
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
+                  : d.kind === "HorizontalPodAutoscaler"
+                  ? "Replica bounds, conditions, each metric against its target, behavior and events, the object it scales and any other HPA on it, the requests and usage of every container in its pods, whether its metrics APIs are available, and its manifest."
                   : d.kind === "NodePool"
                   ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
                   : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
@@ -8562,6 +8565,14 @@ function diagnoseNode(ctx: string, name: string) {
  */
 function diagnoseNapNodePool(ctx: string, name: string) {
   startDiagnosis(ctx, "NodePool", "", name, "", () => api.aiBuildNapDiagnosis(ctx, name));
+}
+
+/**
+ * A HorizontalPodAutoscaler. `kind` selects the HPA system prompt on the Rust
+ * side.
+ */
+function diagnoseHpa(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "HorizontalPodAutoscaler", namespace, name, "", () => api.aiBuildHpaDiagnosis(ctx, namespace, name));
 }
 
 /**
@@ -11245,6 +11256,7 @@ function renderHpaDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">HorizontalPodAutoscaler · ${esc(hd.namespace)} · ${esc(hd.ctx)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${claudeDiagnoseButton(`window.__app.diagnoseHpa(${jsArg(hd.ctx)},${jsArg(hd.namespace)},${jsArg(hd.name)})`, "autoscaler")}
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeHpaDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
@@ -12818,7 +12830,7 @@ function renderHpa(): string {
               const atCeiling = h.current_replicas >= h.max_replicas;
               const status = ok ? "Scaling" : h.condition_reason || "Not scaling";
               return `
-            <tr>
+            <tr data-diagnose-what="hpa" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(h.namespace)}" data-diagnose-name="${esc(h.name)}">
               ${rowCheckboxCell("hpa", keyOf(row))}
               <td title="${esc(status)}">${statusDot(ok)}</td>
               ${
@@ -15703,6 +15715,9 @@ function diagnoseFocusedRow(): boolean {
     case "nodepool":
       diagnoseNapNodePool(ctx, name);
       return true;
+    case "hpa":
+      diagnoseHpa(ctx, ns, name);
+      return true;
     case "pod":
       diagnosePod(ctx, ns, name, d.diagnoseContainer ?? "");
       return true;
@@ -15731,7 +15746,7 @@ function diagnoseFocusedRow(): boolean {
  * free, since a disabled button ignores a click.
  *
  * An open detail panel always wins over the row cursor, including one with
- * nothing to diagnose (HPA, KEDA): it covers the table, and diagnosing a
+ * nothing to diagnose (KEDA): it covers the table, and diagnosing a
  * row you cannot see, while a panel for something else is in front of you,
  * would be the wrong subject.
  */

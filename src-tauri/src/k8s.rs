@@ -2623,6 +2623,200 @@ pub async fn get_hpa_manifest(context_name: &str, namespace: &str, name: &str) -
     Ok(HpaManifest { yaml_full, yaml_without_managed_fields, detail: crate::hpa_detail::hpa_detail(&typed) })
 }
 
+/// Everything an HPA diagnosis reads.
+///
+/// Only the HPA itself is required; the rest each fail on their own, so a
+/// target that cannot be read still leaves the conditions and events — which
+/// usually carry the error verbatim — to diagnose from.
+pub struct HpaDiagnostics {
+    pub detail: HpaDetail,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// The object it scales, as read through discovery.
+    pub target: Result<DynamicObject, String>,
+    /// The selector the HPA itself reads, from the target's scale subresource.
+    pub selector: Result<String, String>,
+    /// The pods that selector matches — the ones whose metrics the HPA averages.
+    pub pods: Result<Vec<Pod>, String>,
+    /// Per-container usage from metrics-server, keyed by (pod, container).
+    pub usage: Result<HashMap<(String, String), (i64, i64)>, String>,
+    /// The metrics APIs registered on the cluster, for the groups this HPA's
+    /// metric types are served by.
+    pub metrics_apis: Result<Vec<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService>, String>,
+    /// Other HPAs in the namespace scaling the same object: (name, owner as `Kind/name`).
+    pub siblings: Result<Vec<(String, String)>, String>,
+}
+
+/// The metrics API group each HPA metric type is read from.
+pub(crate) fn metrics_api_group(kind: &str) -> &'static str {
+    match kind {
+        "Resource" | "ContainerResource" => "metrics.k8s.io",
+        "External" => "external.metrics.k8s.io",
+        _ => "custom.metrics.k8s.io",
+    }
+}
+
+/// Per-container usage in a namespace, from metrics-server.
+///
+/// Unlike `fetch_pod_metrics`, an absent or failing metrics-server is an
+/// error here rather than "no data": for an HPA on resource metrics it is
+/// very likely the answer.
+async fn fetch_container_usage(client: &Client, namespace: &str) -> Result<HashMap<(String, String), (i64, i64)>, String> {
+    let req = http::Request::builder()
+        .uri(format!("/apis/metrics.k8s.io/v1beta1/namespaces/{namespace}/pods"))
+        .body(Vec::new())
+        .map_err(|e| e.to_string())?;
+    let value: serde_json::Value = tokio::time::timeout(METRICS_REQUEST_TIMEOUT, client.request(req))
+        .await
+        .map_err(|_| "metrics.k8s.io did not answer in time".to_string())?
+        .map_err(|e| format!("metrics.k8s.io: {e}"))?;
+    let mut out = HashMap::new();
+    for item in value.get("items").and_then(|v| v.as_array()).into_iter().flatten() {
+        let pod = item.pointer("/metadata/name").and_then(|n| n.as_str()).unwrap_or_default();
+        for c in item.get("containers").and_then(|v| v.as_array()).into_iter().flatten() {
+            let usage = |k: &str| c.pointer(&format!("/usage/{k}")).and_then(|v| v.as_str());
+            out.insert(
+                (pod.to_string(), json_str(Some(c), "name").to_string()),
+                (usage("cpu").map(parse_cpu_millicores).unwrap_or(0), usage("memory").map(parse_memory_ki).unwrap_or(0)),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// The HPA's target and its scale subresource, found by discovery: the
+/// reference carries an apiVersion, and a target can be any kind that
+/// implements `/scale` — an Argo Rollout as readily as a Deployment.
+async fn get_hpa_target(
+    client: &Client,
+    namespace: &str,
+    api_version: &str,
+    kind: &str,
+    name: &str,
+) -> (Result<DynamicObject, String>, Result<String, String>) {
+    let (group, version) = match api_version.split_once('/') {
+        Some((g, v)) => (g, v),
+        None => ("", api_version),
+    };
+    let gvk = GroupVersionKind::gvk(group, version, kind);
+    let ar = match kube::discovery::oneshot::pinned_kind(client, &gvk).await {
+        Ok((ar, _)) => ar,
+        Err(e) => {
+            let e = format!("Failed to discover {kind} in {api_version}: {e}");
+            return (Err(e.clone()), Err(e));
+        }
+    };
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+    let (target, scale) = tokio::join!(api.get(name), api.get_scale(name));
+    (
+        target.map_err(|e| format!("Failed to get {kind} '{name}': {e}")),
+        scale
+            .map_err(|e| format!("Failed to read the scale of {kind} '{name}': {e}"))
+            .and_then(|s| {
+                s.status
+                    .and_then(|st| st.selector)
+                    .filter(|sel| !sel.is_empty())
+                    .ok_or_else(|| format!("{kind} '{name}' reports no selector on its scale subresource"))
+            }),
+    )
+}
+
+pub async fn get_hpa_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<HpaDiagnostics, String> {
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &hpa_resource());
+    let obj = api.get(name).await.map_err(|e| format!("Failed to get HorizontalPodAutoscaler '{name}': {e}"))?;
+    let typed: HorizontalPodAutoscaler = serde_json::to_value(&obj)
+        .and_then(serde_json::from_value)
+        .map_err(|e| format!("Failed to read HorizontalPodAutoscaler '{name}': {e}"))?;
+    let detail = crate::hpa_detail::hpa_detail(&typed);
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+    let target_ref = typed.spec.as_ref().map(|s| s.scale_target_ref.clone()).unwrap_or_default();
+
+    let event_fields = format!(
+        "involvedObject.kind=HorizontalPodAutoscaler,involvedObject.name={name},involvedObject.namespace={namespace}"
+    );
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let services_api: Api<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService> =
+        Api::all(client.clone());
+    let (event_params, all) = (ListParams::default().fields(&event_fields), ListParams::default());
+    let hpas_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
+    let ((target, selector), events, usage, metrics_apis, siblings) = tokio::join!(
+        get_hpa_target(
+            &client,
+            namespace,
+            target_ref.api_version.as_deref().unwrap_or("apps/v1"),
+            &target_ref.kind,
+            &target_ref.name,
+        ),
+        events_api.list(&event_params),
+        fetch_container_usage(&client, namespace),
+        services_api.list(&all),
+        hpas_api.list(&all),
+    );
+    let siblings = siblings
+        .map(|l| {
+            l.items
+                .into_iter()
+                .filter(|h| h.metadata.name.as_deref() != Some(name))
+                .filter(|h| {
+                    h.spec.as_ref().is_some_and(|s| s.scale_target_ref.kind == target_ref.kind && s.scale_target_ref.name == target_ref.name)
+                })
+                .map(|h| {
+                    let owner = h
+                        .metadata
+                        .owner_references
+                        .iter()
+                        .flatten()
+                        .find(|o| o.controller == Some(true))
+                        .map(|o| format!("{}/{}", o.kind, o.name))
+                        .unwrap_or_default();
+                    (h.metadata.name.unwrap_or_default(), owner)
+                })
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list HPAs in '{namespace}': {e}"));
+
+    let pods = match &selector {
+        Ok(sel) => {
+            let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+            pods_api
+                .list(&ListParams::default().labels(sel))
+                .await
+                .map(|l| l.items)
+                .map_err(|e| format!("Failed to list the target's pods: {e}"))
+        }
+        Err(e) => Err(format!("no selector to find the pods by ({e})")),
+    };
+
+    let groups: Vec<&str> = detail.metrics.iter().map(|m| metrics_api_group(&m.kind)).collect();
+    let metrics_apis = metrics_apis
+        .map(|l| {
+            l.items
+                .into_iter()
+                .filter(|s| s.spec.as_ref().and_then(|sp| sp.group.as_deref()).is_some_and(|g| groups.contains(&g)))
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list APIServices: {e}"));
+
+    Ok(HpaDiagnostics {
+        detail,
+        manifest,
+        events: events
+            .map(|l| {
+                let mut items = l.items;
+                items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+                items.into_iter().map(event_to_info).collect()
+            })
+            .map_err(|e| format!("Failed to list events for '{name}': {e}")),
+        target,
+        selector,
+        pods,
+        usage,
+        metrics_apis,
+        siblings,
+    })
+}
+
 /// Same reasoning as `get_keda_events` (filter before the cap).
 pub async fn get_hpa_events(context_name: &str, namespace: &str, name: &str) -> Result<Vec<EventInfo>, String> {
     let client = client_for_context(context_name).await?;
