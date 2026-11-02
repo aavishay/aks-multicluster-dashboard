@@ -3573,8 +3573,9 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
 pub struct IngressBackend {
     pub name: String,
     pub service: Result<k8s_openapi::api::core::v1::Service, String>,
-    /// Ready and total endpoints, from its EndpointSlices.
-    pub endpoints: Result<(usize, usize), String>,
+    /// Its EndpointSlices, kept whole: readiness is per Service port, and a
+    /// multi-port Service can have endpoints for one port and none for another.
+    pub slices: Result<Vec<k8s_openapi::api::discovery::v1::EndpointSlice>, String>,
 }
 
 /// What an Ingress's TLS Secret holds, read without its values: its type, its
@@ -3592,10 +3593,14 @@ pub struct IngressControllerWorkload {
     pub name: String,
     pub desired: i32,
     pub ready: i32,
-    /// Why it was taken for the controller: its args name the class or the
-    /// controller, or — when nothing does — only its name says ingress.
+    /// Why it was taken for the controller: a class flag in its args names
+    /// the class or the controller, or — when nothing does — only its name
+    /// says ingress.
     pub matched_by: String,
+    /// Its pod selector as a label-selector query, expressions included.
     pub selector: String,
+    /// The container whose args matched, whose log is the controller's.
+    pub container: String,
 }
 
 /// Everything an Ingress diagnosis reads.
@@ -3639,6 +3644,72 @@ pub(crate) fn ingress_class_of(ing: &k8s_openapi::api::networking::v1::Ingress) 
         .filter(|c| !c.is_empty())
 }
 
+/// The class an Ingress names, and whether it names it through the legacy
+/// annotation — which, unlike `ingressClassName`, needs no IngressClass
+/// object: a controller started with `--ingress-class=X` claims it either way.
+pub(crate) fn ingress_class_ref(ing: &k8s_openapi::api::networking::v1::Ingress) -> Option<(String, bool)> {
+    match ing.spec.as_ref().and_then(|s| s.ingress_class_name.clone()).filter(|c| !c.is_empty()) {
+        Some(c) => Some((c, false)),
+        None => ing
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("kubernetes.io/ingress.class").cloned())
+            .filter(|c| !c.is_empty())
+            .map(|c| (c, true)),
+    }
+}
+
+/// A label selector as the API's query syntax: `k=v`, `k in (a,b)`,
+/// `k notin (a,b)`, `k`, `!k`.
+pub(crate) fn label_selector_query(sel: &LabelSelector) -> String {
+    let mut terms: Vec<String> = sel.match_labels.iter().flatten().map(|(k, v)| format!("{k}={v}")).collect();
+    for e in sel.match_expressions.iter().flatten() {
+        let values = e.values.clone().unwrap_or_default().join(",");
+        terms.push(match e.operator.as_str() {
+            "In" => format!("{} in ({values})", e.key),
+            "NotIn" => format!("{} notin ({values})", e.key),
+            "Exists" => e.key.clone(),
+            "DoesNotExist" => format!("!{}", e.key),
+            op => format!("{} {op} ({values})", e.key),
+        });
+    }
+    terms.join(",")
+}
+
+/// Whether a container's flags make it the controller for this class.
+///
+/// Only a flag whose name says `class` counts — ingress-nginx's
+/// `--ingress-class` and `--controller-class`, Traefik's
+/// `--providers.kubernetesingress.ingressclass`, Contour's
+/// `--ingress-class-name` — and only when its value is the class or the
+/// controller string. A bare matching word, such as an `nginx` command, is
+/// not a flag. With no class, it is the flag ingress-nginx uses to claim
+/// class-less Ingresses.
+pub(crate) fn controller_flags_match(args: &[String], class: Option<&str>, controller: Option<&str>) -> bool {
+    let mut flags: Vec<(String, Option<String>)> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(flag) = args[i].strip_prefix("--").or_else(|| args[i].strip_prefix('-')) {
+            match flag.split_once('=') {
+                Some((k, v)) => flags.push((k.to_ascii_lowercase(), Some(v.to_string()))),
+                None => {
+                    let value = args.get(i + 1).filter(|v| !v.starts_with('-')).cloned();
+                    if value.is_some() {
+                        i += 1;
+                    }
+                    flags.push((flag.to_ascii_lowercase(), value));
+                }
+            }
+        }
+        i += 1;
+    }
+    flags.iter().any(|(k, v)| match class {
+        Some(class) => k.contains("class") && v.as_deref().is_some_and(|v| v == class || controller == Some(v)),
+        None => k == "watch-ingress-without-class" && v.as_deref().is_none_or(|v| v == "true"),
+    })
+}
+
 /// Every Service an Ingress routes to: its rules' backends and its default.
 pub(crate) fn ingress_backend_services(ing: &k8s_openapi::api::networking::v1::Ingress) -> Vec<String> {
     let spec = ing.spec.as_ref();
@@ -3664,8 +3735,22 @@ pub(crate) fn ingress_log_line_is_about(line: &str, namespace: &str, names: &[St
     if line.contains(" HTTP/1.") || line.contains(" HTTP/2") || line.contains("\"GET ") || line.contains("\"POST ") {
         return false;
     }
-    let tokens: Vec<&str> = line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')).collect();
-    names.iter().any(|n| line.contains(&format!("{namespace}/{n}")) || (tokens.contains(&namespace) && tokens.contains(&n.as_str())))
+    // Whole names only: `ns/api` must not match `other-ns/api` or `ns/api-old`.
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_';
+    let qualified = |n: &str| {
+        let needle = format!("{namespace}/{n}");
+        line.match_indices(&needle).any(|(at, _)| {
+            let before = line[..at].chars().next_back();
+            let after = line[at + needle.len()..].chars().next();
+            !before.is_some_and(|c| word(c) || c == '/') && !after.is_some_and(|c| word(c) || c == '/')
+        })
+    };
+    // As fields: the namespace in a field of its own, and the name as a whole token.
+    let tokens: Vec<&str> = line.split(|c: char| !word(c)).collect();
+    let in_namespace = [format!("namespace={namespace}"), format!("namespace=\"{namespace}\""), format!("\"namespace\":\"{namespace}\""), format!("\"namespace\": \"{namespace}\"")]
+        .iter()
+        .any(|f| line.match_indices(f.as_str()).any(|(at, _)| !line[at + f.len()..].chars().next().is_some_and(word)));
+    names.iter().any(|n| qualified(n) || (in_namespace && tokens.contains(&n.as_str())))
 }
 
 pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<IngressDiagnostics, String> {
@@ -3707,13 +3792,7 @@ pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: 
             IngressBackend {
                 name: svc.clone(),
                 service: service.map_err(|e| get_error("Service", svc, e)),
-                endpoints: slices
-                    .map(|l| {
-                        let eps: Vec<_> = l.items.iter().flat_map(|s| s.endpoints.iter()).collect();
-                        let ready = eps.iter().filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)).count();
-                        (ready, eps.len())
-                    })
-                    .map_err(|e| format!("Failed to list the EndpointSlices of '{svc}': {e}")),
+                slices: slices.map(|l| l.items).map_err(|e| format!("Failed to list the EndpointSlices of '{svc}': {e}")),
             }
         }
     }));
@@ -3781,37 +3860,26 @@ pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: 
     );
     let classes = classes.map(|l| l.items).map_err(|e| format!("Failed to list IngressClasses: {e}"));
 
-    // The class in effect: the one it names, else the cluster's default.
-    let class_name = ingress_class_of(&ingress).or_else(|| {
-        classes.as_ref().ok().and_then(|cs| {
-            cs.iter()
-                .find(|c| c.metadata.annotations.as_ref().and_then(|a| a.get("ingressclass.kubernetes.io/is-default-class")).map(String::as_str) == Some("true"))
-                .and_then(|c| c.metadata.name.clone())
-        })
-    });
+    // The class it names, and nothing else: a default class is applied when
+    // an Ingress is admitted, not afterwards, so one without a class is
+    // claimed only by a controller set to watch class-less Ingresses.
+    let class_name = ingress_class_of(&ingress);
     let controller = class_name.as_ref().and_then(|n| {
         classes.as_ref().ok().and_then(|cs| cs.iter().find(|c| c.metadata.name.as_ref() == Some(n))).and_then(|c| c.spec.as_ref()).and_then(|s| s.controller.clone())
     });
 
-    // The controller, by what its args say it serves. Each controller has its
-    // own flag — ingress-nginx's `--ingress-class=` and `--controller-class=`,
-    // Traefik's `--providers.kubernetesingress.ingressclass=` — but all of
-    // them carry the class or the controller string as a value.
-    let names_class = |args: &[String]| {
-        args.iter().any(|a| {
-            let value = a.split_once('=').map(|(_, v)| v).unwrap_or(a);
-            class_name.as_deref() == Some(value) || controller.as_deref().is_some_and(|c| value == c)
-        })
-    };
+    // The controller, by the class flag its container's args carry.
     let workload = |kind: &str, meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta, template: &k8s_openapi::api::core::v1::PodTemplateSpec, selector: &LabelSelector, desired: i32, ready: i32| {
-        let args: Vec<String> = template.spec.iter().flat_map(|s| s.containers.iter()).flat_map(|c| c.args.iter().flatten().chain(c.command.iter().flatten())).cloned().collect();
         let name = meta.name.clone().unwrap_or_default();
-        let matched_by = if names_class(&args) {
-            "its args name this class or controller"
-        } else if name.contains("ingress") {
-            "name only"
-        } else {
-            return None;
+        let matching = template.spec.iter().flat_map(|s| s.containers.iter()).find(|c| {
+            let args: Vec<String> = c.command.iter().flatten().chain(c.args.iter().flatten()).cloned().collect();
+            controller_flags_match(&args, class_name.as_deref(), controller.as_deref())
+        });
+        let (matched_by, container) = match matching {
+            Some(c) if class_name.is_some() => ("its args name this class or controller", c.name.clone()),
+            Some(c) => ("its args watch class-less Ingresses", c.name.clone()),
+            None if name.contains("ingress") => ("name only", String::new()),
+            None => return None,
         };
         Some(IngressControllerWorkload {
             kind: kind.to_string(),
@@ -3820,7 +3888,8 @@ pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: 
             desired,
             ready,
             matched_by: matched_by.to_string(),
-            selector: selector.match_labels.iter().flatten().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","),
+            selector: label_selector_query(selector),
+            container,
         })
     };
     let controllers = deployments
@@ -3869,7 +3938,10 @@ pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: 
                 }
             };
             for p in list {
+                // Its own container: a pod with an injected sidecar has
+                // several, and a log request without one is refused.
                 let params = LogParams {
+                    container: Some(w.container.clone()),
                     since_seconds: Some(INGRESS_CONTROLLER_LOG_SECONDS),
                     limit_bytes: Some(INGRESS_CONTROLLER_LOG_BYTES),
                     ..Default::default()
