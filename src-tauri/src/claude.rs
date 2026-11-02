@@ -357,6 +357,47 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_INGRESS_SYSTEM: &str = "\
+You diagnose Kubernetes Ingresses for an experienced SRE.
+
+You are given the Ingress's routes, TLS and address; whether its class \
+exists and which controller serves it; the controller's workloads and its \
+own log lines from the last hour about this Ingress, its Services and its \
+Secrets; each backend Service with its port and ready endpoints; each TLS \
+Secret, checked by key name and by the public fields of its certificate; \
+cert-manager's Certificates for those Secrets; other Ingresses with the same \
+hosts; its events; and its manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the log line, the backend, \
+the certificate, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+The controller's log is usually where the actual error is — a rejected \
+configuration, a Service with no active endpoint, a certificate it could not \
+load. Quote it and say what it means for this Ingress.
+
+Say which of these you are looking at, because the fixes differ:
+- Not admitted (no address): the class names no IngressClass, there is no \
+default class, or the controller serving it is down or rejecting it.
+- Admitted but failing requests (502, 503, 404): a backend Service that does \
+not exist, a port that is not one of its ports, no ready endpoint behind it, \
+or a path or pathType that does not match the requests.
+- TLS: the Secret is missing or lacks tls.crt or tls.key, the certificate is \
+expired or names other hosts, or cert-manager cannot issue it — then the \
+controller serves its default certificate.
+- A conflict: another Ingress of the same class claims the same host and \
+path.
+
+If the Ingress looks healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 /// How many drifted resources go into a diagnosis.
 ///
 /// An app with dozens of drifted resources is usually drifted the same way in
@@ -2506,6 +2547,496 @@ pub async fn build_service_diagnosis_payload(context_name: &str, namespace: &str
     })
 }
 
+/// How many distinct controller log entries, and how much of each, go into an
+/// Ingress diagnosis.
+const DIAGNOSE_INGRESS_LOG_ENTRIES: usize = 15;
+const DIAGNOSE_INGRESS_LOG_CHARS: usize = 400;
+
+/// The port an Ingress backend names: its number, or its name.
+fn ingress_backend_port(b: &k8s_openapi::api::networking::v1::IngressServiceBackend) -> String {
+    b.port
+        .as_ref()
+        .map(|p| p.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| p.number.map(|n| n.to_string()).unwrap_or_default()))
+        .unwrap_or_default()
+}
+
+/// Every (Service, port) an Ingress routes to.
+fn ingress_backend_refs(ing: &k8s_openapi::api::networking::v1::Ingress) -> Vec<(String, String)> {
+    let spec = ing.spec.as_ref();
+    let mut refs: Vec<(String, String)> = spec
+        .and_then(|s| s.default_backend.as_ref())
+        .into_iter()
+        .chain(spec.and_then(|s| s.rules.as_ref()).into_iter().flatten().flat_map(|r| r.http.iter().flat_map(|h| h.paths.iter().map(|p| &p.backend))))
+        .filter_map(|b| b.service.as_ref().map(|s| (s.name.clone(), ingress_backend_port(s))))
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+/// The Ingress's own spec and status: its class, its routes, its TLS, and
+/// whether a controller has given it an address.
+fn render_ingress_spec(ing: &k8s_openapi::api::networking::v1::Ingress) -> String {
+    let spec = ing.spec.clone().unwrap_or_default();
+    let mut lines = vec![match k8s::ingress_class_of(ing) {
+        Some(c) => format!("class: {c}"),
+        None => "class: (none named; the cluster's default class applies, if there is one)".to_string(),
+    }];
+    let address: Vec<String> = ing
+        .status
+        .as_ref()
+        .and_then(|s| s.load_balancer.as_ref())
+        .and_then(|lb| lb.ingress.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.ip.clone().or_else(|| i.hostname.clone()))
+        .collect();
+    lines.push(if address.is_empty() {
+        "address: NONE — no controller has admitted it and published an address".to_string()
+    } else {
+        format!("address: {}", address.join(", "))
+    });
+    lines.push("routes:".to_string());
+    let backend = |b: &k8s_openapi::api::networking::v1::IngressBackend| match (&b.service, &b.resource) {
+        (Some(s), _) => format!("Service {}:{}", s.name, ingress_backend_port(s)),
+        (None, Some(r)) => format!("{} {} (a resource backend)", r.kind, r.name),
+        _ => "(no backend)".to_string(),
+    };
+    if let Some(b) = &spec.default_backend {
+        lines.push(format!("  (default backend) → {}", backend(b)));
+    }
+    for r in spec.rules.iter().flatten() {
+        let host = r.host.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| "*".to_string());
+        let paths = r.http.as_ref().map(|h| h.paths.as_slice()).unwrap_or_default();
+        if paths.is_empty() {
+            lines.push(format!("  {host} (no paths)"));
+        }
+        for p in paths {
+            lines.push(format!("  {host}{} ({}) → {}", p.path.as_deref().unwrap_or("/"), p.path_type, backend(&p.backend)));
+        }
+    }
+    if spec.default_backend.is_none() && spec.rules.as_ref().is_none_or(|r| r.is_empty()) {
+        lines.push("  (none: no rules and no default backend)".to_string());
+    }
+    let tls = spec.tls.clone().unwrap_or_default();
+    if tls.is_empty() {
+        lines.push("TLS: none (served over plain HTTP only)".to_string());
+    } else {
+        lines.push("TLS:".to_string());
+        for t in &tls {
+            lines.push(format!(
+                "  {} → Secret {}",
+                t.hosts.clone().unwrap_or_default().join(", "),
+                t.secret_name.as_deref().filter(|s| !s.is_empty()).unwrap_or("(none: the controller's default certificate)")
+            ));
+        }
+        let covered: Vec<String> = tls.iter().flat_map(|t| t.hosts.clone().unwrap_or_default()).collect();
+        let plain: Vec<String> = spec.rules.iter().flatten().filter_map(|r| r.host.clone()).filter(|h| !h.is_empty() && !covered.contains(h)).collect();
+        if !plain.is_empty() {
+            lines.push(format!("  hosts in the rules but in no TLS entry: {}", plain.join(", ")));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Whether the class in effect exists and what controller it is for.
+fn render_ingress_class(ing: &k8s_openapi::api::networking::v1::Ingress, classes: &Result<Vec<k8s_openapi::api::networking::v1::IngressClass>, String>) -> String {
+    let classes = match classes {
+        Ok(c) => c,
+        Err(e) => return format!("(IngressClasses unavailable: {e})"),
+    };
+    let describe = |c: &k8s_openapi::api::networking::v1::IngressClass| {
+        let default = c.metadata.annotations.as_ref().and_then(|a| a.get("ingressclass.kubernetes.io/is-default-class")).map(String::as_str) == Some("true");
+        format!(
+            "{} (controller {}{})",
+            c.metadata.name.as_deref().unwrap_or_default(),
+            c.spec.as_ref().and_then(|s| s.controller.as_deref()).unwrap_or("(unset)"),
+            if default { ", the default" } else { "" }
+        )
+    };
+    let all = if classes.is_empty() { "(none)".to_string() } else { classes.iter().map(describe).collect::<Vec<_>>().join("; ") };
+    match k8s::ingress_class_of(ing) {
+        Some(name) => match classes.iter().find(|c| c.metadata.name.as_deref() == Some(name.as_str())) {
+            Some(c) => format!("named class exists: {}", describe(c)),
+            None => format!("NAMED CLASS {name} DOES NOT EXIST — no controller will claim it\nclasses on the cluster: {all}"),
+        },
+        None => {
+            let defaults: Vec<String> = classes
+                .iter()
+                .filter(|c| c.metadata.annotations.as_ref().and_then(|a| a.get("ingressclass.kubernetes.io/is-default-class")).map(String::as_str) == Some("true"))
+                .map(describe)
+                .collect();
+            match defaults.len() {
+                0 => format!("NO CLASS NAMED AND NO DEFAULT CLASS — only a controller set to watch class-less Ingresses will claim it\nclasses on the cluster: {all}"),
+                1 => format!("no class named; the default applies: {}", defaults[0]),
+                _ => format!("no class named, and SEVERAL CLASSES ARE MARKED DEFAULT: {}", defaults.join("; ")),
+            }
+        }
+    }
+}
+
+/// The workloads taken for the controller, and whether they are up.
+fn render_ingress_controllers(controllers: &Result<Vec<k8s::IngressControllerWorkload>, String>) -> String {
+    match controllers {
+        Ok(c) if c.is_empty() => "(no Deployment or DaemonSet names this class or its controller in its args, and none is called ingress)".to_string(),
+        Ok(c) => c
+            .iter()
+            .map(|w| {
+                let health = if w.desired == 0 {
+                    " — SCALED TO ZERO: nothing is serving this class, and the address in the Ingress's status is left over from when something did"
+                } else if w.ready < w.desired {
+                    " — NOT ALL READY"
+                } else {
+                    ""
+                };
+                format!("{} {}/{}: {} desired, {} ready{health} (matched by {})", w.kind, w.namespace, w.name, w.desired, w.ready, w.matched_by)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("(controller workloads unavailable: {e})"),
+    }
+}
+
+/// The controller's log lines about this Ingress, collapsed on what they say.
+///
+/// ingress-nginx writes klog lines (`W1102 10:00:00.000000 7 file.go:12] msg`),
+/// Traefik and others `level=… msg=…` or JSON. The level and message are
+/// pulled out of whichever it is, so the same error at a different time
+/// counts as one.
+fn render_ingress_controller_logs(lines: &Option<Result<(usize, Vec<String>), String>>) -> String {
+    let lines = match lines {
+        None => return "(no workload's args name this Ingress's class or controller, so there is no controller log to read)".to_string(),
+        Some(Ok((0, _))) => return "(the controller has no pods, so there is no log to read)".to_string(),
+        Some(Ok((_, l))) if l.is_empty() => return "(the controller logged nothing about this Ingress, its Services or its Secrets in the last hour)".to_string(),
+        Some(Ok((_, l))) => l,
+        Some(Err(e)) => return format!("(controller log unavailable: {e})"),
+    };
+    // (level, message) → (count, last time)
+    let mut groups: Vec<((String, String), usize, String)> = Vec::new();
+    for line in lines {
+        let klog = line.len() > 5 && line.as_bytes()[0].is_ascii_alphabetic() && line.as_bytes()[1..5].iter().all(u8::is_ascii_digit);
+        let (level, time, message) = if klog {
+            let level = match &line[..1] {
+                "E" => "ERROR",
+                "W" => "WARN",
+                "F" => "FATAL",
+                _ => "INFO",
+            };
+            let time = line[1..].split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+            let message = line.split_once("] ").map(|(_, m)| m).unwrap_or(line).to_string();
+            (level.to_string(), time, message)
+        } else if let Ok(j) = serde_json::from_str::<serde_json::Value>(line) {
+            let field = |k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let mut message = field("msg");
+            let error = field("error");
+            if !error.is_empty() {
+                message.push_str(&format!(": {error}"));
+            }
+            (field("level").to_uppercase(), field("time"), message)
+        } else {
+            // `key=value` or `key="quoted value"`, logfmt as Traefik writes it.
+            let after = |k: &str| {
+                line.split_once(&format!("{k}=")).map(|(_, rest)| match rest.strip_prefix('"') {
+                    Some(quoted) => quoted.split('"').next().unwrap_or_default().to_string(),
+                    None => rest.split_whitespace().next().unwrap_or_default().to_string(),
+                })
+            };
+            match after("msg") {
+                Some(msg) => {
+                    let mut message = msg;
+                    if let Some(e) = after("error") {
+                        message.push_str(&format!(": {e}"));
+                    }
+                    (after("level").unwrap_or_default().to_uppercase(), after("time").unwrap_or_default(), message)
+                }
+                None => (String::new(), String::new(), line.clone()),
+            }
+        };
+        let message = if message.len() > DIAGNOSE_INGRESS_LOG_CHARS {
+            format!("{} …", truncate_on_char_boundary(&message, DIAGNOSE_INGRESS_LOG_CHARS))
+        } else {
+            message
+        };
+        let key = (level, message);
+        match groups.iter_mut().find(|g| g.0 == key) {
+            Some(g) => {
+                g.1 += 1;
+                g.2 = time;
+            }
+            None => groups.push((key, 1, time)),
+        }
+    }
+    groups.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut out = groups
+        .iter()
+        .take(DIAGNOSE_INGRESS_LOG_ENTRIES)
+        .map(|((level, message), count, last)| {
+            let level = if level.is_empty() { String::new() } else { format!("{level} ") };
+            let last = if last.is_empty() { String::new() } else { format!(", last {last}") };
+            format!("{level}{message} (×{count}{last})")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if groups.len() > DIAGNOSE_INGRESS_LOG_ENTRIES {
+        out.push_str(&format!("\n… and {} older distinct entries", groups.len() - DIAGNOSE_INGRESS_LOG_ENTRIES));
+    }
+    out
+}
+
+/// Each backend Service: whether it exists, whether the port the Ingress
+/// names is one of its ports, and whether anything ready is behind it.
+fn render_ingress_backends(ing: &k8s_openapi::api::networking::v1::Ingress, backends: &[k8s::IngressBackend]) -> String {
+    let refs = ingress_backend_refs(ing);
+    if refs.is_empty() {
+        return "(it routes to no Service)".to_string();
+    }
+    let mut lines = Vec::new();
+    for (svc, port) in refs {
+        let Some(b) = backends.iter().find(|b| b.name == svc) else { continue };
+        let service = match &b.service {
+            Ok(s) => s,
+            Err(e) => {
+                lines.push(format!("Service {svc}:{port}: {}", read_failure("Service", e)));
+                continue;
+            }
+        };
+        let spec = service.spec.clone().unwrap_or_default();
+        let ports = spec.ports.clone().unwrap_or_default();
+        let found = ports.iter().find(|p| p.name.as_deref() == Some(port.as_str()) || p.port.to_string() == port);
+        let have = ports
+            .iter()
+            .map(|p| match &p.name {
+                Some(n) if !n.is_empty() => format!("{}/{n}", p.port),
+                _ => p.port.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut line = format!("Service {svc}:{port} ({})", spec.type_.as_deref().unwrap_or("ClusterIP"));
+        match found {
+            Some(p) => line.push_str(&format!(
+                ": port exists, → target port {}",
+                p.target_port.as_ref().map(int_or_string).unwrap_or_else(|| p.port.to_string())
+            )),
+            None => line.push_str(&format!(": PORT {port} IS NOT A PORT OF THE SERVICE (it has {})", if have.is_empty() { "none".to_string() } else { have })),
+        }
+        if spec.type_.as_deref() == Some("ExternalName") {
+            line.push_str(&format!("; an ExternalName to {}", spec.external_name.as_deref().unwrap_or_default()));
+        } else {
+            match &b.endpoints {
+                Ok((0, 0)) => line.push_str("; NO ENDPOINTS — nothing is behind it"),
+                Ok((0, total)) => line.push_str(&format!("; NO READY ENDPOINT (0 of {total})")),
+                Ok((ready, total)) => line.push_str(&format!("; {ready} of {total} endpoints ready")),
+                Err(e) => line.push_str(&format!("; endpoints unavailable: {e}")),
+            }
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// Whether a certificate name covers a host: exactly, or by a wildcard for
+/// one label.
+fn san_covers(san: &str, host: &str) -> bool {
+    let (san, host) = (san.to_ascii_lowercase(), host.to_ascii_lowercase());
+    if san == host {
+        return true;
+    }
+    match san.strip_prefix("*.") {
+        Some(suffix) => host.split_once('.').is_some_and(|(label, rest)| !label.is_empty() && rest == suffix),
+        None => false,
+    }
+}
+
+/// Each TLS Secret: there, of the right type, with both keys, and holding a
+/// certificate that is in date and names every host it serves.
+fn render_ingress_tls(
+    ing: &k8s_openapi::api::networking::v1::Ingress,
+    tls: &[(String, Result<k8s::IngressTlsSecret, String>)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let entries = ing.spec.as_ref().and_then(|s| s.tls.clone()).unwrap_or_default();
+    if entries.is_empty() {
+        return "(no TLS)".to_string();
+    }
+    let mut lines = Vec::new();
+    for t in &entries {
+        let hosts = t.hosts.clone().unwrap_or_default();
+        let Some(secret) = t.secret_name.as_deref().filter(|s| !s.is_empty()) else {
+            lines.push(format!("{}: no Secret named; the controller's default certificate is served", hosts.join(", ")));
+            continue;
+        };
+        let read = match tls.iter().find(|(n, _)| n == secret) {
+            Some((_, r)) => r,
+            None => continue,
+        };
+        let s = match read {
+            Ok(s) => s,
+            Err(e) => {
+                lines.push(format!("Secret {secret}: {}", read_failure("Secret", e)));
+                continue;
+            }
+        };
+        let mut line = format!("Secret {secret} ({})", s.secret_type);
+        let missing: Vec<&str> = ["tls.crt", "tls.key"].into_iter().filter(|k| !s.keys.iter().any(|have| have == k)).collect();
+        if !missing.is_empty() {
+            line.push_str(&format!(": MISSING KEY {}", missing.join(" and ")));
+        }
+        match &s.leaf {
+            None => line.push_str("\n  no certificate could be read from tls.crt"),
+            Some(c) => {
+                line.push_str(&format!("\n  certificate: subject {}, issuer {}", c.subject, c.issuer));
+                if let Some(after) = c.not_after.as_deref() {
+                    let days = chrono::DateTime::parse_from_rfc3339(after).ok().map(|t| (t.with_timezone(&chrono::Utc) - now).num_days());
+                    match days {
+                        Some(d) if d < 0 => line.push_str(&format!("\n  EXPIRED on {after}, {} days ago", -d)),
+                        Some(d) => line.push_str(&format!("\n  valid until {after} ({d} days left)")),
+                        None => line.push_str(&format!("\n  valid until {after}")),
+                    }
+                }
+                for h in &hosts {
+                    if !c.sans.iter().any(|san| san_covers(san, h)) {
+                        line.push_str(&format!("\n  DOES NOT COVER {h} (it names {})", c.sans.join(", ")));
+                    }
+                }
+            }
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// cert-manager's view of the TLS Secrets, when it issues them.
+fn render_ingress_certificates(certificates: &Option<Result<Vec<kube::api::DynamicObject>, String>>) -> String {
+    match certificates {
+        None => "(cert-manager is not installed, or there is no TLS Secret to issue)".to_string(),
+        Some(Err(e)) => format!("(Certificates unavailable: {e})"),
+        Some(Ok(c)) if c.is_empty() => "(no cert-manager Certificate writes these Secrets)".to_string(),
+        Some(Ok(c)) => c
+            .iter()
+            .map(|cert| {
+                let s = |p: &str| cert.data.pointer(p).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let ready = cert
+                    .data
+                    .pointer("/status/conditions")
+                    .and_then(|v| v.as_array())
+                    .and_then(|cs| cs.iter().find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready")))
+                    .map(|c| {
+                        let f = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+                        format!("Ready={} ({}): {}", f("status"), f("reason"), f("message"))
+                    })
+                    .unwrap_or_else(|| "no Ready condition yet".to_string());
+                let mut line = format!(
+                    "Certificate {} → Secret {}, issuer {} {}: {ready}",
+                    cert.metadata.name.as_deref().unwrap_or_default(),
+                    s("/spec/secretName"),
+                    s("/spec/issuerRef/kind"),
+                    s("/spec/issuerRef/name")
+                );
+                let renewal = s("/status/renewalTime");
+                if !renewal.is_empty() {
+                    line.push_str(&format!("; renews at {renewal}"));
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Other Ingresses claiming one of this one's hosts. Two Ingresses of one
+/// class are merged by the controller; the same host and path in both is a
+/// conflict one of them loses, often silently.
+fn render_ingress_same_host(ing: &k8s_openapi::api::networking::v1::Ingress, others: &Result<Vec<k8s_openapi::api::networking::v1::Ingress>, String>) -> String {
+    let others = match others {
+        Ok(o) if o.is_empty() => return "(no other Ingress has any of its hosts)".to_string(),
+        Ok(o) => o,
+        Err(e) => return format!("(other Ingresses unavailable: {e})"),
+    };
+    let routes = |i: &k8s_openapi::api::networking::v1::Ingress| -> Vec<(String, String)> {
+        i.spec
+            .iter()
+            .flat_map(|s| s.rules.iter().flatten())
+            .flat_map(|r| {
+                let host = r.host.clone().unwrap_or_default();
+                r.http.iter().flat_map(move |h| h.paths.iter().map({
+                    let host = host.clone();
+                    move |p| (host.clone(), p.path.clone().unwrap_or_else(|| "/".to_string()))
+                }))
+            })
+            .collect()
+    };
+    let mine = routes(ing);
+    let my_class = k8s::ingress_class_of(ing);
+    let my_hosts: Vec<&String> = mine.iter().map(|(h, _)| h).collect();
+    others
+        .iter()
+        .map(|o| {
+            let theirs: Vec<(String, String)> = routes(o).into_iter().filter(|(h, _)| my_hosts.contains(&h)).collect();
+            let class = k8s::ingress_class_of(o);
+            let clash: Vec<String> = theirs.iter().filter(|r| mine.contains(r)).map(|(h, p)| format!("{h}{p}")).collect();
+            let mut line = format!(
+                "{}/{} (class {}): {}",
+                o.metadata.namespace.as_deref().unwrap_or_default(),
+                o.metadata.name.as_deref().unwrap_or_default(),
+                class.as_deref().unwrap_or("(none)"),
+                theirs.iter().map(|(h, p)| format!("{h}{p}")).collect::<Vec<_>>().join(", ")
+            );
+            if !clash.is_empty() && class == my_class {
+                line.push_str(&format!(" — SAME HOST AND PATH AS THIS ONE: {}", clash.join(", ")));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Assembles everything an Ingress diagnosis needs, redacted.
+///
+/// An Ingress is a request to a controller, so most of what can be wrong is
+/// outside it: no controller claims its class, the controller is down or
+/// rejected it, a backend Service or its port is wrong or has nothing ready
+/// behind it, or the TLS Secret is missing, expired or for another name. The
+/// controller's own log lines usually say which.
+pub async fn build_ingress_diagnosis_payload(context_name: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_ingress_diagnostics(context_name, namespace, name).await?;
+
+    let spec = redact::redact(&render_ingress_spec(&d.ingress));
+    let class = redact::redact(&render_ingress_class(&d.ingress, &d.classes));
+    let controllers = redact::redact(&render_ingress_controllers(&d.controllers));
+    let logs = redact::redact(&render_ingress_controller_logs(&d.controller_logs));
+    let backends = redact::redact(&render_ingress_backends(&d.ingress, &d.backends));
+    let tls = redact::redact(&render_ingress_tls(&d.ingress, &d.tls, chrono::Utc::now()));
+    let certificates = redact::redact(&render_ingress_certificates(&d.certificates));
+    let same_host = redact::redact(&render_ingress_same_host(&d.ingress, &d.same_host));
+    let events = redact::redact(&render_nap_events(&d.events, "(no events for this Ingress)", false, 25));
+    let manifest = redact::redact(&d.manifest);
+
+    let redaction_summary =
+        redact::Redacted::merge([&spec, &class, &controllers, &logs, &backends, &tls, &certificates, &same_host, &events, &manifest]).summary();
+
+    let prompt = format!(
+        "Ingress {namespace}/{name}.\n\n\
+         ## Spec\n{}\n\n\
+         ## Ingress class\n{}\n\n\
+         ## Controller\n{}\n\n\
+         ## Controller log (last hour, lines about this Ingress, its Services and Secrets)\n{}\n\n\
+         ## Backends\n{}\n\n\
+         ## TLS\n{}\n\n\
+         ## cert-manager\n{}\n\n\
+         ## Other Ingresses with its hosts\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        spec.text, class.text, controllers.text, logs.text, backends.text, tls.text, certificates.text, same_host.text, events.text, manifest.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload {
+        approx_tokens: approx_tokens(&prompt),
+        prompt,
+        redaction_summary,
+        log_note: None,
+    })
+}
+
 /// How many resources from a release's inventory go into a diagnosis.
 ///
 /// The inventory is cheap — one short line each, 66 for the largest release
@@ -3242,6 +3773,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "HorizontalPodAutoscaler" => DIAGNOSE_HPA_SYSTEM,
         "ScaledObject" | "ScaledJob" => DIAGNOSE_KEDA_SYSTEM,
         "Service" => DIAGNOSE_SERVICE_SYSTEM,
+        "Ingress" => DIAGNOSE_INGRESS_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -4450,6 +4982,141 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(render_service_cluster(&Ok(k8s::ControlPlane { role_nodes: 0, aks: false })), "AKS: no\nnodes labelled control-plane or master: 0");
     }
 
+    fn ingress(v: serde_json::Value) -> k8s_openapi::api::networking::v1::Ingress {
+        let mut base = serde_json::json!({ "metadata": { "name": "web", "namespace": "ns" } });
+        json_merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn ingress_class(name: &str, controller: &str, default: bool) -> k8s_openapi::api::networking::v1::IngressClass {
+        let annotations = if default { serde_json::json!({ "ingressclass.kubernetes.io/is-default-class": "true" }) } else { serde_json::json!({}) };
+        serde_json::from_value(serde_json::json!({ "metadata": { "name": name, "annotations": annotations }, "spec": { "controller": controller } })).unwrap()
+    }
+
+    #[test]
+    fn controller_log_lines_are_matched_without_access_logs() {
+        let about = vec!["web".to_string(), "api".to_string()];
+        let nginx = "W1102 10:00:00.000000       7 controller.go:1214] Service \"ns/api\" does not have any active Endpoint.";
+        let traefik = "time=\"2026-11-02T10:00:00Z\" level=error msg=\"Cannot create service\" error=\"service not found\" ingress=web namespace=ns serviceName=api";
+        let access = "10.0.0.1 - - [02/Nov/2026:10:00:00 +0000] \"GET /ns/api HTTP/1.1\" 502 150 \"-\" \"curl\" 80 0.001 [ns-api-80] []";
+        assert!(k8s::ingress_log_line_is_about(nginx, "ns", &about));
+        assert!(k8s::ingress_log_line_is_about(traefik, "ns", &about));
+        assert!(!k8s::ingress_log_line_is_about(access, "ns", &about), "access logs carry client addresses");
+        assert!(!k8s::ingress_log_line_is_about("W1102 10:00:00.000000 7 x.go:1] Service \"other/api\" has no endpoints", "ns", &about));
+
+        let lines = Some(Ok((2, vec![
+            nginx.to_string(),
+            nginx.replace("10:00:00", "10:00:30"),
+            traefik.to_string(),
+            r#"{"level":"error","time":"2026-11-02T10:01:00Z","msg":"reload failed","error":"bad config"}"#.to_string(),
+        ])));
+        assert_eq!(
+            render_ingress_controller_logs(&lines),
+            "ERROR reload failed: bad config (×1, last 2026-11-02T10:01:00Z)\n\
+             ERROR Cannot create service: service not found (×1, last 2026-11-02T10:00:00Z)\n\
+             WARN Service \"ns/api\" does not have any active Endpoint. (×2, last 1102 10:00:30.000000)"
+        );
+        assert_eq!(render_ingress_controller_logs(&Some(Ok((0, vec![])))), "(the controller has no pods, so there is no log to read)");
+        let scaled = Ok(vec![k8s::IngressControllerWorkload {
+            kind: "Deployment".into(),
+            namespace: "ingress-nginx".into(),
+            name: "ingress-nginx-controller".into(),
+            desired: 0,
+            ready: 0,
+            matched_by: "its args name this class or controller".into(),
+            selector: "app=nginx".into(),
+        }]);
+        assert!(render_ingress_controllers(&scaled).contains("SCALED TO ZERO"));
+    }
+
+    #[test]
+    fn the_class_in_effect_is_found_or_said_to_be_missing() {
+        let classes = Ok(vec![ingress_class("nginx", "k8s.io/ingress-nginx", false), ingress_class("webapprouting.kubernetes.azure.com", "approuting.kubernetes.azure.com/nginx", true)]);
+        let named = |c: &str| ingress(serde_json::json!({ "spec": { "ingressClassName": c } }));
+        assert_eq!(render_ingress_class(&named("nginx"), &classes), "named class exists: nginx (controller k8s.io/ingress-nginx)");
+        assert!(render_ingress_class(&named("traefik"), &classes).starts_with("NAMED CLASS traefik DOES NOT EXIST"));
+        assert_eq!(
+            render_ingress_class(&ingress(serde_json::json!({})), &classes),
+            "no class named; the default applies: webapprouting.kubernetes.azure.com (controller approuting.kubernetes.azure.com/nginx, the default)"
+        );
+        let legacy = ingress(serde_json::json!({ "metadata": { "annotations": { "kubernetes.io/ingress.class": "nginx" } } }));
+        assert!(render_ingress_class(&legacy, &classes).starts_with("named class exists: nginx"));
+        let none = Ok(vec![ingress_class("nginx", "k8s.io/ingress-nginx", false)]);
+        assert!(render_ingress_class(&ingress(serde_json::json!({})), &none).starts_with("NO CLASS NAMED AND NO DEFAULT CLASS"));
+    }
+
+    #[test]
+    fn each_backend_is_checked_for_its_service_port_and_endpoints() {
+        let ing = ingress(serde_json::json!({ "spec": { "rules": [{ "host": "a.example.com", "http": { "paths": [
+            { "path": "/", "pathType": "Prefix", "backend": { "service": { "name": "api", "port": { "name": "http" } } } },
+            { "path": "/v2", "pathType": "Prefix", "backend": { "service": { "name": "api", "port": { "number": 8080 } } } },
+            { "path": "/gone", "pathType": "Prefix", "backend": { "service": { "name": "gone", "port": { "number": 80 } } } },
+            { "path": "/idle", "pathType": "Prefix", "backend": { "service": { "name": "idle", "port": { "number": 80 } } } }
+        ] } }] } }));
+        let svc = |name: &str| -> k8s_openapi::api::core::v1::Service {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": name }, "spec": { "ports": [{ "name": "http", "port": 80, "targetPort": 8080 }] } })).unwrap()
+        };
+        let backends = vec![
+            k8s::IngressBackend { name: "api".into(), service: Ok(svc("api")), endpoints: Ok((2, 2)) },
+            k8s::IngressBackend { name: "gone".into(), service: Err("Service 'gone' does not exist".into()), endpoints: Ok((0, 0)) },
+            k8s::IngressBackend { name: "idle".into(), service: Ok(svc("idle")), endpoints: Ok((0, 3)) },
+        ];
+        assert_eq!(
+            render_ingress_backends(&ing, &backends),
+            "Service api:8080 (ClusterIP): PORT 8080 IS NOT A PORT OF THE SERVICE (it has 80/http); 2 of 2 endpoints ready\n\
+             Service api:http (ClusterIP): port exists, → target port 8080; 2 of 2 endpoints ready\n\
+             Service gone:80: (Service 'gone' does not exist)\n\
+             Service idle:80 (ClusterIP): port exists, → target port 8080; NO READY ENDPOINT (0 of 3)"
+        );
+    }
+
+    #[test]
+    fn a_tls_secret_is_checked_for_keys_expiry_and_hosts() {
+        let ing = ingress(serde_json::json!({ "spec": {
+            "tls": [{ "hosts": ["a.example.com", "b.other.com"], "secretName": "web-tls" }, { "hosts": ["c.example.com"], "secretName": "gone" }],
+            "rules": [{ "host": "a.example.com" }, { "host": "plain.example.com" }]
+        } }));
+        let leaf = crate::x509::CertificateInfo {
+            subject: "CN=a.example.com".into(),
+            issuer: "CN=R3".into(),
+            sans: vec!["*.example.com".into()],
+            not_after: Some("2026-10-30T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let tls = vec![
+            ("web-tls".to_string(), Ok(k8s::IngressTlsSecret { secret_type: "kubernetes.io/tls".into(), keys: vec!["tls.crt".into()], leaf: Some(leaf) })),
+            ("gone".to_string(), Err("Secret 'gone' does not exist".to_string())),
+        ];
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-02T00:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(
+            render_ingress_tls(&ing, &tls, now),
+            "Secret web-tls (kubernetes.io/tls): MISSING KEY tls.key\n  \
+             certificate: subject CN=a.example.com, issuer CN=R3\n  \
+             EXPIRED on 2026-10-30T00:00:00Z, 3 days ago\n  \
+             DOES NOT COVER b.other.com (it names *.example.com)\n\
+             Secret gone: (Secret 'gone' does not exist)"
+        );
+        assert!(san_covers("*.example.com", "A.example.com"));
+        assert!(!san_covers("*.example.com", "a.b.example.com"));
+        assert!(!san_covers("*.example.com", "example.com"));
+        assert!(render_ingress_spec(&ing).contains("hosts in the rules but in no TLS entry: plain.example.com"));
+        assert!(render_ingress_spec(&ing).contains("address: NONE"));
+    }
+
+    #[test]
+    fn another_ingress_on_the_same_host_and_path_is_a_conflict() {
+        let rule = |path: &str| serde_json::json!({ "rules": [{ "host": "a.example.com", "http": { "paths": [{ "path": path, "pathType": "Prefix",
+            "backend": { "service": { "name": "api", "port": { "number": 80 } } } }] } }], "ingressClassName": "nginx" });
+        let me = ingress(serde_json::json!({ "spec": rule("/") }));
+        let twin = ingress(serde_json::json!({ "metadata": { "name": "web-old", "namespace": "other" }, "spec": rule("/") }));
+        let sibling = ingress(serde_json::json!({ "metadata": { "name": "web-api" }, "spec": rule("/api") }));
+        assert_eq!(
+            render_ingress_same_host(&me, &Ok(vec![twin, sibling])),
+            "other/web-old (class nginx): a.example.com/ — SAME HOST AND PATH AS THIS ONE: a.example.com/\n\
+             ns/web-api (class nginx): a.example.com/api"
+        );
+    }
+
     #[test]
     fn endpoints_and_spec_say_what_is_behind_the_service() {
         let slice: k8s_openapi::api::discovery::v1::EndpointSlice = serde_json::from_value(serde_json::json!({
@@ -4682,6 +5349,56 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(built > 0, "no Service to diagnose");
         assert_eq!(unavailable, 0);
         assert_eq!(unexplained, 0);
+    }
+
+    /// Builds a diagnosis for every Ingress on a cluster without an address,
+    /// and for a sample of the rest, and checks each section was read, and
+    /// that one with no address is explained by its class or its controller.
+    /// Prints counts only.
+    ///
+    ///   INGRESS_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml ingress_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set INGRESS_DIAG_TEST_CONTEXT to run"]
+    async fn ingress_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("INGRESS_DIAG_TEST_CONTEXT") else { return };
+        let all = crate::resources::get_ingresses(&ctx).await.expect("ingresses");
+        // Every one without an address, and a sample of the rest: each reads
+        // an hour of every controller pod's log.
+        let mut ingresses: Vec<_> = all.iter().filter(|i| i.address.is_empty()).collect();
+        ingresses.extend(all.iter().filter(|i| !i.address.is_empty()).take(15));
+        let (mut built, mut unavailable, mut largest) = (0, 0, 0);
+        let (mut no_address, mut no_address_explained, mut controller_found, mut log_lines) = (0, 0, 0, 0);
+        let (mut bad_backend, mut tls_checked, mut tls_problem, mut cert_manager, mut scaled_to_zero) = (0, 0, 0, 0, 0);
+        for i in ingresses.iter().copied() {
+            let payload = build_ingress_diagnosis_payload(&ctx, &i.namespace, &i.name).await.expect("payload");
+            let p = &payload.prompt;
+            built += 1;
+            unavailable += p.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            controller_found += p.contains("(matched by its args") as usize;
+            log_lines += (!p.contains("logged nothing about this Ingress") && !p.contains("no log to read")) as usize;
+            scaled_to_zero += p.contains("SCALED TO ZERO") as usize;
+            bad_backend += (p.contains("NO READY ENDPOINT") || p.contains("NO ENDPOINTS") || p.contains("IS NOT A PORT") || p.contains("does not exist)")) as usize;
+            tls_checked += p.contains("  certificate: subject") as usize;
+            tls_problem += (p.contains("EXPIRED on") || p.contains("DOES NOT COVER") || p.contains("MISSING KEY")) as usize;
+            cert_manager += p.contains("Certificate ") as usize;
+            if i.address.is_empty() {
+                no_address += 1;
+                no_address_explained += (p.contains("DOES NOT EXIST")
+                    || p.contains("NO CLASS NAMED")
+                    || p.contains("NOT ALL READY")
+                    || p.contains("SCALED TO ZERO")
+                    || p.contains("(no Deployment or DaemonSet names")) as usize;
+            }
+        }
+        println!(
+            "ingresses={} sampled={} built={built} unavailable_sections={unavailable} largest_tokens={largest} no_address={no_address}/{no_address_explained} controller_found={controller_found} with_log_lines={log_lines} bad_backend={bad_backend} tls_checked={tls_checked} tls_problem={tls_problem} cert_manager={cert_manager} controller_scaled_to_zero={scaled_to_zero}",
+            all.len(),
+            ingresses.len()
+        );
+        assert!(built > 0, "no Ingress to diagnose");
+        assert_eq!(unavailable, 0);
     }
 
     /// Builds a diagnosis for every ScaledObject and ScaledJob on a cluster and

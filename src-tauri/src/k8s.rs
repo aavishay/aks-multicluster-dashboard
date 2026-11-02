@@ -3569,6 +3569,356 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
     })
 }
 
+/// A Service an Ingress routes to, as the diagnosis read it.
+pub struct IngressBackend {
+    pub name: String,
+    pub service: Result<k8s_openapi::api::core::v1::Service, String>,
+    /// Ready and total endpoints, from its EndpointSlices.
+    pub endpoints: Result<(usize, usize), String>,
+}
+
+/// What an Ingress's TLS Secret holds, read without its values: its type, its
+/// key names, and the public fields of the certificate in `tls.crt`.
+pub struct IngressTlsSecret {
+    pub secret_type: String,
+    pub keys: Vec<String>,
+    pub leaf: Option<crate::x509::CertificateInfo>,
+}
+
+/// A Deployment or DaemonSet that looks like the Ingress's controller.
+pub struct IngressControllerWorkload {
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub desired: i32,
+    pub ready: i32,
+    /// Why it was taken for the controller: its args name the class or the
+    /// controller, or — when nothing does — only its name says ingress.
+    pub matched_by: String,
+    pub selector: String,
+}
+
+/// Everything an Ingress diagnosis reads.
+///
+/// Only the Ingress itself is required; each of the rest fails on its own and
+/// the payload says so.
+pub struct IngressDiagnostics {
+    pub ingress: k8s_openapi::api::networking::v1::Ingress,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// Every IngressClass, to tell a named class from a missing one and to
+    /// find the default when none is named.
+    pub classes: Result<Vec<k8s_openapi::api::networking::v1::IngressClass>, String>,
+    pub backends: Vec<IngressBackend>,
+    /// Per TLS entry's Secret, in the order the spec names them.
+    pub tls: Vec<(String, Result<IngressTlsSecret, String>)>,
+    /// cert-manager's Certificates for those Secrets; `None` when cert-manager
+    /// is not installed.
+    pub certificates: Option<Result<Vec<DynamicObject>, String>>,
+    /// Other Ingresses, anywhere in the cluster, with a host this one has.
+    pub same_host: Result<Vec<k8s_openapi::api::networking::v1::Ingress>, String>,
+    pub controllers: Result<Vec<IngressControllerWorkload>, String>,
+    /// How many controller pods were read, and their log lines about this
+    /// Ingress, its Services and its Secrets. `None` when no workload was
+    /// found by its args to be the controller, so there is no log to read.
+    pub controller_logs: Option<Result<(usize, Vec<String>), String>>,
+}
+
+/// How far back into the ingress controller's log to look, and how much of
+/// it to read: the same hour as KEDA's operator, for the same reason — a
+/// reload error is logged once, among a great many lines about everything else.
+const INGRESS_CONTROLLER_LOG_SECONDS: i64 = 3600;
+const INGRESS_CONTROLLER_LOG_BYTES: i64 = 8 * 1024 * 1024;
+
+/// The class an Ingress names: `ingressClassName`, or the older annotation.
+pub(crate) fn ingress_class_of(ing: &k8s_openapi::api::networking::v1::Ingress) -> Option<String> {
+    ing.spec
+        .as_ref()
+        .and_then(|s| s.ingress_class_name.clone())
+        .or_else(|| ing.metadata.annotations.as_ref().and_then(|a| a.get("kubernetes.io/ingress.class").cloned()))
+        .filter(|c| !c.is_empty())
+}
+
+/// Every Service an Ingress routes to: its rules' backends and its default.
+pub(crate) fn ingress_backend_services(ing: &k8s_openapi::api::networking::v1::Ingress) -> Vec<String> {
+    let spec = ing.spec.as_ref();
+    let mut names: Vec<String> = spec
+        .and_then(|s| s.default_backend.as_ref())
+        .into_iter()
+        .chain(spec.and_then(|s| s.rules.as_ref()).into_iter().flatten().flat_map(|r| r.http.iter().flat_map(|h| h.paths.iter().map(|p| &p.backend))))
+        .filter_map(|b| b.service.as_ref().map(|s| s.name.clone()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Whether one ingress controller log line is about these objects.
+///
+/// Controllers name what they are complaining about as `namespace/name` —
+/// ingress-nginx's `Service "ns/api" does not have any active Endpoint` — or
+/// as separate fields, as Traefik's `namespace=ns ingress=web` does. Access
+/// log lines are skipped: they carry client addresses and request paths, and
+/// say nothing a diagnosis needs that the controller's own errors do not.
+pub(crate) fn ingress_log_line_is_about(line: &str, namespace: &str, names: &[String]) -> bool {
+    if line.contains(" HTTP/1.") || line.contains(" HTTP/2") || line.contains("\"GET ") || line.contains("\"POST ") {
+        return false;
+    }
+    let tokens: Vec<&str> = line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')).collect();
+    names.iter().any(|n| line.contains(&format!("{namespace}/{n}")) || (tokens.contains(&namespace) && tokens.contains(&n.as_str())))
+}
+
+pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<IngressDiagnostics, String> {
+    use k8s_openapi::api::core::v1::{Secret, Service};
+    use k8s_openapi::api::discovery::v1::EndpointSlice;
+    use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ApiResource::erase::<Ingress>(&()));
+    let mut obj = api.get(name).await.map_err(|e| get_error("Ingress", name, e))?;
+    let ingress: Ingress = serde_json::to_value(&obj)
+        .and_then(serde_json::from_value)
+        .map_err(|e| format!("Failed to read Ingress '{name}': {e}"))?;
+    if let Some(a) = obj.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+    let spec = ingress.spec.clone().unwrap_or_default();
+    let backend_names = ingress_backend_services(&ingress);
+    let tls_secrets: Vec<String> = spec.tls.iter().flatten().filter_map(|t| t.secret_name.clone()).filter(|s| !s.is_empty()).collect();
+    let hosts: Vec<String> = spec.rules.iter().flatten().filter_map(|r| r.host.clone()).filter(|h| !h.is_empty()).collect();
+
+    let event_fields = format!("involvedObject.kind=Ingress,involvedObject.name={name},involvedObject.namespace={namespace}");
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let classes_api: Api<IngressClass> = Api::all(client.clone());
+    let all_ingresses_api: Api<Ingress> = Api::all(client.clone());
+    let deployments_api: Api<Deployment> = Api::all(client.clone());
+    let daemonsets_api: Api<DaemonSet> = Api::all(client.clone());
+    let event_params = ListParams::default().fields(&event_fields);
+    let all = ListParams::default();
+
+    let backends_fut = futures::future::join_all(backend_names.iter().map(|svc| {
+        let client = client.clone();
+        async move {
+            let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+            let slices: Api<EndpointSlice> = Api::namespaced(client, namespace);
+            let params = ListParams::default().labels(&format!("kubernetes.io/service-name={svc}"));
+            let (service, slices) = tokio::join!(services.get(svc), slices.list(&params));
+            IngressBackend {
+                name: svc.clone(),
+                service: service.map_err(|e| get_error("Service", svc, e)),
+                endpoints: slices
+                    .map(|l| {
+                        let eps: Vec<_> = l.items.iter().flat_map(|s| s.endpoints.iter()).collect();
+                        let ready = eps.iter().filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)).count();
+                        (ready, eps.len())
+                    })
+                    .map_err(|e| format!("Failed to list the EndpointSlices of '{svc}': {e}")),
+            }
+        }
+    }));
+    let tls_fut = futures::future::join_all(tls_secrets.iter().map(|secret| {
+        let client = client.clone();
+        async move {
+            let api: Api<Secret> = Api::namespaced(client, namespace);
+            // Keys and the certificate's public fields only: the values are
+            // read here and dropped, and the private key is never parsed.
+            let read = api
+                .get(secret)
+                .await
+                .map(|s| IngressTlsSecret {
+                    secret_type: s.type_.clone().unwrap_or_else(|| "Opaque".to_string()),
+                    keys: s.data.iter().flatten().map(|(k, _)| k.clone()).collect(),
+                    leaf: s
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("tls.crt"))
+                        .and_then(|v| std::str::from_utf8(&v.0).ok())
+                        .map(crate::x509::parse_pem_bundle)
+                        .and_then(|all| crate::secrets::leaf_of(&all).cloned()),
+                })
+                .map_err(|e| get_error("Secret", secret, e));
+            (secret.clone(), read)
+        }
+    }));
+    let certificates_fut = async {
+        if tls_secrets.is_empty() {
+            return None;
+        }
+        // Not installed is an answer; any other discovery failure is a gap.
+        let ar = match kube::discovery::group(&client, "cert-manager.io").await {
+            Ok(g) => match g.recommended_kind("Certificate") {
+                Some((ar, _)) => ar,
+                None => return None,
+            },
+            Err(kube::Error::Discovery(_)) => return None,
+            Err(kube::Error::Api(resp)) if resp.code == 404 => return None,
+            Err(e) => return Some(Err(format!("Failed to discover cert-manager: {e}"))),
+        };
+        let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+        Some(
+            api.list(&all)
+                .await
+                .map(|l| {
+                    l.items
+                        .into_iter()
+                        .filter(|c| c.data.pointer("/spec/secretName").and_then(|v| v.as_str()).is_some_and(|s| tls_secrets.iter().any(|t| t == s)))
+                        .collect()
+                })
+                .map_err(|e| format!("Failed to list Certificates in '{namespace}': {e}")),
+        )
+    };
+
+    let (events, classes, backends, tls, certificates, all_ingresses, deployments, daemonsets) = tokio::join!(
+        events_api.list(&event_params),
+        classes_api.list(&all),
+        backends_fut,
+        tls_fut,
+        certificates_fut,
+        all_ingresses_api.list(&all),
+        deployments_api.list(&all),
+        daemonsets_api.list(&all),
+    );
+    let classes = classes.map(|l| l.items).map_err(|e| format!("Failed to list IngressClasses: {e}"));
+
+    // The class in effect: the one it names, else the cluster's default.
+    let class_name = ingress_class_of(&ingress).or_else(|| {
+        classes.as_ref().ok().and_then(|cs| {
+            cs.iter()
+                .find(|c| c.metadata.annotations.as_ref().and_then(|a| a.get("ingressclass.kubernetes.io/is-default-class")).map(String::as_str) == Some("true"))
+                .and_then(|c| c.metadata.name.clone())
+        })
+    });
+    let controller = class_name.as_ref().and_then(|n| {
+        classes.as_ref().ok().and_then(|cs| cs.iter().find(|c| c.metadata.name.as_ref() == Some(n))).and_then(|c| c.spec.as_ref()).and_then(|s| s.controller.clone())
+    });
+
+    // The controller, by what its args say it serves. Each controller has its
+    // own flag — ingress-nginx's `--ingress-class=` and `--controller-class=`,
+    // Traefik's `--providers.kubernetesingress.ingressclass=` — but all of
+    // them carry the class or the controller string as a value.
+    let names_class = |args: &[String]| {
+        args.iter().any(|a| {
+            let value = a.split_once('=').map(|(_, v)| v).unwrap_or(a);
+            class_name.as_deref() == Some(value) || controller.as_deref().is_some_and(|c| value == c)
+        })
+    };
+    let workload = |kind: &str, meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta, template: &k8s_openapi::api::core::v1::PodTemplateSpec, selector: &LabelSelector, desired: i32, ready: i32| {
+        let args: Vec<String> = template.spec.iter().flat_map(|s| s.containers.iter()).flat_map(|c| c.args.iter().flatten().chain(c.command.iter().flatten())).cloned().collect();
+        let name = meta.name.clone().unwrap_or_default();
+        let matched_by = if names_class(&args) {
+            "its args name this class or controller"
+        } else if name.contains("ingress") {
+            "name only"
+        } else {
+            return None;
+        };
+        Some(IngressControllerWorkload {
+            kind: kind.to_string(),
+            namespace: meta.namespace.clone().unwrap_or_default(),
+            name,
+            desired,
+            ready,
+            matched_by: matched_by.to_string(),
+            selector: selector.match_labels.iter().flatten().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","),
+        })
+    };
+    let controllers = deployments
+        .map_err(|e| format!("Failed to list Deployments: {e}"))
+        .and_then(|d| daemonsets.map(|s| (d, s)).map_err(|e| format!("Failed to list DaemonSets: {e}")))
+        .map(|(deployments, daemonsets)| {
+            let mut found: Vec<IngressControllerWorkload> = deployments
+                .items
+                .iter()
+                .filter_map(|d| {
+                    let spec = d.spec.as_ref()?;
+                    workload("Deployment", &d.metadata, &spec.template, &spec.selector, spec.replicas.unwrap_or(1), d.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0))
+                })
+                .chain(daemonsets.items.iter().filter_map(|d| {
+                    let spec = d.spec.as_ref()?;
+                    let status = d.status.clone().unwrap_or_default();
+                    workload("DaemonSet", &d.metadata, &spec.template, &spec.selector, status.desired_number_scheduled, status.number_ready)
+                }))
+                .collect();
+            // By name only when nothing names the class: a cluster has many
+            // workloads called something-ingress that serve other classes.
+            if found.iter().any(|w| w.matched_by != "name only") {
+                found.retain(|w| w.matched_by != "name only");
+            }
+            found
+        });
+
+    let mut about: Vec<String> = vec![name.to_string()];
+    about.extend(backend_names.iter().cloned());
+    about.extend(tls_secrets.iter().cloned());
+    let named: Vec<&IngressControllerWorkload> =
+        controllers.iter().flatten().filter(|w| w.matched_by != "name only" && !w.selector.is_empty()).collect();
+    let controller_logs = if named.is_empty() {
+        None
+    } else {
+        let mut lines = Vec::new();
+        let mut failure = None;
+        let mut read = 0;
+        for w in named {
+            let pods: Api<Pod> = Api::namespaced(client.clone(), &w.namespace);
+            let list = match pods.list(&ListParams::default().labels(&w.selector)).await {
+                Ok(l) => l.items,
+                Err(e) => {
+                    failure = Some(format!("Failed to list the pods of {}/{}: {e}", w.namespace, w.name));
+                    continue;
+                }
+            };
+            for p in list {
+                let params = LogParams {
+                    since_seconds: Some(INGRESS_CONTROLLER_LOG_SECONDS),
+                    limit_bytes: Some(INGRESS_CONTROLLER_LOG_BYTES),
+                    ..Default::default()
+                };
+                match pods.logs(&p.name_any(), &params).await {
+                    Ok(text) => {
+                        read += 1;
+                        lines.extend(text.lines().filter(|l| ingress_log_line_is_about(l, namespace, &about)).map(str::to_string));
+                    }
+                    Err(e) => failure = Some(format!("Failed to read the log of {}/{}: {e}", w.namespace, p.name_any())),
+                }
+            }
+        }
+        Some(match failure {
+            Some(e) if lines.is_empty() => Err(e),
+            _ => Ok((read, lines)),
+        })
+    };
+
+    let same_host = all_ingresses
+        .map(|l| {
+            l.items
+                .into_iter()
+                .filter(|i| !(i.metadata.namespace.as_deref() == Some(namespace) && i.metadata.name.as_deref() == Some(name)))
+                .filter(|i| i.spec.as_ref().and_then(|s| s.rules.as_ref()).into_iter().flatten().any(|r| r.host.as_ref().is_some_and(|h| hosts.contains(h))))
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list Ingresses: {e}"));
+
+    Ok(IngressDiagnostics {
+        ingress,
+        manifest,
+        events: events
+            .map(|l| {
+                let mut items = l.items;
+                items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+                items.into_iter().map(event_to_info).collect()
+            })
+            .map_err(|e| format!("Failed to list events for '{name}': {e}")),
+        classes,
+        backends,
+        tls,
+        certificates,
+        same_host,
+        controllers,
+        controller_logs,
+    })
+}
+
 /// Same reasoning as `get_workload_events` (filter by involved object before
 /// the cluster-wide cap, and match the namespace since both KEDA kinds are
 /// namespaced). KEDA's own events are the useful half of diagnosing a
