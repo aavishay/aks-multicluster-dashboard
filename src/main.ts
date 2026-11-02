@@ -5902,6 +5902,7 @@ function setMetricsRange(minutes: number) {
   diagnoseNapNodePool,
   diagnoseHpa,
   diagnoseService,
+  diagnoseIngress,
   diagnoseKeda,
   confirmDiagnose,
   closeClaudeDiagnose,
@@ -7095,6 +7096,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
                   : d.kind === "ScaledObject" || d.kind === "ScaledJob"
                   ? "Settings, conditions and triggers, where each credential comes from (checked by key name, never value), the KEDA operator's log lines about it, its events, the HPA it generated or the Jobs it ran, KEDA's own health, and its manifest."
+                  : d.kind === "Ingress"
+                  ? "Its routes, TLS and address, whether its class exists and its controller is up, the controller's log lines about it, each backend Service with its port and ready endpoints, each TLS Secret (checked by key name and the certificate's public fields, never the key), cert-manager's view of them, other Ingresses on its hosts, its events, and its manifest."
                   : d.kind === "Service"
                   ? "Its spec and endpoints, the pods its selector matches with their readiness and probes — or, when it matches none, the pods and workloads that nearly match — whether its target ports exist on them, the events of an unready pod, the Ingresses routing to it, its events, and its manifest."
                   : d.kind === "HorizontalPodAutoscaler"
@@ -8586,6 +8589,13 @@ function diagnoseHpa(ctx: string, namespace: string, name: string) {
  */
 function diagnoseService(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "Service", namespace, name, "", () => api.aiBuildServiceDiagnosis(ctx, namespace, name));
+}
+
+/**
+ * An Ingress. `kind` selects the Ingress system prompt on the Rust side.
+ */
+function diagnoseIngress(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "Ingress", namespace, name, "", () => api.aiBuildIngressDiagnosis(ctx, namespace, name));
 }
 
 /**
@@ -13388,7 +13398,7 @@ function renderIngresses(): string {
     keyOf: (r) => `${r.ctx}:${r.i.namespace}:${r.i.name}`,
     health: { healthy: (r) => ingressIsHealthy(r.i), unhealthyLabel: "without an address", statusText: (r) => (ingressIsHealthy(r.i) ? "Healthy" : "No address") },
     renderRow: ({ ctx, i }) => `
-      <tr>
+      <tr data-diagnose-what="ingress" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(i.namespace)}" data-diagnose-name="${esc(i.name)}">
         ${rowCheckboxCell("ingresses", `${ctx}:${i.namespace}:${i.name}`)}
         <td title="${ingressIsHealthy(i) ? "Has an address" : "No address: no controller has picked it up"}">${statusDot(ingressIsHealthy(i))}</td>
         ${multi ? resourceClusterCell("ingresses", ctx) : ""}
@@ -14335,7 +14345,13 @@ function renderResourceDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">${esc(subtitle)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
-            ${rd.kind === "Service" ? claudeDiagnoseButton(`window.__app.diagnoseService(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service") : ""}
+            ${
+              rd.kind === "Service"
+                ? claudeDiagnoseButton(`window.__app.diagnoseService(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service")
+                : rd.kind === "Ingress"
+                  ? claudeDiagnoseButton(`window.__app.diagnoseIngress(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "ingress")
+                  : ""
+            }
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeResourceDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
@@ -15746,6 +15762,9 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "service":
       diagnoseService(ctx, ns, name);
+      return true;
+    case "ingress":
+      diagnoseIngress(ctx, ns, name);
       return true;
     case "keda":
       diagnoseKeda(ctx, ns, d.diagnoseKind ?? "ScaledObject", name);

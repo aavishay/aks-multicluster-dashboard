@@ -155,7 +155,7 @@ pub async fn get_secret_detail(context_name: &str, namespace: &str, name: &str) 
 /// The end-entity certificate in a bundle, wherever it sits: one that is not
 /// a CA and issues none of the others. A lone certificate is its own leaf,
 /// CA or not; a bundle of CAs has none.
-fn leaf_of(all: &[crate::x509::CertificateInfo]) -> Option<&crate::x509::CertificateInfo> {
+pub(crate) fn leaf_of(all: &[crate::x509::CertificateInfo]) -> Option<&crate::x509::CertificateInfo> {
     if let [only] = all {
         return Some(only);
     }

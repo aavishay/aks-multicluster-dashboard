@@ -212,6 +212,8 @@ export const api = {
     invoke<ClaudeDiagnosisPayload>("ai_build_keda_diagnosis", { contextName, namespace, kind, name }),
   aiBuildServiceDiagnosis: (contextName: string, namespace: string, name: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_service_diagnosis", { contextName, namespace, name }),
+  aiBuildIngressDiagnosis: (contextName: string, namespace: string, name: string) =>
+    invoke<ClaudeDiagnosisPayload>("ai_build_ingress_diagnosis", { contextName, namespace, name }),
   /**
    * Sends an already-previewed diagnosis payload; `onToken` fires per text delta.
    *
