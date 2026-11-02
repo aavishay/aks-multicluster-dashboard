@@ -167,7 +167,7 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, NAP NodePool, workload, pod, Service, Ingress, HPA, KEDA
+Any node, NAP NodePool, workload, pod, Service, Ingress, PVC, HPA, KEDA
 ScaledObject or ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
 and click **Diagnose** in its panel, or press `⌘D` on a focused row. The app gathers the status, events and
 manifest behind it, plus what that kind of object needs:
@@ -186,6 +186,10 @@ manifest behind it, plus what that kind of object needs:
   ready endpoints, and each TLS Secret — checked by key name and by the
   certificate's public fields (expiry, the hosts it names), never the private
   key — with cert-manager's view of it;
+- a PVC: its storage class or why it has none, the volume bound to it and
+  the zone it is pinned to, the pods that mount it with the events of those
+  not ready — where a failed attach or mount is reported — its volume
+  attachments, and how full it is;
 - an HPA: the requests and usage of every container in the pods it scales —
   sidecars injected by a webhook included, the usual reason a utilization
   target cannot be computed — any other HPA on the same target, and whether

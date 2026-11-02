@@ -3569,6 +3569,233 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
     })
 }
 
+/// A volume's usage as the kubelet measures it, from its node's stats summary.
+pub struct PvcUsage {
+    pub node: String,
+    pub used_bytes: Option<u64>,
+    pub capacity_bytes: Option<u64>,
+    pub inodes_used: Option<u64>,
+    pub inodes: Option<u64>,
+}
+
+/// Whether the CSI driver that provisions a volume is installed.
+pub struct PvcCsiDriver {
+    pub name: String,
+    /// A CSIDriver object exists for it.
+    pub registered: bool,
+    /// Nodes whose CSINode lists the driver, of all CSINodes.
+    pub on_nodes: usize,
+    pub nodes: usize,
+}
+
+/// Everything a PersistentVolumeClaim diagnosis reads.
+///
+/// Only the claim itself is required; each of the rest fails on its own and
+/// the payload says so.
+pub struct PvcDiagnostics {
+    pub pvc: k8s_openapi::api::core::v1::PersistentVolumeClaim,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    pub storage_classes: Result<Vec<k8s_openapi::api::storage::v1::StorageClass>, String>,
+    /// The bound PersistentVolume and its events, when the claim names one.
+    pub pv: Option<Result<k8s_openapi::api::core::v1::PersistentVolume, String>>,
+    pub pv_events: Option<Result<Vec<EventInfo>, String>>,
+    /// The provisioner's CSI driver; `None` when no provisioner is known.
+    pub csi_driver: Option<Result<PvcCsiDriver, String>>,
+    /// The pods in the namespace that mount the claim.
+    pub pods: Result<Vec<Pod>, String>,
+    /// The events of the pods that mount it and are not ready: where a
+    /// failed attach or mount is reported, and nowhere on the claim.
+    pub pod_events: Vec<(String, Result<Vec<EventInfo>, String>)>,
+    /// The VolumeAttachments of its volume: which node has it, and why an
+    /// attach or detach failed.
+    pub attachments: Result<Vec<k8s_openapi::api::storage::v1::VolumeAttachment>, String>,
+    /// Per node a running pod mounts it on: the volume's usage.
+    pub usage: Vec<Result<Option<PvcUsage>, String>>,
+}
+
+/// How many not-ready pods' events go into a PVC diagnosis.
+const PVC_DIAG_POD_EVENTS: usize = 3;
+
+/// Whether a pod mounts this claim, directly or through an ephemeral volume
+/// (whose claim is named `<pod>-<volume>`).
+pub(crate) fn pod_mounts_claim(pod: &Pod, claim: &str) -> bool {
+    let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
+    pod.spec.iter().flat_map(|s| s.volumes.iter().flatten()).any(|v| {
+        v.persistent_volume_claim.as_ref().is_some_and(|c| c.claim_name == claim) || (v.ephemeral.is_some() && format!("{pod_name}-{}", v.name) == claim)
+    })
+}
+
+/// One claim's usage in a node's stats summary.
+pub(crate) fn pvc_usage_from_summary(summary: &serde_json::Value, node: &str, namespace: &str, claim: &str) -> Option<PvcUsage> {
+    let volumes = summary.get("pods").and_then(|p| p.as_array()).into_iter().flatten().flat_map(|p| p.get("volume").and_then(|v| v.as_array()).into_iter().flatten());
+    let n = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64());
+    volumes
+        .filter(|v| {
+            v.pointer("/pvcRef/name").and_then(|x| x.as_str()) == Some(claim) && v.pointer("/pvcRef/namespace").and_then(|x| x.as_str()) == Some(namespace)
+        })
+        .map(|v| PvcUsage {
+            node: node.to_string(),
+            used_bytes: n(v, "usedBytes"),
+            capacity_bytes: n(v, "capacityBytes"),
+            inodes_used: n(v, "inodesUsed"),
+            inodes: n(v, "inodes"),
+        })
+        .next()
+}
+
+pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<PvcDiagnostics, String> {
+    use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim};
+    use k8s_openapi::api::storage::v1::{CSIDriver, CSINode, StorageClass, VolumeAttachment};
+
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ApiResource::erase::<PersistentVolumeClaim>(&()));
+    let mut obj = api.get(name).await.map_err(|e| get_error("PersistentVolumeClaim", name, e))?;
+    let pvc: PersistentVolumeClaim = serde_json::to_value(&obj)
+        .and_then(serde_json::from_value)
+        .map_err(|e| format!("Failed to read PersistentVolumeClaim '{name}': {e}"))?;
+    if let Some(a) = obj.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+    let volume_name = pvc.spec.as_ref().and_then(|s| s.volume_name.clone()).filter(|v| !v.is_empty());
+
+    let event_params = ListParams::default().fields(&format!(
+        "involvedObject.kind=PersistentVolumeClaim,involvedObject.name={name},involvedObject.namespace={namespace}"
+    ));
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let classes_api: Api<StorageClass> = Api::all(client.clone());
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let attachments_api: Api<VolumeAttachment> = Api::all(client.clone());
+    let all = ListParams::default();
+    let sorted_events = |l: Result<ObjectList<Event>, kube::Error>, what: &str| {
+        l.map(|l| {
+            let mut items = l.items;
+            items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+            items.into_iter().map(event_to_info).collect::<Vec<_>>()
+        })
+        .map_err(|e| format!("Failed to list events for {what}: {e}"))
+    };
+
+    let pv_fut = async {
+        let Some(pv) = &volume_name else { return (None, None) };
+        let api: Api<PersistentVolume> = Api::all(client.clone());
+        let pv_events: Api<Event> = Api::all(client.clone());
+        let params = ListParams::default().fields(&format!("involvedObject.kind=PersistentVolume,involvedObject.name={pv}"));
+        let (got, events) = tokio::join!(api.get(pv), pv_events.list(&params));
+        (Some(got.map_err(|e| get_error("PersistentVolume", pv, e))), Some(sorted_events(events, &format!("PersistentVolume '{pv}'"))))
+    };
+
+    let (events, classes, pods, attachments, (pv, pv_events)) =
+        tokio::join!(events_api.list(&event_params), classes_api.list(&all), pods_api.list(&all), attachments_api.list(&all), pv_fut);
+    let storage_classes = classes.map(|l| l.items).map_err(|e| format!("Failed to list StorageClasses: {e}"));
+    let pods: Result<Vec<Pod>, String> = pods
+        .map(|l| l.items.into_iter().filter(|p| pod_mounts_claim(p, name)).collect())
+        .map_err(|e| format!("Failed to list pods in '{namespace}': {e}"));
+    let attachments = attachments
+        .map(|l| {
+            l.items
+                .into_iter()
+                .filter(|a| volume_name.is_some() && a.spec.source.persistent_volume_name == volume_name)
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list VolumeAttachments: {e}"));
+
+    // The provisioner, from wherever it is written: the bound volume's CSI
+    // driver, the claim's own annotation, or its class.
+    let class_name = pvc.spec.as_ref().and_then(|s| s.storage_class_name.clone());
+    let provisioner = pv
+        .as_ref()
+        .and_then(|p| p.as_ref().ok())
+        .and_then(|p| p.spec.as_ref())
+        .and_then(|s| s.csi.as_ref())
+        .map(|c| c.driver.clone())
+        .or_else(|| {
+            pvc.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("volume.kubernetes.io/storage-provisioner").or_else(|| a.get("volume.beta.kubernetes.io/storage-provisioner")))
+                .cloned()
+        })
+        .or_else(|| {
+            storage_classes
+                .as_ref()
+                .ok()
+                .and_then(|cs| cs.iter().find(|c| class_name.is_some() && c.metadata.name == class_name))
+                .map(|c| c.provisioner.clone())
+        })
+        .filter(|p| !p.is_empty());
+    let csi_fut = async {
+        let driver = provisioner.clone()?;
+        let drivers: Api<CSIDriver> = Api::all(client.clone());
+        let nodes: Api<CSINode> = Api::all(client.clone());
+        let (registered, csi_nodes) = tokio::join!(drivers.get_opt(&driver), nodes.list(&all));
+        Some((|| {
+            let registered = registered.map_err(|e| format!("Failed to read CSIDriver '{driver}': {e}"))?.is_some();
+            let csi_nodes = csi_nodes.map_err(|e| format!("Failed to list CSINodes: {e}"))?.items;
+            let on_nodes = csi_nodes.iter().filter(|n| n.spec.drivers.iter().any(|d| d.name == driver)).count();
+            Ok(PvcCsiDriver { name: driver.clone(), registered, on_nodes, nodes: csi_nodes.len() })
+        })())
+    };
+
+    // The events of pods that mount it and are not ready.
+    let unready: Vec<String> = pods
+        .iter()
+        .flatten()
+        .filter(|p| !p.status.as_ref().and_then(|s| s.conditions.as_ref()).is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True")))
+        .filter(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) != Some("Succeeded"))
+        .take(PVC_DIAG_POD_EVENTS)
+        .map(|p| p.name_any())
+        .collect();
+    let pod_events_fut = futures::future::join_all(unready.iter().map(|pod| {
+        let events_api = events_api.clone();
+        async move {
+            let params = ListParams::default().fields(&format!("involvedObject.kind=Pod,involvedObject.name={pod},involvedObject.namespace={namespace}"));
+            (pod.clone(), sorted_events(events_api.list(&params).await, &format!("pod '{pod}'")))
+        }
+    }));
+
+    // Usage, from the kubelet of each node a running pod mounts it on.
+    let mut nodes: Vec<String> = pods
+        .iter()
+        .flatten()
+        .filter(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
+        .filter_map(|p| p.spec.as_ref().and_then(|s| s.node_name.clone()))
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    let usage_fut = futures::future::join_all(nodes.iter().map(|node| {
+        let client = client.clone();
+        async move {
+            let req = http::Request::builder()
+                .uri(format!("/api/v1/nodes/{node}/proxy/stats/summary"))
+                .body(Vec::new())
+                .map_err(|e| e.to_string())?;
+            let summary: serde_json::Value = tokio::time::timeout(METRICS_REQUEST_TIMEOUT, client.request(req))
+                .await
+                .map_err(|_| format!("the kubelet on {node} did not answer in time"))?
+                .map_err(|e| format!("Failed to read the kubelet's stats on {node}: {e}"))?;
+            Ok(pvc_usage_from_summary(&summary, node, namespace, name))
+        }
+    }));
+
+    let (csi_driver, pod_events, usage) = tokio::join!(csi_fut, pod_events_fut, usage_fut);
+
+    Ok(PvcDiagnostics {
+        pvc,
+        manifest,
+        events: sorted_events(events, &format!("'{name}'")),
+        storage_classes,
+        pv,
+        pv_events,
+        csi_driver,
+        pods,
+        pod_events,
+        attachments,
+        usage,
+    })
+}
+
 /// A Service an Ingress routes to, as the diagnosis read it.
 pub struct IngressBackend {
     pub name: String,
