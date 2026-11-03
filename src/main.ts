@@ -5903,6 +5903,7 @@ function setMetricsRange(minutes: number) {
   diagnoseHpa,
   diagnoseService,
   diagnoseIngress,
+  diagnosePvc,
   diagnoseKeda,
   confirmDiagnose,
   closeClaudeDiagnose,
@@ -7096,6 +7097,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
                   : d.kind === "ScaledObject" || d.kind === "ScaledJob"
                   ? "Settings, conditions and triggers, where each credential comes from (checked by key name, never value), the KEDA operator's log lines about it, its events, the HPA it generated or the Jobs it ran, KEDA's own health, and its manifest."
+                  : d.kind === "PersistentVolumeClaim"
+                  ? "Phase, size and conditions, its storage class or why it has none, the volume bound to it and its CSI driver, the pods that mount it and the events of those not ready, its volume attachments, how full it is, the events of the claim and volume, and its manifest."
                   : d.kind === "Ingress"
                   ? "Its routes, TLS and address, whether its class exists and its controller is up, the controller's log lines about it, each backend Service with its port and ready endpoints, each TLS Secret (checked by key name and the certificate's public fields, never the key), cert-manager's view of them, other Ingresses on its hosts, its events, and its manifest."
                   : d.kind === "Service"
@@ -8596,6 +8599,13 @@ function diagnoseService(ctx: string, namespace: string, name: string) {
  */
 function diagnoseIngress(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "Ingress", namespace, name, "", () => api.aiBuildIngressDiagnosis(ctx, namespace, name));
+}
+
+/**
+ * A PersistentVolumeClaim. `kind` selects the PVC system prompt on the Rust side.
+ */
+function diagnosePvc(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "PersistentVolumeClaim", namespace, name, "", () => api.aiBuildPvcDiagnosis(ctx, namespace, name));
 }
 
 /**
@@ -13442,7 +13452,7 @@ function renderPvcs(): string {
     keyOf: (r) => `${r.ctx}:${r.c.namespace}:${r.c.name}`,
     health: { healthy: (r) => pvcIsHealthy(r.c), unhealthyLabel: "not bound", statusText: (r) => r.c.status },
     renderRow: ({ ctx, c }) => `
-      <tr>
+      <tr data-diagnose-what="pvc" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(c.namespace)}" data-diagnose-name="${esc(c.name)}">
         ${rowCheckboxCell("pvcs", `${ctx}:${c.namespace}:${c.name}`)}
         <td title="${esc(c.status)}">${statusDot(pvcIsHealthy(c))}</td>
         ${multi ? resourceClusterCell("pvcs", ctx) : ""}
@@ -14350,7 +14360,9 @@ function renderResourceDetailPanel(): string {
                 ? claudeDiagnoseButton(`window.__app.diagnoseService(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service")
                 : rd.kind === "Ingress"
                   ? claudeDiagnoseButton(`window.__app.diagnoseIngress(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "ingress")
-                  : ""
+                  : rd.kind === "PersistentVolumeClaim"
+                    ? claudeDiagnoseButton(`window.__app.diagnosePvc(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "volume claim")
+                    : ""
             }
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeResourceDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
@@ -15765,6 +15777,9 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "ingress":
       diagnoseIngress(ctx, ns, name);
+      return true;
+    case "pvc":
+      diagnosePvc(ctx, ns, name);
       return true;
     case "keda":
       diagnoseKeda(ctx, ns, d.diagnoseKind ?? "ScaledObject", name);
