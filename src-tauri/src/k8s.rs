@@ -4192,24 +4192,22 @@ pub async fn get_deployment_diagnostics(context_name: &str, namespace: &str, nam
             owned
         })
         .map_err(|e| format!("Failed to list ReplicaSets in '{namespace}': {e}"));
-    // Its pods are those of its own ReplicaSets, by their UIDs; by name only
-    // when the ReplicaSets could not be read.
-    let pods: Result<Vec<Pod>, String> = pods
-        .map(|l| {
-            l.items
-                .into_iter()
-                .filter(|p| {
-                    p.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true)).is_some_and(|o| {
-                        o.kind == "ReplicaSet"
-                            && match &replica_sets {
-                                Ok(rs) => rs.iter().any(|r| r.metadata.uid.as_deref() == Some(o.uid.as_str())),
-                                Err(_) => o.name.strip_prefix(name).is_some_and(|rest| rest.starts_with('-')),
-                            }
-                    })
+    // Its pods are those of its own ReplicaSets, by their UIDs. Without the
+    // ReplicaSets there is no telling: a name prefix would take in another
+    // Deployment's pods (`web-worker-…` for `web`), and its budgets with them.
+    let pods: Result<Vec<Pod>, String> = match (&replica_sets, pods) {
+        (Err(_), _) => Err("its ReplicaSets could not be read, so which pods are its is unknown".to_string()),
+        (_, Err(e)) => Err(format!("Failed to list pods in '{namespace}': {e}")),
+        (Ok(rs), Ok(l)) => Ok(l
+            .items
+            .into_iter()
+            .filter(|p| {
+                p.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true)).is_some_and(|o| {
+                    o.kind == "ReplicaSet" && rs.iter().any(|r| r.metadata.uid.as_deref() == Some(o.uid.as_str()))
                 })
-                .collect()
-        })
-        .map_err(|e| format!("Failed to list pods in '{namespace}': {e}"));
+            })
+            .collect()),
+    };
     let hpas = hpas
         .map(|l| {
             l.items

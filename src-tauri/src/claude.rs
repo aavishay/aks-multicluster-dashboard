@@ -4750,7 +4750,16 @@ fn render_deploy_spec(dep: &k8s_openapi::api::apps::v1::Deployment) -> String {
         ));
     }
     if let Some(c) = conditions.iter().find(|c| c.type_ == "ReplicaFailure" && c.status == "True") {
-        lines.push(format!("REPLICA FAILURE: pods are not being created: {}", c.message.as_deref().unwrap_or("(no message)")));
+        // The reason says which way it failed: FailedCreate or FailedDelete.
+        lines.push(format!(
+            "REPLICA FAILURE: {}: {}",
+            match c.reason.as_deref() {
+                Some("FailedCreate") => "pods are not being created".to_string(),
+                Some("FailedDelete") => "pods are not being deleted".to_string(),
+                r => format!("reason {}", r.unwrap_or("(none)")),
+            },
+            c.message.as_deref().unwrap_or("(no message)")
+        ));
     }
     lines.join("\n")
 }
@@ -4783,8 +4792,12 @@ fn render_deploy_replicasets(
             .collect();
         Some((mine.iter().filter(|p| pod_is_ready(p)).count(), mine.len()))
     };
+    // Its replica counts leave out pods that are terminating, so an old
+    // ReplicaSet at zero may still own some; it is shown while it does.
     let holds = |rs: &k8s_openapi::api::apps::v1::ReplicaSet| {
-        rs.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0) > 0 || rs.status.as_ref().is_some_and(|s| s.replicas > 0)
+        rs.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0) > 0
+            || rs.status.as_ref().is_some_and(|s| s.replicas > 0)
+            || pods_of(rs).is_some_and(|(_, total)| total > 0)
     };
 
     let mut lines = Vec::new();
@@ -4824,8 +4837,10 @@ fn render_deploy_replicasets(
         }
         if let Some(c) = st.conditions.iter().flatten().find(|c| c.type_ == "ReplicaFailure" && c.status == "True") {
             let message = c.message.as_deref().unwrap_or("(no message)");
-            line.push_str(&format!("; REPLICA FAILURE: {message}"));
-            if i == 0 {
+            let reason = c.reason.as_deref().unwrap_or("no reason");
+            line.push_str(&format!("; REPLICA FAILURE ({reason}): {message}"));
+            // FailedDelete is a scale-down that cannot remove a pod, not this.
+            if i == 0 && reason == "FailedCreate" {
                 findings.push(format!("THE NEWEST REPLICASET CANNOT CREATE PODS: {message}"));
             }
         }
@@ -4847,7 +4862,12 @@ fn render_deploy_replicasets(
     let new_ready = newest.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0);
     let new_unready = pods_of(newest).map(|(ready, total)| total - ready).unwrap_or(0);
     let old_pods: i32 = replica_sets[1..].iter().filter_map(|r| r.status.as_ref()).map(|s| s.replicas).sum();
-    if old_pods > 0 {
+    if old_pods > 0 && recreate {
+        findings.push(format!(
+            "RECREATE ROLLOUT IN PROGRESS: older ReplicaSets still run {old_pods} pod{}; Recreate stops every old pod before it starts any new one, so the new ReplicaSet waits until they are gone",
+            if old_pods == 1 { "" } else { "s" }
+        ));
+    } else if old_pods > 0 {
         findings.push(format!(
             "ROLLOUT IN PROGRESS: the newest ReplicaSet has {new_ready} of {desired} ready, and older ones still run {old_pods} pod{}; the controller scales them down only as new pods become available{}",
             if old_pods == 1 { "" } else { "s" },
@@ -7330,6 +7350,9 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.contains("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation 5, observed 4"), "{out}");
         assert!(out.contains("ROLLOUT EXCEEDED ITS PROGRESS DEADLINE: it has not progressed for 120s"), "{out}");
         assert!(out.ends_with("REPLICA FAILURE: pods are not being created: pods \"web-r7-x\" is forbidden: exceeded quota: compute"), "{out}");
+        let not_deleting = deployment(serde_json::json!({ "status": { "conditions": [
+            { "type": "ReplicaFailure", "status": "True", "reason": "FailedDelete", "message": "denied" }] } }));
+        assert!(render_deploy_spec(&not_deleting).ends_with("REPLICA FAILURE: pods are not being deleted: denied"));
         let recreate = deployment(serde_json::json!({ "spec": { "strategy": { "type": "Recreate", "rollingUpdate": null } } }));
         assert!(render_deploy_spec(&recreate).contains("strategy: Recreate\n"));
     }
@@ -7347,7 +7370,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         let pods = vec![rs_pod(7, 0, false), rs_pod(6, 0, true), rs_pod(6, 1, true)];
         assert_eq!(
             render_deploy_replicasets(&dep, &Ok(rss), &Ok(pods)),
-            "web-r7: revision 7 (newest); replicas 2, ready 0, available 0; pods 0 ready of 1; images web:7; REPLICA FAILURE: admission webhook denied the request\n\
+            "web-r7: revision 7 (newest); replicas 2, ready 0, available 0; pods 0 ready of 1; images web:7; REPLICA FAILURE (FailedCreate): admission webhook denied the request\n\
              web-r6: revision 6; replicas 2, ready 2, available 2; pods 2 ready of 2; images web:6\n\
              and 2 older ReplicaSets scaled to zero, kept as rollback history\n\
              THE NEWEST REPLICASET CANNOT CREATE PODS: admission webhook denied the request\n\
@@ -7360,6 +7383,15 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         let recreate = deployment(serde_json::json!({ "spec": { "strategy": { "type": "Recreate", "rollingUpdate": null } } }));
         assert!(render_deploy_replicasets(&recreate, &Ok(vec![replica_set(7, 3, 0, serde_json::json!({}))]), &Ok(vec![rs_pod(7, 0, false)]))
             .ends_with("RECREATE: no older pod remains, so while 1 of the new pods is not ready nothing else serves in their place"));
+        let tearing_down = render_deploy_replicasets(&recreate, &Ok(vec![replica_set(7, 0, 0, serde_json::json!({})), replica_set(6, 0, 0, serde_json::json!({ "status": { "replicas": 2 } }))]), &Ok(vec![]));
+        assert!(tearing_down.ends_with("RECREATE ROLLOUT IN PROGRESS: older ReplicaSets still run 2 pods; Recreate stops every old pod before it starts any new one, so the new ReplicaSet waits until they are gone"), "{tearing_down}");
+
+        // A scale-down that cannot delete is not a failure to create; an old
+        // ReplicaSet at zero still owning a terminating pod stays shown.
+        let deleting = render_deploy_replicasets(&dep, &Ok(vec![replica_set(7, 1, 1, serde_json::json!({ "status": { "conditions": [{ "type": "ReplicaFailure", "status": "True",
+            "reason": "FailedDelete", "message": "pods \"web-r7-0\" is forbidden" }] } })), replica_set(6, 0, 0, serde_json::json!({}))]), &Ok(vec![rs_pod(7, 0, true), rs_pod(6, 0, false)]));
+        assert!(deleting.contains("REPLICA FAILURE (FailedDelete)") && !deleting.contains("CANNOT CREATE"), "{deleting}");
+        assert!(deleting.contains("web-r6: revision 6; replicas 0, ready 0, available 0; pods 0 ready of 1") && !deleting.contains("rollback history"), "{deleting}");
         assert_eq!(render_deploy_replicasets(&dep, &Ok(vec![]), &Ok(vec![])), "(it has no ReplicaSet: the controller has not created one)");
         let blind = render_deploy_replicasets(&dep, &Ok(vec![replica_set(7, 3, 3, serde_json::json!({}))]), &Err("forbidden".into()));
         assert_eq!(blind, "web-r7: revision 7 (newest); replicas 3, ready 3, available 3; images web:7\n(pods unavailable: forbidden)");
