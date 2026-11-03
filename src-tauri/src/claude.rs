@@ -152,14 +152,17 @@ user expects the pod there; then the fix is a toleration or a selector, not \
 the node.
 - A pod that cannot fit on its node: a DaemonSet pod runs only on its own \
 node, so it waits for room there. Insufficient CPU or memory means the \
-node's other pods have it; a priorityClassName such as \
-system-node-critical lets it preempt them. A host port already in use means \
+node's other pods have it; it can preempt them only if its priority is \
+higher than theirs and its preemptionPolicy is not Never. A host port already in use means \
 another pod on that node holds it.
 - A rollout that has stopped: pods on the latest revision that are not ready \
-use up maxUnavailable, so the controller replaces no more old pods. They may \
-only be starting; if the new template is broken, correct or revert it, and \
-the controller then replaces them, as it replaces any unavailable pod on an \
-older revision. OnDelete moves a pod only when it is deleted, by design.
+count as unavailable, and once the nodes without an available pod reach \
+maxUnavailable (with no surge), the controller replaces no more old pods. \
+Below that it carries on, so check the counts before calling it stuck. The \
+new pods may only be starting; if the new template is broken, correct or \
+revert it, and the controller then replaces them, as it replaces any \
+unavailable pod on an older revision. OnDelete moves a pod only when it is \
+deleted, by design.
 - A pod that fails on some nodes only: compare those nodes — their pool, \
 OS, kernel or architecture — with the nodes where it is ready.
 - A pod stuck terminating on a node that is NotReady or gone: the kubelet \
@@ -4377,7 +4380,7 @@ fn render_ds_spec(ds: &k8s_openapi::api::apps::v1::DaemonSet, latest: &Result<Op
     }
     if updated < desired {
         lines.push(if kind == "OnDelete" {
-            format!("ON DELETE: {} of {desired} pods run an older template, and one moves to the latest only when deleted", desired - updated)
+            format!("ON DELETE: {updated} of {desired} nodes run the latest template, and a pod moves to it only when deleted")
         } else {
             format!(
                 "ROLLOUT IN PROGRESS: {updated} of {desired} nodes run the latest template; it replaces old pods {} at a time",
@@ -4491,7 +4494,8 @@ fn render_ds_nodes(
         pods.iter().filter(|p| !pod_is_ready(p) || p.metadata.deletion_timestamp.is_some()).collect();
     troubled.sort_by_key(|p| p.metadata.name.clone());
     let (mut new_unready, mut old) = (Vec::new(), 0);
-    let (mut no_room, mut port_taken) = (0, 0);
+    let (mut no_room, mut port_taken) = (Vec::new(), 0);
+    let mut stuck = Vec::new();
     for p in pods {
         let hash = p.metadata.labels.as_ref().and_then(|l| l.get("controller-revision-hash")).cloned().unwrap_or_default();
         if p.metadata.deletion_timestamp.is_none() && !hash.is_empty() {
@@ -4546,7 +4550,9 @@ fn render_ds_nodes(
             .find(|c| c.type_ == "PodScheduled" && c.status == "False")
             .and_then(|c| c.message.clone())
         {
-            no_room += msg.contains("Insufficient") as usize;
+            if msg.contains("Insufficient") {
+                no_room.push(*p);
+            }
             port_taken += msg.contains("free ports") as usize;
             let msg: String = msg.chars().take(300).collect();
             line.push_str(&format!("; UNSCHEDULABLE: {msg}"));
@@ -4555,10 +4561,7 @@ fn render_ds_nodes(
             let mins = (now - t.0).num_minutes();
             line.push_str(&format!("; TERMINATING since {} ({})", t.0.to_rfc3339(), if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }));
             if !note.is_empty() && note != " (node cordoned)" {
-                findings.push(format!(
-                    "{pod_name} IS STUCK TERMINATING ON A NODE THAT IS {}: the kubelet there cannot confirm it stopped",
-                    if note.contains("NO LONGER") { "GONE" } else { "NOT READY" }
-                ));
+                stuck.push((pod_name.to_string(), if note.contains("NO LONGER") { "GONE" } else { "NOT READY" }));
             }
         }
         // Every one is counted above, but only the head of a long list is
@@ -4570,14 +4573,33 @@ fn render_ds_nodes(
     if troubled.len() > SHOWN * 2 {
         lines.push(format!("  and {} more", troubled.len() - SHOWN * 2));
     }
-    if no_room > 0 {
+    match stuck.as_slice() {
+        [] => {}
+        [(pod, why)] => findings.push(format!("{pod} IS STUCK TERMINATING ON A NODE THAT IS {why}: the kubelet there cannot confirm it stopped")),
+        many => findings.push(format!(
+            "{} PODS ARE STUCK TERMINATING ON NODES THAT ARE NOT READY OR GONE: {}{}; the kubelets there cannot confirm they stopped",
+            many.len(),
+            many.iter().take(SHOWN).map(|(p, why)| format!("{p} ({why})")).collect::<Vec<_>>().join(", "),
+            more(many.len())
+        )),
+    }
+    // Whether a pod can preempt is what admission settled on the pod itself:
+    // its priority and preemptionPolicy, which a default class may have set.
+    if let Some(first) = no_room.first() {
+        let pod_spec = first.spec.clone().unwrap_or_default();
+        let priority = pod_spec.priority.unwrap_or(0);
+        let class = pod_spec.priority_class_name.map(|c| format!("class {c}")).unwrap_or_else(|| "no priorityClassName".to_string());
         findings.push(format!(
-            "{no_room} POD{} CANNOT FIT ON {} NODE: a DaemonSet pod runs only on its own node, so it waits for room there; {}",
-            if no_room == 1 { "" } else { "S" },
-            if no_room == 1 { "ITS" } else { "THEIR" },
-            match template.priority_class_name.as_deref() {
-                Some(c) => format!("its priorityClassName {c} lets it preempt pods of lower priority, unless the class sets preemptionPolicy Never"),
-                None => "with no priorityClassName it preempts nothing".to_string(),
+            "{} POD{} CANNOT FIT ON {} NODE: a DaemonSet pod runs only on its own node, so it waits for room there; {}",
+            no_room.len(),
+            if no_room.len() == 1 { "" } else { "S" },
+            if no_room.len() == 1 { "ITS" } else { "THEIR" },
+            if pod_spec.preemption_policy.as_deref() == Some("Never") {
+                format!("its preemptionPolicy is Never ({class}), so it preempts nothing")
+            } else if priority <= 0 {
+                format!("at priority {priority} ({class}) it can preempt only pods of lower priority, which few are; a class such as system-node-critical is what lets it make room")
+            } else {
+                format!("at priority {priority} ({class}) it can preempt pods of lower priority on that node, if evicting them frees enough")
             }
         ));
     }
@@ -4585,8 +4607,30 @@ fn render_ds_nodes(
         findings.push(format!("{port_taken} POD{} BLOCKED BY A HOST PORT ALREADY IN USE ON {} NODE", if port_taken == 1 { " IS" } else { "S ARE" }, if port_taken == 1 { "ITS" } else { "THEIR" }));
     }
     if rolling_update && old > 0 && !new_unready.is_empty() {
+        // With no surge, the controller replaces an available old pod only
+        // while the nodes without an available pod number fewer than
+        // maxUnavailable; surging works differently, so no verdict then.
+        let status = ds.status.clone().unwrap_or_default();
+        let desired = status.desired_number_scheduled;
+        let unavailable = status.number_unavailable.unwrap_or(0);
+        let rolling = spec.update_strategy.as_ref().and_then(|u| u.rolling_update.clone()).unwrap_or_default();
+        let scaled = |v: &Option<k8s_openapi::apimachinery::pkg::util::intstr::IntOrString>, default: i32| match v {
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(i)) => *i,
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(s)) => {
+                s.trim_end_matches('%').parse::<i64>().map(|p| ((p * desired as i64 + 99) / 100) as i32).unwrap_or(default)
+            }
+            None => default,
+        };
+        let (max_unavailable, max_surge) = (scaled(&rolling.max_unavailable, 1), scaled(&rolling.max_surge, 0));
+        let verdict = if max_surge > 0 {
+            format!("it surges up to {max_surge} new pods alongside old ones, and {unavailable} nodes have no available pod")
+        } else if unavailable >= max_unavailable {
+            format!("{unavailable} nodes have no available pod, which uses up maxUnavailable {max_unavailable}, so no more old pods are replaced until one becomes available")
+        } else {
+            format!("{unavailable} nodes have no available pod, under maxUnavailable {max_unavailable}, so replacements can continue")
+        };
         findings.push(format!(
-            "ROLLOUT WAITING ON {} POD{} OF THE LATEST REVISION THAT {} NOT READY ({}{}), with {old} still on older revisions: the controller counts them against its budget and replaces no more old pods meanwhile. They may only be starting; if the new template is broken, correct or revert it, and the controller then replaces them",
+            "ROLLOUT: {} POD{} OF THE LATEST REVISION {} NOT READY ({}{}), with {old} still on older revisions; {verdict}. They may only be starting; if the new template is broken, correct or revert it, and the controller then replaces them",
             new_unready.len(),
             if new_unready.len() == 1 { "" } else { "S" },
             if new_unready.len() == 1 { "IS" } else { "ARE" },
@@ -6862,13 +6906,13 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.ends_with("ROLLOUT IN PROGRESS: 1 of 3 nodes run the latest template; it replaces old pods maxUnavailable 1, maxSurge 0 at a time"), "{out}");
         let on_delete = daemonset(serde_json::json!({ "spec": { "updateStrategy": { "type": "OnDelete", "rollingUpdate": null } }, "status": { "updatedNumberScheduled": 2 } }));
         let out = render_ds_spec(&on_delete, &Ok(None));
-        assert!(out.contains("update strategy: OnDelete\n") && out.ends_with("ON DELETE: 1 of 3 pods run an older template, and one moves to the latest only when deleted"), "{out}");
+        assert!(out.contains("update strategy: OnDelete\n") && out.ends_with("ON DELETE: 2 of 3 nodes run the latest template, and a pod moves to it only when deleted"), "{out}");
     }
 
     #[test]
     fn the_nodes_a_daemonset_misses_are_named() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-03T10:30:00Z").unwrap().with_timezone(&chrono::Utc);
-        let ds = daemonset(serde_json::json!({}));
+        let ds = daemonset(serde_json::json!({ "status": { "numberUnavailable": 2 } }));
         let nodes = vec![
             ds_node("n1", "linux", true, serde_json::json!([])),
             ds_node("n2", "linux", true, serde_json::json!([{ "key": "sku", "value": "gpu", "effect": "NoSchedule" }])),
@@ -6901,8 +6945,8 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
              NO POD ON 1 NODE THAT SHOULD RUN ONE: n3 (node NOT READY); the controller creates one per node, and when it has not, its events say why\n\
              MISSCHEDULED, AND DELETED BY THE CONTROLLER: agent-n6 on n6: taint dedicated:NoExecute not tolerated\n\
              agent-gone IS STUCK TERMINATING ON A NODE THAT IS GONE: the kubelet there cannot confirm it stopped\n\
-             1 POD CANNOT FIT ON ITS NODE: a DaemonSet pod runs only on its own node, so it waits for room there; with no priorityClassName it preempts nothing\n\
-             ROLLOUT WAITING ON 1 POD OF THE LATEST REVISION THAT IS NOT READY (agent-n7), with 1 still on older revisions: the controller counts them against its budget and replaces no more old pods meanwhile. They may only be starting; if the new template is broken, correct or revert it, and the controller then replaces them"
+             1 POD CANNOT FIT ON ITS NODE: a DaemonSet pod runs only on its own node, so it waits for room there; at priority 0 (no priorityClassName) it can preempt only pods of lower priority, which few are; a class such as system-node-critical is what lets it make room\n\
+             ROLLOUT: 1 POD OF THE LATEST REVISION IS NOT READY (agent-n7), with 1 still on older revisions; 2 nodes have no available pod, which uses up maxUnavailable 1, so no more old pods are replaced until one becomes available. They may only be starting; if the new template is broken, correct or revert it, and the controller then replaces them"
         );
 
         let healthy = render_ds_nodes(&ds, &Ok(vec![ds_pod("n1", "h2", true, serde_json::json!({}))]), &Ok(vec![ds_node("n1", "linux", true, serde_json::json!([]))]), &Ok(Some("h2".into())), now);
@@ -6911,7 +6955,29 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(blind, "(nodes unavailable: forbidden; which nodes should run its pod was not worked out)\n(it has no pods)");
         let on_delete = daemonset(serde_json::json!({ "spec": { "updateStrategy": { "type": "OnDelete", "rollingUpdate": null } } }));
         let stalled = vec![ds_pod("n1", "h1", true, serde_json::json!({})), ds_pod("n7", "h2", false, serde_json::json!({}))];
-        assert!(!render_ds_nodes(&on_delete, &Ok(stalled), &Ok(vec![]), &Ok(Some("h2".into())), now).contains("ROLLOUT WAITING"));
+        assert!(!render_ds_nodes(&on_delete, &Ok(stalled.clone()), &Ok(vec![]), &Ok(Some("h2".into())), now).contains("ROLLOUT"));
+        // Under the budget the rollout carries on; a percentage is of desired,
+        // rounded up; with a surge no verdict is given.
+        let budget = |v: serde_json::Value| render_ds_nodes(&daemonset(v), &Ok(stalled.clone()), &Ok(vec![]), &Ok(Some("h2".into())), now);
+        let out = budget(serde_json::json!({ "spec": { "updateStrategy": { "rollingUpdate": { "maxUnavailable": "50%" } } }, "status": { "numberUnavailable": 1 } }));
+        assert!(out.contains("1 nodes have no available pod, under maxUnavailable 2, so replacements can continue"), "{out}");
+        let out = budget(serde_json::json!({ "spec": { "updateStrategy": { "rollingUpdate": { "maxUnavailable": 0, "maxSurge": 1 } } }, "status": { "numberUnavailable": 1 } }));
+        assert!(out.contains("it surges up to 1 new pods alongside old ones"), "{out}");
+
+        // Preemption is read from the pod as admitted; stuck pods are named
+        // up to the cap and counted beyond it.
+        let starved = |spec: serde_json::Value| {
+            let mut extra = serde_json::json!({ "spec": { "nodeName": null }, "status": { "phase": "Pending", "conditions": [{ "type": "PodScheduled", "status": "False", "message": "0/1 nodes are available: 1 Insufficient memory." }] } });
+            json_merge(&mut extra, serde_json::json!({ "spec": spec }));
+            render_ds_nodes(&ds, &Ok(vec![ds_pod("n1", "h2", false, extra)]), &Ok(vec![]), &Ok(Some("h2".into())), now)
+        };
+        assert!(starved(serde_json::json!({ "priority": 2000001000, "priorityClassName": "system-node-critical" }))
+            .contains("at priority 2000001000 (class system-node-critical) it can preempt pods of lower priority on that node"));
+        assert!(starved(serde_json::json!({ "priority": 1000, "preemptionPolicy": "Never" })).contains("its preemptionPolicy is Never (no priorityClassName), so it preempts nothing"));
+        let outage: Vec<_> = (0..25).map(|i| ds_pod(&format!("x{i:02}"), "h2", false, serde_json::json!({ "metadata": { "deletionTimestamp": "2026-11-03T10:00:00Z" } }))).collect();
+        let out = render_ds_nodes(&ds, &Ok(outage), &Ok(vec![ds_node("n1", "linux", true, serde_json::json!([]))]), &Ok(Some("h2".into())), now);
+        assert!(out.ends_with("25 PODS ARE STUCK TERMINATING ON NODES THAT ARE NOT READY OR GONE: agent-x00 (GONE), agent-x01 (GONE), agent-x02 (GONE), agent-x03 (GONE), agent-x04 (GONE), agent-x05 (GONE), agent-x06 (GONE), agent-x07 (GONE), agent-x08 (GONE), agent-x09 (GONE) and 15 more; the kubelets there cannot confirm they stopped"), "{out}");
+        assert_eq!(out.matches("STUCK").count(), 1);
     }
 
     #[test]

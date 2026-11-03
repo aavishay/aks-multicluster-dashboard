@@ -176,6 +176,15 @@ fn controller_owner(refs: &Option<Vec<OwnerReference>>) -> Option<(&str, &str)> 
         .map(|o| (o.kind.as_str(), o.name.as_str()))
 }
 
+/// Whether this object's controller is the given one: by UID too, so that
+/// what a deleted object of the same name left behind is not counted as its.
+fn controlled_by(refs: &Option<Vec<OwnerReference>>, kind: &str, name: &str, uid: Option<&str>) -> bool {
+    refs.iter()
+        .flatten()
+        .find(|o| o.controller == Some(true))
+        .is_some_and(|o| o.kind == kind && o.name == name && uid.is_none_or(|u| o.uid == u))
+}
+
 /// Parse a Kubernetes quantity string (e.g. "500m", "4", "8Gi", "16384Ki")
 /// into millicores (for cpu-ish quantities) or Ki (for memory-ish
 /// quantities). Callers pick the right parser for the field they're reading.
@@ -3882,7 +3891,7 @@ pub async fn get_statefulset_diagnostics(context_name: &str, namespace: &str, na
     let (pods, claims, pdbs, service) = tokio::join!(pods_api.list(&pod_params), claims_fut, pdbs_api.list(&all), service_fut);
 
     let pods: Result<Vec<Pod>, String> = pods
-        .map(|l| l.items.into_iter().filter(|p| controller_owner(&p.metadata.owner_references) == Some(("StatefulSet", name))).collect())
+        .map(|l| l.items.into_iter().filter(|p| controlled_by(&p.metadata.owner_references, "StatefulSet", name, sts.metadata.uid.as_deref())).collect())
         .map_err(|e| format!("Failed to list pods in '{namespace}': {e}"));
     let claims: Result<Vec<PersistentVolumeClaim>, String> = claims
         .map(|items| {
@@ -4111,7 +4120,7 @@ pub async fn get_daemonset_diagnostics(context_name: &str, namespace: &str, name
     let all = ListParams::default();
     let (pods, nodes, revisions) = tokio::join!(pods_api.list(&params), nodes_api.list(&all), revisions_api.list(&params));
 
-    let owned = |refs: &Option<Vec<OwnerReference>>| controller_owner(refs) == Some(("DaemonSet", name));
+    let owned = |refs: &Option<Vec<OwnerReference>>| controlled_by(refs, "DaemonSet", name, ds.metadata.uid.as_deref());
     let pods = pods
         .map(|l| l.items.into_iter().filter(|p| owned(&p.metadata.owner_references)).collect())
         .map_err(|e| format!("Failed to list pods in '{namespace}': {e}"));
