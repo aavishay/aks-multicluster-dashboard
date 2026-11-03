@@ -387,7 +387,7 @@ pub async fn get_overview(context_name: &str) -> Result<ClusterOverview, String>
     })
 }
 
-fn node_is_ready(n: &Node) -> bool {
+pub(crate) fn node_is_ready(n: &Node) -> bool {
     n.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
@@ -3974,6 +3974,161 @@ pub async fn get_statefulset_diagnostics(context_name: &str, namespace: &str, na
 /// Whether a pod's Ready condition is True.
 fn pod_ready_condition(p: &Pod) -> bool {
     p.status.as_ref().and_then(|s| s.conditions.as_ref()).is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+}
+
+/// What a DaemonSet diagnosis reads beyond the generic workload view.
+pub struct DaemonSetDiagnostics {
+    pub ds: DaemonSet,
+    /// The pods it controls, by owner rather than by selector.
+    pub pods: Result<Vec<Pod>, String>,
+    /// Every node: which of them should run its pod is worked out from these.
+    pub nodes: Result<Vec<Node>, String>,
+    /// The hash of its newest ControllerRevision, which pods on the current
+    /// template carry as `controller-revision-hash`.
+    pub latest_revision: Result<Option<String>, String>,
+}
+
+/// The tolerations the DaemonSet controller adds to every pod it makes, so
+/// that its pods stay through node conditions that evict everything else.
+fn daemon_default_tolerations(host_network: bool) -> Vec<k8s_openapi::api::core::v1::Toleration> {
+    let mut taints = vec![
+        ("node.kubernetes.io/not-ready", "NoExecute"),
+        ("node.kubernetes.io/unreachable", "NoExecute"),
+        ("node.kubernetes.io/disk-pressure", "NoSchedule"),
+        ("node.kubernetes.io/memory-pressure", "NoSchedule"),
+        ("node.kubernetes.io/pid-pressure", "NoSchedule"),
+        ("node.kubernetes.io/unschedulable", "NoSchedule"),
+    ];
+    if host_network {
+        taints.push(("node.kubernetes.io/network-unavailable", "NoSchedule"));
+    }
+    taints
+        .into_iter()
+        .map(|(key, effect)| k8s_openapi::api::core::v1::Toleration {
+            key: Some(key.into()),
+            operator: Some("Exists".into()),
+            effect: Some(effect.into()),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Whether a toleration tolerates a taint, as the scheduler decides it.
+pub(crate) fn tolerates(t: &k8s_openapi::api::core::v1::Toleration, taint: &k8s_openapi::api::core::v1::Taint) -> bool {
+    if t.effect.as_deref().is_some_and(|e| !e.is_empty() && e != taint.effect) {
+        return false;
+    }
+    match t.operator.as_deref().unwrap_or("Equal") {
+        "Exists" => t.key.as_deref().is_none_or(|k| k.is_empty() || k == taint.key),
+        _ => t.key.as_deref() == Some(taint.key.as_str()) && t.value.as_deref().unwrap_or("") == taint.value.as_deref().unwrap_or(""),
+    }
+}
+
+/// Whether a node selector requirement holds for a value (a label's, or the
+/// node's name for `matchFields`).
+fn node_requirement_met(r: &k8s_openapi::api::core::v1::NodeSelectorRequirement, value: Option<&str>) -> bool {
+    let values = r.values.as_deref().unwrap_or_default();
+    match r.operator.as_str() {
+        "In" => value.is_some_and(|v| values.iter().any(|x| x == v)),
+        "NotIn" => value.is_none_or(|v| !values.iter().any(|x| x == v)),
+        "Exists" => value.is_some(),
+        "DoesNotExist" => value.is_none(),
+        op @ ("Gt" | "Lt") => match (value.and_then(|v| v.parse::<i64>().ok()), values.first().and_then(|x| x.parse::<i64>().ok())) {
+            (Some(v), Some(x)) => if op == "Gt" { v > x } else { v < x },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether a node selector term selects a node. An empty term selects none.
+pub(crate) fn node_term_matches(term: &k8s_openapi::api::core::v1::NodeSelectorTerm, node: &Node) -> bool {
+    let exprs = term.match_expressions.as_deref().unwrap_or_default();
+    let fields = term.match_fields.as_deref().unwrap_or_default();
+    let labels = node.metadata.labels.as_ref();
+    (!exprs.is_empty() || !fields.is_empty())
+        && exprs.iter().all(|r| node_requirement_met(r, labels.and_then(|l| l.get(&r.key)).map(String::as_str)))
+        && fields.iter().all(|r| r.key == "metadata.name" && node_requirement_met(r, node.metadata.name.as_deref()))
+}
+
+/// Why a DaemonSet's pod does not belong on a node, or `None` when it does,
+/// as the controller decides it. With `scheduling`, a NoSchedule taint counts
+/// too: it keeps a new pod off the node, but does not remove one running.
+pub(crate) fn daemon_pod_misfit(spec: &k8s_openapi::api::core::v1::PodSpec, node: &Node, scheduling: bool) -> Option<String> {
+    let node_name = node.metadata.name.as_deref().unwrap_or_default();
+    if let Some(n) = spec.node_name.as_deref().filter(|n| !n.is_empty() && *n != node_name) {
+        return Some(format!("the template's nodeName is {n}"));
+    }
+    let labels = node.metadata.labels.as_ref();
+    if let Some((k, v)) = spec.node_selector.iter().flatten().find(|(k, v)| labels.and_then(|l| l.get(*k)) != Some(*v)) {
+        return Some(format!("nodeSelector {k}={v} not matched"));
+    }
+    let required = spec.affinity.as_ref().and_then(|a| a.node_affinity.as_ref()).and_then(|a| a.required_during_scheduling_ignored_during_execution.as_ref());
+    if required.is_some_and(|r| !r.node_selector_terms.iter().any(|t| node_term_matches(t, node))) {
+        return Some("required node affinity not matched".to_string());
+    }
+    let tolerations: Vec<_> =
+        spec.tolerations.iter().flatten().cloned().chain(daemon_default_tolerations(spec.host_network == Some(true))).collect();
+    node.spec
+        .as_ref()
+        .and_then(|s| s.taints.as_ref())
+        .into_iter()
+        .flatten()
+        .filter(|t| t.effect == "NoExecute" || (scheduling && t.effect == "NoSchedule"))
+        .find(|t| !tolerations.iter().any(|tol| tolerates(tol, t)))
+        .map(|t| format!("taint {}{}:{} not tolerated", t.key, t.value.as_deref().filter(|v| !v.is_empty()).map(|v| format!("={v}")).unwrap_or_default(), t.effect))
+}
+
+/// The node a DaemonSet pod is for: where it runs, or, while it is Pending,
+/// the node its controller-set affinity names.
+pub(crate) fn daemon_pod_node(p: &Pod) -> Option<String> {
+    let spec = p.spec.as_ref()?;
+    spec.node_name.clone().filter(|n| !n.is_empty()).or_else(|| {
+        spec.affinity
+            .as_ref()?
+            .node_affinity
+            .as_ref()?
+            .required_during_scheduling_ignored_during_execution
+            .as_ref()?
+            .node_selector_terms
+            .iter()
+            .flat_map(|t| t.match_fields.iter().flatten())
+            .find(|r| r.key == "metadata.name" && r.operator == "In")
+            .and_then(|r| r.values.as_ref()?.first().cloned())
+    })
+}
+
+pub async fn get_daemonset_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<DaemonSetDiagnostics, String> {
+    let client = client_for_context(context_name).await?;
+    let ds = Api::<DaemonSet>::namespaced(client.clone(), namespace).get(name).await.map_err(|e| get_error("DaemonSet", name, e))?;
+    let spec = ds.spec.clone().unwrap_or_default();
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let revisions_api: Api<ControllerRevision> = Api::namespaced(client.clone(), namespace);
+    // Its ControllerRevisions carry its template's labels, so its selector
+    // finds them as it finds its pods.
+    let params = ListParams::default().labels(&label_selector_query(&spec.selector));
+    let all = ListParams::default();
+    let (pods, nodes, revisions) = tokio::join!(pods_api.list(&params), nodes_api.list(&all), revisions_api.list(&params));
+
+    let owned = |refs: &Option<Vec<OwnerReference>>| controller_owner(refs) == Some(("DaemonSet", name));
+    let pods = pods
+        .map(|l| l.items.into_iter().filter(|p| owned(&p.metadata.owner_references)).collect())
+        .map_err(|e| format!("Failed to list pods in '{namespace}': {e}"));
+    let nodes = nodes.map(|l| l.items).map_err(|e| format!("Failed to list nodes: {e}"));
+    let latest_revision = revisions
+        .map(|l| {
+            l.items.into_iter().filter(|r| owned(&r.metadata.owner_references)).max_by_key(|r| r.revision).and_then(|r| {
+                r.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("controller-revision-hash").cloned())
+                    .or_else(|| r.metadata.name.as_deref()?.strip_prefix(&format!("{name}-")).map(str::to_string))
+            })
+        })
+        .map_err(|e| format!("Failed to list ControllerRevisions in '{namespace}': {e}"));
+
+    Ok(DaemonSetDiagnostics { ds, pods, nodes, latest_revision })
 }
 
 /// A Service an Ingress routes to, as the diagnosis read it.
