@@ -3796,6 +3796,167 @@ pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str
     })
 }
 
+/// Everything a StatefulSet diagnosis reads beyond what every workload's
+/// does: its pods by ordinal, the nodes they sit on, the claims its volume
+/// templates make, its governing Service and the budgets over its pods.
+///
+/// Only the StatefulSet itself is required; each of the rest fails on its own
+/// and the payload says so.
+pub struct StatefulSetDiagnostics {
+    pub sts: StatefulSet,
+    /// The pods it controls, by owner rather than by selector.
+    pub pods: Result<Vec<Pod>, String>,
+    /// The readiness of the node under each pod that is not ready or is
+    /// terminating: `None` when the node no longer exists.
+    pub nodes: Vec<(String, Result<Option<bool>, String>)>,
+    /// The claims named `<template>-<statefulset>-<ordinal>`.
+    pub claims: Result<Vec<k8s_openapi::api::core::v1::PersistentVolumeClaim>, String>,
+    /// The events of its Pending claims, where provisioning failures are said.
+    pub claim_events: Vec<(String, Result<Vec<EventInfo>, String>)>,
+    /// Its governing Service; `None` when `serviceName` is empty.
+    pub service: Option<Result<Option<k8s_openapi::api::core::v1::Service>, String>>,
+    /// The PodDisruptionBudgets whose selector covers its pod template.
+    pub pdbs: Result<Vec<k8s_openapi::api::policy::v1::PodDisruptionBudget>, String>,
+}
+
+/// How many Pending claims' events go into a StatefulSet diagnosis.
+const STS_DIAG_CLAIM_EVENTS: usize = 3;
+
+/// Whether a label selector selects these labels. An empty selector selects
+/// everything, as a PodDisruptionBudget's does.
+pub(crate) fn label_selector_matches(sel: &LabelSelector, labels: Option<&std::collections::BTreeMap<String, String>>) -> bool {
+    let get = |k: &str| labels.and_then(|l| l.get(k));
+    sel.match_labels.iter().flatten().all(|(k, v)| get(k) == Some(v))
+        && sel.match_expressions.iter().flatten().all(|e| {
+            let values = e.values.clone().unwrap_or_default();
+            match e.operator.as_str() {
+                "In" => get(&e.key).is_some_and(|v| values.contains(v)),
+                "NotIn" => get(&e.key).is_none_or(|v| !values.contains(v)),
+                "Exists" => get(&e.key).is_some(),
+                "DoesNotExist" => get(&e.key).is_none(),
+                _ => false,
+            }
+        })
+}
+
+/// The ordinal in a StatefulSet pod's or claim's name: the number after
+/// `<prefix>-`.
+pub(crate) fn sts_ordinal(name: &str, prefix: &str) -> Option<i32> {
+    name.strip_prefix(prefix)?.strip_prefix('-').filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))?.parse().ok()
+}
+
+pub async fn get_statefulset_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<StatefulSetDiagnostics, String> {
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service};
+    use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+
+    let client = client_for_context(context_name).await?;
+    let sts = Api::<StatefulSet>::namespaced(client.clone(), namespace).get(name).await.map_err(|e| get_error("StatefulSet", name, e))?;
+    let spec = sts.spec.clone().unwrap_or_default();
+    let templates: Vec<String> = spec.volume_claim_templates.iter().flatten().filter_map(|t| t.metadata.name.clone()).collect();
+
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let claims_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+    let pdbs_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    let services_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let pod_params = ListParams::default().labels(&label_selector_query(&spec.selector));
+    let all = ListParams::default();
+    let service_fut = async {
+        if spec.service_name.is_empty() {
+            None
+        } else {
+            Some(services_api.get_opt(&spec.service_name).await.map_err(|e| format!("Failed to get Service '{}': {e}", spec.service_name)))
+        }
+    };
+    let claims_fut = async {
+        // Only when there are templates: a list of every claim in the
+        // namespace is wasted on a StatefulSet that makes none.
+        if templates.is_empty() {
+            Ok(Vec::new())
+        } else {
+            claims_api.list(&all).await.map(|l| l.items)
+        }
+    };
+    let (pods, claims, pdbs, service) = tokio::join!(pods_api.list(&pod_params), claims_fut, pdbs_api.list(&all), service_fut);
+
+    let pods: Result<Vec<Pod>, String> = pods
+        .map(|l| l.items.into_iter().filter(|p| controller_owner(&p.metadata.owner_references) == Some(("StatefulSet", name))).collect())
+        .map_err(|e| format!("Failed to list pods in '{namespace}': {e}"));
+    let claims: Result<Vec<PersistentVolumeClaim>, String> = claims
+        .map(|items| {
+            items
+                .into_iter()
+                .filter(|c| {
+                    let claim = c.metadata.name.as_deref().unwrap_or_default();
+                    templates.iter().any(|t| sts_ordinal(claim, &format!("{t}-{name}")).is_some())
+                })
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list PersistentVolumeClaims in '{namespace}': {e}"));
+    let template_labels = spec.template.metadata.as_ref().and_then(|m| m.labels.as_ref());
+    let pdbs = pdbs
+        .map(|l| {
+            l.items
+                .into_iter()
+                // A budget with no selector selects no pods.
+                .filter(|b| b.spec.as_ref().and_then(|s| s.selector.as_ref()).is_some_and(|sel| label_selector_matches(sel, template_labels)))
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list PodDisruptionBudgets in '{namespace}': {e}"));
+
+    // The nodes under pods that are stuck: a pod on a node that has gone away
+    // or stopped reporting is never replaced on its own.
+    let mut node_names: Vec<String> = pods
+        .iter()
+        .flatten()
+        .filter(|p| p.metadata.deletion_timestamp.is_some() || !pod_ready_condition(p))
+        .filter_map(|p| p.spec.as_ref().and_then(|s| s.node_name.clone()))
+        .collect();
+    node_names.sort();
+    node_names.dedup();
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let nodes_fut = futures::future::join_all(node_names.into_iter().map(|node| {
+        let nodes_api = nodes_api.clone();
+        async move {
+            let ready = nodes_api.get_opt(&node).await.map(|n| n.as_ref().map(node_is_ready)).map_err(|e| format!("Failed to get node '{node}': {e}"));
+            (node, ready)
+        }
+    }));
+    let pending: Vec<String> = claims
+        .iter()
+        .flatten()
+        .filter(|c| c.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Pending"))
+        .take(STS_DIAG_CLAIM_EVENTS)
+        .filter_map(|c| c.metadata.name.clone())
+        .collect();
+    let claim_events_fut = futures::future::join_all(pending.into_iter().map(|claim| {
+        let events_api = events_api.clone();
+        async move {
+            let params = ListParams::default().fields(&format!(
+                "involvedObject.kind=PersistentVolumeClaim,involvedObject.name={claim},involvedObject.namespace={namespace}"
+            ));
+            let events = events_api
+                .list(&params)
+                .await
+                .map(|l| {
+                    let mut items = l.items;
+                    items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+                    items.into_iter().map(event_to_info).collect()
+                })
+                .map_err(|e| format!("Failed to list events for claim '{claim}': {e}"));
+            (claim, events)
+        }
+    }));
+    let (nodes, claim_events) = tokio::join!(nodes_fut, claim_events_fut);
+
+    Ok(StatefulSetDiagnostics { sts, pods, nodes, claims, claim_events, service, pdbs })
+}
+
+/// Whether a pod's Ready condition is True.
+fn pod_ready_condition(p: &Pod) -> bool {
+    p.status.as_ref().and_then(|s| s.conditions.as_ref()).is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+}
+
 /// A Service an Ingress routes to, as the diagnosis read it.
 pub struct IngressBackend {
     pub name: String,
