@@ -422,7 +422,8 @@ WaitForFirstConsumer, Pending until a pod uses it is normal, not a fault.
 - Bound, but its pods cannot use it: a single-node volume wanted on another \
 node (Multi-Attach), a volume pinned to a zone the pod's node is not in, a \
 node at its attach limit, a CSI driver missing from the node. The pods' \
-events and the attachment errors say which.
+events and the attachment errors say which. Having no VolumeAttachment is \
+not evidence: drivers that skip attach, such as Azure Files, create none.
 - A resize that has not finished: the class does not allow expansion, or \
 the filesystem resize waits for the pod to restart.
 - Full, or out of inodes.
@@ -3265,19 +3266,23 @@ fn render_pvc_volume(
             if let Some(m) = status.message.as_deref().filter(|m| !m.is_empty()) {
                 lines.push(format!("status: {} {m}", status.reason.as_deref().unwrap_or_default()));
             }
-            let claim = spec.claim_ref.as_ref();
-            let same_name = claim.is_some_and(|c| c.name.as_deref() == pvc.metadata.name.as_deref() && c.namespace.as_deref() == pvc.metadata.namespace.as_deref());
-            let same_uid = claim.is_some_and(|c| c.uid.is_none() || c.uid == pvc.metadata.uid);
-            if !same_name {
-                lines.push(format!(
-                    "CLAIMED BY ANOTHER: its claimRef is {}/{}",
-                    claim.and_then(|c| c.namespace.as_deref()).unwrap_or("-"),
-                    claim.and_then(|c| c.name.as_deref()).unwrap_or("-")
-                ));
-            } else if !same_uid {
+            match spec.claim_ref.as_ref() {
+                // Named by the claim's volumeName but not yet bound to it, as
+                // when its size, access modes or class do not match the claim.
+                None => lines.push("no claimRef: the volume is not bound to any claim yet".to_string()),
+                Some(c) if c.name.as_deref() != pvc.metadata.name.as_deref() || c.namespace.as_deref() != pvc.metadata.namespace.as_deref() => {
+                    lines.push(format!(
+                        "CLAIMED BY ANOTHER: its claimRef is {}/{}",
+                        c.namespace.as_deref().unwrap_or("-"),
+                        c.name.as_deref().unwrap_or("-")
+                    ));
+                }
                 // A claim deleted and recreated under the same name is a new
                 // object; the volume still belongs to the old one.
-                lines.push("CLAIMED BY AN EARLIER CLAIM OF THE SAME NAME: its claimRef's uid is not this claim's".to_string());
+                Some(c) if c.uid.is_some() && c.uid != pvc.metadata.uid => {
+                    lines.push("CLAIMED BY AN EARLIER CLAIM OF THE SAME NAME: its claimRef's uid is not this claim's".to_string());
+                }
+                Some(_) => {}
             }
             if let Some(c) = &spec.csi {
                 lines.push(format!("CSI driver {}, volume handle {}", c.driver, c.volume_handle));
@@ -3339,16 +3344,22 @@ fn render_pvc_pods(pvc: &k8s_openapi::api::core::v1::PersistentVolumeClaim, pods
             line
         })
         .collect();
+    // A finished pod keeps its claim and node but no longer holds the volume,
+    // so only the others can conflict.
+    let live: Vec<_> = pods
+        .iter()
+        .filter(|p| !matches!(p.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Succeeded" | "Failed")))
+        .collect();
     let modes = pvc.spec.as_ref().and_then(|s| s.access_modes.clone()).unwrap_or_default();
     let single_node = modes.iter().all(|m| m == "ReadWriteOnce" || m == "ReadWriteOncePod");
-    let mut nodes: Vec<&str> = pods.iter().filter_map(|p| p.spec.as_ref().and_then(|s| s.node_name.as_deref())).collect();
+    let mut nodes: Vec<&str> = live.iter().filter_map(|p| p.spec.as_ref().and_then(|s| s.node_name.as_deref())).collect();
     nodes.sort_unstable();
     nodes.dedup();
     if single_node && nodes.len() > 1 {
         lines.push(format!("A SINGLE-NODE VOLUME ({}) IS MOUNTED BY PODS ON {} NODES: {}", modes.join(", "), nodes.len(), nodes.join(", ")));
     }
-    if modes.iter().any(|m| m == "ReadWriteOncePod") && pods.len() > 1 {
-        lines.push(format!("ReadWriteOncePod, but {} pods mount it: only one can", pods.len()));
+    if modes.iter().any(|m| m == "ReadWriteOncePod") && live.len() > 1 {
+        lines.push(format!("ReadWriteOncePod, but {} running pods mount it: only one can", live.len()));
     }
     lines.join("\n")
 }
@@ -3357,7 +3368,9 @@ fn render_pvc_pods(pvc: &k8s_openapi::api::core::v1::PersistentVolumeClaim, pods
 fn render_pvc_attachments(attachments: &Result<Vec<k8s_openapi::api::storage::v1::VolumeAttachment>, String>, bound: bool) -> String {
     let attachments = match attachments {
         Ok(a) if a.is_empty() => {
-            return if bound { "(none: it is attached to no node)".to_string() } else { "(no volume to attach)".to_string() };
+            // Drivers that skip attach (Azure Files, NFS) and in-tree plugins
+            // create none, so an empty list says nothing about attachment.
+            return if bound { "(no VolumeAttachment objects for it)".to_string() } else { "(no volume to attach)".to_string() };
         }
         Ok(a) => a,
         Err(e) => return format!("(VolumeAttachments unavailable: {e})"),
@@ -5660,6 +5673,14 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             render_pvc_pods(&pvc(serde_json::json!({})), &Ok(pods)),
             "db-0: Running, ready; on n1\ndb-1: Running, NOT READY; on n2\nA SINGLE-NODE VOLUME (ReadWriteOnce) IS MOUNTED BY PODS ON 2 NODES: n1, n2"
         );
+
+        // A finished Job pod on another node holds nothing.
+        let done = labelled_pod("job-1", serde_json::json!({}), false, serde_json::json!({
+            "spec": { "nodeName": "n2", "volumes": [{ "name": "d", "persistentVolumeClaim": { "claimName": "data" } }] }, "status": { "phase": "Succeeded" }
+        }));
+        let rwop = pvc(serde_json::json!({ "spec": { "accessModes": ["ReadWriteOncePod"] } }));
+        let out = render_pvc_pods(&rwop, &Ok(vec![mounting("db-0", "n1", true), done]));
+        assert!(!out.contains("SINGLE-NODE") && !out.contains("only one can"), "{out}");
     }
 
     #[test]
@@ -5672,6 +5693,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         .unwrap();
         assert_eq!(render_pvc_attachments(&Ok(vec![va]), true), "on n2: NOT ATTACHED\n  attach error: disk is attached to another node");
         assert_eq!(render_pvc_attachments(&Ok(vec![]), false), "(no volume to attach)");
+        assert_eq!(render_pvc_attachments(&Ok(vec![]), true), "(no VolumeAttachment objects for it)");
 
         let summary = serde_json::json!({ "pods": [{ "volume": [
             { "name": "d", "usedBytes": 9_663_676_416u64, "capacityBytes": 10_737_418_240u64, "inodesUsed": 100, "inodes": 1000, "pvcRef": { "name": "data", "namespace": "ns" } },
@@ -5697,6 +5719,10 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         }))
         .unwrap();
         let csi = Some(Ok(k8s::PvcCsiDriver { name: "disk.csi.azure.com".into(), registered: true, on_nodes: 5, nodes: 6 }));
+        let mut unclaimed = pv.clone();
+        unclaimed.spec.as_mut().unwrap().claim_ref = None;
+        let out = render_pvc_volume(&pvc(serde_json::json!({})), &Some(Ok(unclaimed)), &None);
+        assert!(out.contains("no claimRef: the volume is not bound to any claim yet") && !out.contains("CLAIMED BY"), "{out}");
         assert_eq!(
             render_pvc_volume(&pvc(serde_json::json!({})), &Some(Ok(pv)), &csi),
             "pv-1: phase Released, capacity 10Gi, access modes ReadWriteOnce, reclaim policy Retain\n\
