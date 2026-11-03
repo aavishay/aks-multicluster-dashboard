@@ -3815,8 +3815,10 @@ pub struct StatefulSetDiagnostics {
     pub claim_events: Vec<(String, Result<Vec<EventInfo>, String>)>,
     /// Its governing Service; `None` when `serviceName` is empty.
     pub service: Option<Result<Option<k8s_openapi::api::core::v1::Service>, String>>,
-    /// The PodDisruptionBudgets whose selector covers its pod template.
-    pub pdbs: Result<Vec<k8s_openapi::api::policy::v1::PodDisruptionBudget>, String>,
+    /// The PodDisruptionBudgets over its pods, each with the pods it covers;
+    /// `None` when no pod could be read and it was matched against the pod
+    /// template instead.
+    pub pdbs: Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>,
 }
 
 /// How many Pending claims' events go into a StatefulSet diagnosis.
@@ -3893,13 +3895,30 @@ pub async fn get_statefulset_diagnostics(context_name: &str, namespace: &str, na
                 .collect()
         })
         .map_err(|e| format!("Failed to list PersistentVolumeClaims in '{namespace}': {e}"));
+    // Budgets are matched against the pods' own labels, which carry those the
+    // controller adds (pod-name, pod-index) and the template lacks; against
+    // the template only when there is no pod to read.
     let template_labels = spec.template.metadata.as_ref().and_then(|m| m.labels.as_ref());
+    let live = pods.as_ref().ok().filter(|p| !p.is_empty());
     let pdbs = pdbs
         .map(|l| {
             l.items
                 .into_iter()
-                // A budget with no selector selects no pods.
-                .filter(|b| b.spec.as_ref().and_then(|s| s.selector.as_ref()).is_some_and(|sel| label_selector_matches(sel, template_labels)))
+                .filter_map(|b| {
+                    // A budget with no selector selects no pods.
+                    let sel = b.spec.as_ref()?.selector.as_ref()?;
+                    match live {
+                        Some(pods) => {
+                            let covered: Vec<String> = pods
+                                .iter()
+                                .filter(|p| label_selector_matches(sel, p.metadata.labels.as_ref()))
+                                .filter_map(|p| p.metadata.name.clone())
+                                .collect();
+                            (!covered.is_empty()).then_some((b, Some(covered)))
+                        }
+                        None => label_selector_matches(sel, template_labels).then_some((b, None)),
+                    }
+                })
                 .collect()
         })
         .map_err(|e| format!("Failed to list PodDisruptionBudgets in '{namespace}': {e}"));

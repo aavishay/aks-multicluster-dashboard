@@ -94,10 +94,12 @@ Say which of these you are looking at, because the fixes differ:
 - An ordinal that will not start: its claim is Pending (no class, a \
 provisioner failing, a zone it cannot use) or its pod crashes. With \
 OrderedReady, every ordinal above it waits, so name the lowest one stuck.
-- A rollout that has stopped: a pod already on the new revision is not \
-ready. Fixing or reverting the template does not replace that pod; it has \
-to be deleted. A partition or OnDelete that holds pods on the old revision \
-is by design, not a fault.
+- A rollout that has stopped: a pod on the new revision is not ready. It \
+may only be starting; if the new template is broken, correct or revert it \
+first. With OrderedReady the controller does not replace a pod that is not \
+ready, so a pod left on a broken revision after the template is corrected \
+has to be deleted; with Parallel the controller replaces it. A partition or \
+OnDelete that holds pods on the old revision is by design, not a fault.
 - A pod stuck terminating on a node that is NotReady or gone: the \
 StatefulSet never runs two pods with one identity, so it waits until the \
 pod object is gone. Force-deleting is safe only once the node is confirmed \
@@ -106,9 +108,12 @@ down, since the old pod may still be writing to its volume.
 not resize existing claims), or a volume pinned to a zone with no \
 schedulable node.
 - Peers that cannot find each other: no governing Service, one that is not \
-headless, or one whose selector misses the pods.
-- Drains blocked by a PodDisruptionBudget that allows no eviction, or by \
-more than one budget over the same pods.
+headless, or one whose selector misses the pods. A Service with no selector \
+has endpoints managed by hand, which you are not shown.
+- Drains blocked by a PodDisruptionBudget that allows no disruption (it \
+stops the eviction of healthy pods; whether an unready pod can go depends \
+on its unhealthyPodEvictionPolicy), or by more than one budget over the \
+same pod.
 
 If the StatefulSet is healthy, say so plainly rather than inventing a \
 problem.
@@ -3903,37 +3908,31 @@ fn render_sts_ordinals(
     let spec = sts.spec.clone().unwrap_or_default();
     let ordered = spec.pod_management_policy.as_deref().unwrap_or("OrderedReady") == "OrderedReady";
     let on_delete = spec.update_strategy.as_ref().and_then(|u| u.type_.as_deref()) == Some("OnDelete");
+    let partition = spec.update_strategy.as_ref().and_then(|u| u.rolling_update.as_ref()).and_then(|r| r.partition).unwrap_or(0);
     let by_ordinal: std::collections::BTreeMap<i32, &k8s_openapi::api::core::v1::Pod> =
         pods.iter().filter_map(|p| Some((k8s::sts_ordinal(p.metadata.name.as_deref()?, name)?, p))).collect();
     let node_state = |node: &str| nodes.iter().find(|(n, _)| n == node).map(|(_, r)| r);
+    let revision_of = |p: &k8s_openapi::api::core::v1::Pod| {
+        p.metadata.labels.as_ref().and_then(|l| l.get("controller-revision-hash")).cloned().unwrap_or_default()
+    };
 
-    let mut lines = Vec::new();
-    let mut unhealthy = Vec::new();
-    let mut findings = Vec::new();
-    let wanted = sts_ordinals(sts);
-    for i in wanted.clone() {
-        let pod_name = format!("{name}-{i}");
-        let Some(p) = by_ordinal.get(&i) else {
-            lines.push(format!("{pod_name}: MISSING"));
-            unhealthy.push(pod_name);
-            continue;
-        };
+    // A pod's phase, readiness, revision and node, and a finding when it is
+    // stuck terminating on a node that cannot finish it.
+    let describe = |p: &k8s_openapi::api::core::v1::Pod, pod_name: &str, findings: &mut Vec<String>| -> String {
         let st = p.status.clone().unwrap_or_default();
-        let ready = pod_is_ready(p);
-        let mut line = format!("{pod_name}: {}{}", st.phase.as_deref().unwrap_or("Unknown"), if ready { ", ready" } else { ", NOT READY" });
+        let mut line = format!("{}{}", st.phase.as_deref().unwrap_or("Unknown"), if pod_is_ready(p) { ", ready" } else { ", NOT READY" });
         for c in st.init_container_statuses.iter().flatten().chain(st.container_statuses.iter().flatten()) {
             if let Some(w) = c.state.as_ref().and_then(|s| s.waiting.as_ref()) {
                 line.push_str(&format!("; {} waiting: {}", c.name, w.reason.as_deref().unwrap_or("?")));
             }
         }
-        let hash = p.metadata.labels.as_ref().and_then(|l| l.get("controller-revision-hash")).cloned().unwrap_or_default();
-        let on_new = !update.is_empty() && hash == update;
+        let hash = revision_of(p);
         line.push_str(&format!(
             "; revision {}{}",
             if hash.is_empty() { "(unlabelled)" } else { &hash },
             if !rolling {
                 if hash.is_empty() || hash == update { "" } else { " (NOT THE CURRENT REVISION)" }
-            } else if on_new {
+            } else if hash == update {
                 " (new)"
             } else if hash == current {
                 " (old)"
@@ -3941,9 +3940,8 @@ fn render_sts_ordinals(
                 " (an older revision)"
             }
         ));
-        let node = p.spec.as_ref().and_then(|s| s.node_name.clone());
         let mut bad_node = None;
-        match &node {
+        match p.spec.as_ref().and_then(|s| s.node_name.as_deref()) {
             None => line.push_str("; not scheduled"),
             Some(n) => {
                 line.push_str(&format!("; on {n}"));
@@ -3961,8 +3959,7 @@ fn render_sts_ordinals(
                 }
             }
         }
-        let terminating = p.metadata.deletion_timestamp.as_ref();
-        if let Some(t) = terminating {
+        if let Some(t) = p.metadata.deletion_timestamp.as_ref() {
             let mins = (now - t.0).num_minutes();
             line.push_str(&format!("; TERMINATING since {} ({})", t.0.to_rfc3339(), if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }));
             if let Some(why) = bad_node {
@@ -3971,22 +3968,60 @@ fn render_sts_ordinals(
                 ));
             }
         }
-        lines.push(line);
-        if !ready || terminating.is_some() {
-            if rolling && on_new && !on_delete && terminating.is_none() && st.phase.as_deref() != Some("Succeeded") {
+        line
+    };
+
+    let mut lines = Vec::new();
+    let mut unhealthy = Vec::new();
+    let mut findings = Vec::new();
+    let wanted = sts_ordinals(sts);
+    for i in wanted.clone() {
+        let pod_name = format!("{name}-{i}");
+        let Some(p) = by_ordinal.get(&i) else {
+            lines.push(format!("{pod_name}: MISSING"));
+            unhealthy.push(pod_name);
+            continue;
+        };
+        lines.push(format!("{pod_name}: {}", describe(p, &pod_name, &mut findings)));
+        let terminating = p.metadata.deletion_timestamp.is_some();
+        if pod_is_ready(p) && !terminating {
+            continue;
+        }
+        // Whether a pod that is not ready gets replaced turns on its revision:
+        // with OrderedReady the controller waits for every pod to be ready,
+        // so it never replaces one that is not, even one whose template has
+        // since been corrected.
+        let hash = revision_of(p);
+        let finished = p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Succeeded");
+        if !terminating && !finished && !on_delete && !hash.is_empty() && !update.is_empty() {
+            if hash == update {
+                if rolling {
+                    findings.push(format!(
+                        "{pod_name} IS ON THE NEW REVISION AND NOT READY: the rollout waits on it. It may only be starting; if the new template is broken, correct or revert it{}",
+                        if ordered {
+                            ", then delete this pod if it is still not ready: with OrderedReady the controller does not replace a pod that is not ready"
+                        } else {
+                            ", and the controller then replaces this pod"
+                        }
+                    ));
+                }
+            } else if ordered && i - wanted.start >= partition {
                 findings.push(format!(
-                    "{pod_name} IS ON THE NEW REVISION AND NOT READY: the rollout waits on it, and fixing or reverting the template does not replace it — it must be deleted"
+                    "{pod_name} IS NOT READY ON A SUPERSEDED REVISION, {hash}: with OrderedReady the controller does not replace a pod that is not ready, so it is not moved to {update} — if it does not become ready, delete it and the controller recreates it on {update}"
                 ));
             }
-            unhealthy.push(pod_name);
         }
+        unhealthy.push(pod_name);
     }
+    // Pods past the desired ordinals are left from a scale-down; one stuck
+    // terminating is why the scale-down has not finished.
     for (i, p) in &by_ordinal {
         if !wanted.contains(i) {
+            let pod_name = p.metadata.name.as_deref().unwrap_or_default();
             lines.push(format!(
-                "{}: beyond the desired ordinals{}",
-                p.metadata.name.as_deref().unwrap_or_default(),
-                if p.metadata.deletion_timestamp.is_some() { ", terminating" } else { ", waiting to be removed" }
+                "{pod_name}: beyond the desired ordinals{}; {}",
+                if p.metadata.deletion_timestamp.is_some() { "" } else { ", waiting to be removed" },
+                describe(p, pod_name, &mut findings)
             ));
         }
     }
@@ -4080,10 +4115,21 @@ fn render_sts_claims(
     lines.join("\n")
 }
 
+/// Names, the first few of them, for a line that must stay short.
+fn sts_pod_list(names: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut out = names.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN {
+        out.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    out
+}
+
 /// The governing Service: whether it exists, is headless and selects the pods.
 fn render_sts_service(
     sts: &k8s_openapi::api::apps::v1::StatefulSet,
     service: &Option<Result<Option<k8s_openapi::api::core::v1::Service>, String>>,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
 ) -> String {
     let spec = sts.spec.clone().unwrap_or_default();
     let svc = match service {
@@ -4104,14 +4150,35 @@ fn render_sts_service(
         spec.service_name,
         if ip == "None" { "headless".to_string() } else { format!("NOT HEADLESS (clusterIP {ip}): per-pod DNS names exist only for a headless Service") }
     )];
-    let labels = spec.template.metadata.as_ref().and_then(|m| m.labels.as_ref());
+    // Checked against the pods' own labels: a selector may use one the
+    // controller adds, such as statefulset.kubernetes.io/pod-name, which the
+    // template does not carry.
     match s_spec.selector.as_ref().filter(|s| !s.is_empty()) {
-        None => lines.push("NO SELECTOR: it publishes no addresses for the pods".to_string()),
-        Some(sel) if k8s::selector_terms_met(sel, labels) < sel.len() => lines.push(format!(
-            "ITS SELECTOR DOES NOT SELECT THE PODS: {}",
-            sel.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")
-        )),
-        Some(_) => lines.push("its selector matches the pods".to_string()),
+        None => lines.push(
+            "no selector: its endpoints are managed by hand, in Endpoints or EndpointSlices this diagnosis does not read, so whether they list the pods is unchecked"
+                .to_string(),
+        ),
+        Some(sel) => {
+            let terms = sel.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ");
+            lines.push(match pods {
+                Err(e) => format!("selector {terms}: not checked against the pods (pods unavailable: {e})"),
+                Ok(p) if p.is_empty() => format!("selector {terms}: no pod exists to check it against"),
+                Ok(p) => {
+                    let missed: Vec<String> = p
+                        .iter()
+                        .filter(|p| k8s::selector_terms_met(sel, p.metadata.labels.as_ref()) < sel.len())
+                        .filter_map(|p| p.metadata.name.clone())
+                        .collect();
+                    if missed.is_empty() {
+                        format!("its selector matches all {} pods", p.len())
+                    } else if missed.len() == p.len() {
+                        format!("ITS SELECTOR DOES NOT SELECT THE PODS: {terms}")
+                    } else {
+                        format!("ITS SELECTOR MISSES {}: {terms}", sts_pod_list(&missed))
+                    }
+                }
+            });
+        }
     }
     lines.push(format!(
         "publishNotReadyAddresses: {}",
@@ -4121,7 +4188,7 @@ fn render_sts_service(
 }
 
 /// The PodDisruptionBudgets over the pods, and whether they let a drain through.
-fn render_sts_pdbs(pdbs: &Result<Vec<k8s_openapi::api::policy::v1::PodDisruptionBudget>, String>) -> String {
+fn render_sts_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>) -> String {
     let pdbs = match pdbs {
         Ok(p) if p.is_empty() => return "(no PodDisruptionBudget covers its pods)".to_string(),
         Ok(p) => p,
@@ -4129,7 +4196,7 @@ fn render_sts_pdbs(pdbs: &Result<Vec<k8s_openapi::api::policy::v1::PodDisruption
     };
     let mut lines: Vec<String> = pdbs
         .iter()
-        .map(|b| {
+        .map(|(b, covered)| {
             let spec = b.spec.clone().unwrap_or_default();
             let st = b.status.clone().unwrap_or_default();
             let limit = match (&spec.min_available, &spec.max_unavailable) {
@@ -4137,19 +4204,53 @@ fn render_sts_pdbs(pdbs: &Result<Vec<k8s_openapi::api::policy::v1::PodDisruption
                 (_, Some(m)) => format!("maxUnavailable {}", int_or_string(m)),
                 _ => "no limit".to_string(),
             };
+            // No disruption allowed stops the eviction of healthy pods; an
+            // unready one may still go, as its unhealthyPodEvictionPolicy says.
+            let blocks = if st.disruptions_allowed > 0 {
+                String::new()
+            } else {
+                let unready = match spec.unhealthy_pod_eviction_policy.as_deref() {
+                    Some("AlwaysAllow") => "a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy AlwaysAllow)".to_string(),
+                    policy => {
+                        let policy = if policy.is_some() { "IfHealthyBudget" } else { "IfHealthyBudget, the default" };
+                        if st.current_healthy >= st.desired_healthy {
+                            format!("the budget is met, so a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy {policy})")
+                        } else {
+                            format!("the budget is not met, so a running pod that is not ready cannot be evicted either (unhealthyPodEvictionPolicy {policy})")
+                        }
+                    }
+                };
+                format!(" — NO HEALTHY POD MAY BE EVICTED: a drain waits on any node running one of its ready pods; {unready}")
+            };
             format!(
-                "{}: {limit}; healthy {} of {} expected, {} needed; disruptions allowed {}{}",
+                "{}: {limit}; covers {}; healthy {} of {} expected, {} needed; disruptions allowed {}{blocks}",
                 b.metadata.name.as_deref().unwrap_or_default(),
+                covered.as_deref().map(sts_pod_list).unwrap_or_else(|| "the pod template (no pod to check)".to_string()),
                 st.current_healthy,
                 st.expected_pods,
                 st.desired_healthy,
                 st.disruptions_allowed,
-                if st.disruptions_allowed == 0 { " — ALLOWS NO EVICTION: a drain or node upgrade waits on these pods" } else { "" }
             )
         })
         .collect();
-    if pdbs.len() > 1 {
-        lines.push("MORE THAN ONE BUDGET COVERS THESE PODS: the eviction API refuses to evict a pod covered by more than one".to_string());
+    // The eviction API refuses a pod under two budgets, but budgets over
+    // different ordinals do not overlap.
+    if pdbs.iter().all(|(_, c)| c.is_none()) {
+        if pdbs.len() > 1 {
+            lines.push("MORE THAN ONE BUDGET COVERS THE POD TEMPLATE: the eviction API refuses to evict a pod covered by more than one".to_string());
+        }
+    } else {
+        let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+        for pod in pdbs.iter().filter_map(|(_, c)| c.as_ref()).flatten() {
+            *seen.entry(pod.as_str()).or_default() += 1;
+        }
+        let shared: Vec<String> = seen.into_iter().filter(|(_, n)| *n > 1).map(|(p, _)| p.to_string()).collect();
+        if !shared.is_empty() {
+            lines.push(format!(
+                "MORE THAN ONE BUDGET COVERS {}: the eviction API refuses to evict a pod covered by more than one",
+                sts_pod_list(&shared)
+            ));
+        }
     }
     lines.join("\n")
 }
@@ -4173,7 +4274,7 @@ fn render_sts_sections(d: &k8s::StatefulSetDiagnostics, now: chrono::DateTime<ch
         render_sts_spec(&d.sts),
         render_sts_ordinals(&d.sts, &d.pods, &d.nodes, now),
         render_sts_claims(&d.sts, &d.claims, &d.pods),
-        render_sts_service(&d.sts, &d.service),
+        render_sts_service(&d.sts, &d.service, &d.pods),
         render_sts_pdbs(&d.pdbs),
     )
 }
@@ -6211,7 +6312,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             "db-0: Running, ready; revision db-old (old); on n1\n\
              db-1: MISSING\n\
              db-2: Running, NOT READY; db waiting: CrashLoopBackOff; revision db-new (new); on n1\n\
-             db-2 IS ON THE NEW REVISION AND NOT READY: the rollout waits on it, and fixing or reverting the template does not replace it — it must be deleted\n\
+             db-2 IS ON THE NEW REVISION AND NOT READY: the rollout waits on it. It may only be starting; if the new template is broken, correct or revert it, then delete this pod if it is still not ready: with OrderedReady the controller does not replace a pod that is not ready\n\
              ORDEREDREADY: the controller creates, updates or removes no other pod while db-1 is not running and ready (2 ordinals in all are not)"
         );
 
@@ -6224,11 +6325,42 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         let out = render_sts_ordinals(&statefulset(serde_json::json!({})), &Ok(stuck), &[("gone".to_string(), Ok(None))], now);
         assert!(out.starts_with("db-0: Running, NOT READY; revision db-old; on gone (NODE NO LONGER EXISTS); TERMINATING since 2026-11-03T10:00:00+00:00 (30 min)"), "{out}");
         assert!(out.contains("db-0 IS STUCK TERMINATING ON A NODE THAT IS GONE"), "{out}");
-        assert!(out.contains("db-3: beyond the desired ordinals, terminating"), "{out}");
+        assert!(out.contains("db-3: beyond the desired ordinals; Running, ready; revision db-old; on n1; TERMINATING since"), "{out}");
         assert!(out.contains("ORDEREDREADY: the controller creates, updates or removes no other pod while db-0 is not running and ready\n") || out.ends_with("while db-0 is not running and ready"), "{out}");
 
-        let parallel = statefulset(serde_json::json!({ "spec": { "podManagementPolicy": "Parallel" } }));
-        assert!(!render_sts_ordinals(&parallel, &Ok(vec![]), &[], now).contains("ORDEREDREADY"));
+        // A pod left on a broken revision once the template is reverted (both
+        // revisions name the good one) or corrected (a third revision): with
+        // OrderedReady it is never replaced, unless the partition holds it.
+        let crashing = || sts_pod(2, "db-bad", false, serde_json::json!({}));
+        let healthy = || vec![sts_pod(0, "db-old", true, serde_json::json!({})), sts_pod(1, "db-old", true, serde_json::json!({}))];
+        let reverted = statefulset(serde_json::json!({}));
+        let out = render_sts_ordinals(&reverted, &Ok([healthy(), vec![crashing()]].concat()), &[], now);
+        assert!(out.contains("db-2: Running, NOT READY; revision db-bad (NOT THE CURRENT REVISION)"), "{out}");
+        assert!(out.contains("db-2 IS NOT READY ON A SUPERSEDED REVISION, db-bad: with OrderedReady the controller does not replace a pod that is not ready"), "{out}");
+        let corrected = statefulset(serde_json::json!({ "status": { "updateRevision": "db-fixed" } }));
+        let out = render_sts_ordinals(&corrected, &Ok([healthy(), vec![crashing()]].concat()), &[], now);
+        assert!(out.contains("revision db-bad (an older revision)") && out.contains("db-2 IS NOT READY ON A SUPERSEDED REVISION, db-bad") && out.contains("recreates it on db-fixed"), "{out}");
+        let held = statefulset(serde_json::json!({ "spec": { "updateStrategy": { "type": "RollingUpdate", "rollingUpdate": { "partition": 3 } } },
+            "status": { "updateRevision": "db-fixed" } }));
+        assert!(!render_sts_ordinals(&held, &Ok([healthy(), vec![crashing()]].concat()), &[], now).contains("SUPERSEDED"));
+        let parallel = statefulset(serde_json::json!({ "spec": { "podManagementPolicy": "Parallel" }, "status": { "updateRevision": "db-fixed" } }));
+        let out = render_sts_ordinals(&parallel, &Ok([healthy(), vec![crashing()]].concat()), &[], now);
+        assert!(!out.contains("ORDEREDREADY") && !out.contains("SUPERSEDED"), "{out}");
+        let new_parallel = statefulset(serde_json::json!({ "spec": { "podManagementPolicy": "Parallel" }, "status": { "updateRevision": "db-bad" } }));
+        assert!(render_sts_ordinals(&new_parallel, &Ok([healthy(), vec![crashing()]].concat()), &[], now)
+            .contains("db-2 IS ON THE NEW REVISION AND NOT READY: the rollout waits on it. It may only be starting; if the new template is broken, correct or revert it, and the controller then replaces this pod"));
+
+        // A scale-down held up by a pod past the desired ordinals that is stuck
+        // on a node that is gone, scaled to zero or not.
+        let leftover = || vec![sts_pod(0, "db-old", false, serde_json::json!({ "metadata": { "deletionTimestamp": "2026-11-03T10:00:00Z" }, "spec": { "nodeName": "gone" } }))];
+        let out = render_sts_ordinals(&statefulset(serde_json::json!({ "spec": { "replicas": 0 } })), &Ok(leftover()), &[("gone".to_string(), Ok(None))], now);
+        assert_eq!(
+            out,
+            "db-0: beyond the desired ordinals; Running, NOT READY; revision db-old; on gone (NODE NO LONGER EXISTS); TERMINATING since 2026-11-03T10:00:00+00:00 (30 min)\n\
+             db-0 IS STUCK TERMINATING ON A NODE THAT IS GONE: a StatefulSet never runs two pods with one identity, so it does not recreate db-0 until the pod object is gone"
+        );
+        let waiting = render_sts_ordinals(&statefulset(serde_json::json!({ "spec": { "replicas": 0 } })), &Ok(vec![sts_pod(0, "db-old", true, serde_json::json!({}))]), &[], now);
+        assert_eq!(waiting, "db-0: beyond the desired ordinals, waiting to be removed; Running, ready; revision db-old; on n1");
         let zero = statefulset(serde_json::json!({ "spec": { "replicas": 0 } }));
         assert_eq!(render_sts_ordinals(&zero, &Ok(vec![]), &[], now), "(scaled to zero: no ordinal is wanted and no pod remains)");
     }
@@ -6261,26 +6393,45 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
     #[test]
     fn the_governing_service_and_budgets_are_checked() {
         let sts = statefulset(serde_json::json!({}));
-        assert!(render_sts_service(&sts, &Some(Ok(None))).starts_with("GOVERNING SERVICE db DOES NOT EXIST"));
+        let pods = Ok(vec![sts_pod(0, "db-old", true, serde_json::json!({})), sts_pod(1, "db-old", true, serde_json::json!({}))]);
+        assert!(render_sts_service(&sts, &Some(Ok(None)), &pods).starts_with("GOVERNING SERVICE db DOES NOT EXIST"));
         let svc = |v: serde_json::Value| -> k8s_openapi::api::core::v1::Service { serde_json::from_value(serde_json::json!({ "metadata": { "name": "db" }, "spec": v })).unwrap() };
         assert_eq!(
-            render_sts_service(&sts, &Some(Ok(Some(svc(serde_json::json!({ "clusterIP": "None", "selector": { "app": "db" }, "publishNotReadyAddresses": true })))))),
-            "db: headless\nits selector matches the pods\npublishNotReadyAddresses: true"
+            render_sts_service(&sts, &Some(Ok(Some(svc(serde_json::json!({ "clusterIP": "None", "selector": { "app": "db" }, "publishNotReadyAddresses": true }))))), &pods),
+            "db: headless\nits selector matches all 2 pods\npublishNotReadyAddresses: true"
         );
-        let out = render_sts_service(&sts, &Some(Ok(Some(svc(serde_json::json!({ "clusterIP": "10.0.0.5", "selector": { "app": "postgres" } }))))));
+        let out = render_sts_service(&sts, &Some(Ok(Some(svc(serde_json::json!({ "clusterIP": "10.0.0.5", "selector": { "app": "postgres" } }))))), &pods);
         assert!(out.contains("NOT HEADLESS (clusterIP 10.0.0.5)") && out.contains("ITS SELECTOR DOES NOT SELECT THE PODS: app=postgres"), "{out}");
+        // A label the controller adds is on the pods, not the template.
+        let mut named = pods.clone().unwrap();
+        named[0].metadata.labels.as_mut().unwrap().insert("statefulset.kubernetes.io/pod-name".into(), "db-0".into());
+        let by_name = svc(serde_json::json!({ "clusterIP": "None", "selector": { "statefulset.kubernetes.io/pod-name": "db-0" } }));
+        assert!(render_sts_service(&sts, &Some(Ok(Some(by_name.clone()))), &Ok(named)).contains("ITS SELECTOR MISSES db-1: statefulset.kubernetes.io/pod-name=db-0"));
+        assert!(render_sts_service(&sts, &Some(Ok(Some(by_name))), &Err("boom".into())).contains("not checked against the pods (pods unavailable: boom)"));
+        let manual = render_sts_service(&sts, &Some(Ok(Some(svc(serde_json::json!({ "clusterIP": "None" }))))), &pods);
+        assert!(manual.contains("no selector: its endpoints are managed by hand") && !manual.contains("SELECTOR"), "{manual}");
 
-        let pdb = |name: &str, allowed: i32| -> k8s_openapi::api::policy::v1::PodDisruptionBudget {
-            serde_json::from_value(serde_json::json!({ "metadata": { "name": name }, "spec": { "minAvailable": 3, "selector": { "matchLabels": { "app": "db" } } },
-                "status": { "currentHealthy": 3, "desiredHealthy": 3, "expectedPods": 3, "disruptionsAllowed": allowed } })).unwrap()
+        let pdb = |name: &str, healthy: i32, allowed: i32, policy: Option<&str>| -> k8s_openapi::api::policy::v1::PodDisruptionBudget {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": name },
+                "spec": { "minAvailable": 3, "selector": { "matchLabels": { "app": "db" } }, "unhealthyPodEvictionPolicy": policy },
+                "status": { "currentHealthy": healthy, "desiredHealthy": 3, "expectedPods": 3, "disruptionsAllowed": allowed } })).unwrap()
         };
+        let all = || Some(vec!["db-0".to_string(), "db-1".to_string(), "db-2".to_string()]);
         assert_eq!(render_sts_pdbs(&Ok(vec![])), "(no PodDisruptionBudget covers its pods)");
         assert_eq!(
-            render_sts_pdbs(&Ok(vec![pdb("db", 0), pdb("db-extra", 1)])),
-            "db: minAvailable 3; healthy 3 of 3 expected, 3 needed; disruptions allowed 0 — ALLOWS NO EVICTION: a drain or node upgrade waits on these pods\n\
-             db-extra: minAvailable 3; healthy 3 of 3 expected, 3 needed; disruptions allowed 1\n\
-             MORE THAN ONE BUDGET COVERS THESE PODS: the eviction API refuses to evict a pod covered by more than one"
+            render_sts_pdbs(&Ok(vec![(pdb("db", 3, 0, None), all()), (pdb("db-extra", 3, 1, None), Some(vec!["db-2".to_string()]))])),
+            "db: minAvailable 3; covers db-0, db-1, db-2; healthy 3 of 3 expected, 3 needed; disruptions allowed 0 — NO HEALTHY POD MAY BE EVICTED: a drain waits on any node running one of its ready pods; the budget is met, so a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy IfHealthyBudget, the default)\n\
+             db-extra: minAvailable 3; covers db-2; healthy 3 of 3 expected, 3 needed; disruptions allowed 1\n\
+             MORE THAN ONE BUDGET COVERS db-2: the eviction API refuses to evict a pod covered by more than one"
         );
+        assert!(render_sts_pdbs(&Ok(vec![(pdb("db", 2, 0, Some("IfHealthyBudget")), all())]))
+            .ends_with("the budget is not met, so a running pod that is not ready cannot be evicted either (unhealthyPodEvictionPolicy IfHealthyBudget)"));
+        assert!(render_sts_pdbs(&Ok(vec![(pdb("db", 2, 0, Some("AlwaysAllow")), all())])).ends_with("a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy AlwaysAllow)"));
+        // Budgets over different ordinals do not overlap.
+        let split = render_sts_pdbs(&Ok(vec![(pdb("a", 3, 1, None), Some(vec!["db-0".to_string()])), (pdb("b", 3, 1, None), Some(vec!["db-1".to_string()]))]));
+        assert!(!split.contains("MORE THAN ONE"), "{split}");
+        assert!(render_sts_pdbs(&Ok(vec![(pdb("a", 3, 1, None), None), (pdb("b", 3, 1, None), None)]))
+            .contains("covers the pod template (no pod to check)"));
     }
 
     #[test]
@@ -6742,9 +6893,9 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             headless += sts.contains(": headless\n") as usize;
             no_service += (sts.contains("GOVERNING SERVICE") || sts.contains("(serviceName is empty")) as usize;
             not_headless += sts.contains("NOT HEADLESS") as usize;
-            selector_miss += (sts.contains("ITS SELECTOR DOES NOT SELECT") || sts.contains("NO SELECTOR:")) as usize;
+            selector_miss += (sts.contains("ITS SELECTOR DOES NOT SELECT") || sts.contains("ITS SELECTOR MISSES")) as usize;
             with_pdb += !sts.contains("(no PodDisruptionBudget covers") as usize;
-            pdb_blocks += sts.contains("ALLOWS NO EVICTION") as usize;
+            pdb_blocks += sts.contains("NO HEALTHY POD MAY BE EVICTED") as usize;
             multi_pdb += sts.contains("MORE THAN ONE BUDGET") as usize;
             if !w.healthy {
                 unhealthy += 1;
