@@ -7107,6 +7107,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Replica bounds, conditions, each metric against its target, behavior and events, the object it scales and any other HPA on it, the requests and usage of every container in its pods, whether its metrics APIs are available, and its manifest."
                   : d.kind === "NodePool"
                   ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
+                  : d.kind === "StatefulSet"
+                  ? "Status, revisions and update strategy, each ordinal's pod with its revision and the state of the node under one that is stuck, each ordinal's volume claim against its template, the governing Service, the PodDisruptionBudgets over its pods, its events and manifest, a table of its pods, and the events and recent logs of its least healthy pod."
                   : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
           }</div>
           <div class="${d.payload.redaction_summary.startsWith("Redacted") ? "text-status-warning" : ""}">${esc(d.payload.redaction_summary)}</div>

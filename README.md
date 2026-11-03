@@ -186,6 +186,10 @@ manifest behind it, plus what that kind of object needs:
   ready endpoints, and each TLS Secret — checked by key name and by the
   certificate's public fields (expiry, the hosts it names), never the private
   key — with cert-manager's view of it;
+- a StatefulSet: each ordinal's pod with the revision it runs and the state
+  of the node under one stuck terminating, each ordinal's volume claim against
+  its template, its governing Service, and the PodDisruptionBudgets over its
+  pods;
 - a PVC: its storage class or why it has none, the volume bound to it and
   the zone it is pinned to, the pods that mount it with the events of those
   not ready — where a failed attach or mount is reported — its volume
