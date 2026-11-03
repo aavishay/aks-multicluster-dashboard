@@ -181,6 +181,55 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_DEPLOYMENT_SYSTEM: &str = "\
+You diagnose failing Kubernetes Deployments for an experienced SRE.
+
+You are given the Deployment's replica counts, strategy and conditions; its \
+ReplicaSets newest first, with the pods each holds and the events of the \
+newest; the HorizontalPodAutoscalers that target it; the \
+PodDisruptionBudgets over its pods; its events and manifest; a table of its \
+pods worst first; and the events and recent logs of the pod least likely to \
+be healthy, with its previous instance's logs when it has restarted. \
+Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition, the \
+ReplicaSet, the event, the log line, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- Pods that are never created: the newest ReplicaSet reports ReplicaFailure \
+or FailedCreate events — a ResourceQuota, a LimitRange, Pod Security \
+admission or a webhook refusing them. Nothing crashes, so there are no logs; \
+the message names the cause.
+- A rollout that is not finishing: the newest ReplicaSet's pods are not \
+ready while older ReplicaSets still hold pods. The controller scales the old \
+ones down only as new pods become available, within maxUnavailable and \
+maxSurge, so the old version keeps serving. The new pods may only be \
+starting; if the new template is broken, `kubectl rollout undo` or a \
+corrected template replaces them. ProgressDeadlineExceeded marks the \
+rollout failed; the controller still keeps trying.
+- A paused Deployment: changes to its template do not roll out until it is \
+resumed.
+- Pods that fail after a rollout completed: every pod on the current \
+ReplicaSet failing the same way points at the template or its \
+configuration; one pod differing points at its node.
+- Replica counts that do not stick: an HPA owns them, so a change to \
+spec.replicas is overwritten; more than one HPA on it fight each other.
+- Drains blocked by a PodDisruptionBudget that allows no disruption, often a \
+single replica with minAvailable 1.
+- With the Recreate strategy every old pod is stopped before a new one \
+starts, so a failing new template leaves nothing serving.
+
+If the Deployment is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -4243,7 +4292,7 @@ fn render_sts_service(
 }
 
 /// The PodDisruptionBudgets over the pods, and whether they let a drain through.
-fn render_sts_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>) -> String {
+fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>) -> String {
     let pdbs = match pdbs {
         Ok(p) if p.is_empty() => return "(no PodDisruptionBudget covers its pods)".to_string(),
         Ok(p) => p,
@@ -4330,7 +4379,7 @@ fn render_sts_sections(d: &k8s::StatefulSetDiagnostics, now: chrono::DateTime<ch
         render_sts_ordinals(&d.sts, &d.pods, &d.nodes, now),
         render_sts_claims(&d.sts, &d.claims, &d.pods),
         render_sts_service(&d.sts, &d.service, &d.pods),
-        render_sts_pdbs(&d.pdbs),
+        render_pdbs(&d.pdbs),
     )
 }
 
@@ -4651,6 +4700,243 @@ fn render_ds_sections(d: &k8s::DaemonSetDiagnostics, now: chrono::DateTime<chron
     )
 }
 
+/// A Deployment's replica counts, strategy and conditions, and what its
+/// conditions say about its rollout.
+fn render_deploy_spec(dep: &k8s_openapi::api::apps::v1::Deployment) -> String {
+    let spec = dep.spec.clone().unwrap_or_default();
+    let status = dep.status.clone().unwrap_or_default();
+    let mut lines = vec![format!(
+        "replicas: desired {}, updated {}, ready {}, available {}, unavailable {}",
+        spec.replicas.unwrap_or(1),
+        status.updated_replicas.unwrap_or(0),
+        status.ready_replicas.unwrap_or(0),
+        status.available_replicas.unwrap_or(0),
+        status.unavailable_replicas.unwrap_or(0)
+    )];
+    let strategy = spec.strategy.clone().unwrap_or_default();
+    let kind = strategy.type_.clone().unwrap_or_else(|| "RollingUpdate".into());
+    let mut strategy_line = format!("strategy: {kind}");
+    if kind == "RollingUpdate" {
+        let rolling = strategy.rolling_update.clone().unwrap_or_default();
+        if let Some(m) = &rolling.max_surge {
+            strategy_line.push_str(&format!(", maxSurge {}", int_or_string(m)));
+        }
+        if let Some(m) = &rolling.max_unavailable {
+            strategy_line.push_str(&format!(", maxUnavailable {}", int_or_string(m)));
+        }
+    }
+    lines.push(strategy_line);
+    if let Some(s) = spec.min_ready_seconds.filter(|s| *s > 0) {
+        lines.push(format!("minReadySeconds: {s}"));
+    }
+    let deadline = spec.progress_deadline_seconds.unwrap_or(600);
+    lines.push(format!("progressDeadlineSeconds: {deadline}"));
+    if spec.paused == Some(true) {
+        lines.push("PAUSED: changes to its template do not roll out until it is resumed (kubectl rollout resume)".to_string());
+    }
+    if let (Some(g), Some(o)) = (dep.metadata.generation, status.observed_generation) {
+        if g > o {
+            lines.push(format!("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation {g}, observed {o}"));
+        }
+    }
+    let conditions = status.conditions.unwrap_or_default();
+    for c in &conditions {
+        let message: String = c.message.as_deref().unwrap_or_default().chars().take(300).collect();
+        lines.push(format!("condition {}={}{}{}", c.type_, c.status, c.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default(), if message.is_empty() { String::new() } else { format!(": {message}") }));
+    }
+    if conditions.iter().any(|c| c.type_ == "Progressing" && c.status == "False" && c.reason.as_deref() == Some("ProgressDeadlineExceeded")) {
+        lines.push(format!(
+            "ROLLOUT EXCEEDED ITS PROGRESS DEADLINE: it has not progressed for {deadline}s; this marks it failed, and the controller still keeps trying"
+        ));
+    }
+    if let Some(c) = conditions.iter().find(|c| c.type_ == "ReplicaFailure" && c.status == "True") {
+        lines.push(format!("REPLICA FAILURE: pods are not being created: {}", c.message.as_deref().unwrap_or("(no message)")));
+    }
+    lines.join("\n")
+}
+
+/// A Deployment's ReplicaSets, newest first, with the pods each holds, and
+/// where its rollout stands.
+fn render_deploy_replicasets(
+    dep: &k8s_openapi::api::apps::v1::Deployment,
+    replica_sets: &Result<Vec<k8s_openapi::api::apps::v1::ReplicaSet>, String>,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+) -> String {
+    // ReplicaSets shown; the rest, scaled to zero, are rollback history.
+    const SHOWN: usize = 6;
+    let replica_sets = match replica_sets {
+        Ok(r) if r.is_empty() => return "(it has no ReplicaSet: the controller has not created one)".to_string(),
+        Ok(r) => r,
+        Err(e) => return format!("(ReplicaSets unavailable: {e})"),
+    };
+    let spec = dep.spec.clone().unwrap_or_default();
+    let desired = spec.replicas.unwrap_or(1);
+    let recreate = spec.strategy.as_ref().and_then(|s| s.type_.as_deref()) == Some("Recreate");
+    // Ready and total pods of a ReplicaSet, from its pods as read.
+    let pods_of = |rs: &k8s_openapi::api::apps::v1::ReplicaSet| -> Option<(usize, usize)> {
+        let uid = rs.metadata.uid.as_deref()?;
+        let mine: Vec<_> = pods
+            .as_ref()
+            .ok()?
+            .iter()
+            .filter(|p| p.metadata.owner_references.iter().flatten().any(|o| o.controller == Some(true) && o.uid == uid))
+            .collect();
+        Some((mine.iter().filter(|p| pod_is_ready(p)).count(), mine.len()))
+    };
+    let holds = |rs: &k8s_openapi::api::apps::v1::ReplicaSet| {
+        rs.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0) > 0 || rs.status.as_ref().is_some_and(|s| s.replicas > 0)
+    };
+
+    let mut lines = Vec::new();
+    let mut findings = Vec::new();
+    let (mut history, mut unshown) = (0, 0);
+    for (i, rs) in replica_sets.iter().enumerate() {
+        if i > 0 && !holds(rs) {
+            history += 1;
+            continue;
+        }
+        if lines.len() >= SHOWN {
+            unshown += 1;
+            continue;
+        }
+        let st = rs.status.clone().unwrap_or_default();
+        let images: Vec<String> = rs
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.as_ref())
+            .and_then(|t| t.spec.as_ref())
+            .map(|s| s.containers.iter().filter_map(|c| c.image.clone()).collect())
+            .unwrap_or_default();
+        let mut line = format!(
+            "{}: revision {}{}; replicas {}, ready {}, available {}",
+            rs.metadata.name.as_deref().unwrap_or_default(),
+            k8s::rs_revision(rs),
+            if i == 0 { " (newest)" } else { "" },
+            rs.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0),
+            st.ready_replicas.unwrap_or(0),
+            st.available_replicas.unwrap_or(0)
+        );
+        if let Some((ready, total)) = pods_of(rs) {
+            line.push_str(&format!("; pods {ready} ready of {total}"));
+        }
+        if !images.is_empty() {
+            line.push_str(&format!("; images {}", images.join(", ")));
+        }
+        if let Some(c) = st.conditions.iter().flatten().find(|c| c.type_ == "ReplicaFailure" && c.status == "True") {
+            let message = c.message.as_deref().unwrap_or("(no message)");
+            line.push_str(&format!("; REPLICA FAILURE: {message}"));
+            if i == 0 {
+                findings.push(format!("THE NEWEST REPLICASET CANNOT CREATE PODS: {message}"));
+            }
+        }
+        lines.push(line);
+    }
+    if unshown > 0 {
+        lines.push(format!("and {unshown} more older ReplicaSet{} still holding pods", if unshown == 1 { "" } else { "s" }));
+    }
+    if history > 0 {
+        lines.push(format!("and {history} older ReplicaSet{} scaled to zero, kept as rollback history", if history == 1 { "" } else { "s" }));
+    }
+    if let Err(e) = pods {
+        lines.push(format!("(pods unavailable: {e})"));
+    }
+
+    // Where the rollout stands: older ReplicaSets still holding pods means it
+    // has not finished.
+    let newest = &replica_sets[0];
+    let new_ready = newest.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0);
+    let new_unready = pods_of(newest).map(|(ready, total)| total - ready).unwrap_or(0);
+    let old_pods: i32 = replica_sets[1..].iter().filter_map(|r| r.status.as_ref()).map(|s| s.replicas).sum();
+    if old_pods > 0 {
+        findings.push(format!(
+            "ROLLOUT IN PROGRESS: the newest ReplicaSet has {new_ready} of {desired} ready, and older ones still run {old_pods} pod{}; the controller scales them down only as new pods become available{}",
+            if old_pods == 1 { "" } else { "s" },
+            if new_unready > 0 {
+                format!(
+                    ". {new_unready} of the new pods {} not ready: they may only be starting; if the new template is broken, a rollback or a corrected template replaces them",
+                    if new_unready == 1 { "is" } else { "are" }
+                )
+            } else {
+                String::new()
+            }
+        ));
+    } else if recreate && new_unready > 0 {
+        findings.push(format!(
+            "RECREATE: no older pod remains, so while {new_unready} of the new pods {} not ready nothing else serves in their place",
+            if new_unready == 1 { "is" } else { "are" }
+        ));
+    }
+    lines.extend(findings);
+    lines.join("\n")
+}
+
+/// The HorizontalPodAutoscalers that target a Deployment, and what they say
+/// about scaling it.
+fn render_deploy_hpas(hpas: &Result<Vec<k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler>, String>) -> String {
+    let hpas = match hpas {
+        Ok(h) if h.is_empty() => return "(no HorizontalPodAutoscaler targets it: its replicas are set by hand)".to_string(),
+        Ok(h) => h,
+        Err(e) => return format!("(HorizontalPodAutoscalers unavailable: {e})"),
+    };
+    let mut lines: Vec<String> = hpas
+        .iter()
+        .map(|h| {
+            let spec = h.spec.clone().unwrap_or_default();
+            let st = h.status.clone().unwrap_or_default();
+            let keda = h
+                .metadata
+                .owner_references
+                .iter()
+                .flatten()
+                .find(|o| o.kind == "ScaledObject")
+                .map(|o| format!(" (made by KEDA ScaledObject {})", o.name))
+                .unwrap_or_default();
+            let mut line = format!(
+                "{}{keda}: min {}, max {}, current {}, desired {}",
+                h.metadata.name.as_deref().unwrap_or_default(),
+                spec.min_replicas.unwrap_or(1),
+                spec.max_replicas,
+                st.current_replicas.unwrap_or(0),
+                st.desired_replicas
+            );
+            for c in st.conditions.iter().flatten() {
+                let notable = match c.type_.as_str() {
+                    "AbleToScale" | "ScalingActive" => c.status == "False",
+                    "ScalingLimited" => c.status == "True",
+                    _ => false,
+                };
+                if notable {
+                    let message: String = c.message.as_deref().unwrap_or_default().chars().take(200).collect();
+                    line.push_str(&format!("; {}={} ({}): {message}", c.type_, c.status, c.reason.as_deref().unwrap_or("?")));
+                }
+            }
+            line
+        })
+        .collect();
+    lines.push(if hpas.len() > 1 {
+        "MORE THAN ONE HPA TARGETS IT: each overwrites the replica count the other sets".to_string()
+    } else {
+        "the HPA sets its replicas, so a change to spec.replicas is overwritten".to_string()
+    });
+    lines.join("\n")
+}
+
+/// The Deployment sections of a workload diagnosis.
+fn render_deploy_sections(d: &k8s::DeploymentDiagnostics) -> String {
+    let events = d
+        .new_rs_events
+        .as_ref()
+        .map(|(rs, e)| format!("\n\n## Events (ReplicaSet {rs})\n{}", render_nap_events(e, "(no events for it)", false, 10)))
+        .unwrap_or_default();
+    format!(
+        "## Deployment\n{}\n\n## ReplicaSets\n{}{events}\n\n## Autoscaling\n{}\n\n## PodDisruptionBudgets\n{}",
+        render_deploy_spec(&d.deployment),
+        render_deploy_replicasets(&d.deployment, &d.replica_sets, &d.pods),
+        render_deploy_hpas(&d.hpas),
+        render_pdbs(&d.pdbs),
+    )
+}
+
 /// Assembles everything a workload diagnosis needs, redacted and trimmed.
 ///
 /// Shaped like `build_diagnosis_payload` but a controller sees a different
@@ -4675,7 +4961,9 @@ pub async fn build_workload_diagnosis_payload(
             // A StatefulSet's pods have identities, volumes and an order, so
             // its failures are often about which ordinal is stuck and why, not
             // about what the pods have in common. A DaemonSet's are about
-            // nodes: which should run its pod, and what keeps one off.
+            // nodes: which should run its pod, and what keeps one off. A
+            // Deployment's are about its ReplicaSets: whether the newest can
+            // create pods, and how far the rollout from the old ones has got.
             match kind {
                 "StatefulSet" => Some(match k8s::get_statefulset_diagnostics(context_name, namespace, name).await {
                     Ok(d) => render_sts_sections(&d, chrono::Utc::now()),
@@ -4684,6 +4972,10 @@ pub async fn build_workload_diagnosis_payload(
                 "DaemonSet" => Some(match k8s::get_daemonset_diagnostics(context_name, namespace, name).await {
                     Ok(d) => render_ds_sections(&d, chrono::Utc::now()),
                     Err(e) => format!("## DaemonSet\n(DaemonSet details unavailable: {e})"),
+                }),
+                "Deployment" => Some(match k8s::get_deployment_diagnostics(context_name, namespace, name).await {
+                    Ok(d) => render_deploy_sections(&d),
+                    Err(e) => format!("## Deployment\n(Deployment details unavailable: {e})"),
                 }),
                 _ => None,
             }
@@ -5143,6 +5435,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "PersistentVolumeClaim" => DIAGNOSE_PVC_SYSTEM,
         "StatefulSet" => DIAGNOSE_STATEFULSET_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
+        "Deployment" => DIAGNOSE_DEPLOYMENT_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -6793,20 +7086,20 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
                 "status": { "currentHealthy": healthy, "desiredHealthy": 3, "expectedPods": 3, "disruptionsAllowed": allowed } })).unwrap()
         };
         let all = || Some(vec!["db-0".to_string(), "db-1".to_string(), "db-2".to_string()]);
-        assert_eq!(render_sts_pdbs(&Ok(vec![])), "(no PodDisruptionBudget covers its pods)");
+        assert_eq!(render_pdbs(&Ok(vec![])), "(no PodDisruptionBudget covers its pods)");
         assert_eq!(
-            render_sts_pdbs(&Ok(vec![(pdb("db", 3, 0, None), all()), (pdb("db-extra", 3, 1, None), Some(vec!["db-2".to_string()]))])),
+            render_pdbs(&Ok(vec![(pdb("db", 3, 0, None), all()), (pdb("db-extra", 3, 1, None), Some(vec!["db-2".to_string()]))])),
             "db: minAvailable 3; covers db-0, db-1, db-2; healthy 3 of 3 expected, 3 needed; disruptions allowed 0 — NO HEALTHY POD MAY BE EVICTED: a drain waits on any node running one of its ready pods; the budget is met, so a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy IfHealthyBudget, the default)\n\
              db-extra: minAvailable 3; covers db-2; healthy 3 of 3 expected, 3 needed; disruptions allowed 1\n\
              MORE THAN ONE BUDGET COVERS db-2: the eviction API refuses to evict a pod covered by more than one"
         );
-        assert!(render_sts_pdbs(&Ok(vec![(pdb("db", 2, 0, Some("IfHealthyBudget")), all())]))
+        assert!(render_pdbs(&Ok(vec![(pdb("db", 2, 0, Some("IfHealthyBudget")), all())]))
             .ends_with("the budget is not met, so a running pod that is not ready cannot be evicted either (unhealthyPodEvictionPolicy IfHealthyBudget)"));
-        assert!(render_sts_pdbs(&Ok(vec![(pdb("db", 2, 0, Some("AlwaysAllow")), all())])).ends_with("a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy AlwaysAllow)"));
+        assert!(render_pdbs(&Ok(vec![(pdb("db", 2, 0, Some("AlwaysAllow")), all())])).ends_with("a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy AlwaysAllow)"));
         // Budgets over different ordinals do not overlap.
-        let split = render_sts_pdbs(&Ok(vec![(pdb("a", 3, 1, None), Some(vec!["db-0".to_string()])), (pdb("b", 3, 1, None), Some(vec!["db-1".to_string()]))]));
+        let split = render_pdbs(&Ok(vec![(pdb("a", 3, 1, None), Some(vec!["db-0".to_string()])), (pdb("b", 3, 1, None), Some(vec!["db-1".to_string()]))]));
         assert!(!split.contains("MORE THAN ONE"), "{split}");
-        assert!(render_sts_pdbs(&Ok(vec![(pdb("a", 3, 1, None), None), (pdb("b", 3, 1, None), None)]))
+        assert!(render_pdbs(&Ok(vec![(pdb("a", 3, 1, None), None), (pdb("b", 3, 1, None), None)]))
             .contains("covers the pod template (no pod to check)"));
     }
 
@@ -6978,6 +7271,121 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         let out = render_ds_nodes(&ds, &Ok(outage), &Ok(vec![ds_node("n1", "linux", true, serde_json::json!([]))]), &Ok(Some("h2".into())), now);
         assert!(out.ends_with("25 PODS ARE STUCK TERMINATING ON NODES THAT ARE NOT READY OR GONE: agent-x00 (GONE), agent-x01 (GONE), agent-x02 (GONE), agent-x03 (GONE), agent-x04 (GONE), agent-x05 (GONE), agent-x06 (GONE), agent-x07 (GONE), agent-x08 (GONE), agent-x09 (GONE) and 15 more; the kubelets there cannot confirm they stopped"), "{out}");
         assert_eq!(out.matches("STUCK").count(), 1);
+    }
+
+    fn deployment(v: serde_json::Value) -> k8s_openapi::api::apps::v1::Deployment {
+        let mut base = serde_json::json!({
+            "metadata": { "name": "web", "namespace": "ns", "generation": 4, "uid": "d-uid" },
+            "spec": {
+                "replicas": 3, "selector": { "matchLabels": { "app": "web" } },
+                "template": { "metadata": { "labels": { "app": "web" } }, "spec": { "containers": [{ "name": "web", "image": "web:2" }] } },
+                "strategy": { "type": "RollingUpdate", "rollingUpdate": { "maxSurge": "25%", "maxUnavailable": "25%" } }
+            },
+            "status": { "replicas": 3, "updatedReplicas": 3, "readyReplicas": 3, "availableReplicas": 3, "observedGeneration": 4,
+                "conditions": [{ "type": "Available", "status": "True", "reason": "MinimumReplicasAvailable" },
+                    { "type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable" }] }
+        });
+        json_merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn replica_set(revision: i64, replicas: i32, ready: i32, extra: serde_json::Value) -> k8s_openapi::api::apps::v1::ReplicaSet {
+        let mut base = serde_json::json!({
+            "metadata": { "name": format!("web-r{revision}"), "uid": format!("rs-{revision}"), "annotations": { "deployment.kubernetes.io/revision": revision.to_string() } },
+            "spec": { "replicas": replicas, "selector": { "matchLabels": { "app": "web" } },
+                "template": { "spec": { "containers": [{ "name": "web", "image": format!("web:{revision}") }] } } },
+            "status": { "replicas": replicas, "readyReplicas": ready, "availableReplicas": ready }
+        });
+        json_merge(&mut base, extra);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn rs_pod(revision: i64, n: usize, ready: bool) -> k8s_openapi::api::core::v1::Pod {
+        let mut p = labelled_pod(&format!("web-r{revision}-{n}"), serde_json::json!({ "app": "web" }), ready, serde_json::json!({}));
+        p.metadata.owner_references = Some(vec![serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "ReplicaSet", "name": format!("web-r{revision}"), "uid": format!("rs-{revision}"), "controller": true
+        })).unwrap()]);
+        p
+    }
+
+    #[test]
+    fn a_deployments_conditions_say_where_its_rollout_stands() {
+        assert_eq!(
+            render_deploy_spec(&deployment(serde_json::json!({}))),
+            "replicas: desired 3, updated 3, ready 3, available 3, unavailable 0\n\
+             strategy: RollingUpdate, maxSurge 25%, maxUnavailable 25%\n\
+             progressDeadlineSeconds: 600\n\
+             condition Available=True (MinimumReplicasAvailable)\n\
+             condition Progressing=True (NewReplicaSetAvailable)"
+        );
+        let failed = deployment(serde_json::json!({
+            "metadata": { "generation": 5 },
+            "spec": { "paused": true, "progressDeadlineSeconds": 120 },
+            "status": { "conditions": [
+                { "type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded", "message": "ReplicaSet \"web-r7\" has timed out progressing." },
+                { "type": "ReplicaFailure", "status": "True", "reason": "FailedCreate", "message": "pods \"web-r7-x\" is forbidden: exceeded quota: compute" }] }
+        }));
+        let out = render_deploy_spec(&failed);
+        assert!(out.contains("PAUSED: changes to its template do not roll out until it is resumed"), "{out}");
+        assert!(out.contains("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation 5, observed 4"), "{out}");
+        assert!(out.contains("ROLLOUT EXCEEDED ITS PROGRESS DEADLINE: it has not progressed for 120s"), "{out}");
+        assert!(out.ends_with("REPLICA FAILURE: pods are not being created: pods \"web-r7-x\" is forbidden: exceeded quota: compute"), "{out}");
+        let recreate = deployment(serde_json::json!({ "spec": { "strategy": { "type": "Recreate", "rollingUpdate": null } } }));
+        assert!(render_deploy_spec(&recreate).contains("strategy: Recreate\n"));
+    }
+
+    #[test]
+    fn a_deployments_replicasets_show_how_far_it_has_rolled() {
+        let dep = deployment(serde_json::json!({}));
+        let rss = vec![
+            replica_set(7, 2, 0, serde_json::json!({ "status": { "conditions": [{ "type": "ReplicaFailure", "status": "True", "reason": "FailedCreate",
+                "message": "admission webhook denied the request" }] } })),
+            replica_set(6, 2, 2, serde_json::json!({})),
+            replica_set(5, 0, 0, serde_json::json!({})),
+            replica_set(4, 0, 0, serde_json::json!({})),
+        ];
+        let pods = vec![rs_pod(7, 0, false), rs_pod(6, 0, true), rs_pod(6, 1, true)];
+        assert_eq!(
+            render_deploy_replicasets(&dep, &Ok(rss), &Ok(pods)),
+            "web-r7: revision 7 (newest); replicas 2, ready 0, available 0; pods 0 ready of 1; images web:7; REPLICA FAILURE: admission webhook denied the request\n\
+             web-r6: revision 6; replicas 2, ready 2, available 2; pods 2 ready of 2; images web:6\n\
+             and 2 older ReplicaSets scaled to zero, kept as rollback history\n\
+             THE NEWEST REPLICASET CANNOT CREATE PODS: admission webhook denied the request\n\
+             ROLLOUT IN PROGRESS: the newest ReplicaSet has 0 of 3 ready, and older ones still run 2 pods; the controller scales them down only as new pods become available. 1 of the new pods is not ready: they may only be starting; if the new template is broken, a rollback or a corrected template replaces them"
+        );
+        // Settled: one ReplicaSet holds every pod.
+        let settled = render_deploy_replicasets(&dep, &Ok(vec![replica_set(7, 3, 3, serde_json::json!({})), replica_set(6, 0, 0, serde_json::json!({}))]),
+            &Ok(vec![rs_pod(7, 0, true), rs_pod(7, 1, true), rs_pod(7, 2, true)]));
+        assert_eq!(settled, "web-r7: revision 7 (newest); replicas 3, ready 3, available 3; pods 3 ready of 3; images web:7\nand 1 older ReplicaSet scaled to zero, kept as rollback history");
+        let recreate = deployment(serde_json::json!({ "spec": { "strategy": { "type": "Recreate", "rollingUpdate": null } } }));
+        assert!(render_deploy_replicasets(&recreate, &Ok(vec![replica_set(7, 3, 0, serde_json::json!({}))]), &Ok(vec![rs_pod(7, 0, false)]))
+            .ends_with("RECREATE: no older pod remains, so while 1 of the new pods is not ready nothing else serves in their place"));
+        assert_eq!(render_deploy_replicasets(&dep, &Ok(vec![]), &Ok(vec![])), "(it has no ReplicaSet: the controller has not created one)");
+        let blind = render_deploy_replicasets(&dep, &Ok(vec![replica_set(7, 3, 3, serde_json::json!({}))]), &Err("forbidden".into()));
+        assert_eq!(blind, "web-r7: revision 7 (newest); replicas 3, ready 3, available 3; images web:7\n(pods unavailable: forbidden)");
+    }
+
+    #[test]
+    fn the_autoscalers_on_a_deployment_are_named() {
+        let hpa = |name: &str, extra: serde_json::Value| -> k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler {
+            let mut base = serde_json::json!({ "metadata": { "name": name },
+                "spec": { "minReplicas": 2, "maxReplicas": 10, "scaleTargetRef": { "apiVersion": "apps/v1", "kind": "Deployment", "name": "web" } },
+                "status": { "currentReplicas": 10, "desiredReplicas": 10 } });
+            json_merge(&mut base, extra);
+            serde_json::from_value(base).unwrap()
+        };
+        assert_eq!(render_deploy_hpas(&Ok(vec![])), "(no HorizontalPodAutoscaler targets it: its replicas are set by hand)");
+        let limited = hpa("web", serde_json::json!({ "status": { "conditions": [
+            { "type": "AbleToScale", "status": "True", "reason": "ReadyForNewScale" },
+            { "type": "ScalingLimited", "status": "True", "reason": "TooManyReplicas", "message": "the desired replica count is more than the maximum replica count" }] } }));
+        assert_eq!(
+            render_deploy_hpas(&Ok(vec![limited])),
+            "web: min 2, max 10, current 10, desired 10; ScalingLimited=True (TooManyReplicas): the desired replica count is more than the maximum replica count\n\
+             the HPA sets its replicas, so a change to spec.replicas is overwritten"
+        );
+        let keda = hpa("keda-hpa-web", serde_json::json!({ "metadata": { "ownerReferences": [{ "apiVersion": "keda.sh/v1alpha1", "kind": "ScaledObject", "name": "web", "uid": "u" }] } }));
+        let out = render_deploy_hpas(&Ok(vec![hpa("web", serde_json::json!({})), keda]));
+        assert!(out.contains("keda-hpa-web (made by KEDA ScaledObject web): min 2") && out.ends_with("MORE THAN ONE HPA TARGETS IT: each overwrites the replica count the other sets"), "{out}");
     }
 
     #[test]
@@ -7529,6 +7937,74 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(unavailable, 0);
         assert_eq!(explained, unhealthy);
         assert_eq!(eligibility_differs, 0);
+    }
+
+    /// Builds Deployment diagnoses on a live cluster: every unhealthy one and
+    /// up to 15 healthy ones. Prints counts only.
+    ///
+    ///   DEPLOYMENT_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml deployment_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set DEPLOYMENT_DIAG_TEST_CONTEXT to run"]
+    async fn deployment_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("DEPLOYMENT_DIAG_TEST_CONTEXT") else { return };
+        let all: Vec<_> = k8s::get_workloads(&ctx).await.expect("workloads").into_iter().filter(|w| w.kind == "Deployment").collect();
+        let mut sample: Vec<_> = all.iter().filter(|w| !w.healthy).collect();
+        sample.extend(all.iter().filter(|w| w.healthy).take(15));
+        let (mut built, mut unavailable, mut largest, mut unhealthy, mut explained) = (0, 0, 0, 0, 0);
+        let (mut no_rs, mut history, mut rolling, mut replica_failure, mut deadline, mut paused, mut largest_section) = (0, 0, 0, 0, 0, 0, 0);
+        let (mut with_hpa, mut multi_hpa, mut keda, mut with_pdb, mut pdb_blocks, mut pods_mismatch) = (0, 0, 0, 0, 0, 0);
+        for w in sample.iter().copied() {
+            let payload = build_workload_diagnosis_payload(&ctx, &w.kind, &w.namespace, &w.name).await.expect("payload");
+            let p = &payload.prompt;
+            let dep = p.split("## Deployment\n").nth(1).and_then(|s| s.split("\n\n## Events (Deployment)").next()).expect("Deployment sections");
+            built += 1;
+            unavailable += dep.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            largest_section = largest_section.max(dep.len() / 4);
+            no_rs += dep.contains("(it has no ReplicaSet") as usize;
+            history += dep.contains("kept as rollback history") as usize;
+            rolling += dep.contains("ROLLOUT IN PROGRESS") as usize;
+            replica_failure += (dep.contains("REPLICA FAILURE") || dep.contains("CANNOT CREATE PODS")) as usize;
+            deadline += dep.contains("PROGRESS DEADLINE") as usize;
+            paused += dep.contains("PAUSED:") as usize;
+            with_hpa += !dep.contains("(no HorizontalPodAutoscaler targets it") as usize;
+            multi_hpa += dep.contains("MORE THAN ONE HPA") as usize;
+            keda += dep.contains("(made by KEDA ScaledObject") as usize;
+            with_pdb += !dep.contains("(no PodDisruptionBudget covers") as usize;
+            pdb_blocks += dep.contains("NO HEALTHY POD MAY BE EVICTED") as usize;
+            // The pods counted under its ReplicaSets should be the pods the
+            // generic table lists for it: both are its pods, read two ways.
+            let counted: usize = dep
+                .lines()
+                .filter_map(|l| l.split("; pods ").nth(1)?.split(';').next()?.split(" ready of ").nth(1)?.trim().parse::<usize>().ok())
+                .sum();
+            let table = p.split("## Pods (worst first)\n").nth(1).and_then(|s| s.split("\n\n").next()).unwrap_or_default();
+            let listed = if table.starts_with('(') { 0 } else { table.lines().filter(|l| !l.starts_with("(…")).count() };
+            pods_mismatch += (listed < 20 && counted != listed) as usize;
+            if !w.healthy {
+                unhealthy += 1;
+                let short = dep.lines().any(|l| {
+                    l.split("; pods ").nth(1).and_then(|r| r.split(';').next()).and_then(|r| r.split_once(" ready of ")).is_some_and(|(a, b)| a.trim() != b.trim())
+                });
+                explained += (short
+                    || dep.contains("REPLICA FAILURE")
+                    || dep.contains("ROLLOUT")
+                    || dep.contains("PAUSED")
+                    || dep.contains("NOT YET ACTED")
+                    || dep.contains("condition Available=False")
+                    || dep.contains("(it has no ReplicaSet")) as usize;
+            }
+        }
+        println!(
+            "deployments={} sampled={} built={built} unavailable_sections={unavailable} largest_tokens={largest} largest_section_tokens={largest_section} unhealthy={unhealthy}/{explained} no_rs={no_rs} history={history} rolling={rolling} replica_failure={replica_failure} deadline={deadline} paused={paused} with_hpa={with_hpa} multi_hpa={multi_hpa} keda={keda} with_pdb={with_pdb} pdb_blocks={pdb_blocks} pods_mismatch={pods_mismatch}",
+            all.len(),
+            sample.len()
+        );
+        assert!(built > 0, "no Deployment to diagnose");
+        assert_eq!(unavailable, 0);
+        assert_eq!(explained, unhealthy);
+        assert_eq!(pods_mismatch, 0);
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs

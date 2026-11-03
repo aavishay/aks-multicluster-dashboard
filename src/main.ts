@@ -7109,6 +7109,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
                   : d.kind === "StatefulSet"
                   ? "Status, revisions and update strategy, each ordinal's pod with its revision and the state of the node under one that is stuck, each ordinal's volume claim against its template, the governing Service, the PodDisruptionBudgets over its pods, its events and manifest, a table of its pods, and the events and recent logs of its least healthy pod."
+                  : d.kind === "Deployment"
+                  ? "Status, strategy and conditions, its ReplicaSets newest first with the pods each holds and the events of the newest, the HPAs that target it, the PodDisruptionBudgets over its pods, its events and manifest, a table of its pods, and the events and recent logs of its least healthy pod."
                   : d.kind === "DaemonSet"
                   ? "Status, latest revision and update strategy, which nodes should run its pod and why the others are left out, the nodes missing one, its pods that are not ready with their node and revision, its events and manifest, a table of its pods, and the events and recent logs of its least healthy pod."
                   : "Status, events and manifest, a table of every pod this controls, and the events and recent logs of its least healthy pod."
