@@ -126,6 +126,61 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_DAEMONSET_SYSTEM: &str = "\
+You diagnose failing Kubernetes DaemonSets for an experienced SRE.
+
+You are given the DaemonSet's node counts, latest revision and update \
+strategy; which nodes should run its pod, worked out from its nodeSelector, \
+required node affinity and tolerations (including those the controller adds \
+to every DaemonSet pod), with the reasons the others are excluded; the nodes \
+that should run one but do not; its pods that are not ready, with their node, \
+revision and scheduling message; its events and manifest; a table of its pods \
+worst first; and the events and recent logs of the pod least likely to be \
+healthy, with its previous instance's logs when it has restarted. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the node, the pod, the \
+taint, the event, the log line, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- Nodes that should run a pod and have none: the controller makes one per \
+node, so when it has not, its events say why (FailedCreate: quota, an \
+admission webhook, a policy).
+- Nodes deliberately left out: a taint it does not tolerate, or a \
+nodeSelector or affinity it does not match. That is by design unless the \
+user expects the pod there; then the fix is a toleration or a selector, not \
+the node.
+- A pod that cannot fit on its node: a DaemonSet pod runs only on its own \
+node, so it waits for room there. Insufficient CPU or memory means the \
+node's other pods have it; it can preempt them only if its priority is \
+higher than theirs and its preemptionPolicy is not Never. A host port already in use means \
+another pod on that node holds it.
+- A rollout that has stopped: pods on the latest revision that are not ready \
+count as unavailable, and once the nodes without an available pod reach \
+maxUnavailable (with no surge), the controller replaces no more old pods. \
+Below that it carries on, so check the counts before calling it stuck. The \
+new pods may only be starting; if the new template is broken, correct or \
+revert it, and the controller then replaces them, as it replaces any \
+unavailable pod on an older revision. OnDelete moves a pod only when it is \
+deleted, by design.
+- A pod that fails on some nodes only: compare those nodes — their pool, \
+OS, kernel or architecture — with the nodes where it is ready.
+- A pod stuck terminating on a node that is NotReady or gone: the kubelet \
+there cannot confirm it stopped. Force-delete only once the node is \
+confirmed down.
+- A misscheduled pod: one on a node it no longer fits, which the controller \
+deletes.
+
+If the DaemonSet is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -4279,6 +4334,323 @@ fn render_sts_sections(d: &k8s::StatefulSetDiagnostics, now: chrono::DateTime<ch
     )
 }
 
+/// A DaemonSet's node counts, update strategy and latest revision, and
+/// whether a rollout is under way.
+fn render_ds_spec(ds: &k8s_openapi::api::apps::v1::DaemonSet, latest: &Result<Option<String>, String>) -> String {
+    let spec = ds.spec.clone().unwrap_or_default();
+    let status = ds.status.clone().unwrap_or_default();
+    let desired = status.desired_number_scheduled;
+    let updated = status.updated_number_scheduled.unwrap_or(0);
+    let mut lines = vec![format!(
+        "nodes: desired {desired}, scheduled {}, ready {}, available {}, up to date {updated}, misscheduled {}",
+        status.current_number_scheduled,
+        status.number_ready,
+        status.number_available.unwrap_or(0),
+        status.number_misscheduled
+    )];
+    let strategy = spec.update_strategy.clone().unwrap_or_default();
+    let kind = strategy.type_.clone().unwrap_or_else(|| "RollingUpdate".into());
+    let rolling = strategy.rolling_update.clone().unwrap_or_default();
+    let mut strategy_line = format!("update strategy: {kind}");
+    let mut budget = Vec::new();
+    if kind == "RollingUpdate" {
+        if let Some(m) = &rolling.max_unavailable {
+            budget.push(format!("maxUnavailable {}", int_or_string(m)));
+        }
+        if let Some(m) = &rolling.max_surge {
+            budget.push(format!("maxSurge {}", int_or_string(m)));
+        }
+        if !budget.is_empty() {
+            strategy_line.push_str(&format!(", {}", budget.join(", ")));
+        }
+    }
+    lines.push(strategy_line);
+    if let Some(s) = spec.min_ready_seconds.filter(|s| *s > 0) {
+        lines.push(format!("minReadySeconds: {s}"));
+    }
+    lines.push(match latest {
+        Ok(Some(h)) => format!("latest revision: {h}"),
+        Ok(None) => "latest revision: (none found)".to_string(),
+        Err(e) => format!("latest revision: (revisions unavailable: {e})"),
+    });
+    if let (Some(g), Some(o)) = (ds.metadata.generation, status.observed_generation) {
+        if g > o {
+            lines.push(format!("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation {g}, observed {o}"));
+        }
+    }
+    if updated < desired {
+        lines.push(if kind == "OnDelete" {
+            format!("ON DELETE: {updated} of {desired} nodes run the latest template, and a pod moves to it only when deleted")
+        } else {
+            format!(
+                "ROLLOUT IN PROGRESS: {updated} of {desired} nodes run the latest template; it replaces old pods {} at a time",
+                if budget.is_empty() { "maxUnavailable".to_string() } else { budget.join(", ") }
+            )
+        });
+    }
+    lines.join("\n")
+}
+
+/// Which nodes should run a DaemonSet's pod and which do, why the others are
+/// left out, and its pods that are not ready, with what is holding them.
+fn render_ds_nodes(
+    ds: &k8s_openapi::api::apps::v1::DaemonSet,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+    nodes: &Result<Vec<k8s_openapi::api::core::v1::Node>, String>,
+    latest: &Result<Option<String>, String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    // Lines of each kind, so one large cluster cannot crowd out the rest.
+    const SHOWN: usize = 10;
+    let pods = match pods {
+        Ok(p) => p,
+        Err(e) => return format!("(pods unavailable: {e})"),
+    };
+    let spec = ds.spec.clone().unwrap_or_default();
+    let template = spec.template.spec.clone().unwrap_or_default();
+    let latest = latest.as_ref().ok().cloned().flatten();
+    let rolling_update = spec.update_strategy.as_ref().and_then(|u| u.type_.as_deref()).unwrap_or("RollingUpdate") == "RollingUpdate";
+    let node_list = nodes.as_ref().ok();
+    let node_by_name: std::collections::BTreeMap<&str, &k8s_openapi::api::core::v1::Node> =
+        node_list.into_iter().flatten().filter_map(|n| Some((n.metadata.name.as_deref()?, n))).collect();
+    let mut by_node: std::collections::BTreeMap<String, Vec<&k8s_openapi::api::core::v1::Pod>> = std::collections::BTreeMap::new();
+    for p in pods {
+        by_node.entry(k8s::daemon_pod_node(p).unwrap_or_default()).or_default().push(p);
+    }
+    let node_note = |n: &str| match node_by_name.get(n) {
+        None if node_list.is_some() && !n.is_empty() => " (NODE NO LONGER EXISTS)",
+        Some(node) if !k8s::node_is_ready(node) => " (node NOT READY)",
+        Some(node) if node.spec.as_ref().and_then(|s| s.unschedulable) == Some(true) => " (node cordoned)",
+        _ => "",
+    };
+    let more = |n: usize| if n > SHOWN { format!(" and {} more", n - SHOWN) } else { String::new() };
+
+    let mut lines = Vec::new();
+    let mut findings = Vec::new();
+    match nodes {
+        Err(e) => lines.push(format!("(nodes unavailable: {e}; which nodes should run its pod was not worked out)")),
+        Ok(_) if node_by_name.is_empty() => lines.push("(the cluster lists no nodes)".to_string()),
+        Ok(_) => {
+            let mut excluded: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            let mut missing = Vec::new();
+            let mut misscheduled = Vec::new();
+            let (mut should, mut kept) = (0, 0);
+            for (n, node) in &node_by_name {
+                let here = by_node.get(*n).map(Vec::as_slice).unwrap_or_default();
+                let misfit = k8s::daemon_pod_misfit(&template, node, true);
+                should += misfit.is_none() as usize;
+                match (misfit, here.is_empty()) {
+                    (None, true) => missing.push(format!("{n}{}", node_note(n))),
+                    (Some(why), true) => *excluded.entry(why).or_default() += 1,
+                    (None, false) => {}
+                    (Some(_), false) => match k8s::daemon_pod_misfit(&template, node, false) {
+                        Some(why) => misscheduled.extend(here.iter().map(|p| format!("{} on {n}: {why}", p.metadata.name.as_deref().unwrap_or_default()))),
+                        None => kept += 1,
+                    },
+                }
+            }
+            lines.push(format!(
+                "{} node{}: {should} should run its pod, by its nodeSelector, required node affinity and tolerations (with those every DaemonSet pod gets); {} should not",
+                node_by_name.len(),
+                if node_by_name.len() == 1 { "" } else { "s" },
+                node_by_name.len() - should
+            ));
+            let mut reasons: Vec<(String, usize)> = excluded.into_iter().collect();
+            reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for (why, count) in reasons.iter().take(SHOWN) {
+                lines.push(format!("  {count} left out: {why}"));
+            }
+            if reasons.len() > SHOWN {
+                lines.push(format!("  and {} more reasons", reasons.len() - SHOWN));
+            }
+            if kept > 0 {
+                lines.push(format!(
+                    "  {kept} more {} a pod {} would not get now, under a NoSchedule taint it does not tolerate: a running pod is kept through one",
+                    if kept == 1 { "runs" } else { "run" },
+                    if kept == 1 { "it" } else { "they" }
+                ));
+            }
+            if !missing.is_empty() {
+                findings.push(format!(
+                    "NO POD ON {} NODE{} THAT SHOULD RUN ONE: {}{}; the controller creates one per node, and when it has not, its events say why",
+                    missing.len(),
+                    if missing.len() == 1 { "" } else { "S" },
+                    missing.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", "),
+                    more(missing.len())
+                ));
+            }
+            if !misscheduled.is_empty() {
+                findings.push(format!(
+                    "MISSCHEDULED, AND DELETED BY THE CONTROLLER: {}{}",
+                    misscheduled.iter().take(SHOWN).cloned().collect::<Vec<_>>().join("; "),
+                    more(misscheduled.len())
+                ));
+            }
+        }
+    }
+
+    // Its pods that are not ready or are terminating, by name.
+    let mut troubled: Vec<&k8s_openapi::api::core::v1::Pod> =
+        pods.iter().filter(|p| !pod_is_ready(p) || p.metadata.deletion_timestamp.is_some()).collect();
+    troubled.sort_by_key(|p| p.metadata.name.clone());
+    let (mut new_unready, mut old) = (Vec::new(), 0);
+    let (mut no_room, mut port_taken) = (Vec::new(), 0);
+    let mut stuck = Vec::new();
+    for p in pods {
+        let hash = p.metadata.labels.as_ref().and_then(|l| l.get("controller-revision-hash")).cloned().unwrap_or_default();
+        if p.metadata.deletion_timestamp.is_none() && !hash.is_empty() {
+            match &latest {
+                Some(l) if *l == hash => {
+                    if !pod_is_ready(p) && p.status.as_ref().and_then(|s| s.phase.as_deref()) != Some("Succeeded") {
+                        new_unready.push(p.metadata.name.clone().unwrap_or_default());
+                    }
+                }
+                Some(_) => old += 1,
+                None => {}
+            }
+        }
+    }
+    if troubled.is_empty() {
+        lines.push(if pods.is_empty() { "(it has no pods)".to_string() } else { format!("all {} of its pods are ready", pods.len()) });
+    } else {
+        lines.push(format!("{} of its {} pods are not ready or are terminating:", troubled.len(), pods.len()));
+    }
+    for (i, p) in troubled.iter().enumerate() {
+        let pod_name = p.metadata.name.as_deref().unwrap_or_default();
+        let node = k8s::daemon_pod_node(p).unwrap_or_default();
+        let st = p.status.clone().unwrap_or_default();
+        let note = node_note(&node);
+        let scheduled = p.spec.as_ref().and_then(|s| s.node_name.as_deref()).is_some_and(|n| !n.is_empty());
+        let mut line = format!(
+            "  {pod_name} {} {}{note}: {}{}",
+            if scheduled { "on" } else { "for" },
+            if node.is_empty() { "(no node)" } else { &node },
+            st.phase.as_deref().unwrap_or("Unknown"),
+            if pod_is_ready(p) { ", ready" } else { ", NOT READY" }
+        );
+        for c in st.init_container_statuses.iter().flatten().chain(st.container_statuses.iter().flatten()) {
+            if let Some(w) = c.state.as_ref().and_then(|s| s.waiting.as_ref()) {
+                line.push_str(&format!("; {} waiting: {}", c.name, w.reason.as_deref().unwrap_or("?")));
+            }
+        }
+        let hash = p.metadata.labels.as_ref().and_then(|l| l.get("controller-revision-hash")).cloned().unwrap_or_default();
+        line.push_str(&format!(
+            "; revision {}{}",
+            if hash.is_empty() { "(unlabelled)" } else { &hash },
+            match &latest {
+                Some(l) if *l == hash => " (latest)",
+                Some(_) if !hash.is_empty() => " (OLDER)",
+                _ => "",
+            }
+        ));
+        if let Some(msg) = st
+            .conditions
+            .iter()
+            .flatten()
+            .find(|c| c.type_ == "PodScheduled" && c.status == "False")
+            .and_then(|c| c.message.clone())
+        {
+            if msg.contains("Insufficient") {
+                no_room.push(*p);
+            }
+            port_taken += msg.contains("free ports") as usize;
+            let msg: String = msg.chars().take(300).collect();
+            line.push_str(&format!("; UNSCHEDULABLE: {msg}"));
+        }
+        if let Some(t) = p.metadata.deletion_timestamp.as_ref() {
+            let mins = (now - t.0).num_minutes();
+            line.push_str(&format!("; TERMINATING since {} ({})", t.0.to_rfc3339(), if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }));
+            if !note.is_empty() && note != " (node cordoned)" {
+                stuck.push((pod_name.to_string(), if note.contains("NO LONGER") { "GONE" } else { "NOT READY" }));
+            }
+        }
+        // Every one is counted above, but only the head of a long list is
+        // shown: the rest usually say the same thing.
+        if i < SHOWN * 2 {
+            lines.push(line);
+        }
+    }
+    if troubled.len() > SHOWN * 2 {
+        lines.push(format!("  and {} more", troubled.len() - SHOWN * 2));
+    }
+    match stuck.as_slice() {
+        [] => {}
+        [(pod, why)] => findings.push(format!("{pod} IS STUCK TERMINATING ON A NODE THAT IS {why}: the kubelet there cannot confirm it stopped")),
+        many => findings.push(format!(
+            "{} PODS ARE STUCK TERMINATING ON NODES THAT ARE NOT READY OR GONE: {}{}; the kubelets there cannot confirm they stopped",
+            many.len(),
+            many.iter().take(SHOWN).map(|(p, why)| format!("{p} ({why})")).collect::<Vec<_>>().join(", "),
+            more(many.len())
+        )),
+    }
+    // Whether a pod can preempt is what admission settled on the pod itself:
+    // its priority and preemptionPolicy, which a default class may have set.
+    if let Some(first) = no_room.first() {
+        let pod_spec = first.spec.clone().unwrap_or_default();
+        let priority = pod_spec.priority.unwrap_or(0);
+        let class = pod_spec.priority_class_name.map(|c| format!("class {c}")).unwrap_or_else(|| "no priorityClassName".to_string());
+        findings.push(format!(
+            "{} POD{} CANNOT FIT ON {} NODE: a DaemonSet pod runs only on its own node, so it waits for room there; {}",
+            no_room.len(),
+            if no_room.len() == 1 { "" } else { "S" },
+            if no_room.len() == 1 { "ITS" } else { "THEIR" },
+            if pod_spec.preemption_policy.as_deref() == Some("Never") {
+                format!("its preemptionPolicy is Never ({class}), so it preempts nothing")
+            } else if priority <= 0 {
+                format!("at priority {priority} ({class}) it can preempt only pods of lower priority, which few are; a class such as system-node-critical is what lets it make room")
+            } else {
+                format!("at priority {priority} ({class}) it can preempt pods of lower priority on that node, if evicting them frees enough")
+            }
+        ));
+    }
+    if port_taken > 0 {
+        findings.push(format!("{port_taken} POD{} BLOCKED BY A HOST PORT ALREADY IN USE ON {} NODE", if port_taken == 1 { " IS" } else { "S ARE" }, if port_taken == 1 { "ITS" } else { "THEIR" }));
+    }
+    if rolling_update && old > 0 && !new_unready.is_empty() {
+        // With no surge, the controller replaces an available old pod only
+        // while the nodes without an available pod number fewer than
+        // maxUnavailable; surging works differently, so no verdict then.
+        let status = ds.status.clone().unwrap_or_default();
+        let desired = status.desired_number_scheduled;
+        let unavailable = status.number_unavailable.unwrap_or(0);
+        let rolling = spec.update_strategy.as_ref().and_then(|u| u.rolling_update.clone()).unwrap_or_default();
+        let scaled = |v: &Option<k8s_openapi::apimachinery::pkg::util::intstr::IntOrString>, default: i32| match v {
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(i)) => *i,
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(s)) => {
+                s.trim_end_matches('%').parse::<i64>().map(|p| ((p * desired as i64 + 99) / 100) as i32).unwrap_or(default)
+            }
+            None => default,
+        };
+        let (max_unavailable, max_surge) = (scaled(&rolling.max_unavailable, 1), scaled(&rolling.max_surge, 0));
+        let verdict = if max_surge > 0 {
+            format!("it surges up to {max_surge} new pods alongside old ones, and {unavailable} nodes have no available pod")
+        } else if unavailable >= max_unavailable {
+            format!("{unavailable} nodes have no available pod, which uses up maxUnavailable {max_unavailable}, so no more old pods are replaced until one becomes available")
+        } else {
+            format!("{unavailable} nodes have no available pod, under maxUnavailable {max_unavailable}, so replacements can continue")
+        };
+        findings.push(format!(
+            "ROLLOUT: {} POD{} OF THE LATEST REVISION {} NOT READY ({}{}), with {old} still on older revisions; {verdict}. They may only be starting; if the new template is broken, correct or revert it, and the controller then replaces them",
+            new_unready.len(),
+            if new_unready.len() == 1 { "" } else { "S" },
+            if new_unready.len() == 1 { "IS" } else { "ARE" },
+            new_unready.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", "),
+            more(new_unready.len())
+        ));
+    }
+    lines.extend(findings);
+    lines.join("\n")
+}
+
+/// The DaemonSet sections of a workload diagnosis.
+fn render_ds_sections(d: &k8s::DaemonSetDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "## DaemonSet\n{}\n\n## Nodes and pods\n{}",
+        render_ds_spec(&d.ds, &d.latest_revision),
+        render_ds_nodes(&d.ds, &d.pods, &d.nodes, &d.latest_revision, now),
+    )
+}
+
 /// Assembles everything a workload diagnosis needs, redacted and trimmed.
 ///
 /// Shaped like `build_diagnosis_payload` but a controller sees a different
@@ -4294,26 +4666,29 @@ pub async fn build_workload_diagnosis_payload(
 ) -> Result<ClaudeDiagnosisPayload, String> {
     // Independent reads issued together, as in the pod path — it matters more
     // here because there are four of them before the dependent log fetch.
-    let (workloads, events, manifest, pods, statefulset) = tokio::join!(
+    let (workloads, events, manifest, pods, controller) = tokio::join!(
         k8s::get_workloads(context_name),
         k8s::get_workload_events(context_name, kind, namespace, name),
         k8s::get_workload_manifest(context_name, kind, namespace, name),
         k8s::get_pods(context_name, Some(namespace.to_string())),
         async {
-            if kind == "StatefulSet" {
-                Some(k8s::get_statefulset_diagnostics(context_name, namespace, name).await)
-            } else {
-                None
+            // A StatefulSet's pods have identities, volumes and an order, so
+            // its failures are often about which ordinal is stuck and why, not
+            // about what the pods have in common. A DaemonSet's are about
+            // nodes: which should run its pod, and what keeps one off.
+            match kind {
+                "StatefulSet" => Some(match k8s::get_statefulset_diagnostics(context_name, namespace, name).await {
+                    Ok(d) => render_sts_sections(&d, chrono::Utc::now()),
+                    Err(e) => format!("## StatefulSet\n(StatefulSet details unavailable: {e})"),
+                }),
+                "DaemonSet" => Some(match k8s::get_daemonset_diagnostics(context_name, namespace, name).await {
+                    Ok(d) => render_ds_sections(&d, chrono::Utc::now()),
+                    Err(e) => format!("## DaemonSet\n(DaemonSet details unavailable: {e})"),
+                }),
+                _ => None,
             }
         },
     );
-    // A StatefulSet's pods have identities, volumes and an order, so its
-    // failures are often about which ordinal is stuck and why, not about
-    // what the pods have in common.
-    let statefulset = statefulset.map(|d| match d {
-        Ok(d) => render_sts_sections(&d, chrono::Utc::now()),
-        Err(e) => format!("## StatefulSet\n(StatefulSet details unavailable: {e})"),
-    });
 
     let status = workloads
         .ok()
@@ -4487,11 +4862,11 @@ pub async fn build_workload_diagnosis_payload(
     let manifest_r = redact::redact(&manifest_text);
     let logs_r = redact::redact(&logs_text);
     let previous_r = previous_logs.as_ref().map(|p| redact::redact(&p.text));
-    let statefulset_r = statefulset.as_ref().map(|s| redact::redact(s));
+    let controller_r = controller.as_ref().map(|s| redact::redact(s));
 
     let mut parts = vec![&status, &pods_r, &events_r, &pod_events_r, &manifest_r, &logs_r];
     parts.extend(previous_r.as_ref());
-    parts.extend(statefulset_r.as_ref());
+    parts.extend(controller_r.as_ref());
     let redaction_summary = redact::Redacted::merge(parts).summary();
     let log_note = combine_log_notes(current_note.clone(), previous_logs.as_ref());
 
@@ -4510,7 +4885,7 @@ pub async fn build_workload_diagnosis_payload(
          ## Logs{}{}\n```\n{}\n```{}",
         status.text,
         pods_r.text,
-        statefulset_r.as_ref().map(|s| format!("{}\n\n", s.text)).unwrap_or_default(),
+        controller_r.as_ref().map(|s| format!("{}\n\n", s.text)).unwrap_or_default(),
         events_r.text,
         log_source.as_ref().map(|p| format!(" {p}")).unwrap_or_default(),
         pod_events_r.text,
@@ -4767,6 +5142,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Ingress" => DIAGNOSE_INGRESS_SYSTEM,
         "PersistentVolumeClaim" => DIAGNOSE_PVC_SYSTEM,
         "StatefulSet" => DIAGNOSE_STATEFULSET_SYSTEM,
+        "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
     };
     ai::stream(prompt, system, DIAGNOSE_MAX_TOKENS, DIAGNOSE_EFFORT, on_token).await
@@ -6434,6 +6810,176 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             .contains("covers the pod template (no pod to check)"));
     }
 
+    fn daemonset(v: serde_json::Value) -> k8s_openapi::api::apps::v1::DaemonSet {
+        let mut base = serde_json::json!({
+            "metadata": { "name": "agent", "namespace": "ns", "generation": 2 },
+            "spec": {
+                "selector": { "matchLabels": { "app": "agent" } },
+                "template": { "metadata": { "labels": { "app": "agent" } },
+                    "spec": { "containers": [{ "name": "agent" }], "nodeSelector": { "kubernetes.io/os": "linux" } } },
+                "updateStrategy": { "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 1, "maxSurge": 0 } }
+            },
+            "status": { "desiredNumberScheduled": 3, "currentNumberScheduled": 3, "numberReady": 3, "numberAvailable": 3,
+                "updatedNumberScheduled": 3, "numberMisscheduled": 0, "observedGeneration": 2 }
+        });
+        json_merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn ds_node(name: &str, os: &str, ready: bool, taints: serde_json::Value) -> k8s_openapi::api::core::v1::Node {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": name, "labels": { "kubernetes.io/os": os, "agentpool": "sys", "cores": "8" } },
+            "spec": { "taints": taints },
+            "status": { "conditions": [{ "type": "Ready", "status": if ready { "True" } else { "False" } }] }
+        }))
+        .unwrap()
+    }
+
+    fn ds_pod(node: &str, revision: &str, ready: bool, extra: serde_json::Value) -> k8s_openapi::api::core::v1::Pod {
+        let mut p = labelled_pod(&format!("agent-{node}"), serde_json::json!({ "app": "agent", "controller-revision-hash": revision }), ready, extra);
+        if p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some("n1") {
+            p.spec.as_mut().unwrap().node_name = Some(node.to_string());
+        }
+        p
+    }
+
+    #[test]
+    fn which_nodes_should_run_a_daemon_pod_is_read_as_the_controller_does() {
+        let toleration = |v: serde_json::Value| -> k8s_openapi::api::core::v1::Toleration { serde_json::from_value(v).unwrap() };
+        let taint = |v: serde_json::Value| -> k8s_openapi::api::core::v1::Taint { serde_json::from_value(v).unwrap() };
+        let gpu = taint(serde_json::json!({ "key": "sku", "value": "gpu", "effect": "NoSchedule" }));
+        assert!(k8s::tolerates(&toleration(serde_json::json!({ "operator": "Exists" })), &gpu));
+        assert!(k8s::tolerates(&toleration(serde_json::json!({ "key": "sku", "operator": "Exists", "effect": "NoSchedule" })), &gpu));
+        assert!(k8s::tolerates(&toleration(serde_json::json!({ "key": "sku", "value": "gpu" })), &gpu));
+        assert!(!k8s::tolerates(&toleration(serde_json::json!({ "key": "sku", "value": "cpu" })), &gpu));
+        assert!(!k8s::tolerates(&toleration(serde_json::json!({ "key": "sku", "operator": "Exists", "effect": "NoExecute" })), &gpu));
+
+        let term = |v: serde_json::Value| -> k8s_openapi::api::core::v1::NodeSelectorTerm { serde_json::from_value(v).unwrap() };
+        let n = ds_node("n1", "linux", true, serde_json::json!([]));
+        assert!(k8s::node_term_matches(&term(serde_json::json!({ "matchExpressions": [{ "key": "cores", "operator": "Gt", "values": ["4"] }] })), &n));
+        assert!(!k8s::node_term_matches(&term(serde_json::json!({ "matchExpressions": [{ "key": "cores", "operator": "Lt", "values": ["4"] }] })), &n));
+        assert!(k8s::node_term_matches(&term(serde_json::json!({ "matchFields": [{ "key": "metadata.name", "operator": "In", "values": ["n1"] }] })), &n));
+        assert!(!k8s::node_term_matches(&term(serde_json::json!({})), &n));
+
+        let spec = |v: serde_json::Value| -> k8s_openapi::api::core::v1::PodSpec {
+            let mut base = serde_json::json!({ "containers": [{ "name": "agent" }], "nodeSelector": { "kubernetes.io/os": "linux" } });
+            json_merge(&mut base, v);
+            serde_json::from_value(base).unwrap()
+        };
+        let plain = spec(serde_json::json!({}));
+        assert_eq!(k8s::daemon_pod_misfit(&plain, &n, true), None);
+        assert_eq!(k8s::daemon_pod_misfit(&plain, &ds_node("w1", "windows", true, serde_json::json!([])), true).as_deref(), Some("nodeSelector kubernetes.io/os=linux not matched"));
+        let affine = spec(serde_json::json!({ "affinity": { "nodeAffinity": { "requiredDuringSchedulingIgnoredDuringExecution": {
+            "nodeSelectorTerms": [{ "matchExpressions": [{ "key": "agentpool", "operator": "In", "values": ["user"] }] }] } } } }));
+        assert_eq!(k8s::daemon_pod_misfit(&affine, &n, false).as_deref(), Some("required node affinity not matched"));
+        // NoSchedule keeps a new pod off but not a running one; NoExecute both.
+        let tainted = ds_node("n2", "linux", true, serde_json::json!([{ "key": "sku", "value": "gpu", "effect": "NoSchedule" }]));
+        assert_eq!(k8s::daemon_pod_misfit(&plain, &tainted, true).as_deref(), Some("taint sku=gpu:NoSchedule not tolerated"));
+        assert_eq!(k8s::daemon_pod_misfit(&plain, &tainted, false), None);
+        let evicting = ds_node("n3", "linux", true, serde_json::json!([{ "key": "dedicated", "effect": "NoExecute" }]));
+        assert_eq!(k8s::daemon_pod_misfit(&plain, &evicting, false).as_deref(), Some("taint dedicated:NoExecute not tolerated"));
+        // The tolerations the controller adds: a cordoned or NotReady node
+        // still gets its pod; one without networking only a hostNetwork pod.
+        let down = ds_node("n4", "linux", false, serde_json::json!([
+            { "key": "node.kubernetes.io/not-ready", "effect": "NoExecute" }, { "key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule" }]));
+        assert_eq!(k8s::daemon_pod_misfit(&plain, &down, true), None);
+        let no_net = ds_node("n5", "linux", true, serde_json::json!([{ "key": "node.kubernetes.io/network-unavailable", "effect": "NoSchedule" }]));
+        assert!(k8s::daemon_pod_misfit(&plain, &no_net, true).is_some());
+        assert_eq!(k8s::daemon_pod_misfit(&spec(serde_json::json!({ "hostNetwork": true })), &no_net, true), None);
+
+        let pending = ds_pod("n7", "h", false, serde_json::json!({ "spec": { "nodeName": null, "affinity": { "nodeAffinity": { "requiredDuringSchedulingIgnoredDuringExecution": {
+            "nodeSelectorTerms": [{ "matchFields": [{ "key": "metadata.name", "operator": "In", "values": ["n7"] }] }] } } } } }));
+        assert_eq!(k8s::daemon_pod_node(&pending).as_deref(), Some("n7"));
+        assert_eq!(k8s::daemon_pod_node(&ds_pod("n1", "h", true, serde_json::json!({}))).as_deref(), Some("n1"));
+    }
+
+    #[test]
+    fn a_daemonsets_rollout_says_what_governs_it() {
+        assert_eq!(
+            render_ds_spec(&daemonset(serde_json::json!({})), &Ok(Some("h1".into()))),
+            "nodes: desired 3, scheduled 3, ready 3, available 3, up to date 3, misscheduled 0\nupdate strategy: RollingUpdate, maxUnavailable 1, maxSurge 0\nlatest revision: h1"
+        );
+        let rolling = daemonset(serde_json::json!({ "metadata": { "generation": 3 }, "status": { "updatedNumberScheduled": 1 } }));
+        let out = render_ds_spec(&rolling, &Err("boom".into()));
+        assert!(out.contains("latest revision: (revisions unavailable: boom)"), "{out}");
+        assert!(out.contains("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation 3, observed 2"), "{out}");
+        assert!(out.ends_with("ROLLOUT IN PROGRESS: 1 of 3 nodes run the latest template; it replaces old pods maxUnavailable 1, maxSurge 0 at a time"), "{out}");
+        let on_delete = daemonset(serde_json::json!({ "spec": { "updateStrategy": { "type": "OnDelete", "rollingUpdate": null } }, "status": { "updatedNumberScheduled": 2 } }));
+        let out = render_ds_spec(&on_delete, &Ok(None));
+        assert!(out.contains("update strategy: OnDelete\n") && out.ends_with("ON DELETE: 2 of 3 nodes run the latest template, and a pod moves to it only when deleted"), "{out}");
+    }
+
+    #[test]
+    fn the_nodes_a_daemonset_misses_are_named() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-03T10:30:00Z").unwrap().with_timezone(&chrono::Utc);
+        let ds = daemonset(serde_json::json!({ "status": { "numberUnavailable": 2 } }));
+        let nodes = vec![
+            ds_node("n1", "linux", true, serde_json::json!([])),
+            ds_node("n2", "linux", true, serde_json::json!([{ "key": "sku", "value": "gpu", "effect": "NoSchedule" }])),
+            ds_node("n3", "linux", false, serde_json::json!([])),
+            ds_node("n4", "windows", true, serde_json::json!([])),
+            ds_node("n5", "linux", true, serde_json::json!([{ "key": "sku", "value": "gpu", "effect": "NoSchedule" }])),
+            ds_node("n6", "linux", true, serde_json::json!([{ "key": "dedicated", "effect": "NoExecute" }])),
+            ds_node("n7", "linux", true, serde_json::json!([])),
+        ];
+        let pods = vec![
+            ds_pod("n1", "h1", true, serde_json::json!({})),
+            ds_pod("n5", "h2", true, serde_json::json!({})),
+            ds_pod("n6", "h2", true, serde_json::json!({})),
+            ds_pod("n7", "h2", false, serde_json::json!({ "spec": { "nodeName": null, "affinity": { "nodeAffinity": { "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [{ "matchFields": [{ "key": "metadata.name", "operator": "In", "values": ["n7"] }] }] } } } },
+                "status": { "phase": "Pending", "conditions": [{ "type": "PodScheduled", "status": "False",
+                    "message": "0/7 nodes are available: 1 Insufficient cpu, 6 node(s) didn't match Pod's node affinity/selector." }] } })),
+            ds_pod("gone", "h1", false, serde_json::json!({ "metadata": { "deletionTimestamp": "2026-11-03T10:00:00Z" } })),
+        ];
+        let out = render_ds_nodes(&ds, &Ok(pods), &Ok(nodes), &Ok(Some("h2".into())), now);
+        assert_eq!(
+            out,
+            "7 nodes: 3 should run its pod, by its nodeSelector, required node affinity and tolerations (with those every DaemonSet pod gets); 4 should not\n  \
+             1 left out: nodeSelector kubernetes.io/os=linux not matched\n  \
+             1 left out: taint sku=gpu:NoSchedule not tolerated\n  \
+             1 more runs a pod it would not get now, under a NoSchedule taint it does not tolerate: a running pod is kept through one\n\
+             2 of its 5 pods are not ready or are terminating:\n  \
+             agent-gone on gone (NODE NO LONGER EXISTS): Running, NOT READY; revision h1 (OLDER); TERMINATING since 2026-11-03T10:00:00+00:00 (30 min)\n  \
+             agent-n7 for n7: Pending, NOT READY; revision h2 (latest); UNSCHEDULABLE: 0/7 nodes are available: 1 Insufficient cpu, 6 node(s) didn't match Pod's node affinity/selector.\n\
+             NO POD ON 1 NODE THAT SHOULD RUN ONE: n3 (node NOT READY); the controller creates one per node, and when it has not, its events say why\n\
+             MISSCHEDULED, AND DELETED BY THE CONTROLLER: agent-n6 on n6: taint dedicated:NoExecute not tolerated\n\
+             agent-gone IS STUCK TERMINATING ON A NODE THAT IS GONE: the kubelet there cannot confirm it stopped\n\
+             1 POD CANNOT FIT ON ITS NODE: a DaemonSet pod runs only on its own node, so it waits for room there; at priority 0 (no priorityClassName) it can preempt only pods of lower priority, which few are; a class such as system-node-critical is what lets it make room\n\
+             ROLLOUT: 1 POD OF THE LATEST REVISION IS NOT READY (agent-n7), with 1 still on older revisions; 2 nodes have no available pod, which uses up maxUnavailable 1, so no more old pods are replaced until one becomes available. They may only be starting; if the new template is broken, correct or revert it, and the controller then replaces them"
+        );
+
+        let healthy = render_ds_nodes(&ds, &Ok(vec![ds_pod("n1", "h2", true, serde_json::json!({}))]), &Ok(vec![ds_node("n1", "linux", true, serde_json::json!([]))]), &Ok(Some("h2".into())), now);
+        assert_eq!(healthy, "1 node: 1 should run its pod, by its nodeSelector, required node affinity and tolerations (with those every DaemonSet pod gets); 0 should not\nall 1 of its pods are ready");
+        let blind = render_ds_nodes(&ds, &Ok(vec![]), &Err("forbidden".into()), &Ok(None), now);
+        assert_eq!(blind, "(nodes unavailable: forbidden; which nodes should run its pod was not worked out)\n(it has no pods)");
+        let on_delete = daemonset(serde_json::json!({ "spec": { "updateStrategy": { "type": "OnDelete", "rollingUpdate": null } } }));
+        let stalled = vec![ds_pod("n1", "h1", true, serde_json::json!({})), ds_pod("n7", "h2", false, serde_json::json!({}))];
+        assert!(!render_ds_nodes(&on_delete, &Ok(stalled.clone()), &Ok(vec![]), &Ok(Some("h2".into())), now).contains("ROLLOUT"));
+        // Under the budget the rollout carries on; a percentage is of desired,
+        // rounded up; with a surge no verdict is given.
+        let budget = |v: serde_json::Value| render_ds_nodes(&daemonset(v), &Ok(stalled.clone()), &Ok(vec![]), &Ok(Some("h2".into())), now);
+        let out = budget(serde_json::json!({ "spec": { "updateStrategy": { "rollingUpdate": { "maxUnavailable": "50%" } } }, "status": { "numberUnavailable": 1 } }));
+        assert!(out.contains("1 nodes have no available pod, under maxUnavailable 2, so replacements can continue"), "{out}");
+        let out = budget(serde_json::json!({ "spec": { "updateStrategy": { "rollingUpdate": { "maxUnavailable": 0, "maxSurge": 1 } } }, "status": { "numberUnavailable": 1 } }));
+        assert!(out.contains("it surges up to 1 new pods alongside old ones"), "{out}");
+
+        // Preemption is read from the pod as admitted; stuck pods are named
+        // up to the cap and counted beyond it.
+        let starved = |spec: serde_json::Value| {
+            let mut extra = serde_json::json!({ "spec": { "nodeName": null }, "status": { "phase": "Pending", "conditions": [{ "type": "PodScheduled", "status": "False", "message": "0/1 nodes are available: 1 Insufficient memory." }] } });
+            json_merge(&mut extra, serde_json::json!({ "spec": spec }));
+            render_ds_nodes(&ds, &Ok(vec![ds_pod("n1", "h2", false, extra)]), &Ok(vec![]), &Ok(Some("h2".into())), now)
+        };
+        assert!(starved(serde_json::json!({ "priority": 2000001000, "priorityClassName": "system-node-critical" }))
+            .contains("at priority 2000001000 (class system-node-critical) it can preempt pods of lower priority on that node"));
+        assert!(starved(serde_json::json!({ "priority": 1000, "preemptionPolicy": "Never" })).contains("its preemptionPolicy is Never (no priorityClassName), so it preempts nothing"));
+        let outage: Vec<_> = (0..25).map(|i| ds_pod(&format!("x{i:02}"), "h2", false, serde_json::json!({ "metadata": { "deletionTimestamp": "2026-11-03T10:00:00Z" } }))).collect();
+        let out = render_ds_nodes(&ds, &Ok(outage), &Ok(vec![ds_node("n1", "linux", true, serde_json::json!([]))]), &Ok(Some("h2".into())), now);
+        assert!(out.ends_with("25 PODS ARE STUCK TERMINATING ON NODES THAT ARE NOT READY OR GONE: agent-x00 (GONE), agent-x01 (GONE), agent-x02 (GONE), agent-x03 (GONE), agent-x04 (GONE), agent-x05 (GONE), agent-x06 (GONE), agent-x07 (GONE), agent-x08 (GONE), agent-x09 (GONE) and 15 more; the kubelets there cannot confirm they stopped"), "{out}");
+        assert_eq!(out.matches("STUCK").count(), 1);
+    }
+
     #[test]
     fn a_volume_bound_elsewhere_or_pinned_to_a_zone_is_said() {
         let pv: k8s_openapi::api::core::v1::PersistentVolume = serde_json::from_value(serde_json::json!({
@@ -6918,6 +7464,71 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(built > 0, "no StatefulSet to diagnose");
         assert_eq!(unavailable, 0);
         assert_eq!(explained, unhealthy);
+    }
+
+    /// Builds DaemonSet diagnoses on a live cluster: every unhealthy one and
+    /// up to 15 healthy ones. Prints counts only.
+    ///
+    ///   DAEMONSET_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml daemonset_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set DAEMONSET_DIAG_TEST_CONTEXT to run"]
+    async fn daemonset_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("DAEMONSET_DIAG_TEST_CONTEXT") else { return };
+        let all: Vec<_> = k8s::get_workloads(&ctx).await.expect("workloads").into_iter().filter(|w| w.kind == "DaemonSet").collect();
+        let mut sample: Vec<_> = all.iter().filter(|w| !w.healthy).collect();
+        sample.extend(all.iter().filter(|w| w.healthy).take(15));
+        let (mut built, mut unavailable, mut largest, mut unhealthy, mut explained) = (0, 0, 0, 0, 0);
+        let (mut left_out, mut kept, mut missing, mut misscheduled, mut no_room, mut port, mut rolling, mut stuck, mut all_ready) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let (mut no_pods, mut eligibility_agrees, mut eligibility_differs) = (0, 0, 0);
+        for w in sample.iter().copied() {
+            let payload = build_workload_diagnosis_payload(&ctx, &w.kind, &w.namespace, &w.name).await.expect("payload");
+            let p = &payload.prompt;
+            let ds = p.split("## DaemonSet\n").nth(1).and_then(|s| s.split("\n\n## Events (DaemonSet)").next()).expect("DaemonSet sections");
+            built += 1;
+            unavailable += ds.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            left_out += ds.contains(" left out: ") as usize;
+            kept += ds.contains("NoSchedule taint it does not tolerate") as usize;
+            missing += ds.contains("NO POD ON") as usize;
+            misscheduled += ds.contains("MISSCHEDULED") as usize;
+            no_room += ds.contains("CANNOT FIT ON") as usize;
+            port += ds.contains("HOST PORT ALREADY IN USE") as usize;
+            rolling += (ds.contains("ROLLOUT IN PROGRESS") || ds.contains("ON DELETE:")) as usize;
+            stuck += ds.contains("IS STUCK TERMINATING") as usize;
+            all_ready += ds.contains("of its pods are ready") as usize;
+            no_pods += ds.contains("(it has no pods)") as usize;
+            // The controller's desiredNumberScheduled counts the nodes its pod
+            // should run on, so the eligibility worked out here must agree.
+            let number = |prefix: &str, end: char| {
+                ds.split(prefix).nth(1).and_then(|r| r.split(end).next()).and_then(|n| n.trim().parse::<usize>().ok())
+            };
+            let should = ds.lines().find(|l| l.contains(" should run its pod")).and_then(|l| l.split(": ").nth(1)?.split(' ').next()?.parse::<usize>().ok());
+            match (number("nodes: desired ", ','), should) {
+                (Some(d), Some(s)) if d == s => eligibility_agrees += 1,
+                _ => eligibility_differs += 1,
+            }
+            if !w.healthy {
+                unhealthy += 1;
+                explained += (ds.contains("NOT READY")
+                    || ds.contains("NO POD ON")
+                    || ds.contains("MISSCHEDULED")
+                    || ds.contains("ROLLOUT")
+                    || ds.contains("ON DELETE")
+                    || ds.contains("NOT YET ACTED")
+                    || ds.contains("TERMINATING")
+                    || ds.contains("UNSCHEDULABLE")) as usize;
+            }
+        }
+        println!(
+            "daemonsets={} sampled={} built={built} unavailable_sections={unavailable} largest_tokens={largest} unhealthy={unhealthy}/{explained} left_out={left_out} kept={kept} missing={missing} misscheduled={misscheduled} no_room={no_room} host_port={port} rolling={rolling} stuck_terminating={stuck} all_ready={all_ready} no_pods={no_pods} eligibility_agrees={eligibility_agrees} eligibility_differs={eligibility_differs}",
+            all.len(),
+            sample.len()
+        );
+        assert!(built > 0, "no DaemonSet to diagnose");
+        assert_eq!(unavailable, 0);
+        assert_eq!(explained, unhealthy);
+        assert_eq!(eligibility_differs, 0);
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs

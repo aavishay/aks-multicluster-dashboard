@@ -190,6 +190,11 @@ manifest behind it, plus what that kind of object needs:
   of the node under one stuck terminating, each ordinal's volume claim against
   its template, its governing Service, and the PodDisruptionBudgets over its
   pods;
+- a DaemonSet: which nodes should run its pod — worked out from its
+  nodeSelector, node affinity and tolerations, as its controller does — the
+  reasons the others are left out, the nodes that should run one and have
+  none, and its pods that are not ready, with their node, revision and
+  scheduling message;
 - a PVC: its storage class or why it has none, the volume bound to it and
   the zone it is pinned to, the pods that mount it with the events of those
   not ready — where a failed attach or mount is reported — its volume
