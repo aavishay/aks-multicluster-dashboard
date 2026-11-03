@@ -190,6 +190,10 @@ manifest behind it, plus what that kind of object needs:
   of the node under one stuck terminating, each ordinal's volume claim against
   its template, its governing Service, and the PodDisruptionBudgets over its
   pods;
+- a Deployment: its rollout conditions, its ReplicaSets newest first with
+  the pods each holds — and, for the newest, any pod it could not create and
+  the events that say why — the HPAs that set its replicas, and the
+  PodDisruptionBudgets over its pods;
 - a DaemonSet: which nodes should run its pod — worked out from its
   nodeSelector, node affinity and tolerations, as its controller does — the
   reasons the others are left out, the nodes that should run one and have

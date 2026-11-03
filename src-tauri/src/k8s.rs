@@ -3856,6 +3856,34 @@ pub(crate) fn sts_ordinal(name: &str, prefix: &str) -> Option<i32> {
     name.strip_prefix(prefix)?.strip_prefix('-').filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))?.parse().ok()
 }
 
+/// The PodDisruptionBudgets over a controller's pods, each with the pods it
+/// covers. Matched against the pods' own labels, which carry those a
+/// controller adds (pod-name, pod-index, pod-template-hash) and the template
+/// lacks; against the template only when there is no pod to read, and then
+/// with `None` for the pods covered.
+pub(crate) fn budgets_over(
+    items: Vec<k8s_openapi::api::policy::v1::PodDisruptionBudget>,
+    pods: &Result<Vec<Pod>, String>,
+    template_labels: Option<&std::collections::BTreeMap<String, String>>,
+) -> Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)> {
+    let live = pods.as_ref().ok().filter(|p| !p.is_empty());
+    items
+        .into_iter()
+        .filter_map(|b| {
+            // A budget with no selector selects no pods.
+            let sel = b.spec.as_ref()?.selector.as_ref()?;
+            match live {
+                Some(pods) => {
+                    let covered: Vec<String> =
+                        pods.iter().filter(|p| label_selector_matches(sel, p.metadata.labels.as_ref())).filter_map(|p| p.metadata.name.clone()).collect();
+                    (!covered.is_empty()).then_some((b, Some(covered)))
+                }
+                None => label_selector_matches(sel, template_labels).then_some((b, None)),
+            }
+        })
+        .collect()
+}
+
 pub async fn get_statefulset_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<StatefulSetDiagnostics, String> {
     use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service};
     use k8s_openapi::api::policy::v1::PodDisruptionBudget;
@@ -3904,32 +3932,9 @@ pub async fn get_statefulset_diagnostics(context_name: &str, namespace: &str, na
                 .collect()
         })
         .map_err(|e| format!("Failed to list PersistentVolumeClaims in '{namespace}': {e}"));
-    // Budgets are matched against the pods' own labels, which carry those the
-    // controller adds (pod-name, pod-index) and the template lacks; against
-    // the template only when there is no pod to read.
     let template_labels = spec.template.metadata.as_ref().and_then(|m| m.labels.as_ref());
-    let live = pods.as_ref().ok().filter(|p| !p.is_empty());
     let pdbs = pdbs
-        .map(|l| {
-            l.items
-                .into_iter()
-                .filter_map(|b| {
-                    // A budget with no selector selects no pods.
-                    let sel = b.spec.as_ref()?.selector.as_ref()?;
-                    match live {
-                        Some(pods) => {
-                            let covered: Vec<String> = pods
-                                .iter()
-                                .filter(|p| label_selector_matches(sel, p.metadata.labels.as_ref()))
-                                .filter_map(|p| p.metadata.name.clone())
-                                .collect();
-                            (!covered.is_empty()).then_some((b, Some(covered)))
-                        }
-                        None => label_selector_matches(sel, template_labels).then_some((b, None)),
-                    }
-                })
-                .collect()
-        })
+        .map(|l| budgets_over(l.items, &pods, template_labels))
         .map_err(|e| format!("Failed to list PodDisruptionBudgets in '{namespace}': {e}"));
 
     // The nodes under pods that are stuck: a pod on a node that has gone away
@@ -4138,6 +4143,103 @@ pub async fn get_daemonset_diagnostics(context_name: &str, namespace: &str, name
         .map_err(|e| format!("Failed to list ControllerRevisions in '{namespace}': {e}"));
 
     Ok(DaemonSetDiagnostics { ds, pods, nodes, latest_revision })
+}
+
+/// What a Deployment diagnosis reads beyond the generic workload view.
+pub struct DeploymentDiagnostics {
+    pub deployment: Deployment,
+    /// Its ReplicaSets, by controller UID, newest revision first.
+    pub replica_sets: Result<Vec<ReplicaSet>, String>,
+    /// The pods its ReplicaSets control.
+    pub pods: Result<Vec<Pod>, String>,
+    /// The events of its newest ReplicaSet, where a pod it could not create
+    /// (a quota, an admission webhook, a policy) is said; `None` when it has
+    /// no ReplicaSet.
+    pub new_rs_events: Option<(String, Result<Vec<EventInfo>, String>)>,
+    /// The HorizontalPodAutoscalers that target it.
+    pub hpas: Result<Vec<HorizontalPodAutoscaler>, String>,
+    /// The PodDisruptionBudgets over its pods, each with the pods it covers.
+    pub pdbs: Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>,
+}
+
+/// A ReplicaSet's place in its Deployment's history.
+pub(crate) fn rs_revision(rs: &ReplicaSet) -> i64 {
+    rs.metadata.annotations.as_ref().and_then(|a| a.get("deployment.kubernetes.io/revision")).and_then(|r| r.parse().ok()).unwrap_or(0)
+}
+
+pub async fn get_deployment_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<DeploymentDiagnostics, String> {
+    use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+
+    let client = client_for_context(context_name).await?;
+    let deployment = Api::<Deployment>::namespaced(client.clone(), namespace).get(name).await.map_err(|e| get_error("Deployment", name, e))?;
+    let spec = deployment.spec.clone().unwrap_or_default();
+    let rs_api: Api<ReplicaSet> = Api::namespaced(client.clone(), namespace);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let hpas_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
+    let pdbs_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    // Its ReplicaSets carry its template's labels, so its selector finds them
+    // as it finds its pods.
+    let params = ListParams::default().labels(&label_selector_query(&spec.selector));
+    let all = ListParams::default();
+    let (replica_sets, pods, hpas, pdbs) = tokio::join!(rs_api.list(&params), pods_api.list(&params), hpas_api.list(&all), pdbs_api.list(&all));
+
+    let uid = deployment.metadata.uid.as_deref();
+    let replica_sets: Result<Vec<ReplicaSet>, String> = replica_sets
+        .map(|l| {
+            let mut owned: Vec<ReplicaSet> = l.items.into_iter().filter(|r| controlled_by(&r.metadata.owner_references, "Deployment", name, uid)).collect();
+            owned.sort_by_key(|r| std::cmp::Reverse(rs_revision(r)));
+            owned
+        })
+        .map_err(|e| format!("Failed to list ReplicaSets in '{namespace}': {e}"));
+    // Its pods are those of its own ReplicaSets, by their UIDs. Without the
+    // ReplicaSets there is no telling: a name prefix would take in another
+    // Deployment's pods (`web-worker-…` for `web`), and its budgets with them.
+    let pods: Result<Vec<Pod>, String> = match (&replica_sets, pods) {
+        (Err(_), _) => Err("its ReplicaSets could not be read, so which pods are its is unknown".to_string()),
+        (_, Err(e)) => Err(format!("Failed to list pods in '{namespace}': {e}")),
+        (Ok(rs), Ok(l)) => Ok(l
+            .items
+            .into_iter()
+            .filter(|p| {
+                p.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true)).is_some_and(|o| {
+                    o.kind == "ReplicaSet" && rs.iter().any(|r| r.metadata.uid.as_deref() == Some(o.uid.as_str()))
+                })
+            })
+            .collect()),
+    };
+    let hpas = hpas
+        .map(|l| {
+            l.items
+                .into_iter()
+                .filter(|h| h.spec.as_ref().is_some_and(|s| s.scale_target_ref.kind == "Deployment" && s.scale_target_ref.name == name))
+                .collect()
+        })
+        .map_err(|e| format!("Failed to list HorizontalPodAutoscalers in '{namespace}': {e}"));
+    let template_labels = spec.template.metadata.as_ref().and_then(|m| m.labels.as_ref());
+    let pdbs = pdbs
+        .map(|l| budgets_over(l.items, &pods, template_labels))
+        .map_err(|e| format!("Failed to list PodDisruptionBudgets in '{namespace}': {e}"));
+
+    let newest = replica_sets.as_ref().ok().and_then(|r| r.first()).and_then(|r| r.metadata.name.clone());
+    let new_rs_events = match newest {
+        None => None,
+        Some(rs) => {
+            let params = ListParams::default().fields(&format!("involvedObject.kind=ReplicaSet,involvedObject.name={rs},involvedObject.namespace={namespace}"));
+            let events = events_api
+                .list(&params)
+                .await
+                .map(|l| {
+                    let mut items = l.items;
+                    items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+                    items.into_iter().map(event_to_info).collect()
+                })
+                .map_err(|e| format!("Failed to list events for ReplicaSet '{rs}': {e}"));
+            Some((rs, events))
+        }
+    };
+
+    Ok(DeploymentDiagnostics { deployment, replica_sets, pods, new_rs_events, hpas, pdbs })
 }
 
 /// A Service an Ingress routes to, as the diagnosis read it.
