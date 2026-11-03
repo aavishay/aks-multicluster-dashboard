@@ -12559,8 +12559,14 @@ function renderEvents(): string {
             .map(
               (row) => {
                 const { ctx, e } = row;
+                // Cmd+D on a row diagnoses the workload the event is about.
+                const diagnosis = eventDiagnosis(ctx, e);
                 return `
-            <tr>
+            <tr${
+              diagnosis
+                ? ` data-diagnose-what="workload" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="${esc(diagnosis.kind)}" data-diagnose-ns="${esc(diagnosis.namespace)}" data-diagnose-name="${esc(diagnosis.name)}"`
+                : ""
+            }>
               ${rowCheckboxCell("events", keyOf(row))}
               ${
                 multi
@@ -12625,6 +12631,21 @@ function eventObjectCall(ctx: string, e: EventInfo): { call: string | null; owne
       ? resourcePanelCall(ctx, { group: "apps", kind: "Deployment", namespace, name: owner.name })
       : resourcePanelCall(ctx, { group, kind: e.object_kind, namespace, name: e.object_name });
   return { call, owner };
+}
+
+/**
+ * The workload diagnosis an event leads to: a Deployment's, StatefulSet's or
+ * DaemonSet's own, or for a ReplicaSet its Deployment's, which covers its
+ * ReplicaSets — a ReplicaSet has no diagnosis of its own, as it has no panel.
+ * Only for a workload the Workloads list confirms exists; null otherwise.
+ */
+function eventDiagnosis(ctx: string, e: EventInfo): { kind: string; namespace: string; name: string; what: string } | null {
+  const { owner } = eventObjectCall(ctx, e);
+  if (owner) return { kind: "Deployment", namespace: owner.namespace, name: owner.name, what: `deployment ${owner.name}, which owns this ReplicaSet,` };
+  if (e.object_api_version === "" || apiGroup(e.object_api_version) !== "apps") return null;
+  const namespace = e.object_namespace || e.namespace;
+  const w = state.workloads.get(ctx)?.find((w) => w.kind === e.object_kind && w.namespace === namespace && w.name === e.object_name);
+  return w ? { kind: w.kind, namespace: w.namespace, name: w.name, what: `${w.kind.toLowerCase()} ${w.name}` } : null;
 }
 
 /**
@@ -14320,6 +14341,7 @@ function renderResourceDetailPanel(): string {
   // An Event's own name is generated (`api-x.17f3a2…`); its reason and the
   // object it is about say what it is.
   const ev = rd.kind === "Event" ? findEvent(rd.ctx, rd.namespace, rd.name) : undefined;
+  const evDiagnosis = ev ? eventDiagnosis(rd.ctx, ev) : null;
   const title = ev ? ev.reason || "Event" : rd.name;
   const subtitle = [rd.kind, ev?.involved_object, rd.namespace, rd.ctx].filter(Boolean).join(" · ");
   const tabs: { id: ResourceDetailState["view"]; label: string }[] = [
@@ -14366,7 +14388,12 @@ function renderResourceDetailPanel(): string {
                   ? claudeDiagnoseButton(`window.__app.diagnoseIngress(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "ingress")
                   : rd.kind === "PersistentVolumeClaim"
                     ? claudeDiagnoseButton(`window.__app.diagnosePvc(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "volume claim")
-                    : ""
+                    : evDiagnosis
+                      ? claudeDiagnoseButton(
+                          `window.__app.diagnoseWorkload(${jsArg(rd.ctx)},${jsArg(evDiagnosis.kind)},${jsArg(evDiagnosis.namespace)},${jsArg(evDiagnosis.name)})`,
+                          evDiagnosis.what,
+                        )
+                      : ""
             }
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeResourceDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
