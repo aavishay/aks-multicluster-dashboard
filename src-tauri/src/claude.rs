@@ -3723,17 +3723,35 @@ fn render_ns_status(ns: &k8s_openapi::api::core::v1::Namespace, now: chrono::Dat
     lines.join("\n")
 }
 
-/// A quantity in the unit its resource is counted in, so used and hard
-/// compare: millicores for CPU, KiB for memory and storage, a count for
-/// everything else.
-fn quota_amount(resource: &str, q: &str) -> f64 {
-    if resource.contains("cpu") {
-        k8s::parse_cpu_millicores(q) as f64
-    } else if resource.contains("memory") || resource.contains("storage") {
-        k8s::parse_memory_ki(q) as f64
-    } else {
-        q.parse::<f64>().unwrap_or_else(|_| k8s::parse_cpu_millicores(q) as f64 / 1000.0)
+/// A Kubernetes quantity in its base unit — cores, bytes, or a count — with
+/// every suffix the API accepts: n, u, m; k, M, G, T, P, E; Ki to Ei; and an
+/// exponent. Used and hard of one quota resource always share a unit, so this
+/// is all a comparison needs.
+fn quantity_value(q: &str) -> Option<f64> {
+    let q = q.trim();
+    const SUFFIXES: [(&str, f64); 15] = [
+        ("Ki", 1024.0),
+        ("Mi", 1024.0 * 1024.0),
+        ("Gi", 1024.0 * 1024.0 * 1024.0),
+        ("Ti", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("Pi", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("Ei", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("n", 1e-9),
+        ("u", 1e-6),
+        ("m", 1e-3),
+        ("k", 1e3),
+        ("M", 1e6),
+        ("G", 1e9),
+        ("T", 1e12),
+        ("P", 1e15),
+        ("E", 1e18),
+    ];
+    for (suffix, factor) in SUFFIXES {
+        if let Some(n) = q.strip_suffix(suffix) {
+            return n.parse::<f64>().ok().map(|n| n * factor);
+        }
     }
+    q.parse::<f64>().ok()
 }
 
 /// A namespace's ResourceQuotas, each resource's use against its cap, and a
@@ -3747,28 +3765,41 @@ fn render_ns_quotas(
         Ok(q) => q,
         Err(e) => return format!("(ResourceQuotas unavailable: {e})"),
     };
+    // A pod's containers must declare what a compute quota caps: a quota on
+    // cpu, memory or ephemeral-storage requests or limits. requests.storage
+    // and the counts are about other objects.
+    let compute = |r: &str| {
+        let base = r.strip_prefix("requests.").or_else(|| r.strip_prefix("limits.")).unwrap_or(r);
+        matches!(base, "cpu" | "memory" | "ephemeral-storage")
+    };
     let mut lines = Vec::new();
     let mut needs_declaring: Vec<String> = Vec::new();
     for q in quotas {
         let spec = q.spec.clone().unwrap_or_default();
         let st = q.status.clone().unwrap_or_default();
-        let scopes = spec.scopes.clone().unwrap_or_default();
+        // Its scopes, and a scopeSelector, say which pods it caps.
+        let mut scope: Vec<String> = spec.scopes.clone().unwrap_or_default();
+        scope.extend(spec.scope_selector.iter().flat_map(|s| s.match_expressions.iter().flatten()).map(|e| {
+            let values = e.values.clone().unwrap_or_default();
+            if values.is_empty() { format!("{} {}", e.scope_name, e.operator) } else { format!("{} {} ({})", e.scope_name, e.operator, values.join(", ")) }
+        }));
         lines.push(format!(
             "{}{}:",
             q.metadata.name.as_deref().unwrap_or_default(),
-            if scopes.is_empty() { String::new() } else { format!(" (scopes {})", scopes.join(", ")) }
+            if scope.is_empty() { String::new() } else { format!(" (only pods matching: {})", scope.join("; ")) }
         ));
         for (resource, hard) in st.hard.clone().or(spec.hard.clone()).unwrap_or_default() {
-            if resource.starts_with("requests.") || resource.starts_with("limits.") || resource == "cpu" || resource == "memory" {
-                if !needs_declaring.contains(&resource) {
-                    needs_declaring.push(resource.clone());
-                }
+            if compute(&resource) && !needs_declaring.contains(&resource) {
+                needs_declaring.push(resource.clone());
             }
             let Some(used) = st.used.as_ref().and_then(|u| u.get(&resource)) else {
                 lines.push(format!("  {resource}: hard {} (used not reported yet)", hard.0));
                 continue;
             };
-            let (u, h) = (quota_amount(&resource, &used.0), quota_amount(&resource, &hard.0));
+            let (Some(u), Some(h)) = (quantity_value(&used.0), quantity_value(&hard.0)) else {
+                lines.push(format!("  {resource}: used {} of {}", used.0, hard.0));
+                continue;
+            };
             let pct = if h > 0.0 { (u / h * 100.0).round() as i64 } else { 100 };
             lines.push(format!(
                 "  {resource}: used {} of {} ({pct}%){}",
@@ -3784,16 +3815,31 @@ fn render_ns_quotas(
             ));
         }
     }
-    // A quota on requests or limits makes every new pod declare them; a
-    // LimitRange default declares them for a pod that does not.
-    let defaulted = limit_ranges.as_ref().is_ok_and(|l| {
-        l.iter().flat_map(|r| r.spec.as_ref().map(|s| s.limits.clone()).unwrap_or_default()).any(|i| i.type_ == "Container" && (i.default.is_some() || i.default_request.is_some()))
-    });
-    if !needs_declaring.is_empty() && limit_ranges.is_ok() && !defaulted {
-        lines.push(format!(
-            "A QUOTA ON {} WITH NO LIMITRANGE DEFAULT: a pod whose containers do not set them is refused",
-            needs_declaring.join(", ")
-        ));
+    // A compute quota makes every new pod declare what it caps; a Container
+    // LimitRange default declares it for a pod that does not, resource by
+    // resource: a request from defaultRequest, or from default (a request
+    // left unset takes the limit); a limit only from default.
+    if let Ok(ranges) = limit_ranges {
+        let items: Vec<k8s_openapi::api::core::v1::LimitRangeItem> =
+            ranges.iter().flat_map(|r| r.spec.as_ref().map(|s| s.limits.clone()).unwrap_or_default()).filter(|i| i.type_ == "Container").collect();
+        let has = |m: &Option<std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>, r: &str| m.as_ref().is_some_and(|m| m.contains_key(r));
+        let uncovered: Vec<String> = needs_declaring
+            .into_iter()
+            .filter(|key| {
+                let (limit, base) = match key.strip_prefix("limits.") {
+                    Some(b) => (true, b),
+                    None => (false, key.strip_prefix("requests.").unwrap_or(key)),
+                };
+                !items.iter().any(|i| has(&i.default, base) || (!limit && has(&i.default_request, base)))
+            })
+            .collect();
+        if !uncovered.is_empty() {
+            lines.push(format!(
+                "A QUOTA ON {} WITH NO LIMITRANGE DEFAULT FOR IT: a pod whose containers do not set {} is refused",
+                uncovered.join(", "),
+                if uncovered.len() == 1 { "it" } else { "them" }
+            ));
+        }
     }
     lines.join("\n")
 }
@@ -3834,7 +3880,13 @@ fn render_ns_leftovers(ns: &k8s_openapi::api::core::v1::Namespace, l: &k8s::Name
     const NAMES: usize = 3;
     let mut lines = vec![format!("{} namespaced kinds listed; {} still have objects in it", l.kinds_checked, l.kinds.len())];
     for k in l.kinds.iter().take(KINDS) {
-        let mut line = format!("{}{}: {}", k.kind, if k.group.is_empty() { String::new() } else { format!(" ({})", k.group) }, k.count);
+        let mut line = format!(
+            "{}{}: {}{}",
+            k.kind,
+            if k.group.is_empty() { String::new() } else { format!(" ({})", k.group) },
+            k.count,
+            if k.more { " or more" } else { "" }
+        );
         if !k.with_finalizers.is_empty() {
             let shown: Vec<String> = k.with_finalizers.iter().take(NAMES).map(|(n, f)| format!("{n} [{}]", f.join(", "))).collect();
             line.push_str(&format!(
@@ -7726,8 +7778,8 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
 
         let leftovers = k8s::NamespaceLeftovers {
             kinds: vec![
-                k8s::LeftoverKind { kind: "Certificate".into(), group: "cert-manager.io".into(), count: 2, with_finalizers: vec![("web-tls".into(), vec!["cert-manager.io/finalizer".into()])] },
-                k8s::LeftoverKind { kind: "ConfigMap".into(), group: "".into(), count: 1, with_finalizers: vec![] },
+                k8s::LeftoverKind { kind: "Certificate".into(), group: "cert-manager.io".into(), count: 2, more: false, with_finalizers: vec![("web-tls".into(), vec!["cert-manager.io/finalizer".into()])] },
+                k8s::LeftoverKind { kind: "ConfigMap".into(), group: "".into(), count: 5020, more: true, with_finalizers: vec![] },
             ],
             discovery_failures: vec![("metrics.k8s.io/v1beta1".into(), "the server is currently unable to handle the request".into())],
             list_failures: vec![],
@@ -7737,7 +7789,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             render_ns_leftovers(&stuck, &leftovers),
             "84 namespaced kinds listed; 2 still have objects in it\n\
              Certificate (cert-manager.io): 2; held by finalizers: web-tls [cert-manager.io/finalizer]\n\
-             ConfigMap: 1\n\
+             ConfigMap: 5020 or more\n\
              OBJECTS STILL HOLDING FINALIZERS (Certificate): the controller that removes each is gone or failing, so the namespace cannot finish\n\
              DISCOVERY FAILED FOR metrics.k8s.io/v1beta1 (the server is currently unable to handle the request): the namespace controller cannot list what it cannot discover, so it never finishes"
         );
@@ -7766,10 +7818,31 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
              pods: used 10 of 10 (100%) — EXHAUSTED: a new object asking for more is refused\n  \
              requests.cpu: used 3800m of 4 (95%) — NEARLY EXHAUSTED\n  \
              requests.memory: used 2Gi of 8Gi (25%)\n\
-             A QUOTA ON requests.cpu, requests.memory WITH NO LIMITRANGE DEFAULT: a pod whose containers do not set them is refused"
+             A QUOTA ON requests.cpu, requests.memory WITH NO LIMITRANGE DEFAULT FOR IT: a pod whose containers do not set them is refused"
         );
         let defaulted = Ok(vec![limits(serde_json::json!({ "type": "Container", "defaultRequest": { "cpu": "100m", "memory": "128Mi" }, "max": { "memory": "2Gi" } }))]);
         assert!(!render_ns_quotas(&Ok(vec![q]), &defaulted).contains("NO LIMITRANGE DEFAULT"));
+        // Defaults are per resource, and a request default does not set a limit.
+        let partly = Ok(vec![limits(serde_json::json!({ "type": "Container", "defaultRequest": { "cpu": "100m" } }))]);
+        let both = quota(serde_json::json!({ "requests.cpu": "4", "requests.memory": "8Gi", "limits.cpu": "8" }), serde_json::json!({ "requests.cpu": "1", "requests.memory": "1Gi", "limits.cpu": "1" }));
+        assert!(render_ns_quotas(&Ok(vec![both]), &partly).ends_with("A QUOTA ON limits.cpu, requests.memory WITH NO LIMITRANGE DEFAULT FOR IT: a pod whose containers do not set them is refused"));
+        // Storage and object counts are not a pod's to declare, and every
+        // quantity suffix compares: 1k pods, a count/ key, 2Ti of storage.
+        let other = quota(
+            serde_json::json!({ "requests.storage": "2Ti", "pods": "1k", "count/csistoragecapacities.storage.k8s.io": "10" }),
+            serde_json::json!({ "requests.storage": "512Gi", "pods": "10", "count/csistoragecapacities.storage.k8s.io": "1" }),
+        );
+        assert_eq!(
+            render_ns_quotas(&Ok(vec![other]), &Ok(vec![])),
+            "compute:\n  \
+             count/csistoragecapacities.storage.k8s.io: used 1 of 10 (10%)\n  \
+             pods: used 10 of 1k (1%)\n  \
+             requests.storage: used 512Gi of 2Ti (25%)"
+        );
+        let scoped: k8s_openapi::api::core::v1::ResourceQuota = serde_json::from_value(serde_json::json!({ "metadata": { "name": "high" },
+            "spec": { "hard": { "pods": "2" }, "scopeSelector": { "matchExpressions": [{ "scopeName": "PriorityClass", "operator": "In", "values": ["high"] }] } },
+            "status": { "hard": { "pods": "2" }, "used": { "pods": "2" } } })).unwrap();
+        assert!(render_ns_quotas(&Ok(vec![scoped]), &Ok(vec![])).starts_with("high (only pods matching: PriorityClass In (high)):\n  pods: used 2 of 2 (100%) — EXHAUSTED"));
         assert_eq!(render_ns_limit_ranges(&defaulted), "defaults (Container): defaultRequest cpu=100m, memory=128Mi; max memory=2Gi");
         assert_eq!(render_ns_quotas(&Ok(vec![]), &Ok(vec![])), "(no ResourceQuota: nothing in it is capped)");
         assert_eq!(render_ns_limit_ranges(&Ok(vec![])), "(none)");
@@ -8419,7 +8492,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             quotas += !p.contains("(no ResourceQuota") as usize;
             exhausted += p.contains("— EXHAUSTED") as usize;
             nearly += p.contains("NEARLY EXHAUSTED") as usize;
-            undeclared += p.contains("WITH NO LIMITRANGE DEFAULT") as usize;
+            undeclared += p.contains("WITH NO LIMITRANGE DEFAULT FOR IT") as usize;
             limit_ranges += !p.contains("## LimitRanges\n(none)") as usize;
             with_warnings += !p.contains("(no Warning events in it)") as usize;
         }

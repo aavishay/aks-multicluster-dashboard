@@ -3631,12 +3631,19 @@ pub struct LeftoverKind {
     pub kind: String,
     pub group: String,
     pub count: usize,
-    /// Those still holding finalizers, with them; the first few.
+    /// When there were more than were counted: `count` is a lower bound.
+    pub more: bool,
+    /// Those still holding finalizers, with them.
     pub with_finalizers: Vec<(String, Vec<String>)>,
 }
 
-/// How many objects of each kind are read when looking for what is left.
+/// How many objects of each kind are read in the first page when looking for
+/// what is left; most kinds have none, and this keeps those calls small.
 const NS_LEFTOVERS_PER_KIND: u32 = 20;
+/// Further pages, when the server gives a continuation without saying how
+/// many remain: their size, and how many are followed before counting stops.
+const NS_LEFTOVERS_PAGE: u32 = 500;
+const NS_LEFTOVERS_PAGES: usize = 10;
 /// How many kinds are listed at once.
 const NS_LEFTOVERS_CONCURRENCY: usize = 8;
 
@@ -3649,15 +3656,20 @@ pub(crate) async fn namespace_leftovers(client: &kube::Client, namespace: &str) 
     use kube::core::GroupVersion;
 
     let mut discovery_failures = Vec::new();
+    // Every version a group serves, its preferred one first: a kind served
+    // only at another version (a v1beta1-only CRD in a group preferring v1)
+    // is still a kind the namespace controller must empty.
     let mut gvs: Vec<GroupVersion> = vec![GroupVersion::gv("", "v1")];
     match client.list_api_groups().await {
         Ok(groups) => {
             for g in groups.groups {
-                let preferred = g.preferred_version.or_else(|| g.versions.first().cloned());
-                match preferred.and_then(|v| v.group_version.parse::<GroupVersion>().ok()) {
-                    Some(gv) => gvs.push(gv),
-                    None => discovery_failures.push((g.name, "no version to read".to_string())),
+                let preferred = g.preferred_version.as_ref().map(|v| v.group_version.clone());
+                let mut versions: Vec<String> = g.versions.iter().map(|v| v.group_version.clone()).collect();
+                versions.sort_by_key(|v| Some(v) != preferred.as_ref());
+                if versions.is_empty() {
+                    discovery_failures.push((g.name, "no version to read".to_string()));
                 }
+                gvs.extend(versions.iter().filter_map(|v| v.parse::<GroupVersion>().ok()));
             }
         }
         Err(e) => discovery_failures.push(("(the API group list)".to_string(), e.to_string())),
@@ -3670,42 +3682,68 @@ pub(crate) async fn namespace_leftovers(client: &kube::Client, namespace: &str) 
         }
     }))
     .await;
-    let mut resources = Vec::new();
+    // Each group's resource once, at the first version that serves it — the
+    // preferred one, as they were queued.
+    let mut resources: Vec<ApiResource> = Vec::new();
     for (label, got) in discovered {
         match got {
-            Ok(group) => resources.extend(
-                group
-                    .recommended_resources()
-                    .into_iter()
-                    // Events outlive what they are about and are cleaned up
-                    // on their own; they never hold a namespace up.
-                    .filter(|(ar, caps)| caps.scope == kube::discovery::Scope::Namespaced && caps.supports_operation("list") && ar.kind != "Event")
-                    .map(|(ar, _)| ar),
-            ),
+            Ok(group) => {
+                for (ar, caps) in group.recommended_resources() {
+                    // Events outlive what they are about and are cleaned up on
+                    // their own; they never hold a namespace up.
+                    if caps.scope != kube::discovery::Scope::Namespaced || !caps.supports_operation("list") || ar.kind == "Event" {
+                        continue;
+                    }
+                    if !resources.iter().any(|r| r.group == ar.group && r.plural == ar.plural) {
+                        resources.push(ar);
+                    }
+                }
+            }
             Err(e) => discovery_failures.push((label, e.to_string())),
         }
     }
     let kinds_checked = resources.len();
-    let listed: Vec<(ApiResource, Result<(usize, Vec<(String, Vec<String>)>), String>)> = futures::stream::iter(resources.into_iter().map(|ar| {
+    type Listed = (usize, bool, Vec<(String, Vec<String>)>);
+    let listed: Vec<(ApiResource, Result<Listed, String>)> = futures::stream::iter(resources.into_iter().map(|ar| {
         let client = client.clone();
         async move {
             let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &ar);
-            let got = api
-                .list_metadata(&ListParams::default().limit(NS_LEFTOVERS_PER_KIND))
-                .await
-                .map(|l| {
-                    let count = l.items.len() + l.metadata.remaining_item_count.unwrap_or(0).max(0) as usize;
-                    let held = l
-                        .items
-                        .into_iter()
-                        .filter_map(|o| {
-                            let finalizers = o.metadata.finalizers.unwrap_or_default();
-                            (!finalizers.is_empty()).then(|| (o.metadata.name.unwrap_or_default(), finalizers))
-                        })
-                        .collect();
-                    (count, held)
-                })
-                .map_err(|e| e.to_string());
+            let held_of = |items: Vec<kube::core::PartialObjectMeta<DynamicObject>>| {
+                items
+                    .into_iter()
+                    .filter_map(|o| {
+                        let finalizers = o.metadata.finalizers.unwrap_or_default();
+                        (!finalizers.is_empty()).then(|| (o.metadata.name.unwrap_or_default(), finalizers))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let got = async {
+                let first = api.list_metadata(&ListParams::default().limit(NS_LEFTOVERS_PER_KIND)).await.map_err(|e| e.to_string())?;
+                let mut count = first.items.len();
+                let mut token = first.metadata.continue_.clone().filter(|c| !c.is_empty());
+                let mut held = held_of(first.items);
+                // The server says how many remain, or it does not and the
+                // rest is counted page by page, up to a cap.
+                if let Some(remaining) = first.metadata.remaining_item_count.filter(|r| *r > 0) {
+                    return Ok((count + remaining as usize, false, held));
+                }
+                let mut pages = 0;
+                while let Some(t) = token.take() {
+                    if pages == NS_LEFTOVERS_PAGES {
+                        return Ok((count, true, held));
+                    }
+                    let page = api
+                        .list_metadata(&ListParams::default().limit(NS_LEFTOVERS_PAGE).continue_token(&t))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    count += page.items.len();
+                    token = page.metadata.continue_.clone().filter(|c| !c.is_empty());
+                    held.extend(held_of(page.items));
+                    pages += 1;
+                }
+                Ok((count, false, held))
+            }
+            .await;
             (ar, got)
         }
     }))
@@ -3716,8 +3754,8 @@ pub(crate) async fn namespace_leftovers(client: &kube::Client, namespace: &str) 
     let mut list_failures = Vec::new();
     for (ar, got) in listed {
         match got {
-            Ok((0, _)) => {}
-            Ok((count, with_finalizers)) => kinds.push(LeftoverKind { kind: ar.kind, group: ar.group, count, with_finalizers }),
+            Ok((0, _, _)) => {}
+            Ok((count, more, with_finalizers)) => kinds.push(LeftoverKind { kind: ar.kind, group: ar.group, count, more, with_finalizers }),
             Err(e) => list_failures.push((format!("{} ({})", ar.kind, ar.api_version), e)),
         }
     }
