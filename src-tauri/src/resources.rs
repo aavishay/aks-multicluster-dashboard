@@ -1,5 +1,5 @@
 //! The object kinds behind the Namespaces, Services, Ingress, PVC, PV,
-//! ConfigMaps, ServiceAccounts and PDB tabs: one list per kind, and a single
+//! ConfigMaps, ServiceAccounts, Jobs and PDB tabs: one list per kind, and a single
 //! manifest/events pair shared by their detail panels — and by the
 //! SecretStores tab's, whose list lives with the rest of ESO.
 //!
@@ -12,9 +12,10 @@
 use crate::k8s::{age_days, age_seconds, created_at, event_to_info, list_events_sorted, object_manifest};
 use crate::kubeconfig::client_for_context;
 use crate::models::{
-    ConfigMapEntry, ConfigMapInfo, ConfigMapKeyInfo, EventInfo, IngressInfo, IngressRuleInfo, NamespaceInfo, ObjectManifest, PdbInfo,
-    PvInfo, PvcInfo, ServiceAccountInfo, ServiceInfo,
+    ConfigMapEntry, ConfigMapInfo, ConfigMapKeyInfo, EventInfo, IngressInfo, IngressRuleInfo, JobInfo, NamespaceInfo, ObjectManifest,
+    PdbInfo, PvInfo, PvcInfo, ServiceAccountInfo, ServiceInfo,
 };
+use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Service, ServiceAccount};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressBackend};
@@ -39,6 +40,8 @@ enum Kind {
     ConfigMap,
     ServiceAccount,
     PodDisruptionBudget,
+    Job,
+    CronJob,
     SecretStore,
     ClusterSecretStore,
     Event,
@@ -55,6 +58,8 @@ impl Kind {
             "ConfigMap" => Ok(Self::ConfigMap),
             "ServiceAccount" => Ok(Self::ServiceAccount),
             "PodDisruptionBudget" => Ok(Self::PodDisruptionBudget),
+            "Job" => Ok(Self::Job),
+            "CronJob" => Ok(Self::CronJob),
             "SecretStore" => Ok(Self::SecretStore),
             "ClusterSecretStore" => Ok(Self::ClusterSecretStore),
             "Event" => Ok(Self::Event),
@@ -80,6 +85,8 @@ impl Kind {
             Self::ConfigMap => vec![ApiResource::erase::<ConfigMap>(&())],
             Self::ServiceAccount => vec![ApiResource::erase::<ServiceAccount>(&())],
             Self::PodDisruptionBudget => vec![ApiResource::erase::<PodDisruptionBudget>(&())],
+            Self::Job => vec![ApiResource::erase::<Job>(&())],
+            Self::CronJob => vec![ApiResource::erase::<CronJob>(&())],
             Self::SecretStore => eso("SecretStore", "secretstores"),
             Self::ClusterSecretStore => eso("ClusterSecretStore", "clustersecretstores"),
             Self::Event => vec![ApiResource::erase::<k8s_openapi::api::core::v1::Event>(&())],
@@ -459,6 +466,126 @@ pub(crate) fn pdb_info(pdb: PodDisruptionBudget) -> PdbInfo {
     }
 }
 
+/// A Job's condition of this type, when True.
+fn job_condition<'a>(job: &'a Job, type_: &str) -> Option<&'a k8s_openapi::api::batch::v1::JobCondition> {
+    job.status.as_ref()?.conditions.as_ref()?.iter().find(|c| c.type_ == type_ && c.status == "True")
+}
+
+/// `Kind/name` of what made a Job, as its controller reference says.
+fn job_owner(job: &Job) -> String {
+    job.metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .find(|o| o.controller == Some(true))
+        .map(|o| format!("{}/{}", o.kind, o.name))
+        .unwrap_or_default()
+}
+
+pub(crate) fn job_info(job: &Job, now: chrono::DateTime<chrono::Utc>) -> JobInfo {
+    let spec = job.spec.clone().unwrap_or_default();
+    let status = job.status.clone().unwrap_or_default();
+    let failed_condition = job_condition(job, "Failed");
+    let state = if failed_condition.is_some() {
+        "Failed"
+    } else if job_condition(job, "Complete").is_some() {
+        "Complete"
+    } else if spec.suspend == Some(true) {
+        "Suspended"
+    } else if status.active.unwrap_or(0) > 0 {
+        "Running"
+    } else {
+        "Pending"
+    };
+    let start = status.start_time.as_ref().map(|t| t.0);
+    let end = status.completion_time.as_ref().map(|t| t.0).or_else(|| failed_condition.and_then(|c| c.last_transition_time.as_ref()).map(|t| t.0));
+    JobInfo {
+        kind: "Job".into(),
+        namespace: job.metadata.namespace.clone().unwrap_or_default(),
+        name: job.metadata.name.clone().unwrap_or_default(),
+        owner: job_owner(job),
+        status: state.into(),
+        healthy: failed_condition.is_none(),
+        failure_message: failed_condition.map(|c| {
+            format!("{}: {}", c.reason.as_deref().unwrap_or("Failed"), c.message.as_deref().unwrap_or_default()).trim_end_matches(": ").to_string()
+        }),
+        completions: if spec.completions.is_none() && spec.parallelism.is_some() { None } else { Some(spec.completions.unwrap_or(1)) },
+        succeeded: status.succeeded.unwrap_or(0),
+        failed: status.failed.unwrap_or(0),
+        active: status.active.unwrap_or(0),
+        duration_seconds: start.map(|s| (end.unwrap_or(now) - s).num_seconds().max(0)),
+        age_days: age_days(job.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(job.metadata.creation_timestamp.clone()),
+        created_at: created_at(&job.metadata.creation_timestamp),
+        ..Default::default()
+    }
+}
+
+/// A CronJob, judged by its newest Job: `jobs` is every Job it owns, by
+/// controller UID, newest first.
+pub(crate) fn cronjob_info(cj: &CronJob, jobs: &[&Job], now: chrono::DateTime<chrono::Utc>) -> JobInfo {
+    let spec = cj.spec.clone().unwrap_or_default();
+    let status = cj.status.clone().unwrap_or_default();
+    let active = status.active.as_ref().map_or(0, |a| a.len()) as i32;
+    let newest = jobs.first();
+    let newest_failed = newest.and_then(|j| job_condition(j, "Failed"));
+    JobInfo {
+        kind: "CronJob".into(),
+        namespace: cj.metadata.namespace.clone().unwrap_or_default(),
+        name: cj.metadata.name.clone().unwrap_or_default(),
+        status: if spec.suspend == Some(true) {
+            "Suspended"
+        } else if active > 0 {
+            "Active"
+        } else {
+            "Scheduled"
+        }
+        .into(),
+        healthy: newest_failed.is_none(),
+        failure_message: newest_failed.map(|c| {
+            format!(
+                "its newest run {} failed: {}{}",
+                newest.and_then(|j| j.metadata.name.as_deref()).unwrap_or_default(),
+                c.reason.as_deref().unwrap_or("Failed"),
+                c.message.as_deref().filter(|m| !m.is_empty()).map(|m| format!(": {m}")).unwrap_or_default()
+            )
+        }),
+        active,
+        // The newest run's duration, so a run creeping longer shows here.
+        duration_seconds: newest.and_then(|j| job_info(j, now).duration_seconds),
+        schedule: spec.schedule.clone(),
+        time_zone: spec.time_zone.clone(),
+        suspend: spec.suspend == Some(true),
+        last_schedule_time: status.last_schedule_time.as_ref().map(|t| t.0.to_rfc3339()),
+        last_successful_time: status.last_successful_time.as_ref().map(|t| t.0.to_rfc3339()),
+        jobs: jobs.iter().filter_map(|j| j.metadata.name.clone()).collect(),
+        age_days: age_days(cj.metadata.creation_timestamp.clone()),
+        age_seconds: age_seconds(cj.metadata.creation_timestamp.clone()),
+        created_at: created_at(&cj.metadata.creation_timestamp),
+        ..Default::default()
+    }
+}
+
+/// Jobs and CronJobs together, failed first. A CronJob's Jobs are listed
+/// too, each with its CronJob as owner.
+pub(crate) fn jobs_rows(jobs: &[Job], cronjobs: &[CronJob], now: chrono::DateTime<chrono::Utc>) -> Vec<JobInfo> {
+    let mut rows: Vec<JobInfo> = cronjobs
+        .iter()
+        .map(|cj| {
+            let uid = cj.metadata.uid.as_deref();
+            let mut owned: Vec<&Job> = jobs
+                .iter()
+                .filter(|j| j.metadata.owner_references.iter().flatten().any(|o| o.controller == Some(true) && o.kind == "CronJob" && Some(o.uid.as_str()) == uid))
+                .collect();
+            owned.sort_by(|a, b| b.metadata.creation_timestamp.as_ref().map(|t| t.0).cmp(&a.metadata.creation_timestamp.as_ref().map(|t| t.0)));
+            cronjob_info(cj, &owned, now)
+        })
+        .collect();
+    rows.extend(jobs.iter().map(|j| job_info(j, now)));
+    rows.sort_by(|a, b| a.healthy.cmp(&b.healthy).then_with(|| a.namespace.cmp(&b.namespace)).then_with(|| a.name.cmp(&b.name)));
+    rows
+}
+
 async fn list_all<K>(client: &Client, what: &str) -> Result<Vec<K>, String>
 where
     K: kube::Resource<DynamicType = ()> + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -511,6 +638,12 @@ pub async fn get_configmaps(context_name: &str) -> Result<Vec<ConfigMapInfo>, St
 pub async fn get_service_accounts(context_name: &str) -> Result<Vec<ServiceAccountInfo>, String> {
     let client = client_for_context(context_name).await?;
     Ok(list_all::<ServiceAccount>(&client, "serviceaccounts").await?.into_iter().map(service_account_info).collect())
+}
+
+pub async fn get_jobs(context_name: &str) -> Result<Vec<JobInfo>, String> {
+    let client = client_for_context(context_name).await?;
+    let (jobs, cronjobs) = tokio::join!(list_all::<Job>(&client, "jobs"), list_all::<CronJob>(&client, "cronjobs"));
+    Ok(jobs_rows(&jobs?, &cronjobs?, chrono::Utc::now()))
 }
 
 pub async fn get_pdbs(context_name: &str) -> Result<Vec<PdbInfo>, String> {
@@ -582,6 +715,66 @@ mod tests {
     };
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    fn job(v: serde_json::Value) -> Job {
+        let mut base = serde_json::json!({ "metadata": { "name": "migrate", "namespace": "ns", "uid": "j-uid", "creationTimestamp": "2026-11-09T10:00:00Z" },
+            "spec": { "template": { "spec": { "containers": [{ "name": "c" }] } } }, "status": {} });
+        merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn merge(a: &mut serde_json::Value, b: serde_json::Value) {
+        match (a, b) {
+            (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+                for (k, v) in b {
+                    merge(a.entry(k).or_insert(serde_json::Value::Null), v);
+                }
+            }
+            (a, b) => *a = b,
+        }
+    }
+
+    #[test]
+    fn a_job_row_says_how_it_ended_and_how_long_it_took() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let failed = job(serde_json::json!({ "status": { "startTime": "2026-11-09T10:00:00Z", "failed": 4,
+            "conditions": [{ "type": "Failed", "status": "True", "reason": "BackoffLimitExceeded", "message": "Job has reached the specified backoff limit", "lastTransitionTime": "2026-11-09T10:05:00Z" }] } }));
+        let row = job_info(&failed, now);
+        assert_eq!((row.status.as_str(), row.healthy, row.failed, row.duration_seconds), ("Failed", false, 4, Some(300)));
+        assert_eq!(row.failure_message.as_deref(), Some("BackoffLimitExceeded: Job has reached the specified backoff limit"));
+        let running = job_info(&job(serde_json::json!({ "spec": { "completions": 3 }, "status": { "startTime": "2026-11-09T11:00:00Z", "active": 2, "succeeded": 1 } })), now);
+        assert_eq!((running.status.as_str(), running.healthy, running.completions, running.succeeded, running.duration_seconds), ("Running", true, Some(3), 1, Some(3600)));
+        let queue = job_info(&job(serde_json::json!({ "spec": { "parallelism": 4 } })), now);
+        assert_eq!((queue.status.as_str(), queue.completions, queue.duration_seconds), ("Pending", None, None));
+        assert_eq!(job_info(&job(serde_json::json!({ "spec": { "suspend": true } })), now).status, "Suspended");
+        let done = job_info(&job(serde_json::json!({ "status": { "startTime": "2026-11-09T10:00:00Z", "completionTime": "2026-11-09T10:00:42Z", "succeeded": 1,
+            "conditions": [{ "type": "Complete", "status": "True" }] } })), now);
+        assert_eq!((done.status.as_str(), done.duration_seconds, done.completions), ("Complete", Some(42), Some(1)));
+    }
+
+    #[test]
+    fn a_cronjob_is_judged_by_its_newest_run() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let cron: CronJob = serde_json::from_value(serde_json::json!({ "metadata": { "name": "report", "namespace": "ns", "uid": "cj-uid" },
+            "spec": { "schedule": "0 * * * *", "timeZone": "Etc/UTC", "jobTemplate": { "spec": { "template": { "spec": { "containers": [{ "name": "c" }] } } } } },
+            "status": { "lastScheduleTime": "2026-11-09T11:00:00Z", "lastSuccessfulTime": "2026-11-09T10:01:00Z" } })).unwrap();
+        let run = |name: &str, created: &str, outcome: &str| {
+            job(serde_json::json!({ "metadata": { "name": name, "uid": format!("{name}-uid"), "creationTimestamp": created,
+                "ownerReferences": [{ "apiVersion": "batch/v1", "kind": "CronJob", "name": "report", "uid": "cj-uid", "controller": true }] },
+                "status": { "conditions": [{ "type": outcome, "status": "True", "reason": if outcome == "Failed" { "DeadlineExceeded" } else { "" }, "message": "" }] } }))
+        };
+        let jobs = vec![run("report-1", "2026-11-09T10:00:00Z", "Complete"), run("report-2", "2026-11-09T11:00:00Z", "Failed"), job(serde_json::json!({}))];
+        let rows = jobs_rows(&jobs, &[cron], now);
+        // Failed first: the CronJob and its failed run, then the rest.
+        assert_eq!(rows.iter().map(|r| format!("{}/{}:{}", r.kind, r.name, r.healthy)).collect::<Vec<_>>(), [
+            "CronJob/report:false", "Job/report-2:false", "Job/migrate:true", "Job/report-1:true"
+        ]);
+        let cj = &rows[0];
+        assert_eq!((cj.status.as_str(), cj.schedule.as_str(), cj.time_zone.as_deref(), cj.jobs.clone()), ("Scheduled", "0 * * * *", Some("Etc/UTC"), vec!["report-2".to_string(), "report-1".to_string()]));
+        assert_eq!(cj.failure_message.as_deref(), Some("its newest run report-2 failed: DeadlineExceeded"));
+        assert_eq!(cj.last_successful_time.as_deref(), Some("2026-11-09T10:01:00+00:00"));
+        assert_eq!(rows[1].owner, "CronJob/report");
+    }
 
     fn meta(ns: Option<&str>, name: &str) -> ObjectMeta {
         ObjectMeta { namespace: ns.map(String::from), name: Some(name.into()), ..Default::default() }
@@ -926,6 +1119,42 @@ mod tests {
 
     /// Lists both kinds and fetches one manifest of each through the real
     /// command path. Prints counts only.
+    /// Lists the Jobs tab on a live cluster, its manifest and events path
+    /// included for one of each kind. Prints counts only.
+    ///
+    ///   JOBS_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml jobs_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set JOBS_TEST_CONTEXT to run"]
+    async fn jobs_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("JOBS_TEST_CONTEXT") else { return };
+        let rows = get_jobs(&ctx).await.expect("jobs");
+        let (jobs, crons): (Vec<&JobInfo>, Vec<&JobInfo>) = rows.iter().partition(|r| r.kind == "Job");
+        let count = |list: &[&JobInfo], f: &dyn Fn(&JobInfo) -> bool| list.iter().filter(|r| f(r)).count();
+        // A CronJob's own Jobs, by UID, against the Jobs naming it as owner.
+        let claimed: usize = crons.iter().map(|c| c.jobs.len()).sum();
+        let owned = count(&jobs, &|j| j.owner.starts_with("CronJob/"));
+        for kind in ["Job", "CronJob"] {
+            if let Some(r) = rows.iter().find(|r| r.kind == kind) {
+                get_resource_manifest(&ctx, kind, &r.namespace, &r.name).await.expect("manifest");
+                get_resource_events(&ctx, kind, &r.namespace, &r.name).await.expect("events");
+            }
+        }
+        println!(
+            "jobs={} cronjobs={} failed_jobs={} running={} complete={} owned_by_cronjob={owned} claimed_by_cronjobs={claimed} scaledjob_owned={} cronjobs_failing={} suspended={} active={}",
+            jobs.len(),
+            crons.len(),
+            count(&jobs, &|j| j.status == "Failed"),
+            count(&jobs, &|j| j.status == "Running"),
+            count(&jobs, &|j| j.status == "Complete"),
+            count(&jobs, &|j| j.owner.starts_with("ScaledJob/")),
+            count(&crons, &|c| !c.healthy),
+            count(&crons, &|c| c.suspend),
+            count(&crons, &|c| c.status == "Active"),
+        );
+        assert_eq!(owned, claimed, "a Job naming a CronJob as owner that the CronJob does not claim, or the reverse");
+    }
+
     #[tokio::test]
     #[ignore = "needs a reachable cluster; set RESOURCE_TABS_TEST_CONTEXT to run"]
     async fn service_accounts_and_pdbs_against_a_live_cluster() {

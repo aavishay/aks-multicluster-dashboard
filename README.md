@@ -339,6 +339,11 @@ template runs and reads. Pods is a live pod table with restarts and per-pod CPU/
 panel opens on an Overview — each container's state, restarts, why it last
 exited (OOMKilled, exit code), image and resources, the pod's conditions, its
 node and owner, and every ConfigMap, Secret and PVC it uses, each a link.
+Jobs lists Jobs and CronJobs together, failed first: a Job's status,
+completions and how long it ran, with the CronJob that made it; a CronJob's
+schedule and when it last ran. A CronJob counts as failed when its newest
+run did, and its older runs are not counted again. A Job's panel links to
+its pods; a CronJob's lists the runs it keeps, each opening its own.
 Resource
 Usage rolls the fleet's CPU/memory usage-vs-allocatable into two bars.
 Namespaces lists each namespace with its status, flagging any stuck

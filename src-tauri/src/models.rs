@@ -1401,6 +1401,44 @@ pub struct ServiceAccountInfo {
     pub created_at: Option<String>,
 }
 
+/// A Job or CronJob, a row of the Jobs tab. One shape for both, as the
+/// Workloads tab has for its three kinds: the Job fields are empty on a
+/// CronJob and the other way round. Mirrors `JobInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct JobInfo {
+    /// `Job` or `CronJob`.
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    /// What made a Job: `CronJob/<name>`, `ScaledJob/<name>`, or empty.
+    pub owner: String,
+    /// A Job: Running, Complete, Failed, Suspended or Pending. A CronJob:
+    /// Active while a run is in progress, Suspended, or Scheduled.
+    pub status: String,
+    /// False for a failed Job, and for a CronJob whose newest run failed.
+    pub healthy: bool,
+    /// Why it is not healthy: the Failed condition's reason and message.
+    pub failure_message: Option<String>,
+    /// A Job's desired completions; `None` for a work-queue Job.
+    pub completions: Option<i32>,
+    pub succeeded: i32,
+    pub failed: i32,
+    /// A Job's running pods, or a CronJob's running Jobs.
+    pub active: i32,
+    /// From a Job's start to its completion, or to now while it runs.
+    pub duration_seconds: Option<i64>,
+    pub schedule: String,
+    pub time_zone: Option<String>,
+    pub suspend: bool,
+    pub last_schedule_time: Option<String>,
+    pub last_successful_time: Option<String>,
+    /// A CronJob's Jobs, newest first.
+    pub jobs: Vec<String>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
 /// A PodDisruptionBudget, and whether it lets a drain through. Mirrors
 /// `PdbInfo` in types.ts.
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]

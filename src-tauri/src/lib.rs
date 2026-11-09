@@ -169,6 +169,7 @@ pub fn run() {
             commands::get_object_events,
             commands::get_service_accounts,
             commands::get_pdbs,
+            commands::get_jobs,
             commands::get_secret_stores,
             commands::get_configmap_data,
             commands::get_resource_manifest,

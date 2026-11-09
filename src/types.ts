@@ -778,6 +778,7 @@ export type TabId =
   | "externalsecrets"
   | "secretstores"
   | "pdbs"
+  | "jobs"
   | "cost";
 
 /** Azure Node Auto Provisioning (managed Karpenter). `installed: false` means the CRDs aren't registered, i.e. NAP is off for this cluster. */
@@ -1000,6 +1001,8 @@ export type ResourceKind =
   | "ConfigMap"
   | "ServiceAccount"
   | "PodDisruptionBudget"
+  | "Job"
+  | "CronJob"
   | "SecretStore"
   | "ClusterSecretStore"
   | "Event";
@@ -1017,6 +1020,41 @@ export interface ServiceAccountInfo {
   secrets: string[];
   /** Null when unset, which Kubernetes treats as true. */
   automount_token: boolean | null;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+/**
+ * A Job or CronJob, a row of the Jobs tab: the Job fields are empty on a
+ * CronJob and the other way round. Mirrors `JobInfo` in models.rs.
+ */
+export interface JobInfo {
+  kind: "Job" | "CronJob";
+  namespace: string;
+  name: string;
+  /** What made a Job: `CronJob/<name>`, `ScaledJob/<name>`, or empty. */
+  owner: string;
+  /** A Job: Running, Complete, Failed, Suspended or Pending. A CronJob: Active, Suspended or Scheduled. */
+  status: string;
+  /** False for a failed Job, and for a CronJob whose newest run failed. */
+  healthy: boolean;
+  failure_message: string | null;
+  /** A Job's desired completions; null for a work-queue Job. */
+  completions: number | null;
+  succeeded: number;
+  failed: number;
+  /** A Job's running pods, or a CronJob's running Jobs. */
+  active: number;
+  /** From a Job's start to its completion, or to now while it runs; a CronJob's newest run's. */
+  duration_seconds: number | null;
+  schedule: string;
+  time_zone: string | null;
+  suspend: boolean;
+  last_schedule_time: string | null;
+  last_successful_time: string | null;
+  /** A CronJob's Jobs, newest first. */
+  jobs: string[];
   age_days: number;
   age_seconds: number;
   created_at: string | null;
