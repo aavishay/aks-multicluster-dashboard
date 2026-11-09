@@ -230,6 +230,45 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_PDB_SYSTEM: &str = "\
+You diagnose Kubernetes PodDisruptionBudgets for an experienced SRE.
+
+You are given the budget with its counts, its eviction policy and \
+conditions; the pods it covers with their readiness and the state of their \
+nodes; the controllers behind those pods and how many pods each asks for; \
+the other budgets that cover any of the same pods; its events and manifest. \
+Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the count, the pod, the \
+node, the controller, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- A drain or node upgrade that is waiting on it: the budget allows no \
+disruption while pods it covers sit on cordoned nodes. Say whether the pods \
+are unhealthy (fix them, or the unhealthyPodEvictionPolicy decides whether \
+they can go) or the budget is simply as tight as the replicas.
+- A budget that can never allow a disruption: minAvailable at or above the \
+replicas its pods' controller asks for, or maxUnavailable 0 — the classic \
+single replica with minAvailable 1. The fix is more replicas or a looser \
+budget, not retrying the drain.
+- More than one budget over the same pod: the eviction API refuses to evict \
+it at all, whatever either budget allows.
+- A budget that selects no pods: it protects nothing; compare its selector \
+with the pods' labels.
+- Pods with no controller: an evicted one is not recreated.
+
+If the budget is healthy and allows disruptions, say so plainly rather than \
+inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -4329,7 +4368,11 @@ fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBud
             format!(
                 "{}: {limit}; covers {}; healthy {} of {} expected, {} needed; disruptions allowed {}{blocks}",
                 b.metadata.name.as_deref().unwrap_or_default(),
-                covered.as_deref().map(sts_pod_list).unwrap_or_else(|| "the pod template (no pod to check)".to_string()),
+                match covered.as_deref() {
+                    None => "the pod template (no pod to check)".to_string(),
+                    Some([]) => "no pods".to_string(),
+                    Some(c) => sts_pod_list(c),
+                },
                 st.current_healthy,
                 st.expected_pods,
                 st.desired_healthy,
@@ -4957,6 +5000,198 @@ fn render_deploy_sections(d: &k8s::DeploymentDiagnostics) -> String {
     )
 }
 
+/// A PodDisruptionBudget's own line — its budget, counts and what it lets a
+/// drain do — with its selector, conditions and whether its status is
+/// current.
+fn render_pdb_budget(
+    pdb: &k8s_openapi::api::policy::v1::PodDisruptionBudget,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+) -> String {
+    let covered = pods.as_ref().ok().map(|p| p.iter().filter_map(|p| p.metadata.name.clone()).collect::<Vec<_>>());
+    let selector = pdb.spec.as_ref().and_then(|s| s.selector.as_ref());
+    let mut lines = vec![render_pdbs(&Ok(vec![(pdb.clone(), covered.clone())]))];
+    lines.push(match selector {
+        None => "selector: (none)".to_string(),
+        Some(sel) => {
+            let q = k8s::label_selector_query(sel);
+            format!("selector: {}", if q.is_empty() { "(empty: every pod in its namespace)".to_string() } else { q })
+        }
+    });
+    let status = pdb.status.clone().unwrap_or_default();
+    for c in status.conditions.iter().flatten() {
+        let message: String = c.message.chars().take(300).collect();
+        lines.push(format!("condition {}={} ({}){}", c.type_, c.status, c.reason, if message.is_empty() { String::new() } else { format!(": {message}") }));
+    }
+    if let (Some(g), Some(o)) = (pdb.metadata.generation, status.observed_generation) {
+        if g > o {
+            lines.push(format!("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation {g}, observed {o}, so the counts above may be stale"));
+        }
+    }
+    match (selector, covered.as_deref()) {
+        (None, _) => lines.push("NO SELECTOR: a budget without one selects no pods, so it protects nothing".to_string()),
+        (Some(_), Some([])) => lines.push("SELECTS NO PODS: no pod in its namespace has the labels it selects, so it protects nothing".to_string()),
+        _ => {}
+    }
+    lines.join("\n")
+}
+
+/// The pods a budget covers, with their readiness and nodes, and whether a
+/// drain is waiting on them.
+fn render_pdb_pods(
+    pdb: &k8s_openapi::api::policy::v1::PodDisruptionBudget,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+    nodes: &[(String, Result<Option<k8s_openapi::api::core::v1::Node>, String>)],
+) -> String {
+    const SHOWN: usize = 15;
+    let pods = match pods {
+        Ok(p) if p.is_empty() => return "(none)".to_string(),
+        Ok(p) => p,
+        Err(e) => return format!("(pods unavailable: {e})"),
+    };
+    let allowed = pdb.status.as_ref().map(|s| s.disruptions_allowed).unwrap_or(0);
+    let mut lines = vec![format!("{} pods, {} ready", pods.len(), pods.iter().filter(|p| pod_is_ready(p)).count())];
+    let mut cordoned: Vec<String> = Vec::new();
+    for (i, p) in pods.iter().enumerate() {
+        let node = p.spec.as_ref().and_then(|s| s.node_name.clone()).unwrap_or_default();
+        let note = match nodes.iter().find(|(n, _)| *n == node).map(|(_, r)| r) {
+            Some(Ok(None)) => " (NODE NO LONGER EXISTS)".to_string(),
+            Some(Ok(Some(n))) if !k8s::node_is_ready(n) => " (node NOT READY)".to_string(),
+            Some(Ok(Some(n))) if n.spec.as_ref().and_then(|s| s.unschedulable) == Some(true) => {
+                if !cordoned.contains(&node) {
+                    cordoned.push(node.clone());
+                }
+                " (node CORDONED)".to_string()
+            }
+            Some(Err(e)) => format!(" (node unavailable: {e})"),
+            _ => String::new(),
+        };
+        if i < SHOWN {
+            let phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_else(|| "Unknown".into());
+            lines.push(format!(
+                "{}: {}{}; {}{note}",
+                p.metadata.name.as_deref().unwrap_or_default(),
+                if pod_is_ready(p) { "ready" } else { "NOT READY" },
+                if phase == "Running" { String::new() } else { format!(", {phase}") },
+                if node.is_empty() { "not scheduled".to_string() } else { format!("on {node}") }
+            ));
+        }
+    }
+    if pods.len() > SHOWN {
+        lines.push(format!("and {} more", pods.len() - SHOWN));
+    }
+    if !cordoned.is_empty() {
+        let on_cordoned = pods.iter().filter(|p| p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some_and(|n| cordoned.contains(n))).count();
+        lines.push(if allowed == 0 {
+            format!(
+                "A DRAIN IS WAITING ON THIS BUDGET: {on_cordoned} of its pods {} on cordoned nodes ({}) and it allows no disruption, so {} cannot be evicted",
+                if on_cordoned == 1 { "is" } else { "are" },
+                sts_pod_list(&cordoned),
+                if on_cordoned == 1 { "it" } else { "they" }
+            )
+        } else {
+            format!(
+                "{on_cordoned} of its pods {} on cordoned nodes ({}); it allows {allowed} disruption{} now, so a drain can evict {}",
+                if on_cordoned == 1 { "is" } else { "are" },
+                sts_pod_list(&cordoned),
+                if allowed == 1 { "" } else { "s" },
+                if on_cordoned == 1 { "it" } else { "them" }
+            )
+        });
+    }
+    lines.join("\n")
+}
+
+/// The controllers behind a budget's pods, and whether the budget can ever
+/// allow a disruption given the pods they ask for.
+fn render_pdb_owners(pdb: &k8s_openapi::api::policy::v1::PodDisruptionBudget, owners: &Result<Vec<k8s::PdbOwner>, String>) -> String {
+    let owners = match owners {
+        Ok(o) if o.is_empty() => return "(no pods, so no controller)".to_string(),
+        Ok(o) => o,
+        Err(e) => return format!("(controllers unavailable: {e})"),
+    };
+    let mut lines: Vec<String> = owners
+        .iter()
+        .map(|o| {
+            if o.kind.is_empty() {
+                format!("{} pod{} with no controller: an evicted one is not recreated", o.pods, if o.pods == 1 { "" } else { "s" })
+            } else {
+                format!(
+                    "{} {}: {} of its pods covered; {}",
+                    o.kind,
+                    o.name,
+                    o.pods,
+                    match &o.desired {
+                        Ok(Some(d)) => format!("asks for {d}"),
+                        Ok(None) => "asks for an unknown number".to_string(),
+                        Err(e) => format!("its desired count is unavailable: {e}"),
+                    }
+                )
+            }
+        })
+        .collect();
+    // Measured as the disruption controller does: against the pods the
+    // controllers ask for. Only when every one of them says.
+    let spec = pdb.spec.clone().unwrap_or_default();
+    let managed: Vec<&k8s::PdbOwner> = owners.iter().filter(|o| !o.kind.is_empty()).collect();
+    let desired: Option<i32> = if managed.is_empty() { None } else { managed.iter().map(|o| o.desired.clone().ok().flatten()).sum() };
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    let never = match (&spec.min_available, &spec.max_unavailable) {
+        (Some(IntOrString::String(s)), _) if s.trim() == "100%" => Some(format!("minAvailable {s} keeps every pod")),
+        (Some(IntOrString::Int(m)), _) => desired.filter(|d| m >= d).map(|d| format!("minAvailable {m} with {d} pod{} asked for", if d == 1 { "" } else { "s" })),
+        (_, Some(IntOrString::Int(0))) => Some("maxUnavailable 0".to_string()),
+        (_, Some(IntOrString::String(s))) if s.trim() == "0%" => Some(format!("maxUnavailable {s}")),
+        _ => None,
+    };
+    if let Some(why) = never {
+        lines.push(format!("THE BUDGET CAN NEVER ALLOW A DISRUPTION: {why}, so a drain waits until there are more replicas or the budget is relaxed"));
+    }
+    lines.join("\n")
+}
+
+/// The other budgets over any of these pods: the eviction API refuses to
+/// evict a pod covered by more than one.
+fn render_pdb_others(others: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>) -> String {
+    match others {
+        Err(e) => format!("(other budgets unavailable: {e})"),
+        Ok(o) if o.is_empty() => "(no other budget in its namespace covers any of its pods)".to_string(),
+        Ok(o) => o
+            .iter()
+            .map(|(b, shared)| {
+                format!(
+                    "OVERLAPS WITH {} ON {}: the eviction API refuses to evict a pod covered by more than one budget",
+                    b.metadata.name.as_deref().unwrap_or_default(),
+                    shared.as_deref().map(sts_pod_list).unwrap_or_else(|| "its pods".to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Assembles a PodDisruptionBudget diagnosis, redacted.
+pub async fn build_pdb_diagnosis_payload(context_name: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_pdb_diagnostics(context_name, namespace, name).await?;
+    let budget = redact::redact(&render_pdb_budget(&d.pdb, &d.pods));
+    let pods = redact::redact(&render_pdb_pods(&d.pdb, &d.pods, &d.nodes));
+    let owners = redact::redact(&render_pdb_owners(&d.pdb, &d.owners));
+    let others = redact::redact(&render_pdb_others(&d.others));
+    let events = redact::redact(&render_nap_events(&d.events, "(no events for this budget)", false, 25));
+    let manifest = redact::redact(&d.manifest);
+    let redaction_summary = redact::Redacted::merge([&budget, &pods, &owners, &others, &events, &manifest]).summary();
+
+    let prompt = format!(
+        "PodDisruptionBudget {namespace}/{name}.\n\n\
+         ## Budget\n{}\n\n\
+         ## Pods it covers\n{}\n\n\
+         ## Their controllers\n{}\n\n\
+         ## Other budgets over these pods\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        budget.text, pods.text, owners.text, others.text, events.text, manifest.text,
+    );
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
 /// Assembles everything a workload diagnosis needs, redacted and trimmed.
 ///
 /// Shaped like `build_diagnosis_payload` but a controller sees a different
@@ -5453,6 +5688,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Service" => DIAGNOSE_SERVICE_SYSTEM,
         "Ingress" => DIAGNOSE_INGRESS_SYSTEM,
         "PersistentVolumeClaim" => DIAGNOSE_PVC_SYSTEM,
+        "PodDisruptionBudget" => DIAGNOSE_PDB_SYSTEM,
         "StatefulSet" => DIAGNOSE_STATEFULSET_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
         "Deployment" => DIAGNOSE_DEPLOYMENT_SYSTEM,
@@ -7420,6 +7656,81 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.contains("keda-hpa-web (made by KEDA ScaledObject web): min 2") && out.ends_with("MORE THAN ONE HPA TARGETS IT: each overwrites the replica count the other sets"), "{out}");
     }
 
+    fn budget(v: serde_json::Value) -> k8s_openapi::api::policy::v1::PodDisruptionBudget {
+        let mut base = serde_json::json!({
+            "metadata": { "name": "web", "namespace": "ns", "generation": 2 },
+            "spec": { "minAvailable": 1, "selector": { "matchLabels": { "app": "web" } } },
+            "status": { "currentHealthy": 1, "desiredHealthy": 1, "expectedPods": 1, "disruptionsAllowed": 0, "observedGeneration": 2,
+                "conditions": [{ "type": "DisruptionAllowed", "status": "False", "reason": "InsufficientPods", "message": "", "lastTransitionTime": "2026-11-09T10:00:00Z" }] }
+        });
+        json_merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn owner(kind: &str, name: &str, desired: Option<i32>, pods: usize) -> k8s::PdbOwner {
+        k8s::PdbOwner { kind: kind.into(), name: name.into(), desired: Ok(desired), pods }
+    }
+
+    #[test]
+    fn a_budget_says_whether_a_drain_can_get_past_it() {
+        let pods = || Ok(vec![labelled_pod("web-1", serde_json::json!({ "app": "web" }), true, serde_json::json!({}))]);
+        assert_eq!(
+            render_pdb_budget(&budget(serde_json::json!({})), &pods()),
+            "web: minAvailable 1; covers web-1; healthy 1 of 1 expected, 1 needed; disruptions allowed 0 — NO HEALTHY POD MAY BE EVICTED: a drain waits on any node running one of its ready pods; the budget is met, so a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy IfHealthyBudget, the default)\n\
+             selector: app=web\n\
+             condition DisruptionAllowed=False (InsufficientPods)"
+        );
+        let none = render_pdb_budget(&budget(serde_json::json!({ "spec": { "selector": null } })), &Ok(vec![]));
+        assert!(none.contains("covers no pods") && none.contains("selector: (none)") && none.ends_with("NO SELECTOR: a budget without one selects no pods, so it protects nothing"), "{none}");
+        let misses = render_pdb_budget(&budget(serde_json::json!({ "metadata": { "generation": 3 } })), &Ok(vec![]));
+        assert!(misses.contains("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation 3, observed 2") && misses.ends_with("SELECTS NO PODS: no pod in its namespace has the labels it selects, so it protects nothing"), "{misses}");
+
+        // A drain waiting: a covered pod on a cordoned node, nothing allowed.
+        let node = |name: &str, ready: &str, cordoned: bool| -> k8s_openapi::api::core::v1::Node {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": name }, "spec": { "unschedulable": cordoned },
+                "status": { "conditions": [{ "type": "Ready", "status": ready }] } })).unwrap()
+        };
+        let p = |name: &str, on: &str, ready: bool| labelled_pod(name, serde_json::json!({ "app": "web" }), ready, serde_json::json!({ "spec": { "nodeName": on } }));
+        let nodes = vec![("n1".to_string(), Ok(Some(node("n1", "True", true)))), ("n2".to_string(), Ok(None)), ("n3".to_string(), Ok(Some(node("n3", "False", false))))];
+        assert_eq!(
+            render_pdb_pods(&budget(serde_json::json!({})), &Ok(vec![p("web-1", "n1", true), p("web-2", "n2", false), p("web-3", "n3", false)]), &nodes),
+            "3 pods, 1 ready\n\
+             web-1: ready; on n1 (node CORDONED)\n\
+             web-2: NOT READY; on n2 (NODE NO LONGER EXISTS)\n\
+             web-3: NOT READY; on n3 (node NOT READY)\n\
+             A DRAIN IS WAITING ON THIS BUDGET: 1 of its pods is on cordoned nodes (n1) and it allows no disruption, so it cannot be evicted"
+        );
+        let loose = budget(serde_json::json!({ "status": { "disruptionsAllowed": 2 } }));
+        assert!(render_pdb_pods(&loose, &Ok(vec![p("web-1", "n1", true)]), &nodes).ends_with("1 of its pods is on cordoned nodes (n1); it allows 2 disruptions now, so a drain can evict it"));
+        assert_eq!(render_pdb_pods(&loose, &Err("forbidden".into()), &[]), "(pods unavailable: forbidden)");
+    }
+
+    #[test]
+    fn a_budget_tighter_than_its_replicas_and_overlaps_are_named() {
+        let tight = render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("Deployment", "web", Some(1), 1)]));
+        assert_eq!(
+            tight,
+            "Deployment web: 1 of its pods covered; asks for 1\n\
+             THE BUDGET CAN NEVER ALLOW A DISRUPTION: minAvailable 1 with 1 pod asked for, so a drain waits until there are more replicas or the budget is relaxed"
+        );
+        assert!(!render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("Deployment", "web", Some(3), 3)])).contains("NEVER"));
+        assert!(render_pdb_owners(&budget(serde_json::json!({ "spec": { "minAvailable": null, "maxUnavailable": 0 } })), &Ok(vec![owner("StatefulSet", "db", Some(3), 3)]))
+            .contains("THE BUDGET CAN NEVER ALLOW A DISRUPTION: maxUnavailable 0"));
+        assert!(render_pdb_owners(&budget(serde_json::json!({ "spec": { "minAvailable": "100%" } })), &Ok(vec![owner("Deployment", "web", Some(5), 5)]))
+            .contains("minAvailable 100% keeps every pod"));
+        // Unmanaged pods are said, and give no replica count to measure against.
+        let bare = render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("", "", None, 2)]));
+        assert_eq!(bare, "2 pods with no controller: an evicted one is not recreated");
+        assert_eq!(render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![])), "(no pods, so no controller)");
+
+        assert_eq!(render_pdb_others(&Ok(vec![])), "(no other budget in its namespace covers any of its pods)");
+        assert_eq!(
+            render_pdb_others(&Ok(vec![(budget(serde_json::json!({ "metadata": { "name": "web-extra" } })), Some(vec!["web-1".to_string()]))])),
+            "OVERLAPS WITH web-extra ON web-1: the eviction API refuses to evict a pod covered by more than one budget"
+        );
+        assert_eq!(render_pdb_others(&Err("not checked: the budget's pods could not be read".into())), "(other budgets unavailable: not checked: the budget's pods could not be read)");
+    }
+
     #[test]
     fn a_volume_bound_elsewhere_or_pinned_to_a_zone_is_said() {
         let pv: k8s_openapi::api::core::v1::PersistentVolume = serde_json::from_value(serde_json::json!({
@@ -8037,6 +8348,49 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(unavailable, 0);
         assert_eq!(explained, unhealthy);
         assert_eq!(pods_mismatch, 0);
+    }
+
+    /// Builds a diagnosis for every PodDisruptionBudget on a live cluster.
+    /// Prints counts only.
+    ///
+    ///   PDB_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml pdb_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set PDB_DIAG_TEST_CONTEXT to run"]
+    async fn pdb_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("PDB_DIAG_TEST_CONTEXT") else { return };
+        let all = crate::resources::get_pdbs(&ctx).await.expect("pdbs");
+        let (mut built, mut unavailable, mut largest, mut blocks, mut listed_blocking) = (0, 0, 0, 0, 0);
+        let (mut no_pods, mut never, mut overlap, mut drain_waiting, mut unmanaged, mut count_mismatch) = (0, 0, 0, 0, 0, 0);
+        for b in &all {
+            let payload = build_pdb_diagnosis_payload(&ctx, &b.namespace, &b.name).await.expect("payload");
+            let p = &payload.prompt;
+            built += 1;
+            unavailable += p.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            blocks += p.contains("NO HEALTHY POD MAY BE EVICTED") as usize;
+            listed_blocking += (b.disruptions_allowed == 0) as usize;
+            no_pods += (p.contains("SELECTS NO PODS") || p.contains("NO SELECTOR:")) as usize;
+            never += p.contains("CAN NEVER ALLOW A DISRUPTION") as usize;
+            overlap += p.contains("OVERLAPS WITH") as usize;
+            drain_waiting += p.contains("A DRAIN IS WAITING") as usize;
+            unmanaged += p.contains("with no controller") as usize;
+            // The pods it covers, read here, against the controller's own count.
+            let read = p
+                .split("## Pods it covers\n")
+                .nth(1)
+                .and_then(|s| s.split(" pods, ").next())
+                .and_then(|n| n.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            count_mismatch += (read != b.expected_pods) as usize;
+        }
+        println!(
+            "pdbs={} built={built} unavailable_sections={unavailable} largest_tokens={largest} blocks={blocks} listed_blocking={listed_blocking} no_pods={no_pods} never={never} overlap={overlap} drain_waiting={drain_waiting} unmanaged={unmanaged} count_mismatch={count_mismatch}",
+            all.len()
+        );
+        assert!(built > 0, "no PodDisruptionBudget to diagnose");
+        assert_eq!(unavailable, 0);
+        assert_eq!(blocks, listed_blocking);
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs

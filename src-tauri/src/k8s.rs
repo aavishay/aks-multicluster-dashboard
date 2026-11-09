@@ -4242,6 +4242,167 @@ pub async fn get_deployment_diagnostics(context_name: &str, namespace: &str, nam
     Ok(DeploymentDiagnostics { deployment, replica_sets, pods, new_rs_events, hpas, pdbs })
 }
 
+/// What a PodDisruptionBudget diagnosis reads.
+pub struct PdbDiagnostics {
+    pub pdb: k8s_openapi::api::policy::v1::PodDisruptionBudget,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// The pods its selector covers; empty when it has no selector, which
+    /// selects none.
+    pub pods: Result<Vec<Pod>, String>,
+    /// The nodes under those pods: `None` when the node no longer exists.
+    pub nodes: Vec<(String, Result<Option<Node>, String>)>,
+    /// The controllers of those pods, a ReplicaSet resolved to its
+    /// Deployment, with the pods each asks for when it says.
+    pub owners: Result<Vec<PdbOwner>, String>,
+    /// The other budgets in the namespace that cover any of the same pods,
+    /// each with the pods it shares.
+    pub others: Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>,
+}
+
+/// A controller behind a budget's pods.
+pub struct PdbOwner {
+    pub kind: String,
+    pub name: String,
+    /// The pods it asks for: replicas, or a DaemonSet's desired count.
+    pub desired: Result<Option<i32>, String>,
+    /// The budget's pods it controls.
+    pub pods: usize,
+}
+
+/// How many nodes under a budget's pods are read.
+const PDB_DIAG_NODES: usize = 20;
+
+pub async fn get_pdb_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<PdbDiagnostics, String> {
+    use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ApiResource::erase::<PodDisruptionBudget>(&()));
+    let mut obj = api.get(name).await.map_err(|e| get_error("PodDisruptionBudget", name, e))?;
+    let pdb: PodDisruptionBudget = serde_json::to_value(&obj)
+        .and_then(serde_json::from_value)
+        .map_err(|e| format!("Failed to read PodDisruptionBudget '{name}': {e}"))?;
+    if let Some(a) = obj.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+    let selector = pdb.spec.as_ref().and_then(|s| s.selector.clone());
+
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pdbs_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    let event_params = ListParams::default().fields(&format!(
+        "involvedObject.kind=PodDisruptionBudget,involvedObject.name={name},involvedObject.namespace={namespace}"
+    ));
+    let pods_fut = async {
+        // A budget with no selector selects no pods; an empty one, every pod
+        // in its namespace.
+        match &selector {
+            None => Ok(Vec::new()),
+            Some(sel) => pods_api
+                .list(&ListParams::default().labels(&label_selector_query(sel)))
+                .await
+                .map(|l| l.items)
+                .map_err(|e| format!("Failed to list pods in '{namespace}': {e}")),
+        }
+    };
+    let all = ListParams::default();
+    let (events, pods, pdbs) = tokio::join!(events_api.list(&event_params), pods_fut, pdbs_api.list(&all));
+    let events = events
+        .map(|l| {
+            let mut items = l.items;
+            items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+            items.into_iter().map(event_to_info).collect()
+        })
+        .map_err(|e| format!("Failed to list events for PodDisruptionBudget '{name}': {e}"));
+    // Another budget's overlap is with these pods, so it can only be worked
+    // out once they are known.
+    let others = match (&pods, pdbs) {
+        (Err(_), _) => Err("not checked: the budget's pods could not be read".to_string()),
+        (_, Err(e)) => Err(format!("Failed to list PodDisruptionBudgets in '{namespace}': {e}")),
+        (Ok(p), Ok(_)) if p.is_empty() => Ok(Vec::new()),
+        (Ok(_), Ok(l)) => Ok(budgets_over(
+            l.items.into_iter().filter(|b| b.metadata.name.as_deref() != Some(name)).collect(),
+            &pods,
+            None,
+        )),
+    };
+
+    let mut node_names: Vec<String> = pods.iter().flatten().filter_map(|p| p.spec.as_ref()?.node_name.clone()).collect();
+    node_names.sort();
+    node_names.dedup();
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let nodes_fut = futures::future::join_all(node_names.into_iter().take(PDB_DIAG_NODES).map(|node| {
+        let nodes_api = nodes_api.clone();
+        async move {
+            let got = nodes_api.get_opt(&node).await.map_err(|e| format!("Failed to get node '{node}': {e}"));
+            (node, got)
+        }
+    }));
+
+    // Each distinct controller once; a ReplicaSet stands for its Deployment,
+    // whose replicas are what a budget is measured against.
+    let mut controllers: Vec<((String, String), usize)> = Vec::new();
+    for p in pods.iter().flatten() {
+        let key = controller_owner(&p.metadata.owner_references).map(|(k, n)| (k.to_string(), n.to_string())).unwrap_or_default();
+        match controllers.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => controllers.push((key, 1)),
+        }
+    }
+    let owners_fut = futures::future::join_all(controllers.into_iter().map(|((kind, owner), count)| {
+        let client = client.clone();
+        async move {
+            let api_get = |e: kube::Error, k: &str, n: &str| format!("Failed to get {k} '{n}': {e}");
+            match kind.as_str() {
+                "ReplicaSet" => {
+                    let rs = Api::<ReplicaSet>::namespaced(client.clone(), namespace).get_opt(&owner).await;
+                    match rs {
+                        Ok(Some(rs)) => match controller_owner(&rs.metadata.owner_references) {
+                            Some(("Deployment", d)) => {
+                                let d = d.to_string();
+                                let desired = Api::<Deployment>::namespaced(client.clone(), namespace)
+                                    .get_opt(&d)
+                                    .await
+                                    .map(|got| got.map(|dep| dep.spec.and_then(|s| s.replicas).unwrap_or(1)))
+                                    .map_err(|e| api_get(e, "Deployment", &d));
+                                PdbOwner { kind: "Deployment".into(), name: d, desired, pods: count }
+                            }
+                            _ => PdbOwner { kind, name: owner, desired: Ok(rs.spec.and_then(|s| s.replicas)), pods: count },
+                        },
+                        Ok(None) => PdbOwner { kind, name: owner, desired: Ok(None), pods: count },
+                        Err(e) => PdbOwner { desired: Err(api_get(e, "ReplicaSet", &owner)), kind, name: owner, pods: count },
+                    }
+                }
+                "StatefulSet" => {
+                    let desired = Api::<StatefulSet>::namespaced(client.clone(), namespace)
+                        .get_opt(&owner)
+                        .await
+                        .map(|got| got.map(|s| s.spec.and_then(|s| s.replicas).unwrap_or(1)))
+                        .map_err(|e| api_get(e, "StatefulSet", &owner));
+                    PdbOwner { kind, name: owner, desired, pods: count }
+                }
+                "DaemonSet" => {
+                    let desired = Api::<DaemonSet>::namespaced(client.clone(), namespace)
+                        .get_opt(&owner)
+                        .await
+                        .map(|got| got.and_then(|d| d.status.map(|s| s.desired_number_scheduled)))
+                        .map_err(|e| api_get(e, "DaemonSet", &owner));
+                    PdbOwner { kind, name: owner, desired, pods: count }
+                }
+                _ => PdbOwner { kind, name: owner, desired: Ok(None), pods: count },
+            }
+        }
+    }));
+    let (nodes, owners) = tokio::join!(nodes_fut, owners_fut);
+    let owners = match &pods {
+        Ok(_) => Ok(owners),
+        Err(_) => Err("not checked: the budget's pods could not be read".to_string()),
+    };
+
+    Ok(PdbDiagnostics { pdb, manifest, events, pods, nodes, owners, others })
+}
+
 /// A Service an Ingress routes to, as the diagnosis read it.
 pub struct IngressBackend {
     pub name: String,

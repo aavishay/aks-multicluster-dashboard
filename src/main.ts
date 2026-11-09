@@ -5904,6 +5904,7 @@ function setMetricsRange(minutes: number) {
   diagnoseService,
   diagnoseIngress,
   diagnosePvc,
+  diagnosePdb,
   diagnoseKeda,
   confirmDiagnose,
   closeClaudeDiagnose,
@@ -7099,6 +7100,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Settings, conditions and triggers, where each credential comes from (checked by key name, never value), the KEDA operator's log lines about it, its events, the HPA it generated or the Jobs it ran, KEDA's own health, and its manifest."
                   : d.kind === "PersistentVolumeClaim"
                   ? "Phase, size and conditions, its storage class or why it has none, the volume bound to it and its CSI driver, the pods that mount it and the events of those not ready, its volume attachments, how full it is, the events of the claim and volume, and its manifest."
+                  : d.kind === "PodDisruptionBudget"
+                  ? "Its budget, counts, eviction policy and conditions, the pods it covers with their readiness and nodes, the controllers behind them and the replicas each asks for, any other budget over the same pods, its events, and its manifest."
                   : d.kind === "Ingress"
                   ? "Its routes, TLS and address, whether its class exists and its controller is up, the controller's log lines about it, each backend Service with its port and ready endpoints, each TLS Secret (checked by key name and the certificate's public fields, never the key), cert-manager's view of them, other Ingresses on its hosts, its events, and its manifest."
                   : d.kind === "Service"
@@ -8612,6 +8615,10 @@ function diagnoseIngress(ctx: string, namespace: string, name: string) {
  */
 function diagnosePvc(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "PersistentVolumeClaim", namespace, name, "", () => api.aiBuildPvcDiagnosis(ctx, namespace, name));
+}
+
+function diagnosePdb(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "PodDisruptionBudget", namespace, name, "", () => api.aiBuildPdbDiagnosis(ctx, namespace, name));
 }
 
 /**
@@ -13686,7 +13693,7 @@ function renderPdbs(): string {
     keyOf: (r) => `${r.ctx}:${r.p.namespace}:${r.p.name}`,
     health: { healthy: (r) => pdbIsHealthy(r.p), unhealthyLabel: "blocking evictions", statusText: (r) => pdbStatus(r.p) },
     renderRow: ({ ctx, p }) => `
-      <tr>
+      <tr data-diagnose-what="pdb" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(p.namespace)}" data-diagnose-name="${esc(p.name)}">
         ${rowCheckboxCell("pdbs", `${ctx}:${p.namespace}:${p.name}`)}
         <td title="${esc(pdbStatus(p))}">${statusDot(pdbIsHealthy(p), p.expected_pods === 0)}</td>
         ${multi ? resourceClusterCell("pdbs", ctx) : ""}
@@ -14390,6 +14397,8 @@ function renderResourceDetailPanel(): string {
                   ? claudeDiagnoseButton(`window.__app.diagnoseIngress(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "ingress")
                   : rd.kind === "PersistentVolumeClaim"
                     ? claudeDiagnoseButton(`window.__app.diagnosePvc(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "volume claim")
+                    : rd.kind === "PodDisruptionBudget"
+                    ? claudeDiagnoseButton(`window.__app.diagnosePdb(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "disruption budget")
                     : evDiagnosis
                       ? claudeDiagnoseButton(
                           `window.__app.diagnoseWorkload(${jsArg(rd.ctx)},${jsArg(evDiagnosis.kind)},${jsArg(evDiagnosis.namespace)},${jsArg(evDiagnosis.name)})`,
@@ -15813,6 +15822,9 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "pvc":
       diagnosePvc(ctx, ns, name);
+      return true;
+    case "pdb":
+      diagnosePdb(ctx, ns, name);
       return true;
     case "keda":
       diagnoseKeda(ctx, ns, d.diagnoseKind ?? "ScaledObject", name);
