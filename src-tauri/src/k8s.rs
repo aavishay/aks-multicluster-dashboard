@@ -4394,7 +4394,16 @@ pub async fn get_pdb_diagnostics(context_name: &str, namespace: &str, name: &str
             }
         }
     }));
-    let (nodes, owners) = tokio::join!(nodes_fut, owners_fut);
+    let (nodes, resolved) = tokio::join!(nodes_fut, owners_fut);
+    // Mid-rollout, two ReplicaSets resolve to one Deployment: it is one
+    // controller, asking for its replicas once, over both sets of pods.
+    let mut owners: Vec<PdbOwner> = Vec::new();
+    for o in resolved {
+        match owners.iter_mut().find(|m| m.kind == o.kind && m.name == o.name) {
+            Some(m) => m.pods += o.pods,
+            None => owners.push(o),
+        }
+    }
     let owners = match &pods {
         Ok(_) => Ok(owners),
         Err(_) => Err("not checked: the budget's pods could not be read".to_string()),

@@ -5053,17 +5053,24 @@ fn render_pdb_pods(
     let mut cordoned: Vec<String> = Vec::new();
     for (i, p) in pods.iter().enumerate() {
         let node = p.spec.as_ref().and_then(|s| s.node_name.clone()).unwrap_or_default();
+        // A node can be both NotReady and cordoned; each is said.
         let note = match nodes.iter().find(|(n, _)| *n == node).map(|(_, r)| r) {
             Some(Ok(None)) => " (NODE NO LONGER EXISTS)".to_string(),
-            Some(Ok(Some(n))) if !k8s::node_is_ready(n) => " (node NOT READY)".to_string(),
-            Some(Ok(Some(n))) if n.spec.as_ref().and_then(|s| s.unschedulable) == Some(true) => {
-                if !cordoned.contains(&node) {
-                    cordoned.push(node.clone());
+            Some(Ok(Some(n))) => {
+                let mut note = String::new();
+                if !k8s::node_is_ready(n) {
+                    note.push_str(" (node NOT READY)");
                 }
-                " (node CORDONED)".to_string()
+                if n.spec.as_ref().and_then(|s| s.unschedulable) == Some(true) {
+                    if !cordoned.contains(&node) {
+                        cordoned.push(node.clone());
+                    }
+                    note.push_str(" (node CORDONED)");
+                }
+                note
             }
             Some(Err(e)) => format!(" (node unavailable: {e})"),
-            _ => String::new(),
+            None => String::new(),
         };
         if i < SHOWN {
             let phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_else(|| "Unknown".into());
@@ -5080,13 +5087,30 @@ fn render_pdb_pods(
         lines.push(format!("and {} more", pods.len() - SHOWN));
     }
     if !cordoned.is_empty() {
-        let on_cordoned = pods.iter().filter(|p| p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some_and(|n| cordoned.contains(n))).count();
-        lines.push(if allowed == 0 {
+        let on: Vec<&k8s_openapi::api::core::v1::Pod> =
+            pods.iter().filter(|p| p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some_and(|n| cordoned.contains(n))).collect();
+        let on_cordoned = on.len();
+        // Nothing allowed stops a ready pod's eviction; an unready one may
+        // still go, as the eviction policy in the budget's line says.
+        let ready_on = on.iter().filter(|p| pod_is_ready(p)).count();
+        let unready_on = on_cordoned - ready_on;
+        lines.push(if allowed == 0 && ready_on > 0 {
             format!(
-                "A DRAIN IS WAITING ON THIS BUDGET: {on_cordoned} of its pods {} on cordoned nodes ({}) and it allows no disruption, so {} cannot be evicted",
-                if on_cordoned == 1 { "is" } else { "are" },
+                "A DRAIN IS WAITING ON THIS BUDGET: {ready_on} ready pod{} on cordoned nodes ({}) cannot be evicted while it allows no disruption{}",
+                if ready_on == 1 { "" } else { "s" },
                 sts_pod_list(&cordoned),
-                if on_cordoned == 1 { "it" } else { "they" }
+                if unready_on > 0 {
+                    format!("; {unready_on} not ready there may still be, as its unhealthyPodEvictionPolicy decides")
+                } else {
+                    String::new()
+                }
+            )
+        } else if allowed == 0 {
+            format!(
+                "{unready_on} of its pods on cordoned nodes ({}) {} not ready: whether a drain can evict {} while it allows no disruption is up to its unhealthyPodEvictionPolicy",
+                sts_pod_list(&cordoned),
+                if unready_on == 1 { "is" } else { "are" },
+                if unready_on == 1 { "it" } else { "them" }
             )
         } else {
             format!(
@@ -5132,8 +5156,14 @@ fn render_pdb_owners(pdb: &k8s_openapi::api::policy::v1::PodDisruptionBudget, ow
     // Measured as the disruption controller does: against the pods the
     // controllers ask for. Only when every one of them says.
     let spec = pdb.spec.clone().unwrap_or_default();
+    // Pods with no controller count toward an integer minAvailable but ask
+    // for no replicas, so with any of them the comparison is not made.
     let managed: Vec<&k8s::PdbOwner> = owners.iter().filter(|o| !o.kind.is_empty()).collect();
-    let desired: Option<i32> = if managed.is_empty() { None } else { managed.iter().map(|o| o.desired.clone().ok().flatten()).sum() };
+    let desired: Option<i32> = if managed.is_empty() || managed.len() < owners.len() {
+        None
+    } else {
+        managed.iter().map(|o| o.desired.clone().ok().flatten()).sum()
+    };
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
     let never = match (&spec.min_available, &spec.max_unavailable) {
         (Some(IntOrString::String(s)), _) if s.trim() == "100%" => Some(format!("minAvailable {s} keeps every pod")),
@@ -7691,15 +7721,24 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
                 "status": { "conditions": [{ "type": "Ready", "status": ready }] } })).unwrap()
         };
         let p = |name: &str, on: &str, ready: bool| labelled_pod(name, serde_json::json!({ "app": "web" }), ready, serde_json::json!({ "spec": { "nodeName": on } }));
-        let nodes = vec![("n1".to_string(), Ok(Some(node("n1", "True", true)))), ("n2".to_string(), Ok(None)), ("n3".to_string(), Ok(Some(node("n3", "False", false))))];
+        let nodes = vec![
+            ("n1".to_string(), Ok(Some(node("n1", "True", true)))),
+            ("n2".to_string(), Ok(None)),
+            ("n3".to_string(), Ok(Some(node("n3", "False", false)))),
+            ("n4".to_string(), Ok(Some(node("n4", "False", true)))),
+        ];
         assert_eq!(
-            render_pdb_pods(&budget(serde_json::json!({})), &Ok(vec![p("web-1", "n1", true), p("web-2", "n2", false), p("web-3", "n3", false)]), &nodes),
-            "3 pods, 1 ready\n\
+            render_pdb_pods(&budget(serde_json::json!({})), &Ok(vec![p("web-1", "n1", true), p("web-2", "n2", false), p("web-3", "n3", false), p("web-4", "n4", false)]), &nodes),
+            "4 pods, 1 ready\n\
              web-1: ready; on n1 (node CORDONED)\n\
              web-2: NOT READY; on n2 (NODE NO LONGER EXISTS)\n\
              web-3: NOT READY; on n3 (node NOT READY)\n\
-             A DRAIN IS WAITING ON THIS BUDGET: 1 of its pods is on cordoned nodes (n1) and it allows no disruption, so it cannot be evicted"
+             web-4: NOT READY; on n4 (node NOT READY) (node CORDONED)\n\
+             A DRAIN IS WAITING ON THIS BUDGET: 1 ready pod on cordoned nodes (n1, n4) cannot be evicted while it allows no disruption; 1 not ready there may still be, as its unhealthyPodEvictionPolicy decides"
         );
+        // Only unready pods on the cordoned node: not called blocked.
+        let unready_only = render_pdb_pods(&budget(serde_json::json!({})), &Ok(vec![p("web-4", "n4", false)]), &nodes);
+        assert!(unready_only.ends_with("1 of its pods on cordoned nodes (n4) is not ready: whether a drain can evict it while it allows no disruption is up to its unhealthyPodEvictionPolicy") && !unready_only.contains("WAITING"), "{unready_only}");
         let loose = budget(serde_json::json!({ "status": { "disruptionsAllowed": 2 } }));
         assert!(render_pdb_pods(&loose, &Ok(vec![p("web-1", "n1", true)]), &nodes).ends_with("1 of its pods is on cordoned nodes (n1); it allows 2 disruptions now, so a drain can evict it"));
         assert_eq!(render_pdb_pods(&loose, &Err("forbidden".into()), &[]), "(pods unavailable: forbidden)");
@@ -7721,6 +7760,9 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         // Unmanaged pods are said, and give no replica count to measure against.
         let bare = render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("", "", None, 2)]));
         assert_eq!(bare, "2 pods with no controller: an evicted one is not recreated");
+        // An unmanaged pod counts toward minAvailable without asking for a
+        // replica, so a Deployment of 1 plus one bare pod is not called stuck.
+        assert!(!render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("Deployment", "web", Some(1), 1), owner("", "", None, 1)])).contains("NEVER"));
         assert_eq!(render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![])), "(no pods, so no controller)");
 
         assert_eq!(render_pdb_others(&Ok(vec![])), "(no other budget in its namespace covers any of its pods)");
