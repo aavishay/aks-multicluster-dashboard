@@ -169,8 +169,9 @@ which installs for your user alone and needs no admin rights.
 
 Any node, NAP NodePool, workload, pod, Service, Ingress, PVC, HPA, KEDA
 ScaledObject or ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
-and click **Diagnose** in its panel, or press `⌘D` on a focused row. The app gathers the status, events and
-manifest behind it, plus what that kind of object needs:
+and click **Diagnose** in its panel, or press `⌘D` on a focused row. An event about a workload offers its
+workload's diagnosis the same way; one about a ReplicaSet, its Deployment's, which covers its ReplicaSets.
+The app gathers the status, events and manifest behind it, plus what that kind of object needs:
 
 - a pod: its recent logs, and the logs of its previous instance when the
   container has restarted — usually where a crash loop's crash is written;
