@@ -651,6 +651,11 @@ pub async fn ai_build_service_diagnosis(context_name: String, namespace: String,
 }
 
 #[tauri::command]
+pub async fn ai_build_namespace_diagnosis(context_name: String, name: String) -> Result<ClaudeDiagnosisPayload, String> {
+    with_retry(&context_name, || claude::build_namespace_diagnosis_payload(&context_name, &name)).await
+}
+
+#[tauri::command]
 pub async fn ai_build_ingress_diagnosis(context_name: String, namespace: String, name: String) -> Result<ClaudeDiagnosisPayload, String> {
     with_retry(&context_name, || claude::build_ingress_diagnosis_payload(&context_name, &namespace, &name)).await
 }
