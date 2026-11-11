@@ -5919,6 +5919,7 @@ function setMetricsRange(minutes: number) {
   diagnoseService,
   diagnoseIngress,
   diagnosePvc,
+  diagnoseJob,
   diagnoseKeda,
   confirmDiagnose,
   closeClaudeDiagnose,
@@ -7122,6 +7123,10 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Replica bounds, conditions, each metric against its target, behavior and events, the object it scales and any other HPA on it, the requests and usage of every container in its pods, whether its metrics APIs are available, and its manifest."
                   : d.kind === "NodePool"
                   ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
+                  : d.kind === "CronJob"
+                  ? "Its schedule, policies and recent runs, its newest failed run (or newest run) with its limits, status and conditions, that run's attempts with each container's exit code and node, the events of the CronJob, the run and its worst attempt, that attempt's logs (and its previous instance's when it restarted), and its manifest."
+                  : d.kind === "Job"
+                  ? "Its limits, status and conditions, its CronJob if it has one, its attempts with each container's exit code and node, the events of the Job and its worst attempt, that attempt's logs (and its previous instance's when it restarted), and its manifest."
                   : d.kind === "StatefulSet"
                   ? "Status, revisions and update strategy, each ordinal's pod with its revision and the state of the node under one that is stuck, each ordinal's volume claim against its template, the governing Service, the PodDisruptionBudgets over its pods, its events and manifest, a table of its pods, and the events and recent logs of its least healthy pod."
                   : d.kind === "Deployment"
@@ -8629,6 +8634,10 @@ function diagnoseIngress(ctx: string, namespace: string, name: string) {
  */
 function diagnosePvc(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "PersistentVolumeClaim", namespace, name, "", () => api.aiBuildPvcDiagnosis(ctx, namespace, name));
+}
+
+function diagnoseJob(ctx: string, kind: string, namespace: string, name: string) {
+  startDiagnosis(ctx, kind, namespace, name, "", () => api.aiBuildJobDiagnosis(ctx, kind, namespace, name));
 }
 
 /**
@@ -13779,7 +13788,7 @@ function renderJobs(): string {
     keyOf: (r) => `${r.ctx}:${r.j.kind}:${r.j.namespace}:${r.j.name}`,
     health: { healthy: (r) => r.j.healthy, unhealthyLabel: "failed", statusText: (r) => r.j.failure_message ?? r.j.status },
     renderRow: ({ ctx, j }) => `
-      <tr>
+      <tr data-diagnose-what="job" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="${esc(j.kind)}" data-diagnose-ns="${esc(j.namespace)}" data-diagnose-name="${esc(j.name)}">
         ${rowCheckboxCell("jobs", `${ctx}:${j.kind}:${j.namespace}:${j.name}`)}
         <td title="${esc(j.failure_message ?? j.status)}">${statusDot(j.healthy, j.status === "Pending" || j.status === "Suspended")}</td>
         ${multi ? resourceClusterCell("jobs", ctx) : ""}
@@ -14560,6 +14569,8 @@ function renderResourceDetailPanel(): string {
                   ? claudeDiagnoseButton(`window.__app.diagnoseIngress(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "ingress")
                   : rd.kind === "PersistentVolumeClaim"
                     ? claudeDiagnoseButton(`window.__app.diagnosePvc(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "volume claim")
+                    : rd.kind === "Job" || rd.kind === "CronJob"
+                    ? claudeDiagnoseButton(`window.__app.diagnoseJob(${jsArg(rd.ctx)},${jsArg(rd.kind)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, rd.kind === "Job" ? "job" : "cron job")
                     : evDiagnosis
                       ? claudeDiagnoseButton(
                           `window.__app.diagnoseWorkload(${jsArg(rd.ctx)},${jsArg(evDiagnosis.kind)},${jsArg(evDiagnosis.namespace)},${jsArg(evDiagnosis.name)})`,
@@ -15983,6 +15994,9 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "pvc":
       diagnosePvc(ctx, ns, name);
+      return true;
+    case "job":
+      diagnoseJob(ctx, d.diagnoseKind ?? "Job", ns, name);
       return true;
     case "keda":
       diagnoseKeda(ctx, ns, d.diagnoseKind ?? "ScaledObject", name);

@@ -75,6 +75,48 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_JOB_SYSTEM: &str = "\
+You diagnose failing Kubernetes Jobs and CronJobs for an experienced SRE.
+
+You are given, for a CronJob, its schedule, policies and recent runs, and \
+the run most worth examining; for that Job (or the Job asked about), its \
+limits, status and conditions; its attempts — its pods, newest first, with \
+each container's exit code and reason and the node it ran on; the events of \
+the CronJob, the Job and the worst attempt; the logs of the worst attempt's \
+failing container, with its previous instance's when it restarted in \
+place; and the manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the exit code, the log \
+line, the condition, the event, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- The work itself fails: attempts exit non-zero, the same way each time, \
+until backoffLimit is reached. The logs and exit code say why; fix the \
+command, image or configuration, not the Job's limits.
+- Out of memory: attempts are OOMKilled. Raise the memory limit or reduce \
+the work per pod.
+- It ran too long: DeadlineExceeded means activeDeadlineSeconds stopped it, \
+whatever its pods were doing. Say whether the work is slow or stuck.
+- It never got going: no attempt ran because a pod could not be created \
+(a quota, a LimitRange, admission) or scheduled; the events say which.
+- Its podFailurePolicy decided: the rule and exit code that failed it.
+- A CronJob that does not run: suspended, never scheduled (an invalid \
+schedule or time zone), runs skipped by concurrencyPolicy Forbid behind one \
+that is stuck, or missed starts past startingDeadlineSeconds.
+- A CronJob whose runs fail: treat its newest failed run as a failing Job, \
+and say whether earlier runs failed the same way.
+
+If it is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_STATEFULSET_SYSTEM: &str = "\
 You diagnose failing Kubernetes StatefulSets for an experienced SRE.
 
@@ -4359,6 +4401,329 @@ fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBud
     lines.join("\n")
 }
 
+/// A length of time as people say it: 42s, 5m 3s, 2h 10m, 3d 4h.
+fn job_span(seconds: i64) -> String {
+    let s = seconds.max(0);
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {}s", s / 60, s % 60),
+        3600..=86399 => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+        _ => format!("{}d {}h", s / 86400, (s % 86400) / 3600),
+    }
+}
+
+/// A Job's limits, status and conditions, and how it ended.
+fn render_job(job: &k8s_openapi::api::batch::v1::Job, now: chrono::DateTime<chrono::Utc>) -> String {
+    let spec = job.spec.clone().unwrap_or_default();
+    let status = job.status.clone().unwrap_or_default();
+    let backoff = spec.backoff_limit.unwrap_or(6);
+    let mut lines = vec![format!(
+        "completions {}{}, parallelism {}; backoffLimit {backoff}{}",
+        // Both unset default to 1; parallelism alone makes a work queue.
+        match (spec.completions, spec.parallelism) {
+            (Some(c), _) => c.to_string(),
+            (None, Some(_)) => "(none: a work queue)".to_string(),
+            (None, None) => "1".to_string(),
+        },
+        spec.completion_mode.as_deref().filter(|m| *m != "NonIndexed").map(|m| format!(" ({m})")).unwrap_or_default(),
+        spec.parallelism.unwrap_or(1),
+        spec.backoff_limit_per_index.map(|b| format!(", backoffLimitPerIndex {b}")).unwrap_or_default(),
+    )];
+    if let Some(d) = spec.active_deadline_seconds {
+        lines.push(format!("activeDeadlineSeconds {d}"));
+    }
+    if let Some(t) = spec.ttl_seconds_after_finished {
+        lines.push(format!("ttlSecondsAfterFinished {t}: it and its pods are deleted that long after it finishes"));
+    }
+    if let Some(policy) = &spec.pod_failure_policy {
+        for r in &policy.rules {
+            let on = match (&r.on_exit_codes, &r.on_pod_conditions) {
+                (Some(c), _) => format!(
+                    "exit codes {} {:?}{}",
+                    c.operator,
+                    c.values,
+                    c.container_name.as_deref().map(|n| format!(" in {n}")).unwrap_or_default()
+                ),
+                (_, Some(c)) => format!("pod condition {}", c.iter().map(|c| c.type_.clone()).collect::<Vec<_>>().join(", ")),
+                _ => "(no match)".into(),
+            };
+            lines.push(format!("podFailurePolicy: {} on {on}", r.action));
+        }
+    }
+    let restart = spec.template.spec.as_ref().and_then(|s| s.restart_policy.clone()).unwrap_or_else(|| "(unset)".into());
+    lines.push(format!("restartPolicy {restart}"));
+    lines.push(format!(
+        "pods: active {}, ready {}, succeeded {}, failed {}",
+        status.active.unwrap_or(0),
+        status.ready.unwrap_or(0),
+        status.succeeded.unwrap_or(0),
+        status.failed.unwrap_or(0)
+    ));
+    let start = status.start_time.as_ref().map(|t| t.0);
+    let conditions: Vec<&k8s_openapi::api::batch::v1::JobCondition> = status.conditions.iter().flatten().filter(|c| c.status == "True").collect();
+    let failed = conditions.iter().find(|c| c.type_ == "Failed");
+    let complete = conditions.iter().any(|c| c.type_ == "Complete");
+    let end = status.completion_time.as_ref().map(|t| t.0).or_else(|| failed.and_then(|c| c.last_transition_time.as_ref()).map(|t| t.0));
+    match (start, end) {
+        (Some(s), Some(e)) => lines.push(format!("started {}, finished after {}", s.to_rfc3339(), job_span((e - s).num_seconds()))),
+        (Some(s), None) => lines.push(format!("started {}, running for {}", s.to_rfc3339(), job_span((now - s).num_seconds()))),
+        _ => lines.push("not started".to_string()),
+    }
+    for c in &conditions {
+        let message: String = c.message.as_deref().unwrap_or_default().chars().take(300).collect();
+        lines.push(format!("condition {} ({}){}", c.type_, c.reason.as_deref().unwrap_or("?"), if message.is_empty() { String::new() } else { format!(": {message}") }));
+    }
+    if let Some(c) = failed {
+        let message = c.message.as_deref().unwrap_or_default();
+        lines.push(match c.reason.as_deref() {
+            Some("BackoffLimitExceeded") => format!("THE JOB FAILED: its pods failed {} times, reaching backoffLimit {backoff}", status.failed.unwrap_or(0)),
+            Some("DeadlineExceeded") => format!(
+                "THE JOB FAILED: it ran past activeDeadlineSeconds {}, and its running pods were stopped",
+                spec.active_deadline_seconds.map(|d| d.to_string()).unwrap_or_else(|| "?".into())
+            ),
+            Some("PodFailurePolicy") => format!("THE JOB FAILED BY ITS podFailurePolicy: {message}"),
+            r => format!("THE JOB FAILED ({}): {message}", r.unwrap_or("no reason")),
+        });
+    } else if spec.suspend == Some(true) {
+        lines.push("SUSPENDED: it starts no pods until it is resumed".to_string());
+    } else if !complete && status.active.unwrap_or(0) == 0 {
+        lines.push("NO POD OF IT IS RUNNING: a pod it could not create or schedule shows in its events".to_string());
+    }
+    lines.join("\n")
+}
+
+/// A Job's attempts — its pods, newest first — with how each ended, and
+/// what they have in common.
+fn render_job_attempts(pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>) -> String {
+    const SHOWN: usize = 12;
+    let pods = match pods {
+        Ok(p) if p.is_empty() => {
+            return "(no pod of it is left: a finished Job's pods go with it, or after its ttlSecondsAfterFinished)".to_string()
+        }
+        Ok(p) => p,
+        Err(e) => return format!("(pods unavailable: {e})"),
+    };
+    let mut lines = Vec::new();
+    let mut exits: Vec<i32> = Vec::new();
+    let (mut oom, mut evicted): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for (i, p) in pods.iter().enumerate() {
+        let st = p.status.clone().unwrap_or_default();
+        let phase = st.phase.clone().unwrap_or_else(|| "Unknown".into());
+        let mut parts = vec![phase.clone()];
+        for c in st.init_container_statuses.iter().flatten().chain(st.container_statuses.iter().flatten()) {
+            let state = c.state.clone().unwrap_or_default();
+            if let Some(t) = &state.terminated {
+                parts.push(format!("{} exited {}{}", c.name, t.exit_code, t.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()));
+                if t.exit_code != 0 {
+                    exits.push(t.exit_code);
+                }
+                if t.reason.as_deref() == Some("OOMKilled") {
+                    let limit = p
+                        .spec
+                        .as_ref()
+                        .and_then(|s| s.containers.iter().chain(s.init_containers.iter().flatten()).find(|x| x.name == c.name))
+                        .and_then(|x| x.resources.as_ref()?.limits.as_ref()?.get("memory").map(|q| q.0.clone()));
+                    oom.push(format!("{} (limit {})", c.name, limit.unwrap_or_else(|| "none".into())));
+                }
+            } else if let Some(w) = &state.waiting {
+                parts.push(format!("{} waiting: {}", c.name, w.reason.as_deref().unwrap_or("?")));
+            } else if state.running.is_some() {
+                parts.push(format!("{} running", c.name));
+            }
+            if c.restart_count > 0 {
+                let before = c.last_state.as_ref().and_then(|s| s.terminated.as_ref());
+                parts.push(format!(
+                    "{} restarted {}×{}",
+                    c.name,
+                    c.restart_count,
+                    before.map(|t| format!(", last exit {}{}", t.exit_code, t.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default())).unwrap_or_default()
+                ));
+                if before.is_some_and(|t| t.reason.as_deref() == Some("OOMKilled")) && !oom.iter().any(|o| o.starts_with(&c.name)) {
+                    oom.push(c.name.clone());
+                }
+            }
+        }
+        if let Some(r) = &st.reason {
+            parts.push(format!("{r}: {}", st.message.as_deref().unwrap_or_default().chars().take(200).collect::<String>()));
+            if r == "Evicted" {
+                evicted.push(st.message.clone().unwrap_or_default());
+            }
+        }
+        if let Some(c) = st.conditions.iter().flatten().find(|c| c.type_ == "PodScheduled" && c.status == "False") {
+            parts.push(format!("UNSCHEDULABLE: {}", c.message.as_deref().unwrap_or_default().chars().take(300).collect::<String>()));
+        }
+        if let Some(n) = p.spec.as_ref().and_then(|s| s.node_name.as_deref()) {
+            parts.push(format!("on {n}"));
+        }
+        if let Some(t) = &st.start_time {
+            parts.push(format!("started {}", t.0.to_rfc3339()));
+        }
+        if i < SHOWN {
+            lines.push(format!("{}: {}", p.metadata.name.as_deref().unwrap_or_default(), parts.join("; ")));
+        }
+    }
+    if pods.len() > SHOWN {
+        lines.push(format!("and {} older attempts", pods.len() - SHOWN));
+    }
+    if !oom.is_empty() {
+        lines.push(format!("OOMKILLED: {} hit its memory limit", oom.join(", ")));
+    }
+    if !evicted.is_empty() {
+        lines.push(format!("{} ATTEMPT{} EVICTED: {}", evicted.len(), if evicted.len() == 1 { " WAS" } else { "S WERE" }, evicted[0].chars().take(200).collect::<String>()));
+    }
+    if exits.len() > 1 && exits.iter().all(|e| *e == exits[0]) {
+        lines.push(format!("EVERY FAILED ATTEMPT EXITED {}: it fails the same way each time", exits[0]));
+    }
+    lines.join("\n")
+}
+
+/// A CronJob's schedule and policies, and with its runs read, how they went.
+fn render_cronjob(
+    cj: &k8s_openapi::api::batch::v1::CronJob,
+    runs: Option<&Result<Vec<k8s_openapi::api::batch::v1::Job>, String>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let spec = cj.spec.clone().unwrap_or_default();
+    let status = cj.status.clone().unwrap_or_default();
+    let policy = spec.concurrency_policy.clone().unwrap_or_else(|| "Allow".into());
+    let mut lines = vec![format!(
+        "schedule {}{}; concurrencyPolicy {policy}{}; keeps {} successful and {} failed runs",
+        spec.schedule,
+        spec.time_zone.as_deref().map(|z| format!(" in {z}")).unwrap_or_else(|| " in the controller's time zone".into()),
+        spec.starting_deadline_seconds.map(|d| format!("; startingDeadlineSeconds {d}")).unwrap_or_default(),
+        spec.successful_jobs_history_limit.unwrap_or(3),
+        spec.failed_jobs_history_limit.unwrap_or(1),
+    )];
+    let ago = |t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time| format!("{} ({} ago)", t.0.to_rfc3339(), job_span((now - t.0).num_seconds()));
+    lines.push(format!("last scheduled: {}", status.last_schedule_time.as_ref().map(ago).unwrap_or_else(|| "never".into())));
+    lines.push(format!("last succeeded: {}", status.last_successful_time.as_ref().map(ago).unwrap_or_else(|| "never".into())));
+    let active: Vec<String> = status.active.iter().flatten().filter_map(|r| r.name.clone()).collect();
+    if !active.is_empty() {
+        lines.push(format!("running now: {}", active.join(", ")));
+    }
+    if spec.suspend == Some(true) {
+        lines.push("SUSPENDED: no new run starts until it is resumed".to_string());
+    } else if status.last_schedule_time.is_none() {
+        lines.push("IT HAS NOT BEEN SCHEDULED: no run has started; its events say why, if it is not simply waiting for its first time".to_string());
+    }
+    if policy == "Forbid" && !active.is_empty() {
+        lines.push(format!("CONCURRENCYPOLICY FORBID WITH A RUN STILL ACTIVE ({}): scheduled runs are skipped while it runs", active.join(", ")));
+    }
+    let Some(runs) = runs else { return lines.join("\n") };
+    match runs {
+        Err(e) => lines.push(format!("(runs unavailable: {e})")),
+        Ok(r) if r.is_empty() => lines.push("runs: none left (finished runs are removed past its history limits)".to_string()),
+        Ok(r) => {
+            lines.push(format!("runs, newest first ({}):", r.len()));
+            for j in r {
+                let info = crate::resources::job_info(j, now);
+                lines.push(format!(
+                    "  {}: {}{}; created {}",
+                    info.name,
+                    info.status,
+                    match (info.status.as_str(), info.duration_seconds) {
+                        ("Running", Some(d)) => format!(" for {}", job_span(d)),
+                        (_, Some(d)) => format!(" after {}", job_span(d)),
+                        _ => String::new(),
+                    },
+                    j.metadata.creation_timestamp.as_ref().map(|t| t.0.to_rfc3339()).unwrap_or_default()
+                ));
+                if let Some(m) = &info.failure_message {
+                    lines.push(format!("    {}", m.chars().take(300).collect::<String>()));
+                }
+            }
+            let failed_in_a_row = r.iter().take_while(|j| k8s::job_has_condition(j, "Failed")).count();
+            if failed_in_a_row > 0 {
+                lines.push(format!(
+                    "ITS LAST {failed_in_a_row} RUN{} FAILED{}",
+                    if failed_in_a_row == 1 { "" } else { "S" },
+                    if status.last_successful_time.is_none() { "; NO RUN HAS SUCCEEDED" } else { "" }
+                ));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Assembles a Job or CronJob diagnosis, redacted and trimmed.
+pub async fn build_job_diagnosis_payload(context_name: &str, kind: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_job_diagnostics(context_name, kind, namespace, name).await?;
+    let now = chrono::Utc::now();
+    let cron = d.cronjob.as_ref().map(|cj| redact::redact(&render_cronjob(cj, (d.kind == "CronJob").then_some(&d.runs), now)));
+    let job = redact::redact(&d.job.as_ref().map(|j| render_job(j, now)).unwrap_or_else(|| "(it has no run left to examine)".to_string()));
+    let attempts = redact::redact(&render_job_attempts(&d.pods));
+    let events = redact::redact(&render_nap_events(&d.events, &format!("(no events for this {kind})"), false, 20));
+    let job_events = d.job_events.as_ref().map(|e| redact::redact(&render_nap_events(e, "(no events for the run)", false, 15)));
+    let manifest = redact::redact(&d.manifest);
+    let (pod_events, logs, previous, current_note) = match &d.worst {
+        None => (None, None, None, None),
+        Some(w) => {
+            let (text, note) = match &w.logs {
+                Ok(t) if t.trim().is_empty() => ("(the container produced no log output)".to_string(), None),
+                Ok(t) => redact::tail_lines(t, DIAGNOSE_LOG_LINES),
+                Err(e) => (format!("(logs unavailable: {e})"), None),
+            };
+            (
+                Some(redact::redact(&render_nap_events(&w.events, "(no events for the attempt)", false, 15))),
+                Some(redact::redact(&text)),
+                Some(previous_logs_section(w.previous.clone())),
+                note,
+            )
+        }
+    };
+    let previous_r = previous.as_ref().map(|p| redact::redact(&p.text));
+
+    let mut parts = vec![&job, &attempts, &events, &manifest];
+    parts.extend(cron.as_ref());
+    parts.extend(job_events.as_ref());
+    parts.extend(pod_events.as_ref());
+    parts.extend(logs.as_ref());
+    parts.extend(previous_r.as_ref());
+    let redaction_summary = redact::Redacted::merge(parts).summary();
+    let log_note = combine_log_notes(current_note.clone(), previous.as_ref());
+
+    let run_name = d.job.as_ref().and_then(|j| j.metadata.name.clone()).unwrap_or_default();
+    let head = match (&cron, d.kind.as_str()) {
+        (Some(c), "CronJob") => format!(
+            "## CronJob\n{}\n\n## The run examined{}\n{}\n\n",
+            c.text,
+            if run_name.is_empty() { String::new() } else { format!(": Job {run_name}") },
+            job.text
+        ),
+        (Some(c), _) => format!("## Job\n{}\n\n## Its CronJob\n{}\n\n", job.text, c.text),
+        (None, _) => format!("## Job\n{}\n\n", job.text),
+    };
+    let mut prompt = format!(
+        "{kind} {namespace}/{name}.\n\n{head}\
+         ## Attempts (its pods, newest first)\n{}\n\n\
+         ## Events ({kind})\n{}\n\n",
+        attempts.text, events.text
+    );
+    if let Some(e) = &job_events {
+        prompt.push_str(&format!("## Events (Job {run_name})\n{}\n\n", e.text));
+    }
+    if let (Some(w), Some(e)) = (&d.worst, &pod_events) {
+        prompt.push_str(&format!("## Events (pod {})\n{}\n\n", w.pod, e.text));
+    }
+    prompt.push_str(&format!("## Manifest ({kind}, managed fields omitted)\n```yaml\n{}\n```", manifest.text));
+    match (&d.worst, &logs) {
+        (Some(w), Some(l)) => {
+            prompt.push_str(&format!(
+                "\n\n## Logs (pod {}, container {}){}\n```\n{}\n```",
+                w.pod,
+                w.container,
+                current_note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default(),
+                l.text
+            ));
+            if let (Some(p), Some(r)) = (&previous, &previous_r) {
+                prompt.push_str(&previous_logs_markdown(p, r, None));
+            }
+        }
+        _ => prompt.push_str("\n\n## Logs\n(no attempt left to read logs from)"),
+    }
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note })
+}
+
 /// The StatefulSet sections of a workload diagnosis.
 fn render_sts_sections(d: &k8s::StatefulSetDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
     let claim_events = if d.claim_events.is_empty() {
@@ -5454,6 +5819,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Ingress" => DIAGNOSE_INGRESS_SYSTEM,
         "PersistentVolumeClaim" => DIAGNOSE_PVC_SYSTEM,
         "StatefulSet" => DIAGNOSE_STATEFULSET_SYSTEM,
+        "Job" | "CronJob" => DIAGNOSE_JOB_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
         "Deployment" => DIAGNOSE_DEPLOYMENT_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
@@ -7420,6 +7786,114 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.contains("keda-hpa-web (made by KEDA ScaledObject web): min 2") && out.ends_with("MORE THAN ONE HPA TARGETS IT: each overwrites the replica count the other sets"), "{out}");
     }
 
+    fn batch_job(v: serde_json::Value) -> k8s_openapi::api::batch::v1::Job {
+        let mut base = serde_json::json!({ "metadata": { "name": "migrate", "namespace": "ns", "uid": "j-uid", "creationTimestamp": "2026-11-09T10:00:00Z" },
+            "spec": { "backoffLimit": 3, "template": { "spec": { "restartPolicy": "Never", "containers": [{ "name": "migrate" }] } } }, "status": {} });
+        json_merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn attempt(name: &str, phase: &str, container: serde_json::Value, extra: serde_json::Value) -> k8s_openapi::api::core::v1::Pod {
+        let mut base = serde_json::json!({ "metadata": { "name": name }, "spec": { "nodeName": "n1", "containers": [{ "name": "migrate", "resources": { "limits": { "memory": "256Mi" } } }] },
+            "status": { "phase": phase, "startTime": "2026-11-09T10:00:00Z", "containerStatuses": [container] } });
+        json_merge(&mut base, extra);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn exited(code: i32, reason: &str) -> serde_json::Value {
+        serde_json::json!({ "name": "migrate", "image": "x", "imageID": "", "ready": false, "restartCount": 0, "state": { "terminated": { "exitCode": code, "reason": reason } } })
+    }
+
+    #[test]
+    fn a_job_says_how_it_failed() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let failed = batch_job(serde_json::json!({ "status": { "startTime": "2026-11-09T10:00:00Z", "failed": 4,
+            "conditions": [{ "type": "Failed", "status": "True", "reason": "BackoffLimitExceeded", "message": "Job has reached the specified backoff limit", "lastTransitionTime": "2026-11-09T10:04:05Z" }] } }));
+        assert_eq!(
+            render_job(&failed, now),
+            "completions 1, parallelism 1; backoffLimit 3\n\
+             restartPolicy Never\n\
+             pods: active 0, ready 0, succeeded 0, failed 4\n\
+             started 2026-11-09T10:00:00+00:00, finished after 4m 5s\n\
+             condition Failed (BackoffLimitExceeded): Job has reached the specified backoff limit\n\
+             THE JOB FAILED: its pods failed 4 times, reaching backoffLimit 3"
+        );
+        let deadline = batch_job(serde_json::json!({ "spec": { "activeDeadlineSeconds": 600 }, "status": { "startTime": "2026-11-09T10:00:00Z",
+            "conditions": [{ "type": "Failed", "status": "True", "reason": "DeadlineExceeded", "message": "Job was active longer than specified deadline" }] } }));
+        let out = render_job(&deadline, now);
+        assert!(out.contains("activeDeadlineSeconds 600") && out.ends_with("THE JOB FAILED: it ran past activeDeadlineSeconds 600, and its running pods were stopped"), "{out}");
+        let policy = batch_job(serde_json::json!({ "spec": { "podFailurePolicy": { "rules": [{ "action": "FailJob", "onExitCodes": { "containerName": "migrate", "operator": "In", "values": [42] } }] } },
+            "status": { "conditions": [{ "type": "Failed", "status": "True", "reason": "PodFailurePolicy", "message": "Container migrate for pod ns/migrate-x failed with exit code 42 matching FailJob rule at index 0" }] } }));
+        let out = render_job(&policy, now);
+        assert!(out.contains("podFailurePolicy: FailJob on exit codes In [42] in migrate") && out.ends_with("THE JOB FAILED BY ITS podFailurePolicy: Container migrate for pod ns/migrate-x failed with exit code 42 matching FailJob rule at index 0"), "{out}");
+        assert!(render_job(&batch_job(serde_json::json!({ "spec": { "suspend": true } })), now).ends_with("SUSPENDED: it starts no pods until it is resumed"));
+        assert!(render_job(&batch_job(serde_json::json!({})), now).ends_with("not started\nNO POD OF IT IS RUNNING: a pod it could not create or schedule shows in its events"));
+        let running = render_job(&batch_job(serde_json::json!({ "spec": { "parallelism": 4, "completions": null }, "status": { "startTime": "2026-11-09T11:00:00Z", "active": 4 } })), now);
+        assert!(running.starts_with("completions (none: a work queue), parallelism 4") && running.contains("running for 1h 0m") && !running.contains("NO POD"), "{running}");
+    }
+
+    #[test]
+    fn a_jobs_attempts_say_what_they_have_in_common() {
+        let pods = vec![
+            attempt("migrate-c", "Failed", exited(1, "Error"), serde_json::json!({})),
+            attempt("migrate-b", "Failed", exited(1, "Error"), serde_json::json!({})),
+            attempt("migrate-a", "Failed", exited(137, "OOMKilled"), serde_json::json!({})),
+        ];
+        let out = render_job_attempts(&Ok(pods.clone()));
+        assert!(out.starts_with("migrate-c: Failed; migrate exited 1 (Error); on n1; started 2026-11-09T10:00:00+00:00"), "{out}");
+        assert!(out.contains("OOMKILLED: migrate (limit 256Mi) hit its memory limit") && !out.contains("EVERY FAILED ATTEMPT"), "{out}");
+        let same = render_job_attempts(&Ok(pods[..2].to_vec()));
+        assert!(same.ends_with("EVERY FAILED ATTEMPT EXITED 1: it fails the same way each time"), "{same}");
+        let stuck = attempt("migrate-d", "Pending", serde_json::json!({ "name": "migrate", "image": "x", "imageID": "", "ready": false, "restartCount": 0, "state": { "waiting": { "reason": "ContainerCreating" } } }),
+            serde_json::json!({ "spec": { "nodeName": null }, "status": { "conditions": [{ "type": "PodScheduled", "status": "False", "message": "0/3 nodes are available: 3 Insufficient memory." }] } }));
+        let evicted = attempt("migrate-e", "Failed", exited(0, "Completed"), serde_json::json!({ "status": { "reason": "Evicted", "message": "The node was low on resource: ephemeral-storage." } }));
+        let out = render_job_attempts(&Ok(vec![stuck, evicted]));
+        assert!(out.contains("migrate-d: Pending; migrate waiting: ContainerCreating; UNSCHEDULABLE: 0/3 nodes are available: 3 Insufficient memory."), "{out}");
+        assert!(out.ends_with("1 ATTEMPT WAS EVICTED: The node was low on resource: ephemeral-storage."), "{out}");
+        assert!(render_job_attempts(&Ok(vec![])).starts_with("(no pod of it is left"));
+        // The attempt worth reading: the newest failed one, its failing container.
+        assert_eq!(k8s::worst_attempt(&pods), Some(("migrate-c".to_string(), "migrate".to_string())));
+        assert_eq!(k8s::worst_attempt(&[]), None);
+        assert_eq!(job_span(42), "42s");
+        assert_eq!(job_span(3 * 86400 + 4 * 3600 + 5), "3d 4h");
+    }
+
+    #[test]
+    fn a_cronjob_says_whether_it_runs_and_how_its_runs_end() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let cron = |v: serde_json::Value| -> k8s_openapi::api::batch::v1::CronJob {
+            let mut base = serde_json::json!({ "metadata": { "name": "report", "namespace": "ns", "uid": "cj-uid" },
+                "spec": { "schedule": "0 * * * *", "jobTemplate": { "spec": { "template": { "spec": { "containers": [{ "name": "c" }] } } } } },
+                "status": { "lastScheduleTime": "2026-11-09T11:00:00Z", "lastSuccessfulTime": "2026-11-09T09:00:00Z" } });
+            json_merge(&mut base, v);
+            serde_json::from_value(base).unwrap()
+        };
+        let run = |name: &str, outcome: &str| batch_job(serde_json::json!({ "metadata": { "name": name }, "status": { "startTime": "2026-11-09T10:00:00Z", "completionTime": if outcome == "Complete" { serde_json::json!("2026-11-09T10:00:42Z") } else { serde_json::Value::Null },
+            "conditions": [{ "type": outcome, "status": "True", "reason": if outcome == "Failed" { "BackoffLimitExceeded" } else { "" }, "message": "", "lastTransitionTime": "2026-11-09T10:01:00Z" }] } }));
+        let runs = Ok(vec![run("report-3", "Failed"), run("report-2", "Failed"), run("report-1", "Complete")]);
+        assert_eq!(
+            render_cronjob(&cron(serde_json::json!({})), Some(&runs), now),
+            "schedule 0 * * * * in the controller's time zone; concurrencyPolicy Allow; keeps 3 successful and 1 failed runs\n\
+             last scheduled: 2026-11-09T11:00:00+00:00 (1h 0m ago)\n\
+             last succeeded: 2026-11-09T09:00:00+00:00 (3h 0m ago)\n\
+             runs, newest first (3):\n  \
+             report-3: Failed after 1m 0s; created 2026-11-09T10:00:00+00:00\n    \
+             BackoffLimitExceeded\n  \
+             report-2: Failed after 1m 0s; created 2026-11-09T10:00:00+00:00\n    \
+             BackoffLimitExceeded\n  \
+             report-1: Complete after 42s; created 2026-11-09T10:00:00+00:00\n\
+             ITS LAST 2 RUNS FAILED"
+        );
+        let stuck = cron(serde_json::json!({ "spec": { "concurrencyPolicy": "Forbid", "timeZone": "Asia/Jerusalem" }, "status": { "active": [{ "kind": "Job", "name": "report-4" }] } }));
+        let out = render_cronjob(&stuck, None, now);
+        assert!(out.starts_with("schedule 0 * * * * in Asia/Jerusalem; concurrencyPolicy Forbid") && out.ends_with("CONCURRENCYPOLICY FORBID WITH A RUN STILL ACTIVE (report-4): scheduled runs are skipped while it runs"), "{out}");
+        assert!(render_cronjob(&cron(serde_json::json!({ "spec": { "suspend": true } })), None, now).ends_with("SUSPENDED: no new run starts until it is resumed"));
+        let never = render_cronjob(&cron(serde_json::json!({ "status": { "lastScheduleTime": null, "lastSuccessfulTime": null } })), Some(&Ok(vec![])), now);
+        assert!(never.contains("IT HAS NOT BEEN SCHEDULED") && never.ends_with("runs: none left (finished runs are removed past its history limits)"), "{never}");
+        let all_failed = cron(serde_json::json!({ "status": { "lastSuccessfulTime": null } }));
+        assert!(render_cronjob(&all_failed, Some(&Ok(vec![run("report-1", "Failed")])), now).ends_with("ITS LAST 1 RUN FAILED; NO RUN HAS SUCCEEDED"));
+    }
+
     #[test]
     fn a_volume_bound_elsewhere_or_pinned_to_a_zone_is_said() {
         let pv: k8s_openapi::api::core::v1::PersistentVolume = serde_json::from_value(serde_json::json!({
@@ -8037,6 +8511,55 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(unavailable, 0);
         assert_eq!(explained, unhealthy);
         assert_eq!(pods_mismatch, 0);
+    }
+
+    /// Builds Job and CronJob diagnoses on a live cluster: every failing
+    /// CronJob and standalone failed Job, and a few healthy ones of each
+    /// kind. Prints counts only.
+    ///
+    ///   JOB_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml job_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set JOB_DIAG_TEST_CONTEXT to run"]
+    async fn job_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("JOB_DIAG_TEST_CONTEXT") else { return };
+        let rows = crate::resources::get_jobs(&ctx).await.expect("jobs");
+        let mut sample: Vec<_> = rows.iter().filter(|r| !r.healthy && !r.owner.starts_with("CronJob/")).collect();
+        for kind in ["Job", "CronJob"] {
+            sample.extend(rows.iter().filter(|r| r.healthy && r.kind == kind).take(5));
+        }
+        let (mut built, mut unavailable, mut largest, mut unhealthy, mut explained, mut with_logs, mut no_pods) = (0, 0, 0, 0, 0, 0, 0);
+        let (mut backoff, mut deadline, mut policy, mut oom, mut same_exit, mut evicted, mut suspended, mut forbid, mut last_failed) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+        for r in &sample {
+            let payload = build_job_diagnosis_payload(&ctx, &r.kind, &r.namespace, &r.name).await.expect("payload");
+            let p = &payload.prompt;
+            built += 1;
+            unavailable += p.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            with_logs += p.contains("## Logs (pod ") as usize;
+            no_pods += p.contains("(no pod of it is left") as usize;
+            backoff += p.contains("reaching backoffLimit") as usize;
+            deadline += p.contains("ran past activeDeadlineSeconds") as usize;
+            policy += p.contains("BY ITS podFailurePolicy") as usize;
+            oom += p.contains("OOMKILLED:") as usize;
+            same_exit += p.contains("EVERY FAILED ATTEMPT EXITED") as usize;
+            evicted += p.contains("EVICTED:") as usize;
+            suspended += p.contains("SUSPENDED:") as usize;
+            forbid += p.contains("CONCURRENCYPOLICY FORBID") as usize;
+            last_failed += p.contains("RUN FAILED") as usize + p.contains("RUNS FAILED") as usize;
+            if !r.healthy {
+                unhealthy += 1;
+                explained += (p.contains("THE JOB FAILED") || p.contains("RUN FAILED") || p.contains("RUNS FAILED")) as usize;
+            }
+        }
+        println!(
+            "rows={} sampled={} built={built} unavailable_sections={unavailable} largest_tokens={largest} unhealthy={unhealthy}/{explained} with_logs={with_logs} no_pods_left={no_pods} backoff={backoff} deadline={deadline} pod_failure_policy={policy} oom={oom} same_exit={same_exit} evicted={evicted} suspended={suspended} forbid={forbid} cronjob_last_failed={last_failed}",
+            rows.len(),
+            sample.len()
+        );
+        assert!(built > 0, "no Job to diagnose");
+        assert_eq!(unavailable, 0);
+        assert_eq!(explained, unhealthy);
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs

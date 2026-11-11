@@ -167,7 +167,7 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, NAP NodePool, workload, pod, Service, Ingress, PVC, HPA, KEDA
+Any node, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, PVC, HPA, KEDA
 ScaledObject or ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
 and click **Diagnose** in its panel, or press `⌘D` on a focused row. An event about a workload offers its
 workload's diagnosis the same way; one about a ReplicaSet, its Deployment's, which covers its ReplicaSets.
@@ -187,6 +187,12 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   ready endpoints, and each TLS Secret — checked by key name and by the
   certificate's public fields (expiry, the hosts it names), never the private
   key — with cert-manager's view of it;
+- a Job: its limits, status and conditions — why it failed (backoffLimit,
+  activeDeadlineSeconds, its podFailurePolicy) — and its attempts with each
+  container's exit code, OOM kills and evictions, with the logs of the worst
+  attempt; a CronJob: its schedule and policies, whether it is suspended,
+  never scheduled or held back by Forbid, its recent runs, and its newest
+  failed run examined the same way;
 - a StatefulSet: each ordinal's pod with the revision it runs and the state
   of the node under one stuck terminating, each ordinal's volume claim against
   its template, its governing Service, and the PodDisruptionBudgets over its
