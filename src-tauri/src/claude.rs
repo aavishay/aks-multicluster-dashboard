@@ -4349,7 +4349,8 @@ fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBud
             };
             // No disruption allowed stops the eviction of healthy pods; an
             // unready one may still go, as its unhealthyPodEvictionPolicy says.
-            let blocks = if st.disruptions_allowed > 0 {
+            // A budget over no pods blocks nothing, whatever it allows.
+            let blocks = if st.disruptions_allowed > 0 || st.expected_pods == 0 {
                 String::new()
             } else {
                 let unready = match spec.unhealthy_pod_eviction_policy.as_deref() {
@@ -7710,7 +7711,8 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
              selector: app=web\n\
              condition DisruptionAllowed=False (InsufficientPods)"
         );
-        let none = render_pdb_budget(&budget(serde_json::json!({ "spec": { "selector": null } })), &Ok(vec![]));
+        let none = render_pdb_budget(&budget(serde_json::json!({ "spec": { "selector": null }, "status": { "expectedPods": 0, "currentHealthy": 0 } })), &Ok(vec![]));
+        assert!(!none.contains("NO HEALTHY POD MAY BE EVICTED"), "{none}");
         assert!(none.contains("covers no pods") && none.contains("selector: (none)") && none.ends_with("NO SELECTOR: a budget without one selects no pods, so it protects nothing"), "{none}");
         let misses = render_pdb_budget(&budget(serde_json::json!({ "metadata": { "generation": 3 } })), &Ok(vec![]));
         assert!(misses.contains("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation 3, observed 2") && misses.ends_with("SELECTS NO PODS: no pod in its namespace has the labels it selects, so it protects nothing"), "{misses}");
@@ -8411,7 +8413,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             unavailable += p.matches("unavailable: ").count();
             largest = largest.max(payload.approx_tokens);
             blocks += p.contains("NO HEALTHY POD MAY BE EVICTED") as usize;
-            listed_blocking += (b.disruptions_allowed == 0) as usize;
+            listed_blocking += (b.disruptions_allowed == 0 && b.expected_pods > 0) as usize;
             no_pods += (p.contains("SELECTS NO PODS") || p.contains("NO SELECTOR:")) as usize;
             never += p.contains("CAN NEVER ALLOW A DISRUPTION") as usize;
             overlap += p.contains("OVERLAPS WITH") as usize;
