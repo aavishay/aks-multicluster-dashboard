@@ -5782,6 +5782,7 @@ function setMetricsRange(minutes: number) {
   selectTabGroup,
   viewPodsForWorkload,
   viewPodsForCronJob,
+  viewPodsForJob,
   viewPodsForNode,
   openPodDetail,
   closePodDetail,
@@ -13800,10 +13801,21 @@ function renderJobs(): string {
   });
 }
 
+/** The Pods tab, filtered to a Job's pods, leaving its panel for Back to restore. */
+function viewPodsForJob(ctx: string, namespace: string, name: string) {
+  viewPodsForWorkload(ctx, "Job", namespace, name);
+  closeResourceDetail();
+}
+
 /** The Pods tab, filtered to a CronJob's runs: its pods are its Jobs'. */
 function viewPodsForCronJob(ctx: string, namespace: string, name: string) {
   const cj = state.jobs.get(ctx)?.find((j) => j.kind === "CronJob" && j.namespace === namespace && j.name === name);
   pushViewHistory(["pods"]);
+  // After the history entry, so Back reopens the panel; before the switch,
+  // so it does not cover the Pods table.
+  resourceDetailToken += 1;
+  state.resourceDetail = null;
+  state.yamlEdit = null;
   state.filterState.pods = {
     cluster: { enumValues: new Set([ctx]) },
     namespace: { enumValues: new Set([namespace]) },
@@ -14292,7 +14304,7 @@ function renderResourceOverview(rd: ResourceDetailState): string {
       rows.push(
         overviewRow(
           "Pods",
-          `<button type="button" onclick="window.__app.viewPodsForWorkload(${jsArg(ctx)},'Job',${jsArg(namespace)},${jsArg(name)})" class="text-series-blue hover:underline">view its pods</button>`,
+          `<button type="button" onclick="window.__app.viewPodsForJob(${jsArg(ctx)},${jsArg(namespace)},${jsArg(name)})" class="text-series-blue hover:underline">view its pods</button>`,
         ),
       );
     } else {

@@ -528,7 +528,14 @@ pub(crate) fn cronjob_info(cj: &CronJob, jobs: &[&Job], now: chrono::DateTime<ch
     let status = cj.status.clone().unwrap_or_default();
     let active = status.active.as_ref().map_or(0, |a| a.len()) as i32;
     let newest = jobs.first();
-    let newest_failed = newest.and_then(|j| job_condition(j, "Failed"));
+    // The newest Job kept is not always the newest run: with
+    // successfulJobsHistoryLimit 0 a later success is deleted, and only
+    // lastSuccessfulTime remembers it. A failure it postdates is history.
+    let succeeded_since = |j: &Job| {
+        let created = j.metadata.creation_timestamp.as_ref().map(|t| t.0);
+        status.last_successful_time.as_ref().is_some_and(|s| created.is_some_and(|c| s.0 > c))
+    };
+    let newest_failed = newest.filter(|j| !succeeded_since(j)).and_then(|j| job_condition(j, "Failed"));
     JobInfo {
         kind: "CronJob".into(),
         namespace: cj.metadata.namespace.clone().unwrap_or_default(),
@@ -774,6 +781,15 @@ mod tests {
         assert_eq!(cj.failure_message.as_deref(), Some("its newest run report-2 failed: DeadlineExceeded"));
         assert_eq!(cj.last_successful_time.as_deref(), Some("2026-11-09T10:01:00+00:00"));
         assert_eq!(rows[1].owner, "CronJob/report");
+
+        // A later success the CronJob no longer keeps a Job for still counts.
+        let since: CronJob = serde_json::from_value(serde_json::json!({ "metadata": { "name": "report", "namespace": "ns", "uid": "cj-uid" },
+            "spec": { "schedule": "0 * * * *", "successfulJobsHistoryLimit": 0, "jobTemplate": { "spec": { "template": { "spec": { "containers": [{ "name": "c" }] } } } } },
+            "status": { "lastSuccessfulTime": "2026-11-09T12:01:00Z" } })).unwrap();
+        let only_failure = vec![run("report-2", "2026-11-09T11:00:00Z", "Failed")];
+        let rows = jobs_rows(&only_failure, &[since], now);
+        let row = rows.iter().find(|r| r.kind == "CronJob").unwrap();
+        assert!(row.healthy && row.failure_message.is_none(), "{row:?}");
     }
 
     fn meta(ns: Option<&str>, name: &str) -> ObjectMeta {
