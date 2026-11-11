@@ -1,6 +1,6 @@
 [package]
 name = "k8s-view"
-version = "0.7.63"
+version = "0.7.64"
 description = "Native multi-cluster Kubernetes dashboard for Azure AKS fleets"
 authors = ["Avishay Ashkenazi"]
 edition = "2021"
