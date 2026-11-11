@@ -337,9 +337,9 @@ federated, or a credential Secret or key it names is missing.
 - The store is missing, or a ClusterSecretStore does not admit this \
 namespace through its conditions.
 - The target Secret is the problem: owned by something else, which ESO will \
-not overwrite; expected to exist already under creationPolicy Merge or \
-None; or of a different type than the template asks for, which cannot \
-change in place.
+not overwrite; expected to exist already under creationPolicy Merge; or of \
+a different type than the template asks for, which cannot change in place. \
+Under creationPolicy None ESO writes no Secret at all, by design.
 - It has stopped refreshing: ESO's controller is down or not reconciling.
 - A template error: the sync error names the template or a key it uses.
 
@@ -5287,6 +5287,9 @@ fn render_es_mappings(es: &kube::api::DynamicObject) -> String {
 /// The store an ExternalSecret reads through: whether it exists, admits this
 /// namespace, and can reach its provider.
 fn render_es_store(kind: &str, name: &str, namespace: &str, store: &Result<Option<kube::api::DynamicObject>, String>) -> String {
+    if name.is_empty() {
+        return "(it names no store: its data comes from generators)".to_string();
+    }
     let s = match store {
         Err(e) => return format!("(store unavailable: {e})"),
         Ok(None) => {
@@ -5353,7 +5356,12 @@ fn render_es_store(kind: &str, name: &str, namespace: &str, store: &Result<Optio
 fn render_es_credentials(credentials: &[crate::external_secrets::StoreCredential], store: &Result<Option<kube::api::DynamicObject>, String>) -> String {
     if credentials.is_empty() {
         return match store {
-            Ok(Some(_)) => "(the store names no Secret or ServiceAccount to sign in with: its identity is ambient, such as a managed identity)".to_string(),
+            // Ambient only where the store says so; otherwise only that no
+            // reference was recognised.
+            Ok(Some(s)) if crate::k8s::json_str(s.data.pointer("/spec/provider/azurekv"), "authType") == "ManagedIdentity" => {
+                "(it signs in with a managed identity: there is no Secret or ServiceAccount to check from here)".to_string()
+            }
+            Ok(Some(_)) => "(no Secret or ServiceAccount reference was recognised in the store's provider block; how it signs in is in its manifest)".to_string(),
             _ => "(no store to read them from)".to_string(),
         };
     }
@@ -5386,15 +5394,15 @@ fn render_es_credentials(credentials: &[crate::external_secrets::StoreCredential
 fn render_es_target(es: &kube::api::DynamicObject, target: &Result<Option<crate::external_secrets::TargetSecret>, String>) -> String {
     let o = crate::external_secrets::overview_of(es);
     let name = &o.info.target_name;
+    // None writes no Secret at all, by design: nothing here to hold to it.
+    if o.creation_policy == "None" {
+        return format!("creationPolicy None: ESO writes no Secret, so {name} is not checked against it");
+    }
     let t = match target {
         Err(e) => return format!("(target Secret unavailable: {e})"),
         Ok(None) => {
             return match o.creation_policy.as_str() {
-                "Merge" | "None" => format!(
-                    "TARGET SECRET {name} DOES NOT EXIST: with creationPolicy {} ESO does not create it, only {} one that exists",
-                    o.creation_policy,
-                    if o.creation_policy == "Merge" { "merges into" } else { "reads" }
-                ),
+                "Merge" => format!("TARGET SECRET {name} DOES NOT EXIST: with creationPolicy Merge ESO does not create it, only merges into one that exists"),
                 p => format!("Secret {name} does not exist yet: with creationPolicy {p} ESO creates it on its first successful sync"),
             }
         }
@@ -5419,21 +5427,30 @@ fn render_es_target(es: &kube::api::DynamicObject, target: &Result<Option<crate:
         }
         None => lines.push("no owner".to_string()),
     }
-    if o.template && o.info.target_type != "Opaque" && o.info.target_type != t.secret_type {
-        lines.push(format!(
-            "TYPE {}, NOT THE TEMPLATE'S {}: a Secret's type cannot change in place, so it has to be recreated",
-            t.secret_type, o.info.target_type
-        ));
+    // The type the template asks for, only when it asks for one: Opaque
+    // asked for is as fixed as any other.
+    let asked = crate::k8s::json_str(es.data.pointer("/spec/target/template"), "type");
+    if !asked.is_empty() && asked != t.secret_type {
+        lines.push(format!("TYPE {}, NOT THE TEMPLATE'S {asked}: a Secret's type cannot change in place, so it has to be recreated", t.secret_type));
     }
-    // The keys it should hold: what the template builds, else what it maps.
-    let expected: Vec<String> = if o.template && !o.template_keys.is_empty() {
-        o.template_keys.clone()
-    } else {
-        es.data.pointer("/spec/data").and_then(|v| v.as_array()).into_iter().flatten().map(|e| crate::k8s::json_str(Some(e), "secretKey").to_string()).filter(|k| !k.is_empty()).collect()
-    };
-    let missing: Vec<&String> = expected.iter().filter(|k| !t.keys.contains(k)).collect();
+    // The keys it should hold. A template's named keys; and with mergePolicy
+    // Merge, or no template, the keys it maps. What templateFrom or dataFrom
+    // produce is not known from here, so those are not expected.
+    let mapped: Vec<String> =
+        es.data.pointer("/spec/data").and_then(|v| v.as_array()).into_iter().flatten().map(|e| crate::k8s::json_str(Some(e), "secretKey").to_string()).filter(|k| !k.is_empty()).collect();
+    let mut expected: Vec<String> = if o.template { o.template_keys.clone() } else { Vec::new() };
+    if !o.template || o.template_merge_policy == "Merge" {
+        expected.extend(mapped.into_iter().filter(|k| !expected.contains(k)).collect::<Vec<_>>());
+    }
+    let missing: Vec<&str> = expected.iter().filter(|k| !t.keys.contains(k)).map(String::as_str).collect();
     if !missing.is_empty() {
-        lines.push(format!("MISSING KEYS IT SHOULD HOLD: {}", missing.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")));
+        // With deletionPolicy Merge ESO removes a key whose remote value is
+        // gone, so an absent key may be intended.
+        lines.push(if o.deletion_policy == "Merge" {
+            format!("absent from it: {} (with deletionPolicy Merge, ESO removes keys whose remote value is gone)", missing.join(", "))
+        } else {
+            format!("MISSING KEYS IT SHOULD HOLD: {}", missing.join(", "))
+        });
     }
     lines.join("\n")
 }
@@ -5469,35 +5486,37 @@ fn render_es_logs(lines: &Result<Vec<String>, String>) -> String {
         Ok(l) => l,
         Err(e) => return format!("(controller log unavailable: {e})"),
     };
-    // (level, message, error) → (count, last time)
-    let mut groups: Vec<((String, String, String), usize, String)> = Vec::new();
+    // (level, message, error) → (count, latest time). The latest, not the
+    // last seen: lines from several pods arrive one pod after another.
+    let mut groups: Vec<((String, String, String), usize, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
     for line in lines {
         let Ok(f) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
         let s = |k: &str| crate::k8s::json_str(Some(&f), k).to_string();
         let time = match f.get("ts") {
-            Some(serde_json::Value::Number(n)) => n
-                .as_f64()
-                .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0))
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_default(),
-            Some(serde_json::Value::String(t)) => t.clone(),
-            _ => String::new(),
+            Some(serde_json::Value::Number(n)) => n.as_f64().and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0)),
+            Some(serde_json::Value::String(t)) => chrono::DateTime::parse_from_rfc3339(t).ok().map(|t| t.with_timezone(&chrono::Utc)),
+            _ => None,
         };
         let key = (s("level"), s("msg"), s("error").chars().take(500).collect::<String>());
         match groups.iter_mut().find(|(k, _, _)| *k == key) {
             Some(g) => {
                 g.1 += 1;
-                g.2 = time;
+                g.2 = g.2.max(time);
             }
             None => groups.push((key, 1, time)),
         }
     }
+    // The most recent first, so the cap keeps what is happening now.
+    groups.sort_by(|a, b| b.2.cmp(&a.2));
     let mut out: Vec<String> = groups
         .iter()
-        .rev()
         .take(GROUPS)
         .map(|((level, msg, error), count, last)| {
-            format!("[{level}] ×{count}, last {last}: {msg}{}", if error.is_empty() { String::new() } else { format!(" — {error}") })
+            format!(
+                "[{level}] ×{count}, last {}: {msg}{}",
+                last.map(|t| t.to_rfc3339()).unwrap_or_else(|| "(no time)".into()),
+                if error.is_empty() { String::new() } else { format!(" — {error}") }
+            )
         })
         .collect();
     if groups.len() > GROUPS {
@@ -9206,10 +9225,13 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         // The credentials a store names, found in any provider's own shape.
         let refs = crate::external_secrets::store_credential_refs(
             Some(&serde_json::json!({ "azurekv": { "authSecretRef": { "clientId": { "name": "sp", "key": "client-id" }, "clientSecret": { "name": "sp", "key": "client-secret", "namespace": "ops" } } },
-                "vault": { "auth": { "kubernetes": { "serviceAccountRef": { "name": "vault-reader" } } } } })),
+                "vault": { "auth": { "kubernetes": { "serviceAccountRef": { "name": "vault-reader" } } } },
+                "kubernetes": { "auth": { "token": { "bearerToken": { "name": "k8s-token", "key": "token" } } },
+                    "server": { "caProvider": { "type": "ConfigMap", "name": "ca", "key": "ca.crt" } } } })),
             "app",
         );
         assert_eq!(refs, vec![
+            ("Secret", "app".to_string(), "k8s-token".to_string(), Some("token".to_string())),
             ("Secret", "app".to_string(), "sp".to_string(), Some("client-id".to_string())),
             ("Secret", "ops".to_string(), "sp".to_string(), Some("client-secret".to_string())),
             ("ServiceAccount", "app".to_string(), "vault-reader".to_string(), None),
@@ -9229,7 +9251,10 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
              SECRET DOES NOT EXIST: Secret app/sp\n\
              ServiceAccount app/sp: exists, with azure.workload.identity/client-id"
         );
-        assert!(render_es_credentials(&[], &Ok(Some(store("SecretStore", serde_json::json!({}))))).contains("its identity is ambient"));
+        assert!(render_es_credentials(&[], &Ok(Some(store("SecretStore", serde_json::json!({}))))).contains("it signs in with a managed identity"));
+        let other = store("SecretStore", serde_json::json!({ "spec": { "provider": { "azurekv": null, "kubernetes": { "server": { "url": "https://k" } } } } }));
+        assert!(render_es_credentials(&[], &Ok(Some(other))).contains("no Secret or ServiceAccount reference was recognised"));
+        assert_eq!(render_es_store("SecretStore", "", "app", &Ok(None)), "(it names no store: its data comes from generators)");
 
         let target = |keys: &[&str], owner: Option<(&str, &str, &str)>, t: &str| crate::external_secrets::TargetSecret {
             secret_type: t.into(), keys: keys.iter().map(|k| k.to_string()).collect(),
@@ -9244,6 +9269,16 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             .contains("OWNED BY ExternalSecret db-old: ESO will not take over a Secret another owner controls"));
         let merge = external_secret(serde_json::json!({ "spec": { "target": { "creationPolicy": "Merge" } } }));
         assert_eq!(render_es_target(&merge, &Ok(None)), "TARGET SECRET db-creds DOES NOT EXIST: with creationPolicy Merge ESO does not create it, only merges into one that exists");
+        let none = external_secret(serde_json::json!({ "spec": { "target": { "creationPolicy": "None" } } }));
+        assert_eq!(render_es_target(&none, &Ok(None)), "creationPolicy None: ESO writes no Secret, so db-creds is not checked against it");
+        // deletionPolicy Merge removes keys whose remote value is gone.
+        let pruning = external_secret(serde_json::json!({ "spec": { "target": { "deletionPolicy": "Merge" } } }));
+        let out = render_es_target(&pruning, &Ok(Some(target(&["password"], Some(("ExternalSecret", "db", "es-uid")), "Opaque"))));
+        assert!(out.ends_with("absent from it: user (with deletionPolicy Merge, ESO removes keys whose remote value is gone)") && !out.contains("MISSING KEYS"), "{out}");
+        // An explicit Opaque is checked too; a Merge template keeps the mapped keys.
+        let opaque = external_secret(serde_json::json!({ "spec": { "target": { "template": { "type": "Opaque", "mergePolicy": "Merge", "data": { "url": "{{ .host }}" } } } } }));
+        let out = render_es_target(&opaque, &Ok(Some(target(&["url", "password"], Some(("ExternalSecret", "db", "es-uid")), "kubernetes.io/tls"))));
+        assert!(out.contains("TYPE kubernetes.io/tls, NOT THE TEMPLATE'S Opaque") && out.ends_with("MISSING KEYS IT SHOULD HOLD: user"), "{out}");
         assert!(render_es_target(&es, &Ok(None)).starts_with("Secret db-creds does not exist yet"));
         let tls = external_secret(serde_json::json!({ "spec": { "target": { "template": { "type": "kubernetes.io/tls", "data": { "tls.crt": "", "tls.key": "" } } } } }));
         let out = render_es_target(&tls, &Ok(Some(target(&["tls.crt", "tls.key"], Some(("ExternalSecret", "db", "es-uid")), "Opaque"))));
@@ -9260,8 +9295,21 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(crate::external_secrets::eso_log_line_is_about(&line("app", "db", 1.0, "e"), "app", "db"));
         assert!(!crate::external_secrets::eso_log_line_is_about(&line("app", "db-2", 1.0, "e"), "app", "db"));
         assert!(!crate::external_secrets::eso_log_line_is_about("not json", "app", "db"));
-        let lines = Ok(vec![line("app", "db", 1762851600.0, "403 Forbidden"), line("app", "db", 1762855200.0, "403 Forbidden")]);
-        assert_eq!(render_es_logs(&lines), "[error] ×2, last 2025-11-11T10:00:00+00:00: Reconciler error — 403 Forbidden");
+        // Lines from two pods, the later one's first: grouped by their latest
+        // time, the most recent group first.
+        let lines = Ok(vec![line("app", "db", 1762855200.0, "403 Forbidden"), line("app", "db", 1762851600.0, "403 Forbidden"), line("app", "db", 1762852000.0, "timeout")]);
+        assert_eq!(
+            render_es_logs(&lines),
+            "[error] ×2, last 2025-11-11T10:00:00+00:00: Reconciler error — 403 Forbidden\n[error] ×1, last 2025-11-11T09:06:40+00:00: Reconciler error — timeout"
+        );
+        // A template's literal text is masked, its keys and references kept.
+        let mut templated = external_secret(serde_json::json!({ "spec": { "target": { "template": {
+            "data": { "conn": "postgres://admin:hunter2@{{ .host }}/db", "token": "ordinary-literal-credential" },
+            "templateFrom": [{ "literal": "key: plain-value" }, { "configMap": { "name": "tpl" } }] } } } }));
+        crate::external_secrets::mask_template_literals(&mut templated);
+        let manifest = serde_json::to_string(&templated.data).unwrap();
+        assert!(!manifest.contains("hunter2") && !manifest.contains("ordinary-literal-credential") && !manifest.contains("plain-value"), "{manifest}");
+        assert!(manifest.contains("\"conn\":\"[MASKED: literal around {{ .host }}]\"") && manifest.contains("\"configMap\":{\"name\":\"tpl\"}"), "{manifest}");
         assert_eq!(render_es_logs(&Ok(vec![])), "(the controller logged nothing about it in the last hour)");
 
         let deployment = |ready: i32| -> k8s_openapi::api::apps::v1::Deployment {
@@ -10055,7 +10103,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             store_missing += p.contains("DOES NOT EXIST: nothing can sync") as usize;
             store_down += p.contains("STORE NOT READY") as usize;
             not_allowed += p.contains("NOT ALLOWED FROM NAMESPACE") as usize;
-            ambient += p.contains("its identity is ambient") as usize;
+            ambient += p.contains("it signs in with a managed identity") as usize;
             cred_missing += (p.contains("MISSING KEY ") || p.contains("SECRET DOES NOT EXIST") || p.contains("SERVICEACCOUNT DOES NOT EXIST")) as usize;
             target_missing += p.contains("TARGET SECRET") as usize;
             owned_other += p.contains("OWNED BY ") as usize;
