@@ -4632,7 +4632,17 @@ fn render_cronjob(
                     lines.push(format!("    {}", m.chars().take(300).collect::<String>()));
                 }
             }
-            let failed_in_a_row = r.iter().take_while(|j| k8s::job_has_condition(j, "Failed")).count();
+            // Only failures no success has followed: with
+            // successfulJobsHistoryLimit 0 a later success keeps no Job, and
+            // lastSuccessfulTime is all that remembers it.
+            let succeeded_since = |j: &k8s_openapi::api::batch::v1::Job| {
+                let created = j.metadata.creation_timestamp.as_ref().map(|t| t.0);
+                status.last_successful_time.as_ref().is_some_and(|s| created.is_some_and(|c| s.0 > c))
+            };
+            let failed_in_a_row = r.iter().take_while(|j| k8s::job_has_condition(j, "Failed") && !succeeded_since(j)).count();
+            if failed_in_a_row == 0 && r.first().is_some_and(|j| k8s::job_has_condition(j, "Failed")) {
+                lines.push("the failed runs above are older than its last success, which kept no Job".to_string());
+            }
             if failed_in_a_row > 0 {
                 lines.push(format!(
                     "ITS LAST {failed_in_a_row} RUN{} FAILED{}",
@@ -7890,6 +7900,10 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(render_cronjob(&cron(serde_json::json!({ "spec": { "suspend": true } })), None, now).ends_with("SUSPENDED: no new run starts until it is resumed"));
         let never = render_cronjob(&cron(serde_json::json!({ "status": { "lastScheduleTime": null, "lastSuccessfulTime": null } })), Some(&Ok(vec![])), now);
         assert!(never.contains("IT HAS NOT BEEN SCHEDULED") && never.ends_with("runs: none left (finished runs are removed past its history limits)"), "{never}");
+        // A success newer than every kept failure, whose Job is gone.
+        let later = cron(serde_json::json!({ "status": { "lastSuccessfulTime": "2026-11-09T11:30:00Z" } }));
+        let out = render_cronjob(&later, Some(&Ok(vec![run("report-3", "Failed")])), now);
+        assert!(out.ends_with("the failed runs above are older than its last success, which kept no Job") && !out.contains("RUN FAILED"), "{out}");
         let all_failed = cron(serde_json::json!({ "status": { "lastSuccessfulTime": null } }));
         assert!(render_cronjob(&all_failed, Some(&Ok(vec![run("report-1", "Failed")])), now).ends_with("ITS LAST 1 RUN FAILED; NO RUN HAS SUCCEEDED"));
     }
