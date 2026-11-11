@@ -4476,6 +4476,12 @@ fn render_job(job: &k8s_openapi::api::batch::v1::Job, now: chrono::DateTime<chro
     if let Some(c) = failed {
         let message = c.message.as_deref().unwrap_or_default();
         lines.push(match c.reason.as_deref() {
+            // With OnFailure the retries are container restarts inside a pod
+            // as well as failed pods, which status.failed does not count.
+            Some("BackoffLimitExceeded") if restart == "OnFailure" => format!(
+                "THE JOB FAILED: it used up backoffLimit {backoff}; with restartPolicy OnFailure its retries include container restarts within a pod, not only the {} failed pod(s)",
+                status.failed.unwrap_or(0)
+            ),
             Some("BackoffLimitExceeded") => format!("THE JOB FAILED: its pods failed {} times, reaching backoffLimit {backoff}", status.failed.unwrap_or(0)),
             Some("DeadlineExceeded") => format!(
                 "THE JOB FAILED: it ran past activeDeadlineSeconds {}, and its running pods were stopped",
@@ -4504,18 +4510,21 @@ fn render_job_attempts(pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, Strin
         Err(e) => return format!("(pods unavailable: {e})"),
     };
     let mut lines = Vec::new();
-    let mut exits: Vec<i32> = Vec::new();
+    // Each failed pod's own failure exit code: the one non-zero exit among
+    // its containers, or None when it has none or several.
+    let mut failed_exits: Vec<Option<i32>> = Vec::new();
     let (mut oom, mut evicted): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     for (i, p) in pods.iter().enumerate() {
         let st = p.status.clone().unwrap_or_default();
         let phase = st.phase.clone().unwrap_or_else(|| "Unknown".into());
         let mut parts = vec![phase.clone()];
+        let mut pod_exits: Vec<i32> = Vec::new();
         for c in st.init_container_statuses.iter().flatten().chain(st.container_statuses.iter().flatten()) {
             let state = c.state.clone().unwrap_or_default();
             if let Some(t) = &state.terminated {
                 parts.push(format!("{} exited {}{}", c.name, t.exit_code, t.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()));
                 if t.exit_code != 0 {
-                    exits.push(t.exit_code);
+                    pod_exits.push(t.exit_code);
                 }
                 if t.reason.as_deref() == Some("OOMKilled") {
                     let limit = p
@@ -4542,6 +4551,10 @@ fn render_job_attempts(pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, Strin
                     oom.push(c.name.clone());
                 }
             }
+        }
+        if phase == "Failed" {
+            pod_exits.dedup();
+            failed_exits.push(if pod_exits.len() == 1 && st.reason.is_none() { Some(pod_exits[0]) } else { None });
         }
         if let Some(r) = &st.reason {
             parts.push(format!("{r}: {}", st.message.as_deref().unwrap_or_default().chars().take(200).collect::<String>()));
@@ -4571,8 +4584,10 @@ fn render_job_attempts(pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, Strin
     if !evicted.is_empty() {
         lines.push(format!("{} ATTEMPT{} EVICTED: {}", evicted.len(), if evicted.len() == 1 { " WAS" } else { "S WERE" }, evicted[0].chars().take(200).collect::<String>()));
     }
-    if exits.len() > 1 && exits.iter().all(|e| *e == exits[0]) {
-        lines.push(format!("EVERY FAILED ATTEMPT EXITED {}: it fails the same way each time", exits[0]));
+    if let [Some(first), ..] = failed_exits.as_slice() {
+        if failed_exits.len() > 1 && failed_exits.iter().all(|e| *e == Some(*first)) {
+            lines.push(format!("EVERY FAILED ATTEMPT EXITED {first}: it fails the same way each time"));
+        }
     }
     lines.join("\n")
 }
@@ -4689,7 +4704,6 @@ pub async fn build_job_diagnosis_payload(context_name: &str, kind: &str, namespa
     parts.extend(pod_events.as_ref());
     parts.extend(logs.as_ref());
     parts.extend(previous_r.as_ref());
-    let redaction_summary = redact::Redacted::merge(parts).summary();
     let log_note = combine_log_notes(current_note.clone(), previous.as_ref());
 
     let run_name = d.job.as_ref().and_then(|j| j.metadata.name.clone()).unwrap_or_default();
@@ -4731,6 +4745,13 @@ pub async fn build_job_diagnosis_payload(context_name: &str, kind: &str, namespa
         }
         _ => prompt.push_str("\n\n## Logs\n(no attempt left to read logs from)"),
     }
+    // The headings carry names the sections did not — the namespace, the
+    // run, the pod, the container — so the whole prompt is redacted again;
+    // what the sections already replaced is not counted twice.
+    let whole = redact::redact(&prompt);
+    parts.push(&whole);
+    let redaction_summary = redact::Redacted::merge(parts).summary();
+    let prompt = whole.text.clone();
     Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note })
 }
 
@@ -7838,6 +7859,9 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.contains("podFailurePolicy: FailJob on exit codes In [42] in migrate") && out.ends_with("THE JOB FAILED BY ITS podFailurePolicy: Container migrate for pod ns/migrate-x failed with exit code 42 matching FailJob rule at index 0"), "{out}");
         assert!(render_job(&batch_job(serde_json::json!({ "spec": { "suspend": true } })), now).ends_with("SUSPENDED: it starts no pods until it is resumed"));
         assert!(render_job(&batch_job(serde_json::json!({})), now).ends_with("not started\nNO POD OF IT IS RUNNING: a pod it could not create or schedule shows in its events"));
+        let restarts = batch_job(serde_json::json!({ "spec": { "template": { "spec": { "restartPolicy": "OnFailure" } } }, "status": { "failed": 1,
+            "conditions": [{ "type": "Failed", "status": "True", "reason": "BackoffLimitExceeded", "message": "" }] } }));
+        assert!(render_job(&restarts, now).ends_with("THE JOB FAILED: it used up backoffLimit 3; with restartPolicy OnFailure its retries include container restarts within a pod, not only the 1 failed pod(s)"));
         let running = render_job(&batch_job(serde_json::json!({ "spec": { "parallelism": 4, "completions": null }, "status": { "startTime": "2026-11-09T11:00:00Z", "active": 4 } })), now);
         assert!(running.starts_with("completions (none: a work queue), parallelism 4") && running.contains("running for 1h 0m") && !running.contains("NO POD"), "{running}");
     }
@@ -7854,6 +7878,17 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.contains("OOMKILLED: migrate (limit 256Mi) hit its memory limit") && !out.contains("EVERY FAILED ATTEMPT"), "{out}");
         let same = render_job_attempts(&Ok(pods[..2].to_vec()));
         assert!(same.ends_with("EVERY FAILED ATTEMPT EXITED 1: it fails the same way each time"), "{same}");
+        // Judged per failed pod: one evicted with no exit of its own, or one
+        // that succeeded, breaks or does not join the run of matching exits.
+        let evicted_too = attempt("migrate-x", "Failed", serde_json::json!({ "name": "migrate", "image": "x", "imageID": "", "ready": false, "restartCount": 0, "state": {} }),
+            serde_json::json!({ "status": { "reason": "Evicted", "message": "low on memory" } }));
+        assert!(!render_job_attempts(&Ok(vec![pods[0].clone(), pods[1].clone(), evicted_too])).contains("EVERY FAILED ATTEMPT"));
+        let succeeded = attempt("migrate-y", "Succeeded", exited(0, "Completed"), serde_json::json!({}));
+        assert!(render_job_attempts(&Ok(vec![succeeded, pods[0].clone(), pods[1].clone()])).contains("EVERY FAILED ATTEMPT EXITED 1"));
+        // An init container that failed once and recovered is not the one read.
+        let recovered = attempt("migrate-z", "Failed", exited(2, "Error"), serde_json::json!({ "spec": { "initContainers": [{ "name": "init" }] }, "status": { "initContainerStatuses": [{ "name": "init", "image": "x", "imageID": "", "ready": true, "restartCount": 1,
+            "state": { "terminated": { "exitCode": 0, "reason": "Completed" } }, "lastState": { "terminated": { "exitCode": 1, "reason": "Error" } } }] } }));
+        assert_eq!(k8s::worst_attempt(&[recovered]), Some(("migrate-z".to_string(), "migrate".to_string())));
         let stuck = attempt("migrate-d", "Pending", serde_json::json!({ "name": "migrate", "image": "x", "imageID": "", "ready": false, "restartCount": 0, "state": { "waiting": { "reason": "ContainerCreating" } } }),
             serde_json::json!({ "spec": { "nodeName": null }, "status": { "conditions": [{ "type": "PodScheduled", "status": "False", "message": "0/3 nodes are available: 3 Insufficient memory." }] } }));
         let evicted = attempt("migrate-e", "Failed", exited(0, "Completed"), serde_json::json!({ "status": { "reason": "Evicted", "message": "The node was low on resource: ephemeral-storage." } }));
@@ -8552,7 +8587,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             largest = largest.max(payload.approx_tokens);
             with_logs += p.contains("## Logs (pod ") as usize;
             no_pods += p.contains("(no pod of it is left") as usize;
-            backoff += p.contains("reaching backoffLimit") as usize;
+            backoff += (p.contains("reaching backoffLimit") || p.contains("used up backoffLimit")) as usize;
             deadline += p.contains("ran past activeDeadlineSeconds") as usize;
             policy += p.contains("BY ITS podFailurePolicy") as usize;
             oom += p.contains("OOMKILLED:") as usize;

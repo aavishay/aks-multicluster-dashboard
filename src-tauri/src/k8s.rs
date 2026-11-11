@@ -3852,14 +3852,16 @@ pub(crate) fn job_has_condition(job: &Job, type_: &str) -> bool {
 /// a failing or waiting container, then any; and in it the container that
 /// failed, or the first.
 pub(crate) fn worst_attempt(pods: &[Pod]) -> Option<(String, String)> {
+    // A container failing now beats one waiting, which beats one that failed
+    // before and recovered: an init container that failed once and then
+    // completed is not why the app exits non-zero.
     let failing_container = |p: &Pod| -> Option<String> {
         let st = p.status.as_ref()?;
-        st.init_container_statuses.iter().flatten().chain(st.container_statuses.iter().flatten()).find_map(|c| {
-            let state = c.state.as_ref();
-            let bad_now = state.and_then(|s| s.terminated.as_ref()).is_some_and(|t| t.exit_code != 0) || state.and_then(|s| s.waiting.as_ref()).is_some();
-            let bad_before = c.last_state.as_ref().and_then(|s| s.terminated.as_ref()).is_some_and(|t| t.exit_code != 0);
-            (bad_now || bad_before).then(|| c.name.clone())
-        })
+        let all: Vec<&k8s_openapi::api::core::v1::ContainerStatus> = st.init_container_statuses.iter().flatten().chain(st.container_statuses.iter().flatten()).collect();
+        let exited_badly = |c: &&&k8s_openapi::api::core::v1::ContainerStatus| c.state.as_ref().and_then(|s| s.terminated.as_ref()).is_some_and(|t| t.exit_code != 0);
+        let waiting = |c: &&&k8s_openapi::api::core::v1::ContainerStatus| c.state.as_ref().and_then(|s| s.waiting.as_ref()).is_some();
+        let failed_before = |c: &&&k8s_openapi::api::core::v1::ContainerStatus| c.last_state.as_ref().and_then(|s| s.terminated.as_ref()).is_some_and(|t| t.exit_code != 0);
+        all.iter().find(exited_badly).or_else(|| all.iter().find(waiting)).or_else(|| all.iter().find(failed_before)).map(|c| c.name.clone())
     };
     let first_container = |p: &Pod| p.spec.as_ref().and_then(|s| s.containers.first()).map(|c| c.name.clone()).unwrap_or_default();
     let failed = |p: &&Pod| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Failed");
@@ -3875,10 +3877,13 @@ pub async fn get_job_diagnostics(context_name: &str, kind: &str, namespace: &str
     let jobs_api: Api<Job> = Api::namespaced(client.clone(), namespace);
     let cronjobs_api: Api<CronJob> = Api::namespaced(client.clone(), namespace);
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let events_of = |kind: &'static str, object: String| {
+    // By UID too, when known: a recreated object of the same name does not
+    // inherit its predecessor's events.
+    let events_of = |kind: &'static str, object: String, uid: Option<String>| {
         let events_api = events_api.clone();
         async move {
-            let params = ListParams::default().fields(&format!("involvedObject.kind={kind},involvedObject.name={object},involvedObject.namespace={namespace}"));
+            let by_uid = uid.map(|u| format!(",involvedObject.uid={u}")).unwrap_or_default();
+            let params = ListParams::default().fields(&format!("involvedObject.kind={kind},involvedObject.name={object},involvedObject.namespace={namespace}{by_uid}"));
             events_api
                 .list(&params)
                 .await
@@ -3898,6 +3903,7 @@ pub async fn get_job_diagnostics(context_name: &str, kind: &str, namespace: &str
         other => return Err(format!("Unsupported kind '{other}'")),
     };
     let mut obj = Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &ar).get(name).await.map_err(|e| get_error(kind, name, e))?;
+    let subject_uid = obj.metadata.uid.clone();
     let value = serde_json::to_value(&obj).map_err(|e| format!("Failed to read {kind} '{name}': {e}"))?;
     if let Some(a) = obj.metadata.annotations.as_mut() {
         a.remove(LAST_APPLIED_ANNOTATION);
@@ -3921,9 +3927,11 @@ pub async fn get_job_diagnostics(context_name: &str, kind: &str, namespace: &str
         (Some(cj), runs, job)
     } else {
         let job: Job = serde_json::from_value(value).map_err(|e| format!("Failed to read Job '{name}': {e}"))?;
-        let owner = job.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true) && o.kind == "CronJob").map(|o| o.name.clone());
+        // Only its own CronJob: one recreated under the same name since is
+        // not what made this Job.
+        let owner = job.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true) && o.kind == "CronJob").map(|o| (o.name.clone(), o.uid.clone()));
         let cronjob = match owner {
-            Some(cj) => cronjobs_api.get_opt(&cj).await.ok().flatten(),
+            Some((cj, uid)) => cronjobs_api.get_opt(&cj).await.ok().flatten().filter(|c| c.metadata.uid.as_deref() == Some(uid.as_str())),
             None => None,
         };
         (cronjob, Ok(Vec::new()), Some(job))
@@ -3945,17 +3953,18 @@ pub async fn get_job_diagnostics(context_name: &str, kind: &str, namespace: &str
     };
     let job_events_fut = async {
         match (&job_name, kind) {
-            (Some(j), "CronJob") => Some(events_of("Job", j.clone()).await),
+            (Some(j), "CronJob") => Some(events_of("Job", j.clone(), job_uid.clone()).await),
             _ => None,
         }
     };
-    let (events, pods, job_events) = tokio::join!(events_of(if kind == "Job" { "Job" } else { "CronJob" }, name.to_string()), pods_fut, job_events_fut);
+    let (events, pods, job_events) = tokio::join!(events_of(if kind == "Job" { "Job" } else { "CronJob" }, name.to_string(), subject_uid), pods_fut, job_events_fut);
 
     let worst = match pods.as_ref().ok().and_then(|p| worst_attempt(p)) {
         None => None,
         Some((pod, container)) => {
+            let pod_uid = pods.iter().flatten().find(|p| p.metadata.name.as_deref() == Some(pod.as_str())).and_then(|p| p.metadata.uid.clone());
             let (events, logs, previous) = tokio::join!(
-                events_of("Pod", pod.clone()),
+                events_of("Pod", pod.clone(), pod_uid),
                 get_workload_logs(context_name, namespace, std::slice::from_ref(&pod), &container, true, JOB_DIAG_LOG_LINES),
                 get_previous_pod_logs(context_name, namespace, &pod, &container, JOB_DIAG_LOG_LINES),
             );
