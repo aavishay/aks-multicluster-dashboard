@@ -64,7 +64,7 @@ keyring = "4"
 regex = "1"
 anyhow = "1"
 thiserror = "2"
-dirs = "5"
+dirs = "7"
 http = "1"
 
 [target.'cfg(unix)'.dependencies]
