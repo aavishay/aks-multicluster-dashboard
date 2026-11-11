@@ -219,6 +219,8 @@ export const api = {
     invoke<ClaudeDiagnosisPayload>("ai_build_namespace_diagnosis", { contextName, name }),
   aiBuildPvcDiagnosis: (contextName: string, namespace: string, name: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_pvc_diagnosis", { contextName, namespace, name }),
+  aiBuildJobDiagnosis: (contextName: string, kind: string, namespace: string, name: string) =>
+    invoke<ClaudeDiagnosisPayload>("ai_build_job_diagnosis", { contextName, kind, namespace, name }),
   aiBuildPdbDiagnosis: (contextName: string, namespace: string, name: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_pdb_diagnosis", { contextName, namespace, name }),
   /**

@@ -200,6 +200,7 @@ pub fn run() {
             commands::ai_build_pvc_diagnosis,
             commands::ai_build_pdb_diagnosis,
             commands::ai_build_keda_diagnosis,
+            commands::ai_build_job_diagnosis,
             commands::ai_diagnose,
             commands::kubeconfig_path,
             commands::get_write_enabled,

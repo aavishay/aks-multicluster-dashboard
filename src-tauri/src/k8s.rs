@@ -8,6 +8,7 @@ use crate::retry::retry_transient;
 use chrono::Utc;
 use futures::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::{ControllerRevision, DaemonSet, Deployment, ReplicaSet, StatefulSet};
+use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::autoscaling::v2::{
     CrossVersionObjectReference, HorizontalPodAutoscaler, HorizontalPodAutoscalerCondition, MetricSpec, MetricStatus,
     MetricTarget, MetricValueStatus,
@@ -4018,6 +4019,175 @@ pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str
         attachments,
         usage,
     })
+}
+
+/// What a Job or CronJob diagnosis reads.
+pub struct JobDiagnostics {
+    /// `Job` or `CronJob`: what was asked about.
+    pub kind: String,
+    /// The subject's manifest, last-applied removed.
+    pub manifest: String,
+    /// The CronJob asked about, or the one that made the Job asked about.
+    pub cronjob: Option<k8s_openapi::api::batch::v1::CronJob>,
+    /// A CronJob's runs, by controller UID, newest first; empty for a Job.
+    pub runs: Result<Vec<Job>, String>,
+    /// The Job looked into: the one asked about, or a CronJob's newest failed
+    /// run, else its newest. `None` for a CronJob with no runs left.
+    pub job: Option<Job>,
+    /// That Job's pods (its attempts), by controller UID, newest first.
+    pub pods: Result<Vec<Pod>, String>,
+    /// The subject's events.
+    pub events: Result<Vec<EventInfo>, String>,
+    /// The looked-into run's events, when the subject is its CronJob.
+    pub job_events: Option<Result<Vec<EventInfo>, String>>,
+    /// The attempt most worth reading, its failing container, its events and
+    /// logs: current, and previous when the container restarted in place.
+    pub worst: Option<JobAttempt>,
+}
+
+pub struct JobAttempt {
+    pub pod: String,
+    pub container: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    pub logs: Result<String, String>,
+    pub previous: Result<Option<String>, String>,
+}
+
+/// How many of a CronJob's runs are read.
+const JOB_DIAG_RUNS: usize = 10;
+/// How many lines of an attempt's log are fetched.
+const JOB_DIAG_LOG_LINES: i64 = 400;
+
+/// Whether a Job's condition of this type is True.
+pub(crate) fn job_has_condition(job: &Job, type_: &str) -> bool {
+    job.status.as_ref().and_then(|s| s.conditions.as_ref()).is_some_and(|c| c.iter().any(|c| c.type_ == type_ && c.status == "True"))
+}
+
+/// A Job's attempt worth reading, newest first: a failed one, then one with
+/// a failing or waiting container, then any; and in it the container that
+/// failed, or the first.
+pub(crate) fn worst_attempt(pods: &[Pod]) -> Option<(String, String)> {
+    // A container failing now beats one waiting, which beats one that failed
+    // before and recovered: an init container that failed once and then
+    // completed is not why the app exits non-zero.
+    let failing_container = |p: &Pod| -> Option<String> {
+        let st = p.status.as_ref()?;
+        let all: Vec<&k8s_openapi::api::core::v1::ContainerStatus> = st.init_container_statuses.iter().flatten().chain(st.container_statuses.iter().flatten()).collect();
+        let exited_badly = |c: &&&k8s_openapi::api::core::v1::ContainerStatus| c.state.as_ref().and_then(|s| s.terminated.as_ref()).is_some_and(|t| t.exit_code != 0);
+        let waiting = |c: &&&k8s_openapi::api::core::v1::ContainerStatus| c.state.as_ref().and_then(|s| s.waiting.as_ref()).is_some();
+        let failed_before = |c: &&&k8s_openapi::api::core::v1::ContainerStatus| c.last_state.as_ref().and_then(|s| s.terminated.as_ref()).is_some_and(|t| t.exit_code != 0);
+        all.iter().find(exited_badly).or_else(|| all.iter().find(waiting)).or_else(|| all.iter().find(failed_before)).map(|c| c.name.clone())
+    };
+    let first_container = |p: &Pod| p.spec.as_ref().and_then(|s| s.containers.first()).map(|c| c.name.clone()).unwrap_or_default();
+    let failed = |p: &&Pod| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Failed");
+    let pick = pods.iter().find(failed).or_else(|| pods.iter().find(|p| failing_container(p).is_some())).or_else(|| pods.first())?;
+    Some((pick.metadata.name.clone().unwrap_or_default(), failing_container(pick).unwrap_or_else(|| first_container(pick))))
+}
+
+pub async fn get_job_diagnostics(context_name: &str, kind: &str, namespace: &str, name: &str) -> Result<JobDiagnostics, String> {
+    use k8s_openapi::api::batch::v1::CronJob;
+
+    let client = client_for_context(context_name).await?;
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let jobs_api: Api<Job> = Api::namespaced(client.clone(), namespace);
+    let cronjobs_api: Api<CronJob> = Api::namespaced(client.clone(), namespace);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    // By UID too, when known: a recreated object of the same name does not
+    // inherit its predecessor's events.
+    let events_of = |kind: &'static str, object: String, uid: Option<String>| {
+        let events_api = events_api.clone();
+        async move {
+            let by_uid = uid.map(|u| format!(",involvedObject.uid={u}")).unwrap_or_default();
+            let params = ListParams::default().fields(&format!("involvedObject.kind={kind},involvedObject.name={object},involvedObject.namespace={namespace}{by_uid}"));
+            events_api
+                .list(&params)
+                .await
+                .map(|l| {
+                    let mut items = l.items;
+                    items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+                    items.into_iter().map(event_to_info).collect::<Vec<_>>()
+                })
+                .map_err(|e| format!("Failed to list events for {kind} '{object}': {e}"))
+        }
+    };
+    let newest_first = |a: &Job, b: &Job| b.metadata.creation_timestamp.as_ref().map(|t| t.0).cmp(&a.metadata.creation_timestamp.as_ref().map(|t| t.0));
+
+    let ar = match kind {
+        "Job" => ApiResource::erase::<Job>(&()),
+        "CronJob" => ApiResource::erase::<CronJob>(&()),
+        other => return Err(format!("Unsupported kind '{other}'")),
+    };
+    let mut obj = Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &ar).get(name).await.map_err(|e| get_error(kind, name, e))?;
+    let subject_uid = obj.metadata.uid.clone();
+    let value = serde_json::to_value(&obj).map_err(|e| format!("Failed to read {kind} '{name}': {e}"))?;
+    if let Some(a) = obj.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+
+    let (cronjob, runs, job) = if kind == "CronJob" {
+        let cj: CronJob = serde_json::from_value(value).map_err(|e| format!("Failed to read CronJob '{name}': {e}"))?;
+        let uid = cj.metadata.uid.clone();
+        let runs = jobs_api
+            .list(&ListParams::default())
+            .await
+            .map(|l| {
+                let mut owned: Vec<Job> = l.items.into_iter().filter(|j| controlled_by(&j.metadata.owner_references, "CronJob", name, uid.as_deref())).collect();
+                owned.sort_by(newest_first);
+                owned.truncate(JOB_DIAG_RUNS);
+                owned
+            })
+            .map_err(|e| format!("Failed to list Jobs in '{namespace}': {e}"));
+        let job = runs.as_ref().ok().and_then(|r| r.iter().find(|j| job_has_condition(j, "Failed")).or_else(|| r.first()).cloned());
+        (Some(cj), runs, job)
+    } else {
+        let job: Job = serde_json::from_value(value).map_err(|e| format!("Failed to read Job '{name}': {e}"))?;
+        // Only its own CronJob: one recreated under the same name since is
+        // not what made this Job.
+        let owner = job.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true) && o.kind == "CronJob").map(|o| (o.name.clone(), o.uid.clone()));
+        let cronjob = match owner {
+            Some((cj, uid)) => cronjobs_api.get_opt(&cj).await.ok().flatten().filter(|c| c.metadata.uid.as_deref() == Some(uid.as_str())),
+            None => None,
+        };
+        (cronjob, Ok(Vec::new()), Some(job))
+    };
+
+    let job_name = job.as_ref().and_then(|j| j.metadata.name.clone());
+    let job_uid = job.as_ref().and_then(|j| j.metadata.uid.clone());
+    let pods_fut = async {
+        let Some(job_name) = &job_name else { return Ok(Vec::new()) };
+        pods_api
+            .list(&ListParams::default())
+            .await
+            .map(|l| {
+                let mut mine: Vec<Pod> = l.items.into_iter().filter(|p| controlled_by(&p.metadata.owner_references, "Job", job_name, job_uid.as_deref())).collect();
+                mine.sort_by(|a, b| b.metadata.creation_timestamp.as_ref().map(|t| t.0).cmp(&a.metadata.creation_timestamp.as_ref().map(|t| t.0)));
+                mine
+            })
+            .map_err(|e| format!("Failed to list pods in '{namespace}': {e}"))
+    };
+    let job_events_fut = async {
+        match (&job_name, kind) {
+            (Some(j), "CronJob") => Some(events_of("Job", j.clone(), job_uid.clone()).await),
+            _ => None,
+        }
+    };
+    let (events, pods, job_events) = tokio::join!(events_of(if kind == "Job" { "Job" } else { "CronJob" }, name.to_string(), subject_uid), pods_fut, job_events_fut);
+
+    let worst = match pods.as_ref().ok().and_then(|p| worst_attempt(p)) {
+        None => None,
+        Some((pod, container)) => {
+            let pod_uid = pods.iter().flatten().find(|p| p.metadata.name.as_deref() == Some(pod.as_str())).and_then(|p| p.metadata.uid.clone());
+            let (events, logs, previous) = tokio::join!(
+                events_of("Pod", pod.clone(), pod_uid),
+                get_workload_logs(context_name, namespace, std::slice::from_ref(&pod), &container, true, JOB_DIAG_LOG_LINES),
+                get_previous_pod_logs(context_name, namespace, &pod, &container, JOB_DIAG_LOG_LINES),
+            );
+            Some(JobAttempt { pod, container, events, logs, previous })
+        }
+    };
+
+    Ok(JobDiagnostics { kind: kind.to_string(), manifest, cronjob, runs, job, pods, events, job_events, worst })
 }
 
 /// Everything a StatefulSet diagnosis reads beyond what every workload's
