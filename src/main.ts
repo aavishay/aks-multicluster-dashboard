@@ -5903,6 +5903,7 @@ function setMetricsRange(minutes: number) {
   diagnoseHpa,
   diagnoseService,
   diagnoseIngress,
+  diagnoseNamespace,
   diagnosePvc,
   diagnoseKeda,
   confirmDiagnose,
@@ -7095,6 +7096,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Capacity and kubelet details, every condition the cluster reports on it, its taints and events, the pods it is holding, and its manifest without the image cache."
                   : d.kind === "Release"
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
+                  : d.kind === "Namespace"
+                  ? "Its phase, finalizers and conditions, its ResourceQuotas with what each has used, its LimitRanges, its recent Warning events, and its manifest; while it is terminating, what is still in it — every namespaced kind listed, with the objects holding finalizers — and the APIServices that are not available."
                   : d.kind === "ScaledObject" || d.kind === "ScaledJob"
                   ? "Settings, conditions and triggers, where each credential comes from (checked by key name, never value), the KEDA operator's log lines about it, its events, the HPA it generated or the Jobs it ran, KEDA's own health, and its manifest."
                   : d.kind === "PersistentVolumeClaim"
@@ -8605,6 +8608,10 @@ function diagnoseService(ctx: string, namespace: string, name: string) {
  */
 function diagnoseIngress(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "Ingress", namespace, name, "", () => api.aiBuildIngressDiagnosis(ctx, namespace, name));
+}
+
+function diagnoseNamespace(ctx: string, name: string) {
+  startDiagnosis(ctx, "Namespace", "", name, "", () => api.aiBuildNamespaceDiagnosis(ctx, name));
 }
 
 /**
@@ -13334,7 +13341,7 @@ function renderNamespaces(): string {
     keyOf: (r) => `${r.ctx}:${r.n.name}`,
     health: { healthy: (r) => namespaceIsHealthy(r.n), unhealthyLabel: "terminating", statusText: (r) => r.n.status },
     renderRow: ({ ctx, n }) => `
-      <tr>
+      <tr data-diagnose-what="namespace" data-diagnose-ctx="${esc(ctx)}" data-diagnose-name="${esc(n.name)}">
         ${rowCheckboxCell("namespaces", `${ctx}:${n.name}`)}
         <td title="${esc(n.status)}">${statusDot(namespaceIsHealthy(n))}</td>
         ${multi ? resourceClusterCell("namespaces", ctx) : ""}
@@ -14384,7 +14391,9 @@ function renderResourceDetailPanel(): string {
           </div>
           <div class="flex shrink-0 items-center gap-2">
             ${
-              rd.kind === "Service"
+              rd.kind === "Namespace"
+                ? claudeDiagnoseButton(`window.__app.diagnoseNamespace(${jsArg(rd.ctx)},${jsArg(rd.name)})`, "namespace")
+                : rd.kind === "Service"
                 ? claudeDiagnoseButton(`window.__app.diagnoseService(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service")
                 : rd.kind === "Ingress"
                   ? claudeDiagnoseButton(`window.__app.diagnoseIngress(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "ingress")
@@ -15807,6 +15816,9 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "service":
       diagnoseService(ctx, ns, name);
+      return true;
+    case "namespace":
+      diagnoseNamespace(ctx, name);
       return true;
     case "ingress":
       diagnoseIngress(ctx, ns, name);

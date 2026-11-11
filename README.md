@@ -167,7 +167,7 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, NAP NodePool, workload, pod, Service, Ingress, PVC, HPA, KEDA
+Any node, namespace, NAP NodePool, workload, pod, Service, Ingress, PVC, HPA, KEDA
 ScaledObject or ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
 and click **Diagnose** in its panel, or press `⌘D` on a focused row. An event about a workload offers its
 workload's diagnosis the same way; one about a ReplicaSet, its Deployment's, which covers its ReplicaSets.
@@ -200,6 +200,11 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   reasons the others are left out, the nodes that should run one and have
   none, and its pods that are not ready, with their node, revision and
   scheduling message;
+- a namespace: its ResourceQuotas with what each has used — and a quota on
+  requests or limits with no LimitRange default for a pod that sets none —
+  its LimitRanges and its Warning events; while it is stuck terminating,
+  everything still in it with the objects holding finalizers, the API
+  groups that could not be discovered, and the APIServices that are down;
 - a PVC: its storage class or why it has none, the volume bound to it and
   the zone it is pinned to, the pods that mount it with the events of those
   not ready — where a failed attach or mount is reported — its volume
