@@ -28,7 +28,7 @@ fn rules(r: &HPAScalingRules, default_window: i32) -> Vec<String> {
 }
 
 pub(crate) fn hpa_detail(hpa: &HorizontalPodAutoscaler) -> HpaDetail {
-    let spec = hpa.spec.as_ref();
+    let spec = Some(&hpa.spec);
     let status = hpa.status.as_ref();
     let behavior = spec.and_then(|s| s.behavior.as_ref());
     // Kubernetes' documented defaults when `behavior` (or one direction of it)
@@ -102,7 +102,7 @@ mod tests {
                 }]),
                 ..Default::default()
             },
-            spec: Some(HorizontalPodAutoscalerSpec {
+            spec: HorizontalPodAutoscalerSpec {
                 scale_target_ref: CrossVersionObjectReference { kind: "Deployment".into(), name: "api".into(), ..Default::default() },
                 max_replicas: 10,
                 metrics: Some(vec![
@@ -125,7 +125,7 @@ mod tests {
                 ]),
                 behavior,
                 ..Default::default()
-            }),
+            },
             status: Some(HorizontalPodAutoscalerStatus {
                 current_metrics: Some(vec![MetricStatus {
                     type_: "Resource".into(),

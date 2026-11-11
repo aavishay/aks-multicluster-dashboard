@@ -500,7 +500,7 @@ pub(crate) fn mask_template_literals(obj: &mut DynamicObject) {
 /// else the first. Named in the log request, since a pod with an injected
 /// sidecar refuses one that does not say.
 fn eso_container(d: &k8s_openapi::api::apps::v1::Deployment) -> Option<String> {
-    let containers = &d.spec.as_ref()?.template.spec.as_ref()?.containers;
+    let containers = &d.spec.template.spec.as_ref()?.containers;
     containers
         .iter()
         .find(|c| c.image.as_deref().is_some_and(|i| i.contains("external-secrets")))
@@ -616,8 +616,9 @@ pub async fn get_external_secret_diagnostics(context_name: &str, namespace: &str
             let ns = d.namespace().unwrap_or_default();
             let Some(selector) = d
                 .spec
+                .selector
+                .match_labels
                 .as_ref()
-                .and_then(|s| s.selector.match_labels.as_ref())
                 .map(|m| m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","))
                 .filter(|s| !s.is_empty())
             else {

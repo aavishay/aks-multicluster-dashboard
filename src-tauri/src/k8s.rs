@@ -145,16 +145,34 @@ async fn fetch_pod_metrics(client: &Client, namespace: &Option<String>) -> HashM
     out
 }
 
+/// k8s-openapi's times are `jiff` timestamps; the app works in chrono. A
+/// `Time` or `MicroTime` reads as chrono through `.0.utc()`.
+pub(crate) trait Chrono {
+    fn utc(&self) -> chrono::DateTime<Utc>;
+}
+
+impl Chrono for k8s_openapi::jiff::Timestamp {
+    fn utc(&self) -> chrono::DateTime<Utc> {
+        chrono::DateTime::from_timestamp(self.as_second(), self.subsec_nanosecond().max(0) as u32).unwrap_or_default()
+    }
+}
+
+/// The other way, for building objects in tests.
+#[cfg(test)]
+pub(crate) fn k8s_time(t: chrono::DateTime<Utc>) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
+    k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(k8s_openapi::jiff::Timestamp::new(t.timestamp(), t.timestamp_subsec_nanos() as i32).unwrap())
+}
+
 pub(crate) fn age_days(ts: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> i64 {
     match ts {
-        Some(t) => (Utc::now() - t.0).num_days().max(0),
+        Some(t) => (Utc::now() - t.0.utc()).num_days().max(0),
         None => 0,
     }
 }
 
 pub(crate) fn age_seconds(ts: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> i64 {
     match ts {
-        Some(t) => (Utc::now() - t.0).num_seconds().max(0),
+        Some(t) => (Utc::now() - t.0.utc()).num_seconds().max(0),
         None => 0,
     }
 }
@@ -164,7 +182,7 @@ pub(crate) fn age_seconds(ts: Option<k8s_openapi::apimachinery::pkg::apis::meta:
 /// measured when the list is built, so subtracting it from the frontend's clock
 /// later would be off by however long ago that was.
 pub(crate) fn created_at(ts: &Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> Option<String> {
-    ts.as_ref().map(|t| t.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    ts.as_ref().map(|t| t.0.utc().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 /// The object's managing controller (kind, name), if it has one — e.g. a Pod's
@@ -867,19 +885,19 @@ fn container_names_from(spec: Option<&k8s_openapi::api::core::v1::PodSpec>) -> V
 
 impl HasPodTemplateContainers for Deployment {
     fn container_names(&self) -> Vec<String> {
-        self.spec.as_ref().map_or_else(Vec::new, |s| container_names_from(s.template.spec.as_ref()))
+        container_names_from(self.spec.template.spec.as_ref())
     }
 }
 
 impl HasPodTemplateContainers for StatefulSet {
     fn container_names(&self) -> Vec<String> {
-        self.spec.as_ref().map_or_else(Vec::new, |s| container_names_from(s.template.spec.as_ref()))
+        container_names_from(self.spec.template.spec.as_ref())
     }
 }
 
 impl HasPodTemplateContainers for DaemonSet {
     fn container_names(&self) -> Vec<String> {
-        self.spec.as_ref().map_or_else(Vec::new, |s| container_names_from(s.template.spec.as_ref()))
+        container_names_from(self.spec.template.spec.as_ref())
     }
 }
 
@@ -1325,7 +1343,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
 
     if let Ok(list) = deployments_result {
         for d in list.items {
-            let spec = d.spec.clone().unwrap_or_default();
+            let spec = d.spec.clone();
             let status = d.status.clone().unwrap_or_default();
             let desired = spec.replicas.unwrap_or(0);
             let ready = status.ready_replicas.unwrap_or(0);
@@ -1348,8 +1366,8 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 chart: v.chart,
                 failure_message: pick_failure_condition(status.conditions.iter().flatten().map(|c| {
                     (
-                        c.type_.as_str(),
-                        c.status.as_str(),
+                        c.type_.as_deref().unwrap_or(""),
+                        c.status.as_deref().unwrap_or(""),
                         c.reason.as_deref().unwrap_or(""),
                         c.message.as_deref().unwrap_or(""),
                     )
@@ -1360,7 +1378,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
 
     if let Ok(list) = statefulsets_result {
         for s in list.items {
-            let spec = s.spec.clone().unwrap_or_default();
+            let spec = s.spec.clone();
             let status = s.status.clone().unwrap_or_default();
             let desired = spec.replicas.unwrap_or(0);
             let ready = status.ready_replicas.unwrap_or(0);
@@ -1383,8 +1401,8 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 chart: v.chart,
                 failure_message: pick_failure_condition(status.conditions.iter().flatten().map(|c| {
                     (
-                        c.type_.as_str(),
-                        c.status.as_str(),
+                        c.type_.as_deref().unwrap_or(""),
+                        c.status.as_deref().unwrap_or(""),
                         c.reason.as_deref().unwrap_or(""),
                         c.message.as_deref().unwrap_or(""),
                     )
@@ -1398,7 +1416,7 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
             let status = d.status.clone().unwrap_or_default();
             let desired = status.desired_number_scheduled;
             let ready = status.number_ready;
-            let v = workload_version_fields(d.labels(), d.spec.as_ref().and_then(|sp| sp.template.spec.as_ref()));
+            let v = workload_version_fields(d.labels(), d.spec.template.spec.as_ref());
             out.push(WorkloadInfo {
                 kind: "DaemonSet".to_string(),
                 name: d.name_any(),
@@ -1417,8 +1435,8 @@ pub async fn get_workloads(context_name: &str) -> Result<Vec<WorkloadInfo>, Stri
                 chart: v.chart,
                 failure_message: pick_failure_condition(status.conditions.iter().flatten().map(|c| {
                     (
-                        c.type_.as_str(),
-                        c.status.as_str(),
+                        c.type_.as_deref().unwrap_or(""),
+                        c.status.as_deref().unwrap_or(""),
                         c.reason.as_deref().unwrap_or(""),
                         c.message.as_deref().unwrap_or(""),
                     )
@@ -1469,8 +1487,8 @@ fn revision_template_yaml(template: &serde_json::Value) -> String {
 /// images out of that JSON by path instead of deserializing the whole thing.
 fn controller_revision_images(cr: &ControllerRevision) -> Vec<String> {
     cr.data
-        .as_ref()
-        .and_then(|d| d.0.pointer("/spec/template/spec/containers"))
+        .0
+        .pointer("/spec/template/spec/containers")
         .and_then(|c| c.as_array())
         .map(|containers| {
             containers
@@ -1515,7 +1533,7 @@ pub async fn get_workload_revisions(
                 // in a same-prefixed sibling Deployment's ReplicaSets.
                 .filter(|rs| controller_owner(&rs.metadata.owner_references) == Some(("Deployment", name)))
                 .map(|rs| {
-                    let spec = rs.spec.clone().unwrap_or_default();
+                    let spec = rs.spec.clone();
                     let status = rs.status.clone().unwrap_or_default();
                     WorkloadRevisionInfo {
                         revision: rs
@@ -1555,15 +1573,15 @@ pub async fn get_workload_revisions(
                 .into_iter()
                 .filter(|cr| controller_owner(&cr.metadata.owner_references) == Some((kind, name)))
                 .map(|cr| WorkloadRevisionInfo {
-                    revision: cr.revision,
+                    revision: cr.revision.unwrap_or(0),
                     name: cr.name_any(),
                     replicas: None,
                     ready_replicas: None,
                     images: controller_revision_images(&cr),
                     template_yaml: cr
                         .data
-                        .as_ref()
-                        .and_then(|d| d.0.pointer("/spec/template"))
+                        .0
+                        .pointer("/spec/template")
                         .map(revision_template_yaml)
                         .unwrap_or_default(),
                     current: false,
@@ -1617,10 +1635,10 @@ pub(crate) fn event_last_seen(e: &Event) -> Option<chrono::DateTime<Utc>> {
     e.series
         .as_ref()
         .and_then(|s| s.last_observed_time.as_ref())
-        .map(|t| t.0)
-        .or_else(|| e.last_timestamp.as_ref().map(|t| t.0))
-        .or_else(|| e.event_time.as_ref().map(|t| t.0))
-        .or_else(|| e.first_timestamp.as_ref().map(|t| t.0))
+        .map(|t| t.0.utc())
+        .or_else(|| e.last_timestamp.as_ref().map(|t| t.0.utc()))
+        .or_else(|| e.event_time.as_ref().map(|t| t.0.utc()))
+        .or_else(|| e.first_timestamp.as_ref().map(|t| t.0.utc()))
 }
 
 /// Who reported an event: `events.k8s.io`'s reporting controller and
@@ -1649,7 +1667,7 @@ pub(crate) fn event_to_info(e: Event) -> EventInfo {
         object_name: o.name.clone().unwrap_or_default(),
         object_uid: o.uid.clone().unwrap_or_default(),
         name: e.metadata.name.clone().unwrap_or_default(),
-        first_seen: e.first_timestamp.as_ref().map(|t| t.0).or_else(|| e.event_time.as_ref().map(|t| t.0)).map(|t| t.to_rfc3339()),
+        first_seen: e.first_timestamp.as_ref().map(|t| t.0).or_else(|| e.event_time.as_ref().map(|t| t.0)).map(|t| t.utc().to_rfc3339()),
         source: event_source(&e),
         field_path: o.field_path.clone().unwrap_or_default(),
         action: e.action.clone().unwrap_or_default(),
@@ -2576,7 +2594,7 @@ fn hpa_condition(conditions: &[HorizontalPodAutoscalerCondition], want: &str) ->
 }
 
 fn hpa_to_info(hpa: HorizontalPodAutoscaler) -> HpaInfo {
-    let spec = hpa.spec.unwrap_or_default();
+    let spec = hpa.spec;
     let status = hpa.status.unwrap_or_default();
     let conditions = status.conditions.unwrap_or_default();
 
@@ -2610,7 +2628,7 @@ fn hpa_to_info(hpa: HorizontalPodAutoscaler) -> HpaInfo {
         scaling_active,
         scaling_limited,
         condition_reason,
-        last_scale_at: status.last_scale_time.map(|t| t.0.to_rfc3339()),
+        last_scale_at: status.last_scale_time.map(|t| t.0.utc().to_rfc3339()),
         age_days: age_days(hpa.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(hpa.metadata.creation_timestamp.clone()),
         created_at: created_at(&hpa.metadata.creation_timestamp),
@@ -2770,7 +2788,7 @@ pub async fn get_hpa_diagnostics(context_name: &str, namespace: &str, name: &str
         .map_err(|e| format!("Failed to read HorizontalPodAutoscaler '{name}': {e}"))?;
     let detail = crate::hpa_detail::hpa_detail(&typed);
     let manifest = object_manifest(obj)?.yaml_without_managed_fields;
-    let target_ref = typed.spec.as_ref().map(|s| s.scale_target_ref.clone()).unwrap_or_default();
+    let target_ref = typed.spec.scale_target_ref.clone();
 
     let event_fields = format!(
         "involvedObject.kind=HorizontalPodAutoscaler,involvedObject.name={name},involvedObject.namespace={namespace}"
@@ -2799,7 +2817,7 @@ pub async fn get_hpa_diagnostics(context_name: &str, namespace: &str, name: &str
                 .into_iter()
                 .filter(|h| h.metadata.name.as_deref() != Some(name))
                 .filter(|h| {
-                    h.spec.as_ref().is_some_and(|s| s.scale_target_ref.kind == target_ref.kind && s.scale_target_ref.name == target_ref.name)
+                    h.spec.scale_target_ref.kind == target_ref.kind && h.spec.scale_target_ref.name == target_ref.name
                 })
                 .map(|h| {
                     let owner = h
@@ -3275,7 +3293,7 @@ pub async fn get_keda_diagnostics(context_name: &str, namespace: &str, kind: &st
         .as_ref()
         .ok()
         .and_then(|d| d.iter().find(|d| d.metadata.name.as_deref() == Some("keda-operator")))
-        .and_then(|d| d.spec.as_ref())
+        .map(|d| &d.spec)
         .and_then(|s| s.selector.match_labels.as_ref())
         .map(|m| m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","))
         .filter(|s| !s.is_empty());
@@ -3458,7 +3476,7 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
         });
         let mut out = Vec::new();
         for d in deployments {
-            let spec = d.spec.unwrap_or_default();
+            let spec = d.spec;
             out.push(ServiceWorkload {
                 kind: "Deployment".into(),
                 name: d.metadata.name.unwrap_or_default(),
@@ -3468,7 +3486,7 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
             });
         }
         for d in statefulsets {
-            let spec = d.spec.unwrap_or_default();
+            let spec = d.spec;
             out.push(ServiceWorkload {
                 kind: "StatefulSet".into(),
                 name: d.metadata.name.unwrap_or_default(),
@@ -3478,7 +3496,7 @@ pub async fn get_service_diagnostics(context_name: &str, namespace: &str, name: 
             });
         }
         for d in daemonsets {
-            let spec = d.spec.unwrap_or_default();
+            let spec = d.spec;
             let status = d.status.unwrap_or_default();
             out.push(ServiceWorkload {
                 kind: "DaemonSet".into(),
@@ -4275,7 +4293,7 @@ pub async fn get_statefulset_diagnostics(context_name: &str, namespace: &str, na
 
     let client = client_for_context(context_name).await?;
     let sts = Api::<StatefulSet>::namespaced(client.clone(), namespace).get(name).await.map_err(|e| get_error("StatefulSet", name, e))?;
-    let spec = sts.spec.clone().unwrap_or_default();
+    let spec = sts.spec.clone();
     let templates: Vec<String> = spec.volume_claim_templates.iter().flatten().filter_map(|t| t.metadata.name.clone()).collect();
 
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
@@ -4285,11 +4303,12 @@ pub async fn get_statefulset_diagnostics(context_name: &str, namespace: &str, na
     let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
     let pod_params = ListParams::default().labels(&label_selector_query(&spec.selector));
     let all = ListParams::default();
+    let service_name = spec.service_name.clone().unwrap_or_default();
     let service_fut = async {
-        if spec.service_name.is_empty() {
+        if service_name.is_empty() {
             None
         } else {
-            Some(services_api.get_opt(&spec.service_name).await.map_err(|e| format!("Failed to get Service '{}': {e}", spec.service_name)))
+            Some(services_api.get_opt(&service_name).await.map_err(|e| format!("Failed to get Service '{service_name}': {e}")))
         }
     };
     let claims_fut = async {
@@ -4500,7 +4519,7 @@ pub(crate) fn daemon_pod_node(p: &Pod) -> Option<String> {
 pub async fn get_daemonset_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<DaemonSetDiagnostics, String> {
     let client = client_for_context(context_name).await?;
     let ds = Api::<DaemonSet>::namespaced(client.clone(), namespace).get(name).await.map_err(|e| get_error("DaemonSet", name, e))?;
-    let spec = ds.spec.clone().unwrap_or_default();
+    let spec = ds.spec.clone();
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let nodes_api: Api<Node> = Api::all(client.clone());
     let revisions_api: Api<ControllerRevision> = Api::namespaced(client.clone(), namespace);
@@ -4557,7 +4576,7 @@ pub async fn get_deployment_diagnostics(context_name: &str, namespace: &str, nam
 
     let client = client_for_context(context_name).await?;
     let deployment = Api::<Deployment>::namespaced(client.clone(), namespace).get(name).await.map_err(|e| get_error("Deployment", name, e))?;
-    let spec = deployment.spec.clone().unwrap_or_default();
+    let spec = deployment.spec.clone();
     let rs_api: Api<ReplicaSet> = Api::namespaced(client.clone(), namespace);
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let hpas_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
@@ -4597,7 +4616,7 @@ pub async fn get_deployment_diagnostics(context_name: &str, namespace: &str, nam
         .map(|l| {
             l.items
                 .into_iter()
-                .filter(|h| h.spec.as_ref().is_some_and(|s| s.scale_target_ref.kind == "Deployment" && s.scale_target_ref.name == name))
+                .filter(|h| h.spec.scale_target_ref.kind == "Deployment" && h.spec.scale_target_ref.name == name)
                 .collect()
         })
         .map_err(|e| format!("Failed to list HorizontalPodAutoscalers in '{namespace}': {e}"));
@@ -4749,11 +4768,11 @@ pub async fn get_pdb_diagnostics(context_name: &str, namespace: &str, name: &str
                                 let desired = Api::<Deployment>::namespaced(client.clone(), namespace)
                                     .get_opt(&d)
                                     .await
-                                    .map(|got| got.map(|dep| dep.spec.and_then(|s| s.replicas).unwrap_or(1)))
+                                    .map(|got| got.map(|dep| dep.spec.replicas.unwrap_or(1)))
                                     .map_err(|e| api_get(e, "Deployment", &d));
                                 PdbOwner { kind: "Deployment".into(), name: d, desired, pods: count }
                             }
-                            _ => PdbOwner { kind, name: owner, desired: Ok(rs.spec.and_then(|s| s.replicas)), pods: count },
+                            _ => PdbOwner { kind, name: owner, desired: Ok(rs.spec.replicas), pods: count },
                         },
                         Ok(None) => PdbOwner { kind, name: owner, desired: Ok(None), pods: count },
                         Err(e) => PdbOwner { desired: Err(api_get(e, "ReplicaSet", &owner)), kind, name: owner, pods: count },
@@ -4763,7 +4782,7 @@ pub async fn get_pdb_diagnostics(context_name: &str, namespace: &str, name: &str
                     let desired = Api::<StatefulSet>::namespaced(client.clone(), namespace)
                         .get_opt(&owner)
                         .await
-                        .map(|got| got.map(|s| s.spec.and_then(|s| s.replicas).unwrap_or(1)))
+                        .map(|got| got.map(|s| s.spec.replicas.unwrap_or(1)))
                         .map_err(|e| api_get(e, "StatefulSet", &owner));
                     PdbOwner { kind, name: owner, desired, pods: count }
                 }
@@ -5128,11 +5147,11 @@ pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: 
                 .items
                 .iter()
                 .filter_map(|d| {
-                    let spec = d.spec.as_ref()?;
+                    let spec = &d.spec;
                     workload("Deployment", &d.metadata, &spec.template, &spec.selector, spec.replicas.unwrap_or(1), d.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0))
                 })
                 .chain(daemonsets.items.iter().filter_map(|d| {
-                    let spec = d.spec.as_ref()?;
+                    let spec = &d.spec;
                     let status = d.status.clone().unwrap_or_default();
                     workload("DaemonSet", &d.metadata, &spec.template, &spec.selector, status.desired_number_scheduled, status.number_ready)
                 }))
@@ -5929,9 +5948,8 @@ mod tests {
 
     #[test]
     fn created_at_is_utc_to_the_second() {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-        let t = chrono::DateTime::parse_from_rfc3339("2026-04-29T19:37:04.6162361+03:00").unwrap().with_timezone(&Utc);
-        assert_eq!(created_at(&Some(Time(t))), Some("2026-04-29T16:37:04Z".to_string()));
+            let t = chrono::DateTime::parse_from_rfc3339("2026-04-29T19:37:04.6162361+03:00").unwrap().with_timezone(&Utc);
+        assert_eq!(created_at(&Some(k8s_time(t))), Some("2026-04-29T16:37:04Z".to_string()));
         assert_eq!(created_at(&None), None);
     }
 
@@ -7259,18 +7277,18 @@ mod tests {
     #[test]
     fn controller_revision_images_reads_the_embedded_template() {
         let cr = ControllerRevision {
-            revision: 3,
-            data: Some(k8s_openapi::apimachinery::pkg::runtime::RawExtension(serde_json::json!({
+            revision: Some(3),
+            data: k8s_openapi::apimachinery::pkg::runtime::RawExtension(serde_json::json!({
                 "spec": { "template": { "spec": { "containers": [
                     { "name": "etcd", "image": "docker.io/bitnamilegacy/etcd:latest" }
                 ] } } }
-            }))),
+            })),
             metadata: Default::default(),
         };
         assert_eq!(controller_revision_images(&cr), vec!["docker.io/bitnamilegacy/etcd:latest"]);
 
         // A revision with no usable data must not panic.
-        let empty = ControllerRevision { revision: 1, data: None, metadata: Default::default() };
+        let empty = ControllerRevision { revision: Some(1), data: k8s_openapi::apimachinery::pkg::runtime::RawExtension(serde_json::Value::Null), metadata: Default::default() };
         assert!(controller_revision_images(&empty).is_empty());
     }
 
