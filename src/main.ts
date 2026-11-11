@@ -5922,6 +5922,7 @@ function setMetricsRange(minutes: number) {
   diagnoseNamespace,
   diagnosePvc,
   diagnoseJob,
+  diagnoseExternalSecret,
   diagnosePdb,
   diagnoseKeda,
   confirmDiagnose,
@@ -7130,6 +7131,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Replica bounds, conditions, each metric against its target, behavior and events, the object it scales and any other HPA on it, the requests and usage of every container in its pods, whether its metrics APIs are available, and its manifest."
                   : d.kind === "NodePool"
                   ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
+                  : d.kind === "ExternalSecret"
+                  ? "Its store, target, policies, refresh and conditions, what it maps from the provider, its store with how it signs in and whether it is ready, the Secrets and ServiceAccount the store signs in with (checked by key name, never value), the target Secret's type, key names and owner (never its values), ESO's controller and its log lines about it, its events, and its manifest."
                   : d.kind === "CronJob"
                   ? "Its schedule, policies and recent runs, its newest failed run (or newest run) with its limits, status and conditions, that run's attempts with each container's exit code and node, the events of the CronJob, the run and its worst attempt, that attempt's logs (and its previous instance's when it restarted), and its manifest."
                   : d.kind === "Job"
@@ -8645,6 +8648,10 @@ function diagnoseNamespace(ctx: string, name: string) {
  */
 function diagnosePvc(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "PersistentVolumeClaim", namespace, name, "", () => api.aiBuildPvcDiagnosis(ctx, namespace, name));
+}
+
+function diagnoseExternalSecret(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "ExternalSecret", namespace, name, "", () => api.aiBuildExternalSecretDiagnosis(ctx, namespace, name));
 }
 
 function diagnoseJob(ctx: string, kind: string, namespace: string, name: string) {
@@ -11892,6 +11899,7 @@ function renderExternalSecretDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">ExternalSecret · ${esc(ed.namespace)} · ${esc(ed.ctx)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${claudeDiagnoseButton(`window.__app.diagnoseExternalSecret(${jsArg(ed.ctx)},${jsArg(ed.namespace)},${jsArg(ed.name)})`, "external secret")}
             ${writeModeToggle(true)}
             <button type="button" onclick="window.__app.closeExternalSecretDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
@@ -13174,7 +13182,7 @@ function renderExternalSecrets(): string {
               const { ctx, e } = row;
               const status = externalSecretStatus(e);
               return `
-            <tr>
+            <tr data-diagnose-what="externalsecret" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(e.namespace)}" data-diagnose-name="${esc(e.name)}">
               ${rowCheckboxCell("externalsecrets", keyOf(row))}
               <td title="${esc(e.message ? `${status}: ${e.message}` : status)}">${statusDot(e.ready)}</td>
               ${
@@ -16027,6 +16035,9 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "pvc":
       diagnosePvc(ctx, ns, name);
+      return true;
+    case "externalsecret":
+      diagnoseExternalSecret(ctx, ns, name);
       return true;
     case "job":
       diagnoseJob(ctx, d.diagnoseKind ?? "Job", ns, name);

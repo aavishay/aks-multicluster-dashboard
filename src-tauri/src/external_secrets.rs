@@ -3,7 +3,10 @@
 //!
 //! An ExternalSecret carries references, not values: a store, a remote key
 //! and a property. So unlike `secrets.rs` there is nothing to redact, and its
-//! YAML and its mappings are shown as they are.
+//! YAML and its mappings are shown as they are. The diagnosis below reads the
+//! Secrets around it — its target, its store's credentials — by key name
+//! only, dropping their values as it reads them, and its payload is redacted
+//! like every other, since a template can hold literal text.
 
 use crate::k8s::{age_days, age_seconds, created_at, event_to_info, json_str, list_events_sorted, object_manifest};
 use crate::kubeconfig::client_for_context;
@@ -106,7 +109,7 @@ pub async fn get_external_secrets(context_name: &str) -> Result<ExternalSecretsR
 /// A store's provider, read generically: ESO has some thirty providers, each
 /// with its own fields, so this names the common ones and falls back to the
 /// provider's name alone.
-fn store_info(obj: &DynamicObject, kind: &str) -> SecretStoreInfo {
+pub(crate) fn store_info(obj: &DynamicObject, kind: &str) -> SecretStoreInfo {
     let spec = obj.data.get("spec");
     let status = obj.data.get("status");
     let (provider, conf) = spec
@@ -232,7 +235,7 @@ fn mappings(spec: Option<&Value>) -> Vec<ExternalSecretMapping> {
 /// One `spec.dataFrom` entry as a line a reader can take in at a glance.
 /// Each can yield any number of keys, so there is no key list to show — only
 /// what it pulls.
-fn describe_data_from(entry: &Value) -> String {
+pub(crate) fn describe_data_from(entry: &Value) -> String {
     if let Some(extract) = entry.get("extract") {
         let key = json_str(Some(extract), "key");
         return match json_str(Some(extract), "property") {
@@ -282,7 +285,7 @@ fn or_default(v: Option<&Value>, key: &str, default: &str) -> String {
     }
 }
 
-fn overview_of(obj: &DynamicObject) -> ExternalSecretOverview {
+pub(crate) fn overview_of(obj: &DynamicObject) -> ExternalSecretOverview {
     let spec = obj.data.get("spec");
     let status = obj.data.get("status");
     let target = spec.and_then(|s| s.get("target"));
@@ -335,6 +338,245 @@ pub async fn get_external_secret_events(context_name: &str, namespace: &str, nam
         })
         .map(event_to_info)
         .collect())
+}
+
+/// What an ExternalSecret diagnosis reads.
+pub struct ExternalSecretDiagnostics {
+    /// The ExternalSecret as read, last-applied removed.
+    pub object: DynamicObject,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// The store it names, `None` when it does not exist.
+    pub store_kind: String,
+    pub store_name: String,
+    pub store: Result<Option<DynamicObject>, String>,
+    /// The Secrets and ServiceAccounts the store signs in with.
+    pub credentials: Vec<StoreCredential>,
+    /// The Secret it writes to, `None` when it does not exist.
+    pub target: Result<Option<TargetSecret>, String>,
+    /// ESO's controller Deployments.
+    pub controller: Result<Vec<k8s_openapi::api::apps::v1::Deployment>, String>,
+    /// The controller's log lines about this ExternalSecret, oldest first.
+    pub controller_logs: Result<Vec<String>, String>,
+}
+
+/// A Secret key or a ServiceAccount a store signs in with, and what was
+/// found: the Secret's key names, or the ServiceAccount's annotation names —
+/// never a value. `None` when it does not exist.
+pub struct StoreCredential {
+    pub kind: &'static str,
+    pub namespace: String,
+    pub name: String,
+    /// The Secret key the store reads.
+    pub key: Option<String>,
+    pub found: Result<Option<Vec<String>>, String>,
+}
+
+/// The target Secret, read without its values.
+pub struct TargetSecret {
+    pub secret_type: String,
+    pub keys: Vec<String>,
+    /// Its controller: kind, name and UID.
+    pub owner: Option<(String, String, String)>,
+    /// It carries ESO's reconcile labels or annotations.
+    pub managed: bool,
+}
+
+/// How far back into ESO's controller log to look: an hour, by time, since a
+/// failing sync is retried on a backoff that can space errors far apart.
+const ESO_LOG_SECONDS: i64 = 3600;
+/// The most of its log to read for that hour.
+const ESO_LOG_BYTES: i64 = 8 * 1024 * 1024;
+
+/// Whether a line of ESO's controller log is about this ExternalSecret. The
+/// controller logs JSON, keying each line by the object it reconciles.
+pub(crate) fn eso_log_line_is_about(line: &str, namespace: &str, name: &str) -> bool {
+    let Ok(fields) = serde_json::from_str::<Value>(line.trim()) else { return false };
+    let es = fields.get("ExternalSecret");
+    let keyed = json_str(es, "name") == name && json_str(es, "namespace") == namespace;
+    let named = json_str(Some(&fields), "controllerKind") == "ExternalSecret"
+        && json_str(Some(&fields), "name") == name
+        && json_str(Some(&fields), "namespace") == namespace;
+    keyed || named
+}
+
+/// The Secret keys and ServiceAccounts a store's provider block names:
+/// any `{name, key}` under a `…SecretRef`, and any `serviceAccountRef`. Read
+/// generically, as ESO's providers each name theirs differently. A reference
+/// without a namespace is the ExternalSecret's.
+pub(crate) fn store_credential_refs(provider: Option<&Value>, default_namespace: &str) -> Vec<(&'static str, String, String, Option<String>)> {
+    fn walk(v: &Value, under_secret_ref: bool, ns: &str, out: &mut Vec<(&'static str, String, String, Option<String>)>) {
+        let Some(obj) = v.as_object() else { return };
+        let name = obj.get("name").and_then(Value::as_str);
+        let namespace = obj.get("namespace").and_then(Value::as_str).unwrap_or(ns).to_string();
+        if let (true, Some(n), Some(k)) = (under_secret_ref, name, obj.get("key").and_then(Value::as_str)) {
+            out.push(("Secret", namespace, n.to_string(), Some(k.to_string())));
+            return;
+        }
+        for (k, child) in obj {
+            if k == "serviceAccountRef" {
+                if let Some(n) = child.get("name").and_then(Value::as_str) {
+                    let sa_ns = child.get("namespace").and_then(Value::as_str).unwrap_or(ns).to_string();
+                    out.push(("ServiceAccount", sa_ns, n.to_string(), None));
+                }
+                continue;
+            }
+            walk(child, under_secret_ref || k.to_ascii_lowercase().ends_with("secretref"), ns, out);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(p) = provider {
+        walk(p, false, default_namespace, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A store by kind and name, newest API version first; `None` when it does
+/// not exist at any.
+pub(crate) async fn get_store(client: &Client, kind: &str, namespace: &str, name: &str) -> Result<Option<DynamicObject>, String> {
+    let plural = if kind == "ClusterSecretStore" { "clustersecretstores" } else { "secretstores" };
+    for version in VERSIONS {
+        let ar = ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(GROUP, version, kind), plural);
+        let api: Api<DynamicObject> =
+            if kind == "ClusterSecretStore" { Api::all_with(client.clone(), &ar) } else { Api::namespaced_with(client.clone(), namespace, &ar) };
+        match api.get_opt(name).await {
+            Ok(Some(obj)) => return Ok(Some(obj)),
+            Ok(None) => continue,
+            // A version this cluster does not serve answers 404 to the
+            // collection as well; the next version is tried.
+            Err(kube::Error::Api(resp)) if resp.code == 404 => continue,
+            Err(e) => return Err(format!("Failed to get {kind} '{name}': {e}")),
+        }
+    }
+    Ok(None)
+}
+
+pub async fn get_external_secret_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<ExternalSecretDiagnostics, String> {
+    use k8s_openapi::api::apps::v1::Deployment;
+    use k8s_openapi::api::core::v1::{Event, Pod, Secret, ServiceAccount};
+    use kube::api::LogParams;
+    use kube::ResourceExt;
+
+    let client = client_for_context(context_name).await?;
+    let mut object = get_one(&client, namespace, name).await?;
+    if let Some(a) = object.metadata.annotations.as_mut() {
+        a.remove(crate::k8s::LAST_APPLIED_ANNOTATION);
+    }
+    let manifest = object_manifest(object.clone())?.yaml_without_managed_fields;
+    let info = to_info(&object);
+    let uid = object.metadata.uid.clone();
+
+    let events_fut = async {
+        let by_uid = uid.as_deref().map(|u| format!(",involvedObject.uid={u}")).unwrap_or_default();
+        let params =
+            ListParams::default().fields(&format!("involvedObject.kind=ExternalSecret,involvedObject.name={name},involvedObject.namespace={namespace}{by_uid}"));
+        Api::<Event>::namespaced(client.clone(), namespace)
+            .list(&params)
+            .await
+            .map(|l| {
+                let mut items = l.items;
+                items.sort_by(|a, b| crate::k8s::event_last_seen(b).cmp(&crate::k8s::event_last_seen(a)));
+                items.into_iter().map(event_to_info).collect()
+            })
+            .map_err(|e| format!("Failed to list events for ExternalSecret '{name}': {e}"))
+    };
+    let store_fut = get_store(&client, &info.store_kind, namespace, &info.store_name);
+    // Keys, type and owner only: the values are read here and dropped.
+    let target_fut = async {
+        Api::<Secret>::namespaced(client.clone(), namespace)
+            .get_opt(&info.target_name)
+            .await
+            .map(|got| {
+                got.map(|s| TargetSecret {
+                    secret_type: s.type_.clone().unwrap_or_else(|| "Opaque".to_string()),
+                    keys: s.data.iter().flatten().map(|(k, _)| k.clone()).collect(),
+                    owner: s.metadata.owner_references.iter().flatten().find(|o| o.controller == Some(true)).map(|o| (o.kind.clone(), o.name.clone(), o.uid.clone())),
+                    managed: s
+                        .metadata
+                        .labels
+                        .iter()
+                        .flatten()
+                        .map(|(k, _)| k)
+                        .chain(s.metadata.annotations.iter().flatten().map(|(k, _)| k))
+                        .any(|k| k.starts_with("reconcile.external-secrets.io/")),
+                })
+            })
+            .map_err(|e| format!("Failed to get Secret '{}': {e}", info.target_name))
+    };
+    // The controller by its Helm chart's label: its webhook and certificate
+    // controller carry names of their own.
+    let controller_fut = async {
+        Api::<Deployment>::all(client.clone())
+            .list(&ListParams::default().labels("app.kubernetes.io/name=external-secrets"))
+            .await
+            .map(|l| l.items)
+            .map_err(|e| format!("Failed to list ESO's Deployments: {e}"))
+    };
+    let (events, store, target, controller) = tokio::join!(events_fut, store_fut, target_fut, controller_fut);
+
+    let credential_refs = match &store {
+        Ok(Some(s)) => store_credential_refs(s.data.pointer("/spec/provider"), namespace),
+        _ => Vec::new(),
+    };
+    let credentials_fut = futures::future::join_all(credential_refs.into_iter().map(|(kind, ns, n, key)| {
+        let client = client.clone();
+        async move {
+            // Key and annotation names only, never their values.
+            let found = if kind == "Secret" {
+                Api::<Secret>::namespaced(client, &ns)
+                    .get_opt(&n)
+                    .await
+                    .map(|got| got.map(|s| s.data.iter().flatten().map(|(k, _)| k.clone()).collect()))
+                    .map_err(|e| format!("Failed to get Secret '{n}': {e}"))
+            } else {
+                Api::<ServiceAccount>::namespaced(client, &ns)
+                    .get_opt(&n)
+                    .await
+                    .map(|got| got.map(|sa| sa.metadata.annotations.iter().flatten().map(|(k, _)| k.clone()).collect()))
+                    .map_err(|e| format!("Failed to get ServiceAccount '{n}': {e}"))
+            };
+            StoreCredential { kind, namespace: ns, name: n, key, found }
+        }
+    }));
+    let logs_fut = async {
+        let deployments = controller.as_ref().map_err(|e| e.clone())?;
+        let d = deployments.first().ok_or_else(|| "ESO's controller was not found by its Helm chart's label".to_string())?;
+        let ns = d.namespace().unwrap_or_default();
+        let selector = d
+            .spec
+            .as_ref()
+            .and_then(|s| s.selector.match_labels.as_ref())
+            .map(|m| m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "ESO's controller Deployment has no selector".to_string())?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+        let controller_pods = pods.list(&ListParams::default().labels(&selector)).await.map_err(|e| format!("Failed to list ESO's controller pods: {e}"))?.items;
+        let mut lines = Vec::new();
+        for p in &controller_pods {
+            let params = LogParams { since_seconds: Some(ESO_LOG_SECONDS), limit_bytes: Some(ESO_LOG_BYTES), ..Default::default() };
+            match pods.logs(&p.name_any(), &params).await {
+                Ok(text) => lines.extend(text.lines().filter(|l| eso_log_line_is_about(l, namespace, name)).map(str::to_string)),
+                Err(e) => return Err(format!("Failed to read ESO's controller log: {e}")),
+            }
+        }
+        Ok(lines)
+    };
+    let (credentials, controller_logs) = tokio::join!(credentials_fut, logs_fut);
+
+    Ok(ExternalSecretDiagnostics {
+        object,
+        manifest,
+        events,
+        store_kind: info.store_kind,
+        store_name: info.store_name,
+        store,
+        credentials,
+        target,
+        controller,
+        controller_logs,
+    })
 }
 
 #[cfg(test)]
