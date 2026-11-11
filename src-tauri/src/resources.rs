@@ -521,6 +521,17 @@ pub(crate) fn job_info(job: &Job, now: chrono::DateTime<chrono::Utc>) -> JobInfo
     }
 }
 
+/// Whether a CronJob's success came after this run failed: the newest Job
+/// kept is not always the newest run, since with successfulJobsHistoryLimit
+/// 0 a later success keeps no Job and only lastSuccessfulTime remembers it.
+/// Compared with when the run failed, not when it started — with
+/// concurrencyPolicy Allow an older run can succeed while a newer one is
+/// still failing — and kept as a failure when that time is not known.
+pub(crate) fn failure_superseded(job: &Job, last_success: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>) -> bool {
+    let failed_at = job_condition(job, "Failed").and_then(|c| c.last_transition_time.as_ref()).map(|t| t.0);
+    matches!((last_success, failed_at), (Some(s), Some(f)) if s.0 > f)
+}
+
 /// A CronJob, judged by its newest Job: `jobs` is every Job it owns, by
 /// controller UID, newest first.
 pub(crate) fn cronjob_info(cj: &CronJob, jobs: &[&Job], now: chrono::DateTime<chrono::Utc>) -> JobInfo {
@@ -528,14 +539,7 @@ pub(crate) fn cronjob_info(cj: &CronJob, jobs: &[&Job], now: chrono::DateTime<ch
     let status = cj.status.clone().unwrap_or_default();
     let active = status.active.as_ref().map_or(0, |a| a.len()) as i32;
     let newest = jobs.first();
-    // The newest Job kept is not always the newest run: with
-    // successfulJobsHistoryLimit 0 a later success is deleted, and only
-    // lastSuccessfulTime remembers it. A failure it postdates is history.
-    let succeeded_since = |j: &Job| {
-        let created = j.metadata.creation_timestamp.as_ref().map(|t| t.0);
-        status.last_successful_time.as_ref().is_some_and(|s| created.is_some_and(|c| s.0 > c))
-    };
-    let newest_failed = newest.filter(|j| !succeeded_since(j)).and_then(|j| job_condition(j, "Failed"));
+    let newest_failed = newest.filter(|j| !failure_superseded(j, status.last_successful_time.as_ref())).and_then(|j| job_condition(j, "Failed"));
     JobInfo {
         kind: "CronJob".into(),
         namespace: cj.metadata.namespace.clone().unwrap_or_default(),
@@ -768,7 +772,7 @@ mod tests {
         let run = |name: &str, created: &str, outcome: &str| {
             job(serde_json::json!({ "metadata": { "name": name, "uid": format!("{name}-uid"), "creationTimestamp": created,
                 "ownerReferences": [{ "apiVersion": "batch/v1", "kind": "CronJob", "name": "report", "uid": "cj-uid", "controller": true }] },
-                "status": { "conditions": [{ "type": outcome, "status": "True", "reason": if outcome == "Failed" { "DeadlineExceeded" } else { "" }, "message": "" }] } }))
+                "status": { "conditions": [{ "type": outcome, "status": "True", "reason": if outcome == "Failed" { "DeadlineExceeded" } else { "" }, "message": "", "lastTransitionTime": created }] } }))
         };
         let jobs = vec![run("report-1", "2026-11-09T10:00:00Z", "Complete"), run("report-2", "2026-11-09T11:00:00Z", "Failed"), job(serde_json::json!({}))];
         let rows = jobs_rows(&jobs, &[cron], now);
@@ -787,9 +791,24 @@ mod tests {
             "spec": { "schedule": "0 * * * *", "successfulJobsHistoryLimit": 0, "jobTemplate": { "spec": { "template": { "spec": { "containers": [{ "name": "c" }] } } } } },
             "status": { "lastSuccessfulTime": "2026-11-09T12:01:00Z" } })).unwrap();
         let only_failure = vec![run("report-2", "2026-11-09T11:00:00Z", "Failed")];
-        let rows = jobs_rows(&only_failure, &[since], now);
+        let rows = jobs_rows(&only_failure, &[since.clone()], now);
         let row = rows.iter().find(|r| r.kind == "CronJob").unwrap();
         assert!(row.healthy && row.failure_message.is_none(), "{row:?}");
+
+        // Overlapping runs: an older run succeeded after this one started but
+        // before it failed. The failure is the newer outcome and stands.
+        let mut overlap = since;
+        overlap.status.as_mut().unwrap().last_successful_time =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::DateTime::parse_from_rfc3339("2026-11-09T11:30:00Z").unwrap().with_timezone(&chrono::Utc)));
+        let late = job(serde_json::json!({ "metadata": { "name": "report-3", "uid": "report-3-uid", "creationTimestamp": "2026-11-09T11:00:00Z",
+            "ownerReferences": [{ "apiVersion": "batch/v1", "kind": "CronJob", "name": "report", "uid": "cj-uid", "controller": true }] },
+            "status": { "conditions": [{ "type": "Failed", "status": "True", "reason": "BackoffLimitExceeded", "message": "", "lastTransitionTime": "2026-11-09T11:45:00Z" }] } }));
+        let rows = jobs_rows(&[late.clone()], &[overlap.clone()], now);
+        assert!(!rows.iter().find(|r| r.kind == "CronJob").unwrap().healthy);
+        // And with no time for the failure, it is kept as one.
+        let mut unknown = late;
+        unknown.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].last_transition_time = None;
+        assert!(!jobs_rows(&[unknown], &[overlap], now).iter().find(|r| r.kind == "CronJob").unwrap().healthy);
     }
 
     fn meta(ns: Option<&str>, name: &str) -> ObjectMeta {

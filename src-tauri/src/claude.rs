@@ -4953,7 +4953,9 @@ fn render_job_attempts(pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, Strin
         lines.push(format!("and {} older attempts", pods.len() - SHOWN));
     }
     if !oom.is_empty() {
-        lines.push(format!("OOMKILLED: {} hit its memory limit", oom.join(", ")));
+        // Killed for memory: by its own limit, or by the node running out,
+        // which the kill itself does not say.
+        lines.push(format!("OOMKILLED: {} was killed for running out of memory, by its limit or the node's", oom.join(", ")));
     }
     if !evicted.is_empty() {
         lines.push(format!("{} ATTEMPT{} EVICTED: {}", evicted.len(), if evicted.len() == 1 { " WAS" } else { "S WERE" }, evicted[0].chars().take(200).collect::<String>()));
@@ -5021,14 +5023,9 @@ fn render_cronjob(
                     lines.push(format!("    {}", m.chars().take(300).collect::<String>()));
                 }
             }
-            // Only failures no success has followed: with
-            // successfulJobsHistoryLimit 0 a later success keeps no Job, and
-            // lastSuccessfulTime is all that remembers it.
-            let succeeded_since = |j: &k8s_openapi::api::batch::v1::Job| {
-                let created = j.metadata.creation_timestamp.as_ref().map(|t| t.0);
-                status.last_successful_time.as_ref().is_some_and(|s| created.is_some_and(|c| s.0 > c))
-            };
-            let failed_in_a_row = r.iter().take_while(|j| k8s::job_has_condition(j, "Failed") && !succeeded_since(j)).count();
+            // Only failures no success has followed.
+            let superseded = |j: &k8s_openapi::api::batch::v1::Job| crate::resources::failure_superseded(j, status.last_successful_time.as_ref());
+            let failed_in_a_row = r.iter().take_while(|j| k8s::job_has_condition(j, "Failed") && !superseded(j)).count();
             if failed_in_a_row == 0 && r.first().is_some_and(|j| k8s::job_has_condition(j, "Failed")) {
                 lines.push("the failed runs above are older than its last success, which kept no Job".to_string());
             }
@@ -8473,7 +8470,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         ];
         let out = render_job_attempts(&Ok(pods.clone()));
         assert!(out.starts_with("migrate-c: Failed; migrate exited 1 (Error); on n1; started 2026-11-09T10:00:00+00:00"), "{out}");
-        assert!(out.contains("OOMKILLED: migrate (limit 256Mi) hit its memory limit") && !out.contains("EVERY FAILED ATTEMPT"), "{out}");
+        assert!(out.contains("OOMKILLED: migrate (limit 256Mi) was killed for running out of memory, by its limit or the node's") && !out.contains("EVERY FAILED ATTEMPT"), "{out}");
         let same = render_job_attempts(&Ok(pods[..2].to_vec()));
         assert!(same.ends_with("EVERY FAILED ATTEMPT EXITED 1: it fails the same way each time"), "{same}");
         // Judged per failed pod: one evicted with no exit of its own, or one
