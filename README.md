@@ -167,7 +167,7 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, namespace, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, PVC, PodDisruptionBudget, HPA, KEDA
+Any node, namespace, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, PVC, PodDisruptionBudget, ExternalSecret, HPA, KEDA
 ScaledObject or ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
 and click **Diagnose** in its panel, or press `⌘D` on a focused row. An event about a workload offers its
 workload's diagnosis the same way; one about a ReplicaSet, its Deployment's, which covers its ReplicaSets.
@@ -206,6 +206,11 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   reasons the others are left out, the nodes that should run one and have
   none, and its pods that are not ready, with their node, revision and
   scheduling message;
+- an ExternalSecret: the provider's own sync error, its store with how it
+  signs in and whether it is ready (and, for a ClusterSecretStore, whether it
+  admits the namespace), the Secrets and ServiceAccount the store signs in
+  with, the target Secret's type, key names and owner — never a value — the
+  mapped keys it lacks, and ESO's controller with its log lines about it;
 - a PodDisruptionBudget: the pods it covers with their readiness and the
   state of their nodes — a drain waiting on it shows as covered pods on
   cordoned nodes — the controllers behind them and the replicas each asks

@@ -311,6 +311,48 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_EXTERNALSECRET_SYSTEM: &str = "\
+You diagnose External Secrets Operator ExternalSecrets for an experienced \
+SRE.
+
+You are given the ExternalSecret's store, target, policies, refresh state \
+and conditions; what it maps from the provider into which keys; its store \
+with the provider, how it signs in and whether ESO can reach it; the Secrets \
+and ServiceAccount the store signs in with, checked by key or annotation \
+name only; the target Secret's type, key names and owner, never its values; \
+ESO's controller and its log lines about this ExternalSecret; its events and \
+manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition message, \
+the log line, the store, the key, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- The provider refuses or cannot find it: the sync error names the remote \
+key, a permission (an Azure Key Vault access policy or RBAC role for the \
+store's identity, an IAM policy), or a version. Fix it at the provider or in \
+the remoteRef, not in Kubernetes.
+- The store cannot sign in: it is not ready, its identity is wrong or not \
+federated, or a credential Secret or key it names is missing.
+- The store is missing, or a ClusterSecretStore does not admit this \
+namespace through its conditions.
+- The target Secret is the problem: owned by something else, which ESO will \
+not overwrite; expected to exist already under creationPolicy Merge; or of \
+a different type than the template asks for, which cannot change in place. \
+Under creationPolicy None ESO writes no Secret at all, by design.
+- It has stopped refreshing: ESO's controller is down or not reconciling.
+- A template error: the sync error names the template or a key it uses.
+
+If it is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -5126,6 +5168,398 @@ pub async fn build_job_diagnosis_payload(context_name: &str, kind: &str, namespa
     Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note })
 }
 
+/// A Go duration as ESO writes refreshInterval (`1h`, `15m`, `1h30m`, `0`),
+/// in seconds; `None` when it is not one.
+fn go_duration_seconds(d: &str) -> Option<i64> {
+    let d = d.trim();
+    if d == "0" {
+        return Some(0);
+    }
+    let (mut total, mut number) = (0f64, String::new());
+    let mut chars = d.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            number.push(c);
+            continue;
+        }
+        let unit = match (c, chars.peek()) {
+            ('m', Some('s')) => {
+                chars.next();
+                0.001
+            }
+            ('h', _) => 3600.0,
+            ('m', _) => 60.0,
+            ('s', _) => 1.0,
+            _ => return None,
+        };
+        total += number.parse::<f64>().ok()? * unit;
+        number.clear();
+    }
+    number.is_empty().then_some(total as i64)
+}
+
+/// An ExternalSecret's store, target, policies, refresh and conditions, and
+/// whether it is synced and current.
+fn render_es_status(es: &kube::api::DynamicObject, now: chrono::DateTime<chrono::Utc>) -> String {
+    let o = crate::external_secrets::overview_of(es);
+    let i = &o.info;
+    let spec = es.data.get("spec");
+    let mut lines = vec![
+        format!("store: {} {}", i.store_kind, i.store_name),
+        format!(
+            "target: Secret {}, type {}; creationPolicy {}, deletionPolicy {}{}",
+            i.target_name,
+            i.target_type,
+            o.creation_policy,
+            o.deletion_policy,
+            if o.target_immutable { ", immutable" } else { "" }
+        ),
+    ];
+    let interval = spec.and_then(|s| s.get("refreshInterval")).and_then(|v| v.as_str()).unwrap_or("1h");
+    lines.push(format!("refresh: {} every {interval}", o.refresh_policy));
+    let refreshed = i.last_refresh.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&chrono::Utc));
+    lines.push(match refreshed {
+        Some(t) => format!("last refreshed: {} ({} ago)", t.to_rfc3339(), job_span((now - t).num_seconds())),
+        None => "last refreshed: never".to_string(),
+    });
+    for c in &o.conditions {
+        let message: String = c.message.chars().take(500).collect();
+        lines.push(format!("condition {}={} ({}){}", c.condition_type, c.status, c.reason, if message.is_empty() { String::new() } else { format!(": {message}") }));
+    }
+    let ready = o.conditions.iter().find(|c| c.condition_type == "Ready");
+    match ready {
+        None => lines.push("NOT YET SYNCED: ESO has reported nothing on it; is its controller running?".to_string()),
+        Some(c) if c.status != "True" => lines.push(format!("NOT SYNCED ({}): {}", c.reason, c.message.chars().take(500).collect::<String>())),
+        Some(_) => {}
+    }
+    // A periodic refresh that has not happened in three intervals: the
+    // controller is not getting to it. Only while it is synced: a failing
+    // one's refresh time is its last success, and it is being retried.
+    let synced = ready.is_some_and(|c| c.status == "True");
+    if let (true, Some(t), Some(every), "Periodic") = (synced, refreshed, go_duration_seconds(interval), o.refresh_policy.as_str()) {
+        let since = (now - t).num_seconds();
+        if every > 0 && since > (every * 3).max(600) {
+            lines.push(format!("NOT REFRESHED FOR {}, THOUGH IT REFRESHES EVERY {interval}: ESO's controller is not getting to it", job_span(since)));
+        }
+    }
+    lines.join("\n")
+}
+
+/// What an ExternalSecret maps from the provider, and into which keys.
+fn render_es_mappings(es: &kube::api::DynamicObject) -> String {
+    const SHOWN: usize = 20;
+    let spec = es.data.get("spec");
+    let o = crate::external_secrets::overview_of(es);
+    let mut lines = Vec::new();
+    let data = spec.and_then(|s| s.get("data")).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    for e in data.iter().take(SHOWN) {
+        let remote = e.get("remoteRef");
+        let field = |k: &str| crate::k8s::json_str(remote, k);
+        lines.push(format!(
+            "{} ← {}{}{}",
+            crate::k8s::json_str(Some(e), "secretKey"),
+            field("key"),
+            if field("property").is_empty() { String::new() } else { format!(", property {}", field("property")) },
+            if field("version").is_empty() { String::new() } else { format!(", version {}", field("version")) }
+        ));
+    }
+    if data.len() > SHOWN {
+        lines.push(format!("and {} more", data.len() - SHOWN));
+    }
+    for e in spec.and_then(|s| s.get("dataFrom")).and_then(|v| v.as_array()).into_iter().flatten() {
+        lines.push(crate::external_secrets::describe_data_from(e));
+    }
+    if o.template {
+        lines.push(format!(
+            "template (engine {}, mergePolicy {}) builds keys: {}",
+            o.template_engine,
+            o.template_merge_policy,
+            if o.template_keys.is_empty() { "(none named)".to_string() } else { o.template_keys.join(", ") }
+        ));
+    }
+    if lines.is_empty() {
+        "(it maps nothing)".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// The store an ExternalSecret reads through: whether it exists, admits this
+/// namespace, and can reach its provider.
+fn render_es_store(kind: &str, name: &str, namespace: &str, store: &Result<Option<kube::api::DynamicObject>, String>) -> String {
+    if name.is_empty() {
+        return "(it names no store: its data comes from generators)".to_string();
+    }
+    let s = match store {
+        Err(e) => return format!("(store unavailable: {e})"),
+        Ok(None) => {
+            return format!(
+                "{kind} {name} DOES NOT EXIST{}: nothing can sync until it does",
+                if kind == "ClusterSecretStore" { String::new() } else { format!(" in {namespace}") }
+            )
+        }
+        Ok(Some(s)) => s,
+    };
+    let info = crate::external_secrets::store_info(s, kind);
+    let mut lines = vec![format!(
+        "{kind} {name}: provider {}{}; signs in with {}{}",
+        info.provider,
+        if info.target.is_empty() { String::new() } else { format!(" at {}", info.target) },
+        if info.auth.is_empty() { "(no method named)".to_string() } else { info.auth.clone() },
+        if info.identity.is_empty() { String::new() } else { format!(" as {}", info.identity) },
+    )];
+    if !info.capabilities.is_empty() {
+        lines.push(format!("capabilities: {}", info.capabilities));
+    }
+    if info.ready {
+        lines.push(format!("Ready{}", if info.message.is_empty() { String::new() } else { format!(": {}", info.message) }));
+    } else {
+        lines.push(format!(
+            "STORE NOT READY{}: {}",
+            if info.reason.is_empty() { String::new() } else { format!(" ({})", info.reason) },
+            if info.message.is_empty() { "(no message)".to_string() } else { info.message.chars().take(500).collect() }
+        ));
+    }
+    // A ClusterSecretStore's conditions say which namespaces may use it.
+    let conditions = s.data.pointer("/spec/conditions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if kind == "ClusterSecretStore" && !conditions.is_empty() {
+        let mut only_lists = true;
+        let mut admitted = false;
+        for c in &conditions {
+            let names: Vec<&str> = c.get("namespaces").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()).collect();
+            let selector = c.get("namespaceSelector").filter(|v| !v.is_null());
+            let regexes: Vec<&str> = c.get("namespaceRegexes").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()).collect();
+            only_lists &= selector.is_none() && regexes.is_empty();
+            admitted |= names.contains(&namespace);
+            lines.push(format!(
+                "admits: {}",
+                [
+                    (!names.is_empty()).then(|| format!("namespaces {}", names.join(", "))),
+                    selector.map(|s| format!("namespaces selected by {s}")),
+                    (!regexes.is_empty()).then(|| format!("namespaces matching {}", regexes.join(", "))),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ")
+            ));
+        }
+        if only_lists && !admitted {
+            lines.push(format!("NOT ALLOWED FROM NAMESPACE {namespace}: its conditions do not admit it"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// The Secrets and ServiceAccounts a store signs in with, by name and key —
+/// never a value.
+fn render_es_credentials(credentials: &[crate::external_secrets::StoreCredential], store: &Result<Option<kube::api::DynamicObject>, String>) -> String {
+    if credentials.is_empty() {
+        return match store {
+            // Ambient only where the store says so; otherwise only that no
+            // reference was recognised.
+            Ok(Some(s)) if crate::k8s::json_str(s.data.pointer("/spec/provider/azurekv"), "authType") == "ManagedIdentity" => {
+                "(it signs in with a managed identity: there is no Secret or ServiceAccount to check from here)".to_string()
+            }
+            Ok(Some(_)) => "(no Secret or ServiceAccount reference was recognised in the store's provider block; how it signs in is in its manifest)".to_string(),
+            _ => "(no store to read them from)".to_string(),
+        };
+    }
+    credentials
+        .iter()
+        .map(|c| {
+            let what = format!("{} {}/{}", c.kind, c.namespace, c.name);
+            match (&c.found, c.kind, &c.key) {
+                (Err(e), _, _) => format!("{what}: (unavailable: {e})"),
+                (Ok(None), _, _) => format!("{} DOES NOT EXIST: {what}", c.kind.to_uppercase()),
+                (Ok(Some(keys)), "Secret", Some(k)) if keys.contains(k) => format!("{what}: has key {k}"),
+                (Ok(Some(keys)), "Secret", Some(k)) => format!("MISSING KEY {k} IN {what} (it has: {})", if keys.is_empty() { "none".to_string() } else { keys.join(", ") }),
+                (Ok(Some(annotations)), _, _) => format!(
+                    "{what}: exists{}",
+                    match annotations.iter().find(|a| a.starts_with("azure.workload.identity/client-id")) {
+                        Some(_) => ", with azure.workload.identity/client-id",
+                        None if annotations.iter().any(|a| a.starts_with("eks.amazonaws.com/") || a.starts_with("iam.gke.io/")) => ", with a cloud identity annotation",
+                        None => ", with no workload identity annotation",
+                    }
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The Secret an ExternalSecret writes: whether it exists as its creation
+/// policy needs, who owns it, its type against the template's, and the
+/// mapped keys it lacks. Key names only.
+fn render_es_target(es: &kube::api::DynamicObject, target: &Result<Option<crate::external_secrets::TargetSecret>, String>) -> String {
+    let o = crate::external_secrets::overview_of(es);
+    let name = &o.info.target_name;
+    // None writes no Secret at all, by design: nothing here to hold to it.
+    if o.creation_policy == "None" {
+        return format!("creationPolicy None: ESO writes no Secret, so {name} is not checked against it");
+    }
+    let t = match target {
+        Err(e) => return format!("(target Secret unavailable: {e})"),
+        Ok(None) => {
+            return match o.creation_policy.as_str() {
+                "Merge" => format!("TARGET SECRET {name} DOES NOT EXIST: with creationPolicy Merge ESO does not create it, only merges into one that exists"),
+                p => format!("Secret {name} does not exist yet: with creationPolicy {p} ESO creates it on its first successful sync"),
+            }
+        }
+        Ok(Some(t)) => t,
+    };
+    let mut lines = vec![format!(
+        "Secret {name}: type {}; {} key{}: {}",
+        t.secret_type,
+        t.keys.len(),
+        if t.keys.len() == 1 { "" } else { "s" },
+        if t.keys.is_empty() { "(none)".to_string() } else { t.keys.join(", ") }
+    )];
+    let uid = es.metadata.uid.as_deref().unwrap_or_default();
+    match &t.owner {
+        Some((kind, owner, owner_uid)) if kind == "ExternalSecret" && owner_uid == uid => lines.push("owned by this ExternalSecret".to_string()),
+        Some((kind, owner, _)) if o.creation_policy == "Owner" => {
+            lines.push(format!("OWNED BY {kind} {owner}: ESO will not take over a Secret another owner controls"))
+        }
+        Some((kind, owner, _)) => lines.push(format!("owned by {kind} {owner}")),
+        None if o.creation_policy == "Owner" && !t.managed => {
+            lines.push("no owner and no ESO labels: under creationPolicy Owner, ESO normally owns the Secret it writes".to_string())
+        }
+        None => lines.push("no owner".to_string()),
+    }
+    // The type the template asks for, only when it asks for one: Opaque
+    // asked for is as fixed as any other.
+    let asked = crate::k8s::json_str(es.data.pointer("/spec/target/template"), "type");
+    if !asked.is_empty() && asked != t.secret_type {
+        lines.push(format!("TYPE {}, NOT THE TEMPLATE'S {asked}: a Secret's type cannot change in place, so it has to be recreated", t.secret_type));
+    }
+    // The keys it should hold. A template's named keys; and with mergePolicy
+    // Merge, or no template, the keys it maps. What templateFrom or dataFrom
+    // produce is not known from here, so those are not expected.
+    let mapped: Vec<String> =
+        es.data.pointer("/spec/data").and_then(|v| v.as_array()).into_iter().flatten().map(|e| crate::k8s::json_str(Some(e), "secretKey").to_string()).filter(|k| !k.is_empty()).collect();
+    let mut expected: Vec<String> = if o.template { o.template_keys.clone() } else { Vec::new() };
+    if !o.template || o.template_merge_policy == "Merge" {
+        expected.extend(mapped.into_iter().filter(|k| !expected.contains(k)).collect::<Vec<_>>());
+    }
+    let missing: Vec<&str> = expected.iter().filter(|k| !t.keys.contains(k)).map(String::as_str).collect();
+    if !missing.is_empty() {
+        // With deletionPolicy Merge ESO removes a key whose remote value is
+        // gone, so an absent key may be intended.
+        lines.push(if o.deletion_policy == "Merge" {
+            format!("absent from it: {} (with deletionPolicy Merge, ESO removes keys whose remote value is gone)", missing.join(", "))
+        } else {
+            format!("MISSING KEYS IT SHOULD HOLD: {}", missing.join(", "))
+        });
+    }
+    lines.join("\n")
+}
+
+/// ESO's controller: whether it is up.
+fn render_es_controller(controller: &Result<Vec<k8s_openapi::api::apps::v1::Deployment>, String>) -> String {
+    match controller {
+        Err(e) => format!("(controller unavailable: {e})"),
+        Ok(d) if d.is_empty() => "(ESO's controller was not found by its Helm chart's label, so whether it runs is unknown)".to_string(),
+        Ok(d) => d
+            .iter()
+            .map(|d| {
+                let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+                let ready = d.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0);
+                let name = format!("{}/{}", d.metadata.namespace.as_deref().unwrap_or_default(), d.metadata.name.as_deref().unwrap_or_default());
+                if ready < want.max(1) {
+                    format!("ESO'S CONTROLLER IS NOT READY: {name} has {ready} of {want} ready, and nothing syncs without it")
+                } else {
+                    format!("{name}: {ready} of {want} ready")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// ESO's controller log lines about this ExternalSecret, grouped: the same
+/// error repeats on every retry.
+fn render_es_logs(lines: &Result<Vec<String>, String>) -> String {
+    const GROUPS: usize = 10;
+    let lines = match lines {
+        Ok(l) if l.is_empty() => return "(the controller logged nothing about it in the last hour)".to_string(),
+        Ok(l) => l,
+        Err(e) => return format!("(controller log unavailable: {e})"),
+    };
+    // (level, message, error) → (count, latest time). The latest, not the
+    // last seen: lines from several pods arrive one pod after another.
+    let mut groups: Vec<((String, String, String), usize, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
+    for line in lines {
+        let Ok(f) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
+        let s = |k: &str| crate::k8s::json_str(Some(&f), k).to_string();
+        let time = match f.get("ts") {
+            Some(serde_json::Value::Number(n)) => n.as_f64().and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0)),
+            Some(serde_json::Value::String(t)) => chrono::DateTime::parse_from_rfc3339(t).ok().map(|t| t.with_timezone(&chrono::Utc)),
+            _ => None,
+        };
+        let key = (s("level"), s("msg"), s("error").chars().take(500).collect::<String>());
+        match groups.iter_mut().find(|(k, _, _)| *k == key) {
+            Some(g) => {
+                g.1 += 1;
+                g.2 = g.2.max(time);
+            }
+            None => groups.push((key, 1, time)),
+        }
+    }
+    // The most recent first, so the cap keeps what is happening now.
+    groups.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut out: Vec<String> = groups
+        .iter()
+        .take(GROUPS)
+        .map(|((level, msg, error), count, last)| {
+            format!(
+                "[{level}] ×{count}, last {}: {msg}{}",
+                last.map(|t| t.to_rfc3339()).unwrap_or_else(|| "(no time)".into()),
+                if error.is_empty() { String::new() } else { format!(" — {error}") }
+            )
+        })
+        .collect();
+    if groups.len() > GROUPS {
+        out.push(format!("and {} other kinds of line", groups.len() - GROUPS));
+    }
+    out.join("\n")
+}
+
+/// Assembles an ExternalSecret diagnosis, redacted.
+pub async fn build_external_secret_diagnosis_payload(context_name: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = crate::external_secrets::get_external_secret_diagnostics(context_name, namespace, name).await?;
+    let now = chrono::Utc::now();
+    let status = redact::redact(&render_es_status(&d.object, now));
+    let mappings = redact::redact(&render_es_mappings(&d.object));
+    let store = redact::redact(&render_es_store(&d.store_kind, &d.store_name, namespace, &d.store));
+    let credentials = redact::redact(&render_es_credentials(&d.credentials, &d.store));
+    let target = redact::redact(&render_es_target(&d.object, &d.target));
+    let controller = redact::redact(&render_es_controller(&d.controller));
+    let logs = redact::redact(&render_es_logs(&d.controller_logs));
+    let events = redact::redact(&render_nap_events(&d.events, "(no events for this ExternalSecret)", false, 20));
+    let manifest = redact::redact(&d.manifest);
+
+    let prompt = format!(
+        "ExternalSecret {namespace}/{name}.\n\n\
+         ## Status\n{}\n\n\
+         ## What it maps\n{}\n\n\
+         ## Store\n{}\n\n\
+         ## How the store signs in\n{}\n\n\
+         ## Target Secret (key names only)\n{}\n\n\
+         ## ESO's controller\n{}\n\n\
+         ## Controller log lines about it (last hour)\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        status.text, mappings.text, store.text, credentials.text, target.text, controller.text, logs.text, events.text, manifest.text,
+    );
+    // The headings carry the namespace and name, which no section did.
+    let whole = redact::redact(&prompt);
+    let redaction_summary =
+        redact::Redacted::merge([&status, &mappings, &store, &credentials, &target, &controller, &logs, &events, &manifest, &whole]).summary();
+    let prompt = whole.text.clone();
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
 /// The StatefulSet sections of a workload diagnosis.
 fn render_sts_sections(d: &k8s::StatefulSetDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
     let claim_events = if d.claim_events.is_empty() {
@@ -6446,6 +6880,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "PodDisruptionBudget" => DIAGNOSE_PDB_SYSTEM,
         "StatefulSet" => DIAGNOSE_STATEFULSET_SYSTEM,
         "Job" | "CronJob" => DIAGNOSE_JOB_SYSTEM,
+        "ExternalSecret" => DIAGNOSE_EXTERNALSECRET_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
         "Deployment" => DIAGNOSE_DEPLOYMENT_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
@@ -8725,6 +9160,166 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(render_ns_quotas(&Ok(vec![fresh]), &Ok(vec![])).contains("pods: hard 10 (used not reported yet)"));
     }
 
+    fn external_secret(v: serde_json::Value) -> kube::api::DynamicObject {
+        let mut base = serde_json::json!({
+            "apiVersion": "external-secrets.io/v1", "kind": "ExternalSecret",
+            "metadata": { "name": "db", "namespace": "app", "uid": "es-uid" },
+            "spec": { "refreshInterval": "1h", "secretStoreRef": { "kind": "SecretStore", "name": "vault" },
+                "target": { "name": "db-creds" },
+                "data": [{ "secretKey": "password", "remoteRef": { "key": "db-password" } }, { "secretKey": "user", "remoteRef": { "key": "db", "property": "user" } }] },
+            "status": { "refreshTime": "2026-11-11T11:30:00Z",
+                "conditions": [{ "type": "Ready", "status": "True", "reason": "SecretSynced", "message": "secret synced" }] }
+        });
+        json_merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn an_external_secret_says_whether_it_syncs() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(
+            render_es_status(&external_secret(serde_json::json!({})), now),
+            "store: SecretStore vault\n\
+             target: Secret db-creds, type Opaque; creationPolicy Owner, deletionPolicy Retain\n\
+             refresh: Periodic every 1h\n\
+             last refreshed: 2026-11-11T11:30:00+00:00 (30m 0s ago)\n\
+             condition Ready=True (SecretSynced): secret synced"
+        );
+        let failing = external_secret(serde_json::json!({ "status": { "refreshTime": "2026-11-11T06:00:00Z", "conditions": [{ "type": "Ready", "status": "False", "reason": "SecretSyncedError",
+            "message": "could not get secret data from provider: key \"db-password\": Secret not found" }] } }));
+        let out = render_es_status(&failing, now);
+        assert!(out.contains("NOT SYNCED (SecretSyncedError): could not get secret data from provider") && !out.contains("NOT REFRESHED"), "{out}");
+        let stuck = render_es_status(&external_secret(serde_json::json!({ "status": { "refreshTime": "2026-11-11T06:00:00Z" } })), now);
+        assert!(stuck.ends_with("NOT REFRESHED FOR 6h 0m, THOUGH IT REFRESHES EVERY 1h: ESO's controller is not getting to it"), "{stuck}");
+        let fresh = render_es_status(&external_secret(serde_json::json!({ "status": { "refreshTime": null, "conditions": [] } })), now);
+        assert!(fresh.contains("last refreshed: never") && fresh.ends_with("NOT YET SYNCED: ESO has reported nothing on it; is its controller running?"), "{fresh}");
+        assert_eq!((go_duration_seconds("1h30m"), go_duration_seconds("15m"), go_duration_seconds("0"), go_duration_seconds("soon")), (Some(5400), Some(900), Some(0), None));
+
+        let templated = external_secret(serde_json::json!({ "spec": { "target": { "template": { "type": "kubernetes.io/tls", "data": { "tls.crt": "{{ .cert }}", "tls.key": "{{ .key }}" } } } } }));
+        assert_eq!(
+            render_es_mappings(&templated),
+            "password ← db-password\nuser ← db, property user\ntemplate (engine v2, mergePolicy Replace) builds keys: tls.crt, tls.key"
+        );
+    }
+
+    #[test]
+    fn an_external_secrets_store_and_target_are_checked_by_name_only() {
+        let store = |kind: &str, v: serde_json::Value| -> kube::api::DynamicObject {
+            let mut base = serde_json::json!({ "apiVersion": "external-secrets.io/v1", "kind": kind, "metadata": { "name": "vault" },
+                "spec": { "provider": { "azurekv": { "vaultUrl": "https://kv.example", "authType": "ManagedIdentity", "identityId": "id-1" } } },
+                "status": { "conditions": [{ "type": "Ready", "status": "True", "reason": "Valid", "message": "store validated" }] } });
+            json_merge(&mut base, v);
+            serde_json::from_value(base).unwrap()
+        };
+        assert_eq!(
+            render_es_store("SecretStore", "vault", "app", &Ok(Some(store("SecretStore", serde_json::json!({}))))),
+            "SecretStore vault: provider azurekv at https://kv.example; signs in with ManagedIdentity as id-1\nReady: store validated"
+        );
+        assert_eq!(render_es_store("SecretStore", "vault", "app", &Ok(None)), "SecretStore vault DOES NOT EXIST in app: nothing can sync until it does");
+        let down = store("SecretStore", serde_json::json!({ "status": { "conditions": [{ "type": "Ready", "status": "False", "reason": "InvalidProviderConfig", "message": "unable to validate store" }] } }));
+        assert!(render_es_store("SecretStore", "vault", "app", &Ok(Some(down))).ends_with("STORE NOT READY (InvalidProviderConfig): unable to validate store"));
+        let fenced = store("ClusterSecretStore", serde_json::json!({ "spec": { "conditions": [{ "namespaces": ["team-a", "team-b"] }] } }));
+        let out = render_es_store("ClusterSecretStore", "vault", "app", &Ok(Some(fenced)));
+        assert!(out.contains("admits: namespaces team-a, team-b") && out.ends_with("NOT ALLOWED FROM NAMESPACE app: its conditions do not admit it"), "{out}");
+
+        // The credentials a store names, found in any provider's own shape.
+        let refs = crate::external_secrets::store_credential_refs(
+            Some(&serde_json::json!({ "azurekv": { "authSecretRef": { "clientId": { "name": "sp", "key": "client-id" }, "clientSecret": { "name": "sp", "key": "client-secret", "namespace": "ops" } } },
+                "vault": { "auth": { "kubernetes": { "serviceAccountRef": { "name": "vault-reader" } } } },
+                "kubernetes": { "auth": { "token": { "bearerToken": { "name": "k8s-token", "key": "token" } } },
+                    "server": { "caProvider": { "type": "ConfigMap", "name": "ca", "key": "ca.crt" } } } })),
+            "app",
+        );
+        assert_eq!(refs, vec![
+            ("Secret", "app".to_string(), "k8s-token".to_string(), Some("token".to_string())),
+            ("Secret", "app".to_string(), "sp".to_string(), Some("client-id".to_string())),
+            ("Secret", "ops".to_string(), "sp".to_string(), Some("client-secret".to_string())),
+            ("ServiceAccount", "app".to_string(), "vault-reader".to_string(), None),
+        ]);
+        let cred = |kind: &'static str, key: Option<&str>, found: Result<Option<Vec<String>>, String>| crate::external_secrets::StoreCredential {
+            kind, namespace: "app".into(), name: "sp".into(), key: key.map(str::to_string), found,
+        };
+        assert_eq!(
+            render_es_credentials(&[
+                cred("Secret", Some("client-id"), Ok(Some(vec!["client-id".into()]))),
+                cred("Secret", Some("client-secret"), Ok(Some(vec!["client-id".into()]))),
+                cred("Secret", Some("x"), Ok(None)),
+                cred("ServiceAccount", None, Ok(Some(vec!["azure.workload.identity/client-id".into()]))),
+            ], &Ok(None)),
+            "Secret app/sp: has key client-id\n\
+             MISSING KEY client-secret IN Secret app/sp (it has: client-id)\n\
+             SECRET DOES NOT EXIST: Secret app/sp\n\
+             ServiceAccount app/sp: exists, with azure.workload.identity/client-id"
+        );
+        assert!(render_es_credentials(&[], &Ok(Some(store("SecretStore", serde_json::json!({}))))).contains("it signs in with a managed identity"));
+        let other = store("SecretStore", serde_json::json!({ "spec": { "provider": { "azurekv": null, "kubernetes": { "server": { "url": "https://k" } } } } }));
+        assert!(render_es_credentials(&[], &Ok(Some(other))).contains("no Secret or ServiceAccount reference was recognised"));
+        assert_eq!(render_es_store("SecretStore", "", "app", &Ok(None)), "(it names no store: its data comes from generators)");
+
+        let target = |keys: &[&str], owner: Option<(&str, &str, &str)>, t: &str| crate::external_secrets::TargetSecret {
+            secret_type: t.into(), keys: keys.iter().map(|k| k.to_string()).collect(),
+            owner: owner.map(|(k, n, u)| (k.into(), n.into(), u.into())), managed: owner.is_some(),
+        };
+        let es = external_secret(serde_json::json!({}));
+        assert_eq!(
+            render_es_target(&es, &Ok(Some(target(&["password"], Some(("ExternalSecret", "db", "es-uid")), "Opaque")))),
+            "Secret db-creds: type Opaque; 1 key: password\nowned by this ExternalSecret\nMISSING KEYS IT SHOULD HOLD: user"
+        );
+        assert!(render_es_target(&es, &Ok(Some(target(&["password", "user"], Some(("ExternalSecret", "db-old", "other")), "Opaque"))))
+            .contains("OWNED BY ExternalSecret db-old: ESO will not take over a Secret another owner controls"));
+        let merge = external_secret(serde_json::json!({ "spec": { "target": { "creationPolicy": "Merge" } } }));
+        assert_eq!(render_es_target(&merge, &Ok(None)), "TARGET SECRET db-creds DOES NOT EXIST: with creationPolicy Merge ESO does not create it, only merges into one that exists");
+        let none = external_secret(serde_json::json!({ "spec": { "target": { "creationPolicy": "None" } } }));
+        assert_eq!(render_es_target(&none, &Ok(None)), "creationPolicy None: ESO writes no Secret, so db-creds is not checked against it");
+        // deletionPolicy Merge removes keys whose remote value is gone.
+        let pruning = external_secret(serde_json::json!({ "spec": { "target": { "deletionPolicy": "Merge" } } }));
+        let out = render_es_target(&pruning, &Ok(Some(target(&["password"], Some(("ExternalSecret", "db", "es-uid")), "Opaque"))));
+        assert!(out.ends_with("absent from it: user (with deletionPolicy Merge, ESO removes keys whose remote value is gone)") && !out.contains("MISSING KEYS"), "{out}");
+        // An explicit Opaque is checked too; a Merge template keeps the mapped keys.
+        let opaque = external_secret(serde_json::json!({ "spec": { "target": { "template": { "type": "Opaque", "mergePolicy": "Merge", "data": { "url": "{{ .host }}" } } } } }));
+        let out = render_es_target(&opaque, &Ok(Some(target(&["url", "password"], Some(("ExternalSecret", "db", "es-uid")), "kubernetes.io/tls"))));
+        assert!(out.contains("TYPE kubernetes.io/tls, NOT THE TEMPLATE'S Opaque") && out.ends_with("MISSING KEYS IT SHOULD HOLD: user"), "{out}");
+        assert!(render_es_target(&es, &Ok(None)).starts_with("Secret db-creds does not exist yet"));
+        let tls = external_secret(serde_json::json!({ "spec": { "target": { "template": { "type": "kubernetes.io/tls", "data": { "tls.crt": "", "tls.key": "" } } } } }));
+        let out = render_es_target(&tls, &Ok(Some(target(&["tls.crt", "tls.key"], Some(("ExternalSecret", "db", "es-uid")), "Opaque"))));
+        assert!(out.contains("TYPE Opaque, NOT THE TEMPLATE'S kubernetes.io/tls") && !out.contains("MISSING KEYS"), "{out}");
+    }
+
+    #[test]
+    fn eso_controller_log_lines_are_matched_and_grouped() {
+        let line = |ns: &str, name: &str, ts: f64, err: &str| {
+            serde_json::json!({ "level": "error", "ts": ts, "msg": "Reconciler error", "controller": "externalsecret", "controllerGroup": "external-secrets.io",
+                "controllerKind": "ExternalSecret", "ExternalSecret": { "name": name, "namespace": ns }, "namespace": ns, "name": name,
+                "reconcileID": "r", "error": err, "stacktrace": "goroutine 1 …" }).to_string()
+        };
+        assert!(crate::external_secrets::eso_log_line_is_about(&line("app", "db", 1.0, "e"), "app", "db"));
+        assert!(!crate::external_secrets::eso_log_line_is_about(&line("app", "db-2", 1.0, "e"), "app", "db"));
+        assert!(!crate::external_secrets::eso_log_line_is_about("not json", "app", "db"));
+        // Lines from two pods, the later one's first: grouped by their latest
+        // time, the most recent group first.
+        let lines = Ok(vec![line("app", "db", 1762855200.0, "403 Forbidden"), line("app", "db", 1762851600.0, "403 Forbidden"), line("app", "db", 1762852000.0, "timeout")]);
+        assert_eq!(
+            render_es_logs(&lines),
+            "[error] ×2, last 2025-11-11T10:00:00+00:00: Reconciler error — 403 Forbidden\n[error] ×1, last 2025-11-11T09:06:40+00:00: Reconciler error — timeout"
+        );
+        // A template's literal text is masked, its keys and references kept.
+        let mut templated = external_secret(serde_json::json!({ "spec": { "target": { "template": {
+            "data": { "conn": "postgres://admin:hunter2@{{ .host }}/db", "token": "ordinary-literal-credential" },
+            "templateFrom": [{ "literal": "key: plain-value" }, { "configMap": { "name": "tpl" } }] } } } }));
+        crate::external_secrets::mask_template_literals(&mut templated);
+        let manifest = serde_json::to_string(&templated.data).unwrap();
+        assert!(!manifest.contains("hunter2") && !manifest.contains("ordinary-literal-credential") && !manifest.contains("plain-value"), "{manifest}");
+        assert!(manifest.contains("\"conn\":\"[MASKED: literal around {{ .host }}]\"") && manifest.contains("\"configMap\":{\"name\":\"tpl\"}"), "{manifest}");
+        assert_eq!(render_es_logs(&Ok(vec![])), "(the controller logged nothing about it in the last hour)");
+
+        let deployment = |ready: i32| -> k8s_openapi::api::apps::v1::Deployment {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": "external-secrets", "namespace": "external-secrets" },
+                "spec": { "replicas": 1, "selector": {}, "template": {} }, "status": { "readyReplicas": ready } })).unwrap()
+        };
+        assert_eq!(render_es_controller(&Ok(vec![deployment(1)])), "external-secrets/external-secrets: 1 of 1 ready");
+        assert!(render_es_controller(&Ok(vec![deployment(0)])).starts_with("ESO'S CONTROLLER IS NOT READY"));
+    }
+
     #[test]
     fn a_volume_bound_elsewhere_or_pinned_to_a_zone_is_said() {
         let pv: k8s_openapi::api::core::v1::PersistentVolume = serde_json::from_value(serde_json::json!({
@@ -9480,6 +10075,54 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(built > 0, "no namespace to diagnose");
         assert_eq!(unavailable, 0);
         assert!(l.kinds_checked > 20, "discovery found too few namespaced kinds");
+    }
+
+    /// Builds ExternalSecret diagnoses on a live cluster: every one not
+    /// synced and up to ten that are. Prints counts only.
+    ///
+    ///   EXTERNALSECRET_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml external_secret_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set EXTERNALSECRET_DIAG_TEST_CONTEXT to run"]
+    async fn external_secret_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("EXTERNALSECRET_DIAG_TEST_CONTEXT") else { return };
+        let all = crate::external_secrets::get_external_secrets(&ctx).await.expect("external secrets").external_secrets;
+        let mut sample: Vec<_> = all.iter().filter(|e| !e.ready).collect();
+        sample.extend(all.iter().filter(|e| e.ready).take(10));
+        let (mut built, mut unavailable, mut largest, mut failing, mut explained, mut with_logs, mut controller_ok) = (0, 0, 0, 0, 0, 0, 0);
+        let (mut store_missing, mut store_down, mut not_allowed, mut ambient, mut cred_missing) = (0, 0, 0, 0, 0);
+        let (mut target_missing, mut owned_other, mut missing_keys, mut type_mismatch, mut stale) = (0, 0, 0, 0, 0);
+        for e in &sample {
+            let payload = build_external_secret_diagnosis_payload(&ctx, &e.namespace, &e.name).await.expect("payload");
+            let p = &payload.prompt;
+            built += 1;
+            unavailable += p.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            with_logs += p.contains("## Controller log lines about it (last hour)\n[") as usize;
+            controller_ok += (p.contains(" ready\n\n## Controller log") && !p.contains("CONTROLLER IS NOT READY")) as usize;
+            store_missing += p.contains("DOES NOT EXIST: nothing can sync") as usize;
+            store_down += p.contains("STORE NOT READY") as usize;
+            not_allowed += p.contains("NOT ALLOWED FROM NAMESPACE") as usize;
+            ambient += p.contains("it signs in with a managed identity") as usize;
+            cred_missing += (p.contains("MISSING KEY ") || p.contains("SECRET DOES NOT EXIST") || p.contains("SERVICEACCOUNT DOES NOT EXIST")) as usize;
+            target_missing += p.contains("TARGET SECRET") as usize;
+            owned_other += p.contains("OWNED BY ") as usize;
+            missing_keys += p.contains("MISSING KEYS IT SHOULD HOLD") as usize;
+            type_mismatch += p.contains("NOT THE TEMPLATE'S") as usize;
+            stale += p.contains("NOT REFRESHED FOR") as usize;
+            if !e.ready {
+                failing += 1;
+                explained += (p.contains("NOT SYNCED") || p.contains("NOT YET SYNCED")) as usize;
+            }
+        }
+        println!(
+            "external_secrets={} sampled={} built={built} unavailable_sections={unavailable} largest_tokens={largest} failing={failing}/{explained} with_logs={with_logs} controller_ready={controller_ok} store_missing={store_missing} store_not_ready={store_down} not_allowed={not_allowed} ambient_identity={ambient} credential_missing={cred_missing} target_missing={target_missing} owned_by_other={owned_other} missing_keys={missing_keys} type_mismatch={type_mismatch} stale={stale}",
+            all.len(),
+            sample.len()
+        );
+        assert!(built > 0, "no ExternalSecret to diagnose");
+        assert_eq!(unavailable, 0);
+        assert_eq!(explained, failing);
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs

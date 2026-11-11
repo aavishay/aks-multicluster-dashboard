@@ -170,7 +170,7 @@ pub(crate) fn created_at(ts: &Option<k8s_openapi::apimachinery::pkg::apis::meta:
 /// The object's managing controller (kind, name), if it has one — e.g. a Pod's
 /// managing controller is usually the ReplicaSet that created it, not the
 /// Deployment that created the ReplicaSet.
-fn controller_owner(refs: &Option<Vec<OwnerReference>>) -> Option<(&str, &str)> {
+pub(crate) fn controller_owner(refs: &Option<Vec<OwnerReference>>) -> Option<(&str, &str)> {
     refs.as_ref()?
         .iter()
         .find(|o| o.controller == Some(true))
@@ -1613,7 +1613,7 @@ fn event_count(e: &Event) -> i32 {
 /// timestamp — and, because `list_events_sorted` orders on this, sorted them
 /// below every timestamped event regardless of age, where the cluster-wide
 /// `take(300)` then cut them first.
-fn event_last_seen(e: &Event) -> Option<chrono::DateTime<Utc>> {
+pub(crate) fn event_last_seen(e: &Event) -> Option<chrono::DateTime<Utc>> {
     e.series
         .as_ref()
         .and_then(|s| s.last_observed_time.as_ref())
@@ -5291,7 +5291,7 @@ pub async fn get_gitops_events(context_name: &str, namespace: &str, name: &str) 
 // letting it be mistaken for the Git diff.
 
 /// The annotation holding the manifest most recently applied to a resource.
-const LAST_APPLIED_ANNOTATION: &str = "kubectl.kubernetes.io/last-applied-configuration";
+pub(crate) const LAST_APPLIED_ANNOTATION: &str = "kubectl.kubernetes.io/last-applied-configuration";
 
 /// Metadata the server or a controller owns, which a manifest does not declare.
 ///
