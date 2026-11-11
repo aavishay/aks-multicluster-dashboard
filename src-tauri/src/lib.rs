@@ -195,6 +195,7 @@ pub fn run() {
             commands::ai_build_hpa_diagnosis,
             commands::ai_build_service_diagnosis,
             commands::ai_build_ingress_diagnosis,
+            commands::ai_build_namespace_diagnosis,
             commands::ai_build_pvc_diagnosis,
             commands::ai_build_pdb_diagnosis,
             commands::ai_build_keda_diagnosis,
