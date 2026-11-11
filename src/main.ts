@@ -5919,8 +5919,10 @@ function setMetricsRange(minutes: number) {
   diagnoseHpa,
   diagnoseService,
   diagnoseIngress,
+  diagnoseNamespace,
   diagnosePvc,
   diagnoseJob,
+  diagnosePdb,
   diagnoseKeda,
   confirmDiagnose,
   closeClaudeDiagnose,
@@ -7112,10 +7114,14 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Capacity and kubelet details, every condition the cluster reports on it, its taints and events, the pods it is holding, and its manifest without the image cache."
                   : d.kind === "Release"
                   ? "Chart and status, the user-supplied values, a list of the resources it renders, and the revision history with Helm's description of each failure."
+                  : d.kind === "Namespace"
+                  ? "Its phase, finalizers and conditions, its ResourceQuotas with what each has used, its LimitRanges, its recent Warning events, and its manifest; while it is terminating, what is still in it — every namespaced kind listed, with the objects holding finalizers — and the APIServices that are not available."
                   : d.kind === "ScaledObject" || d.kind === "ScaledJob"
                   ? "Settings, conditions and triggers, where each credential comes from (checked by key name, never value), the KEDA operator's log lines about it, its events, the HPA it generated or the Jobs it ran, KEDA's own health, and its manifest."
                   : d.kind === "PersistentVolumeClaim"
                   ? "Phase, size and conditions, its storage class or why it has none, the volume bound to it and its CSI driver, the pods that mount it and the events of those not ready, its volume attachments, how full it is, the events of the claim and volume, and its manifest."
+                  : d.kind === "PodDisruptionBudget"
+                  ? "Its budget, counts, eviction policy and conditions, the pods it covers with their readiness and nodes, the controllers behind them and the replicas each asks for, any other budget over the same pods, its events, and its manifest."
                   : d.kind === "Ingress"
                   ? "Its routes, TLS and address, whether its class exists and its controller is up, the controller's log lines about it, each backend Service with its port and ready endpoints, each TLS Secret (checked by key name and the certificate's public fields, never the key), cert-manager's view of them, other Ingresses on its hosts, its events, and its manifest."
                   : d.kind === "Service"
@@ -8630,6 +8636,10 @@ function diagnoseIngress(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "Ingress", namespace, name, "", () => api.aiBuildIngressDiagnosis(ctx, namespace, name));
 }
 
+function diagnoseNamespace(ctx: string, name: string) {
+  startDiagnosis(ctx, "Namespace", "", name, "", () => api.aiBuildNamespaceDiagnosis(ctx, name));
+}
+
 /**
  * A PersistentVolumeClaim. `kind` selects the PVC system prompt on the Rust side.
  */
@@ -8639,6 +8649,10 @@ function diagnosePvc(ctx: string, namespace: string, name: string) {
 
 function diagnoseJob(ctx: string, kind: string, namespace: string, name: string) {
   startDiagnosis(ctx, kind, namespace, name, "", () => api.aiBuildJobDiagnosis(ctx, kind, namespace, name));
+}
+
+function diagnosePdb(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "PodDisruptionBudget", namespace, name, "", () => api.aiBuildPdbDiagnosis(ctx, namespace, name));
 }
 
 /**
@@ -13365,7 +13379,7 @@ function renderNamespaces(): string {
     keyOf: (r) => `${r.ctx}:${r.n.name}`,
     health: { healthy: (r) => namespaceIsHealthy(r.n), unhealthyLabel: "terminating", statusText: (r) => r.n.status },
     renderRow: ({ ctx, n }) => `
-      <tr>
+      <tr data-diagnose-what="namespace" data-diagnose-ctx="${esc(ctx)}" data-diagnose-name="${esc(n.name)}">
         ${rowCheckboxCell("namespaces", `${ctx}:${n.name}`)}
         <td title="${esc(n.status)}">${statusDot(namespaceIsHealthy(n))}</td>
         ${multi ? resourceClusterCell("namespaces", ctx) : ""}
@@ -13717,7 +13731,7 @@ function renderPdbs(): string {
     keyOf: (r) => `${r.ctx}:${r.p.namespace}:${r.p.name}`,
     health: { healthy: (r) => pdbIsHealthy(r.p), unhealthyLabel: "blocking evictions", statusText: (r) => pdbStatus(r.p) },
     renderRow: ({ ctx, p }) => `
-      <tr>
+      <tr data-diagnose-what="pdb" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(p.namespace)}" data-diagnose-name="${esc(p.name)}">
         ${rowCheckboxCell("pdbs", `${ctx}:${p.namespace}:${p.name}`)}
         <td title="${esc(pdbStatus(p))}">${statusDot(pdbIsHealthy(p), p.expected_pods === 0)}</td>
         ${multi ? resourceClusterCell("pdbs", ctx) : ""}
@@ -14575,7 +14589,9 @@ function renderResourceDetailPanel(): string {
           </div>
           <div class="flex shrink-0 items-center gap-2">
             ${
-              rd.kind === "Service"
+              rd.kind === "Namespace"
+                ? claudeDiagnoseButton(`window.__app.diagnoseNamespace(${jsArg(rd.ctx)},${jsArg(rd.name)})`, "namespace")
+                : rd.kind === "Service"
                 ? claudeDiagnoseButton(`window.__app.diagnoseService(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service")
                 : rd.kind === "Ingress"
                   ? claudeDiagnoseButton(`window.__app.diagnoseIngress(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "ingress")
@@ -14583,6 +14599,8 @@ function renderResourceDetailPanel(): string {
                     ? claudeDiagnoseButton(`window.__app.diagnosePvc(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "volume claim")
                     : rd.kind === "Job" || rd.kind === "CronJob"
                     ? claudeDiagnoseButton(`window.__app.diagnoseJob(${jsArg(rd.ctx)},${jsArg(rd.kind)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, rd.kind === "Job" ? "job" : "cron job")
+                    : rd.kind === "PodDisruptionBudget"
+                    ? claudeDiagnoseButton(`window.__app.diagnosePdb(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "disruption budget")
                     : evDiagnosis
                       ? claudeDiagnoseButton(
                           `window.__app.diagnoseWorkload(${jsArg(rd.ctx)},${jsArg(evDiagnosis.kind)},${jsArg(evDiagnosis.namespace)},${jsArg(evDiagnosis.name)})`,
@@ -16001,6 +16019,9 @@ function diagnoseFocusedRow(): boolean {
     case "service":
       diagnoseService(ctx, ns, name);
       return true;
+    case "namespace":
+      diagnoseNamespace(ctx, name);
+      return true;
     case "ingress":
       diagnoseIngress(ctx, ns, name);
       return true;
@@ -16009,6 +16030,9 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "job":
       diagnoseJob(ctx, d.diagnoseKind ?? "Job", ns, name);
+      return true;
+    case "pdb":
+      diagnosePdb(ctx, ns, name);
       return true;
     case "keda":
       diagnoseKeda(ctx, ns, d.diagnoseKind ?? "ScaledObject", name);

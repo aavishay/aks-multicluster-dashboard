@@ -3598,6 +3598,221 @@ pub struct PvcCsiDriver {
     pub nodes: usize,
 }
 
+/// What a Namespace diagnosis reads.
+pub struct NamespaceDiagnostics {
+    pub namespace: k8s_openapi::api::core::v1::Namespace,
+    pub manifest: String,
+    pub quotas: Result<Vec<k8s_openapi::api::core::v1::ResourceQuota>, String>,
+    pub limit_ranges: Result<Vec<k8s_openapi::api::core::v1::LimitRange>, String>,
+    /// The Warning events in it, newest first: a quota or a LimitRange
+    /// refusing a pod lands here, on the object that could not create it.
+    pub warnings: Result<Vec<EventInfo>, String>,
+    /// Only while it is terminating: the APIServices, since one that is not
+    /// available stops the namespace controller discovering what to delete.
+    pub api_services: Option<Result<Vec<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService>, String>>,
+    /// Only while it is terminating: what is still in it.
+    pub leftovers: Option<NamespaceLeftovers>,
+}
+
+/// What is still in a namespace, read the way the namespace controller does:
+/// every namespaced kind the API server serves, listed in it.
+pub struct NamespaceLeftovers {
+    /// Each kind that still has objects in it.
+    pub kinds: Vec<LeftoverKind>,
+    /// API groups whose discovery failed, with the error: the namespace
+    /// controller cannot delete what it cannot discover.
+    pub discovery_failures: Vec<(String, String)>,
+    /// Kinds that could not be listed, with the error.
+    pub list_failures: Vec<(String, String)>,
+    /// How many namespaced kinds were listed.
+    pub kinds_checked: usize,
+}
+
+pub struct LeftoverKind {
+    pub kind: String,
+    pub group: String,
+    pub count: usize,
+    /// When there were more than were counted: `count` is a lower bound.
+    pub more: bool,
+    /// Those still holding finalizers, with them.
+    pub with_finalizers: Vec<(String, Vec<String>)>,
+}
+
+/// How many objects of each kind are read in the first page when looking for
+/// what is left; most kinds have none, and this keeps those calls small.
+const NS_LEFTOVERS_PER_KIND: u32 = 20;
+/// Further pages, when the server gives a continuation without saying how
+/// many remain: their size, and how many are followed before counting stops.
+const NS_LEFTOVERS_PAGE: u32 = 500;
+const NS_LEFTOVERS_PAGES: usize = 10;
+/// How many kinds are listed at once.
+const NS_LEFTOVERS_CONCURRENCY: usize = 8;
+
+/// Every namespaced kind the API server serves, listed in `namespace`:
+/// metadata only, a few of each, counting the rest. Discovery is per group,
+/// so one group that cannot be discovered — an APIService that is down — is
+/// reported rather than hiding every other.
+pub(crate) async fn namespace_leftovers(client: &kube::Client, namespace: &str) -> NamespaceLeftovers {
+    use futures::StreamExt;
+    use kube::core::GroupVersion;
+
+    let mut discovery_failures = Vec::new();
+    // Every version a group serves, its preferred one first: a kind served
+    // only at another version (a v1beta1-only CRD in a group preferring v1)
+    // is still a kind the namespace controller must empty.
+    let mut gvs: Vec<GroupVersion> = vec![GroupVersion::gv("", "v1")];
+    match client.list_api_groups().await {
+        Ok(groups) => {
+            for g in groups.groups {
+                let preferred = g.preferred_version.as_ref().map(|v| v.group_version.clone());
+                let mut versions: Vec<String> = g.versions.iter().map(|v| v.group_version.clone()).collect();
+                versions.sort_by_key(|v| Some(v) != preferred.as_ref());
+                if versions.is_empty() {
+                    discovery_failures.push((g.name, "no version to read".to_string()));
+                }
+                gvs.extend(versions.iter().filter_map(|v| v.parse::<GroupVersion>().ok()));
+            }
+        }
+        Err(e) => discovery_failures.push(("(the API group list)".to_string(), e.to_string())),
+    }
+    let discovered = futures::future::join_all(gvs.into_iter().map(|gv| {
+        let client = client.clone();
+        async move {
+            let label = gv.api_version();
+            (label, kube::discovery::oneshot::pinned_group(&client, &gv).await)
+        }
+    }))
+    .await;
+    // Each group's resource once, at the first version that serves it — the
+    // preferred one, as they were queued.
+    let mut resources: Vec<ApiResource> = Vec::new();
+    for (label, got) in discovered {
+        match got {
+            Ok(group) => {
+                for (ar, caps) in group.recommended_resources() {
+                    // Events outlive what they are about and are cleaned up on
+                    // their own; they never hold a namespace up.
+                    if caps.scope != kube::discovery::Scope::Namespaced || !caps.supports_operation("list") || ar.kind == "Event" {
+                        continue;
+                    }
+                    if !resources.iter().any(|r| r.group == ar.group && r.plural == ar.plural) {
+                        resources.push(ar);
+                    }
+                }
+            }
+            Err(e) => discovery_failures.push((label, e.to_string())),
+        }
+    }
+    let kinds_checked = resources.len();
+    type Listed = (usize, bool, Vec<(String, Vec<String>)>);
+    let listed: Vec<(ApiResource, Result<Listed, String>)> = futures::stream::iter(resources.into_iter().map(|ar| {
+        let client = client.clone();
+        async move {
+            let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &ar);
+            let held_of = |items: Vec<kube::core::PartialObjectMeta<DynamicObject>>| {
+                items
+                    .into_iter()
+                    .filter_map(|o| {
+                        let finalizers = o.metadata.finalizers.unwrap_or_default();
+                        (!finalizers.is_empty()).then(|| (o.metadata.name.unwrap_or_default(), finalizers))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let got = async {
+                let first = api.list_metadata(&ListParams::default().limit(NS_LEFTOVERS_PER_KIND)).await.map_err(|e| e.to_string())?;
+                let mut count = first.items.len();
+                let mut token = first.metadata.continue_.clone().filter(|c| !c.is_empty());
+                let mut held = held_of(first.items);
+                // The server says how many remain, or it does not and the
+                // rest is counted page by page, up to a cap.
+                if let Some(remaining) = first.metadata.remaining_item_count.filter(|r| *r > 0) {
+                    return Ok((count + remaining as usize, false, held));
+                }
+                let mut pages = 0;
+                while let Some(t) = token.take() {
+                    if pages == NS_LEFTOVERS_PAGES {
+                        return Ok((count, true, held));
+                    }
+                    let page = api
+                        .list_metadata(&ListParams::default().limit(NS_LEFTOVERS_PAGE).continue_token(&t))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    count += page.items.len();
+                    token = page.metadata.continue_.clone().filter(|c| !c.is_empty());
+                    held.extend(held_of(page.items));
+                    pages += 1;
+                }
+                Ok((count, false, held))
+            }
+            .await;
+            (ar, got)
+        }
+    }))
+    .buffer_unordered(NS_LEFTOVERS_CONCURRENCY)
+    .collect()
+    .await;
+    let mut kinds = Vec::new();
+    let mut list_failures = Vec::new();
+    for (ar, got) in listed {
+        match got {
+            Ok((0, _, _)) => {}
+            Ok((count, more, with_finalizers)) => kinds.push(LeftoverKind { kind: ar.kind, group: ar.group, count, more, with_finalizers }),
+            Err(e) => list_failures.push((format!("{} ({})", ar.kind, ar.api_version), e)),
+        }
+    }
+    kinds.sort_by(|a, b| b.with_finalizers.len().cmp(&a.with_finalizers.len()).then(b.count.cmp(&a.count)).then(a.kind.cmp(&b.kind)));
+    list_failures.sort();
+    discovery_failures.sort();
+    NamespaceLeftovers { kinds, discovery_failures, list_failures, kinds_checked }
+}
+
+pub async fn get_namespace_diagnostics(context_name: &str, name: &str) -> Result<NamespaceDiagnostics, String> {
+    use k8s_openapi::api::core::v1::{LimitRange, Namespace, ResourceQuota};
+    use k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService;
+
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ApiResource::erase::<Namespace>(&()));
+    let mut obj = api.get(name).await.map_err(|e| get_error("Namespace", name, e))?;
+    let namespace: Namespace = serde_json::to_value(&obj).and_then(serde_json::from_value).map_err(|e| format!("Failed to read Namespace '{name}': {e}"))?;
+    if let Some(a) = obj.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+    let terminating = namespace.metadata.deletion_timestamp.is_some() || namespace.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Terminating");
+
+    let quotas_api: Api<ResourceQuota> = Api::namespaced(client.clone(), name);
+    let limits_api: Api<LimitRange> = Api::namespaced(client.clone(), name);
+    let events_api: Api<Event> = Api::namespaced(client.clone(), name);
+    let all = ListParams::default();
+    let warning_params = ListParams::default().fields("type=Warning");
+    let api_services_fut = async {
+        if !terminating {
+            return None;
+        }
+        Some(Api::<APIService>::all(client.clone()).list(&all).await.map(|l| l.items).map_err(|e| format!("Failed to list APIServices: {e}")))
+    };
+    let leftovers_fut = async {
+        if terminating {
+            Some(namespace_leftovers(&client, name).await)
+        } else {
+            None
+        }
+    };
+    let (quotas, limit_ranges, warnings, api_services, leftovers) =
+        tokio::join!(quotas_api.list(&all), limits_api.list(&all), events_api.list(&warning_params), api_services_fut, leftovers_fut);
+    let quotas = quotas.map(|l| l.items).map_err(|e| format!("Failed to list ResourceQuotas in '{name}': {e}"));
+    let limit_ranges = limit_ranges.map(|l| l.items).map_err(|e| format!("Failed to list LimitRanges in '{name}': {e}"));
+    let warnings = warnings
+        .map(|l| {
+            let mut items = l.items;
+            items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+            items.into_iter().map(event_to_info).collect()
+        })
+        .map_err(|e| format!("Failed to list events in '{name}': {e}"));
+
+    Ok(NamespaceDiagnostics { namespace, manifest, quotas, limit_ranges, warnings, api_services, leftovers })
+}
+
 /// Everything a PersistentVolumeClaim diagnosis reads.
 ///
 /// Only the claim itself is required; each of the rest fails on its own and
@@ -4410,6 +4625,176 @@ pub async fn get_deployment_diagnostics(context_name: &str, namespace: &str, nam
     };
 
     Ok(DeploymentDiagnostics { deployment, replica_sets, pods, new_rs_events, hpas, pdbs })
+}
+
+/// What a PodDisruptionBudget diagnosis reads.
+pub struct PdbDiagnostics {
+    pub pdb: k8s_openapi::api::policy::v1::PodDisruptionBudget,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// The pods its selector covers; empty when it has no selector, which
+    /// selects none.
+    pub pods: Result<Vec<Pod>, String>,
+    /// The nodes under those pods: `None` when the node no longer exists.
+    pub nodes: Vec<(String, Result<Option<Node>, String>)>,
+    /// The controllers of those pods, a ReplicaSet resolved to its
+    /// Deployment, with the pods each asks for when it says.
+    pub owners: Result<Vec<PdbOwner>, String>,
+    /// The other budgets in the namespace that cover any of the same pods,
+    /// each with the pods it shares.
+    pub others: Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>,
+}
+
+/// A controller behind a budget's pods.
+pub struct PdbOwner {
+    pub kind: String,
+    pub name: String,
+    /// The pods it asks for: replicas, or a DaemonSet's desired count.
+    pub desired: Result<Option<i32>, String>,
+    /// The budget's pods it controls.
+    pub pods: usize,
+}
+
+/// How many nodes under a budget's pods are read.
+const PDB_DIAG_NODES: usize = 20;
+
+pub async fn get_pdb_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<PdbDiagnostics, String> {
+    use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ApiResource::erase::<PodDisruptionBudget>(&()));
+    let mut obj = api.get(name).await.map_err(|e| get_error("PodDisruptionBudget", name, e))?;
+    let pdb: PodDisruptionBudget = serde_json::to_value(&obj)
+        .and_then(serde_json::from_value)
+        .map_err(|e| format!("Failed to read PodDisruptionBudget '{name}': {e}"))?;
+    if let Some(a) = obj.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+    let selector = pdb.spec.as_ref().and_then(|s| s.selector.clone());
+
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pdbs_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    let event_params = ListParams::default().fields(&format!(
+        "involvedObject.kind=PodDisruptionBudget,involvedObject.name={name},involvedObject.namespace={namespace}"
+    ));
+    let pods_fut = async {
+        // A budget with no selector selects no pods; an empty one, every pod
+        // in its namespace.
+        match &selector {
+            None => Ok(Vec::new()),
+            Some(sel) => pods_api
+                .list(&ListParams::default().labels(&label_selector_query(sel)))
+                .await
+                .map(|l| l.items)
+                .map_err(|e| format!("Failed to list pods in '{namespace}': {e}")),
+        }
+    };
+    let all = ListParams::default();
+    let (events, pods, pdbs) = tokio::join!(events_api.list(&event_params), pods_fut, pdbs_api.list(&all));
+    let events = events
+        .map(|l| {
+            let mut items = l.items;
+            items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+            items.into_iter().map(event_to_info).collect()
+        })
+        .map_err(|e| format!("Failed to list events for PodDisruptionBudget '{name}': {e}"));
+    // Another budget's overlap is with these pods, so it can only be worked
+    // out once they are known.
+    let others = match (&pods, pdbs) {
+        (Err(_), _) => Err("not checked: the budget's pods could not be read".to_string()),
+        (_, Err(e)) => Err(format!("Failed to list PodDisruptionBudgets in '{namespace}': {e}")),
+        (Ok(p), Ok(_)) if p.is_empty() => Ok(Vec::new()),
+        (Ok(_), Ok(l)) => Ok(budgets_over(
+            l.items.into_iter().filter(|b| b.metadata.name.as_deref() != Some(name)).collect(),
+            &pods,
+            None,
+        )),
+    };
+
+    let mut node_names: Vec<String> = pods.iter().flatten().filter_map(|p| p.spec.as_ref()?.node_name.clone()).collect();
+    node_names.sort();
+    node_names.dedup();
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let nodes_fut = futures::future::join_all(node_names.into_iter().take(PDB_DIAG_NODES).map(|node| {
+        let nodes_api = nodes_api.clone();
+        async move {
+            let got = nodes_api.get_opt(&node).await.map_err(|e| format!("Failed to get node '{node}': {e}"));
+            (node, got)
+        }
+    }));
+
+    // Each distinct controller once; a ReplicaSet stands for its Deployment,
+    // whose replicas are what a budget is measured against.
+    let mut controllers: Vec<((String, String), usize)> = Vec::new();
+    for p in pods.iter().flatten() {
+        let key = controller_owner(&p.metadata.owner_references).map(|(k, n)| (k.to_string(), n.to_string())).unwrap_or_default();
+        match controllers.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => controllers.push((key, 1)),
+        }
+    }
+    let owners_fut = futures::future::join_all(controllers.into_iter().map(|((kind, owner), count)| {
+        let client = client.clone();
+        async move {
+            let api_get = |e: kube::Error, k: &str, n: &str| format!("Failed to get {k} '{n}': {e}");
+            match kind.as_str() {
+                "ReplicaSet" => {
+                    let rs = Api::<ReplicaSet>::namespaced(client.clone(), namespace).get_opt(&owner).await;
+                    match rs {
+                        Ok(Some(rs)) => match controller_owner(&rs.metadata.owner_references) {
+                            Some(("Deployment", d)) => {
+                                let d = d.to_string();
+                                let desired = Api::<Deployment>::namespaced(client.clone(), namespace)
+                                    .get_opt(&d)
+                                    .await
+                                    .map(|got| got.map(|dep| dep.spec.and_then(|s| s.replicas).unwrap_or(1)))
+                                    .map_err(|e| api_get(e, "Deployment", &d));
+                                PdbOwner { kind: "Deployment".into(), name: d, desired, pods: count }
+                            }
+                            _ => PdbOwner { kind, name: owner, desired: Ok(rs.spec.and_then(|s| s.replicas)), pods: count },
+                        },
+                        Ok(None) => PdbOwner { kind, name: owner, desired: Ok(None), pods: count },
+                        Err(e) => PdbOwner { desired: Err(api_get(e, "ReplicaSet", &owner)), kind, name: owner, pods: count },
+                    }
+                }
+                "StatefulSet" => {
+                    let desired = Api::<StatefulSet>::namespaced(client.clone(), namespace)
+                        .get_opt(&owner)
+                        .await
+                        .map(|got| got.map(|s| s.spec.and_then(|s| s.replicas).unwrap_or(1)))
+                        .map_err(|e| api_get(e, "StatefulSet", &owner));
+                    PdbOwner { kind, name: owner, desired, pods: count }
+                }
+                "DaemonSet" => {
+                    let desired = Api::<DaemonSet>::namespaced(client.clone(), namespace)
+                        .get_opt(&owner)
+                        .await
+                        .map(|got| got.and_then(|d| d.status.map(|s| s.desired_number_scheduled)))
+                        .map_err(|e| api_get(e, "DaemonSet", &owner));
+                    PdbOwner { kind, name: owner, desired, pods: count }
+                }
+                _ => PdbOwner { kind, name: owner, desired: Ok(None), pods: count },
+            }
+        }
+    }));
+    let (nodes, resolved) = tokio::join!(nodes_fut, owners_fut);
+    // Mid-rollout, two ReplicaSets resolve to one Deployment: it is one
+    // controller, asking for its replicas once, over both sets of pods.
+    let mut owners: Vec<PdbOwner> = Vec::new();
+    for o in resolved {
+        match owners.iter_mut().find(|m| m.kind == o.kind && m.name == o.name) {
+            Some(m) => m.pods += o.pods,
+            None => owners.push(o),
+        }
+    }
+    let owners = match &pods {
+        Ok(_) => Ok(owners),
+        Err(_) => Err("not checked: the budget's pods could not be read".to_string()),
+    };
+
+    Ok(PdbDiagnostics { pdb, manifest, events, pods, nodes, owners, others })
 }
 
 /// A Service an Ingress routes to, as the diagnosis read it.

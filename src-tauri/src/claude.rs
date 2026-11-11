@@ -272,6 +272,45 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_PDB_SYSTEM: &str = "\
+You diagnose Kubernetes PodDisruptionBudgets for an experienced SRE.
+
+You are given the budget with its counts, its eviction policy and \
+conditions; the pods it covers with their readiness and the state of their \
+nodes; the controllers behind those pods and how many pods each asks for; \
+the other budgets that cover any of the same pods; its events and manifest. \
+Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the count, the pod, the \
+node, the controller, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- A drain or node upgrade that is waiting on it: the budget allows no \
+disruption while pods it covers sit on cordoned nodes. Say whether the pods \
+are unhealthy (fix them, or the unhealthyPodEvictionPolicy decides whether \
+they can go) or the budget is simply as tight as the replicas.
+- A budget that can never allow a disruption: minAvailable at or above the \
+replicas its pods' controller asks for, or maxUnavailable 0 — the classic \
+single replica with minAvailable 1. The fix is more replicas or a looser \
+budget, not retrying the drain.
+- More than one budget over the same pod: the eviction API refuses to evict \
+it at all, whatever either budget allows.
+- A budget that selects no pods: it protects nothing; compare its selector \
+with the pods' labels.
+- Pods with no controller: an evicted one is not recreated.
+
+If the budget is healthy and allows disruptions, say so plainly rather than \
+inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -589,6 +628,46 @@ controller serves its default certificate.
 path.
 
 If the Ingress looks healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
+const DIAGNOSE_NAMESPACE_SYSTEM: &str = "\
+You diagnose Kubernetes namespaces for an experienced SRE.
+
+You are given the namespace's phase, finalizers and conditions; its \
+ResourceQuotas with what each has used; its LimitRanges; its recent Warning \
+events, each with the object it is about; and, while it is terminating, \
+what is still in it — every namespaced kind listed, with the objects still \
+holding finalizers — the API groups that could not be discovered, and the \
+APIServices that are not available. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition, the \
+object, the finalizer, the quota, the event, or the APIService.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- A namespace stuck terminating because objects in it still hold \
+finalizers: the controller that should remove them (an operator, a CSI \
+driver, a cloud controller) is gone or failing. Fix or reinstall that \
+controller first; removing a finalizer by hand skips its cleanup and can \
+leak the external resource it guards.
+- A namespace stuck terminating because an API group cannot be discovered: \
+an APIService that is not available (often metrics or a webhook-backed \
+API) stops the namespace controller listing everything, so it never \
+finishes. Fix or remove that APIService.
+- Nothing left in it but its own finalizer: the namespace controller has \
+not caught up, or is failing; its conditions say why.
+- Pods or other objects refused by a ResourceQuota (exhausted, or a quota \
+on requests or limits that a pod does not declare, with no LimitRange \
+default) or by a LimitRange's min or max. The Warning events name the \
+object that was refused.
+- A healthy namespace: say so plainly rather than inventing a problem.
 
 Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
 a list of possibilities. If the evidence is genuinely insufficient, say so \
@@ -3692,6 +3771,296 @@ pub async fn build_pvc_diagnosis_payload(context_name: &str, namespace: &str, na
     })
 }
 
+/// A namespace's phase, finalizers and conditions, and how long it has been
+/// terminating.
+fn render_ns_status(ns: &k8s_openapi::api::core::v1::Namespace, now: chrono::DateTime<chrono::Utc>) -> String {
+    let status = ns.status.clone().unwrap_or_default();
+    let mut lines = vec![format!("phase: {}", status.phase.as_deref().unwrap_or("Active"))];
+    let spec_finalizers = ns.spec.as_ref().and_then(|s| s.finalizers.clone()).unwrap_or_default();
+    let meta_finalizers = ns.metadata.finalizers.clone().unwrap_or_default();
+    if !spec_finalizers.is_empty() {
+        lines.push(format!("spec.finalizers: {}", spec_finalizers.join(", ")));
+    }
+    if !meta_finalizers.is_empty() {
+        lines.push(format!("metadata.finalizers: {}", meta_finalizers.join(", ")));
+    }
+    if let Some(t) = &ns.metadata.deletion_timestamp {
+        let mins = (now - t.0).num_minutes();
+        lines.push(format!(
+            "TERMINATING since {} ({})",
+            t.0.to_rfc3339(),
+            if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }
+        ));
+    }
+    for c in status.conditions.iter().flatten() {
+        let message: String = c.message.as_deref().unwrap_or_default().chars().take(400).collect();
+        let reason = c.reason.as_deref().unwrap_or("?");
+        lines.push(if c.status == "True" {
+            format!("DELETION BLOCKED: {} ({reason}): {message}", c.type_)
+        } else {
+            format!("condition {}={} ({reason})", c.type_, c.status)
+        });
+    }
+    lines.join("\n")
+}
+
+/// A Kubernetes quantity in its base unit — cores, bytes, or a count — with
+/// every suffix the API accepts: n, u, m; k, M, G, T, P, E; Ki to Ei; and an
+/// exponent. Used and hard of one quota resource always share a unit, so this
+/// is all a comparison needs.
+fn quantity_value(q: &str) -> Option<f64> {
+    let q = q.trim();
+    const SUFFIXES: [(&str, f64); 15] = [
+        ("Ki", 1024.0),
+        ("Mi", 1024.0 * 1024.0),
+        ("Gi", 1024.0 * 1024.0 * 1024.0),
+        ("Ti", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("Pi", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("Ei", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("n", 1e-9),
+        ("u", 1e-6),
+        ("m", 1e-3),
+        ("k", 1e3),
+        ("M", 1e6),
+        ("G", 1e9),
+        ("T", 1e12),
+        ("P", 1e15),
+        ("E", 1e18),
+    ];
+    for (suffix, factor) in SUFFIXES {
+        if let Some(n) = q.strip_suffix(suffix) {
+            return n.parse::<f64>().ok().map(|n| n * factor);
+        }
+    }
+    q.parse::<f64>().ok()
+}
+
+/// A namespace's ResourceQuotas, each resource's use against its cap, and a
+/// quota a pod must answer that no LimitRange answers for it.
+fn render_ns_quotas(
+    quotas: &Result<Vec<k8s_openapi::api::core::v1::ResourceQuota>, String>,
+    limit_ranges: &Result<Vec<k8s_openapi::api::core::v1::LimitRange>, String>,
+) -> String {
+    let quotas = match quotas {
+        Ok(q) if q.is_empty() => return "(no ResourceQuota: nothing in it is capped)".to_string(),
+        Ok(q) => q,
+        Err(e) => return format!("(ResourceQuotas unavailable: {e})"),
+    };
+    // A pod's containers must declare what a compute quota caps: a quota on
+    // cpu, memory or ephemeral-storage requests or limits. requests.storage
+    // and the counts are about other objects.
+    let compute = |r: &str| {
+        let base = r.strip_prefix("requests.").or_else(|| r.strip_prefix("limits.")).unwrap_or(r);
+        matches!(base, "cpu" | "memory" | "ephemeral-storage")
+    };
+    let mut lines = Vec::new();
+    let mut needs_declaring: Vec<String> = Vec::new();
+    for q in quotas {
+        let spec = q.spec.clone().unwrap_or_default();
+        let st = q.status.clone().unwrap_or_default();
+        // Its scopes, and a scopeSelector, say which pods it caps.
+        let mut scope: Vec<String> = spec.scopes.clone().unwrap_or_default();
+        scope.extend(spec.scope_selector.iter().flat_map(|s| s.match_expressions.iter().flatten()).map(|e| {
+            let values = e.values.clone().unwrap_or_default();
+            if values.is_empty() { format!("{} {}", e.scope_name, e.operator) } else { format!("{} {} ({})", e.scope_name, e.operator, values.join(", ")) }
+        }));
+        lines.push(format!(
+            "{}{}:",
+            q.metadata.name.as_deref().unwrap_or_default(),
+            if scope.is_empty() { String::new() } else { format!(" (only pods matching: {})", scope.join("; ")) }
+        ));
+        for (resource, hard) in st.hard.clone().or(spec.hard.clone()).unwrap_or_default() {
+            if compute(&resource) && !needs_declaring.contains(&resource) {
+                needs_declaring.push(resource.clone());
+            }
+            let Some(used) = st.used.as_ref().and_then(|u| u.get(&resource)) else {
+                lines.push(format!("  {resource}: hard {} (used not reported yet)", hard.0));
+                continue;
+            };
+            let (Some(u), Some(h)) = (quantity_value(&used.0), quantity_value(&hard.0)) else {
+                lines.push(format!("  {resource}: used {} of {}", used.0, hard.0));
+                continue;
+            };
+            let pct = if h > 0.0 { (u / h * 100.0).round() as i64 } else { 100 };
+            lines.push(format!(
+                "  {resource}: used {} of {} ({pct}%){}",
+                used.0,
+                hard.0,
+                if u >= h {
+                    " — EXHAUSTED: a new object asking for more is refused"
+                } else if pct >= 90 {
+                    " — NEARLY EXHAUSTED"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    // A compute quota makes every new pod declare what it caps; a Container
+    // LimitRange default declares it for a pod that does not, resource by
+    // resource: a request from defaultRequest, or from default (a request
+    // left unset takes the limit); a limit only from default.
+    if let Ok(ranges) = limit_ranges {
+        let items: Vec<k8s_openapi::api::core::v1::LimitRangeItem> =
+            ranges.iter().flat_map(|r| r.spec.as_ref().map(|s| s.limits.clone()).unwrap_or_default()).filter(|i| i.type_ == "Container").collect();
+        let has = |m: &Option<std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>, r: &str| m.as_ref().is_some_and(|m| m.contains_key(r));
+        let uncovered: Vec<String> = needs_declaring
+            .into_iter()
+            .filter(|key| {
+                let (limit, base) = match key.strip_prefix("limits.") {
+                    Some(b) => (true, b),
+                    None => (false, key.strip_prefix("requests.").unwrap_or(key)),
+                };
+                !items.iter().any(|i| has(&i.default, base) || (!limit && has(&i.default_request, base)))
+            })
+            .collect();
+        if !uncovered.is_empty() {
+            lines.push(format!(
+                "A QUOTA ON {} WITH NO LIMITRANGE DEFAULT FOR IT: a pod whose containers do not set {} is refused",
+                uncovered.join(", "),
+                if uncovered.len() == 1 { "it" } else { "them" }
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// A namespace's LimitRanges: the defaults they give and the bounds they set.
+fn render_ns_limit_ranges(limit_ranges: &Result<Vec<k8s_openapi::api::core::v1::LimitRange>, String>) -> String {
+    let ranges = match limit_ranges {
+        Ok(l) if l.is_empty() => return "(none)".to_string(),
+        Ok(l) => l,
+        Err(e) => return format!("(LimitRanges unavailable: {e})"),
+    };
+    let pairs = |m: &Option<std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>| {
+        m.as_ref().map(|m| m.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>().join(", "))
+    };
+    let mut lines = Vec::new();
+    for r in ranges {
+        for item in r.spec.as_ref().map(|s| s.limits.clone()).unwrap_or_default() {
+            let parts: Vec<String> = [
+                ("default", pairs(&item.default)),
+                ("defaultRequest", pairs(&item.default_request)),
+                ("min", pairs(&item.min)),
+                ("max", pairs(&item.max)),
+                ("maxLimitRequestRatio", pairs(&item.max_limit_request_ratio)),
+            ]
+            .into_iter()
+            .filter_map(|(k, v)| v.filter(|v| !v.is_empty()).map(|v| format!("{k} {v}")))
+            .collect();
+            lines.push(format!("{} ({}): {}", r.metadata.name.as_deref().unwrap_or_default(), item.type_, if parts.is_empty() { "(nothing set)".to_string() } else { parts.join("; ") }));
+        }
+    }
+    lines.join("\n")
+}
+
+/// What is still in a terminating namespace, and what the namespace
+/// controller could not discover or list.
+fn render_ns_leftovers(ns: &k8s_openapi::api::core::v1::Namespace, l: &k8s::NamespaceLeftovers) -> String {
+    const KINDS: usize = 15;
+    const NAMES: usize = 3;
+    let mut lines = vec![format!("{} namespaced kinds listed; {} still have objects in it", l.kinds_checked, l.kinds.len())];
+    for k in l.kinds.iter().take(KINDS) {
+        let mut line = format!(
+            "{}{}: {}{}",
+            k.kind,
+            if k.group.is_empty() { String::new() } else { format!(" ({})", k.group) },
+            k.count,
+            if k.more { " or more" } else { "" }
+        );
+        if !k.with_finalizers.is_empty() {
+            let shown: Vec<String> = k.with_finalizers.iter().take(NAMES).map(|(n, f)| format!("{n} [{}]", f.join(", "))).collect();
+            line.push_str(&format!(
+                "; held by finalizers: {}{}",
+                shown.join(", "),
+                if k.with_finalizers.len() > NAMES { format!(" and {} more", k.with_finalizers.len() - NAMES) } else { String::new() }
+            ));
+        }
+        lines.push(line);
+    }
+    if l.kinds.len() > KINDS {
+        lines.push(format!("and {} more kinds", l.kinds.len() - KINDS));
+    }
+    let held: Vec<&str> = l.kinds.iter().filter(|k| !k.with_finalizers.is_empty()).map(|k| k.kind.as_str()).collect();
+    if !held.is_empty() {
+        lines.push(format!(
+            "OBJECTS STILL HOLDING FINALIZERS ({}): the controller that removes each is gone or failing, so the namespace cannot finish",
+            held.join(", ")
+        ));
+    }
+    if !l.discovery_failures.is_empty() {
+        lines.push(format!(
+            "DISCOVERY FAILED FOR {}: the namespace controller cannot list what it cannot discover, so it never finishes",
+            l.discovery_failures.iter().map(|(g, e)| format!("{g} ({})", e.chars().take(200).collect::<String>())).collect::<Vec<_>>().join("; ")
+        ));
+    }
+    if !l.list_failures.is_empty() {
+        lines.push(format!(
+            "could not list {}",
+            l.list_failures.iter().map(|(k, e)| format!("{k} ({})", e.chars().take(200).collect::<String>())).collect::<Vec<_>>().join("; ")
+        ));
+    }
+    if l.kinds.is_empty() && l.discovery_failures.is_empty() && l.list_failures.is_empty() {
+        let own = ns.spec.as_ref().and_then(|s| s.finalizers.clone()).unwrap_or_default();
+        lines.push(format!(
+            "NOTHING IS LEFT IN IT: only its own finalizers ({}) remain, which the namespace controller removes once it has finished",
+            if own.is_empty() { "none".to_string() } else { own.join(", ") }
+        ));
+    }
+    lines.join("\n")
+}
+
+/// The APIServices that are not available: one stops the namespace
+/// controller discovering every kind, so a terminating namespace stalls.
+fn render_ns_api_services(api_services: &Result<Vec<k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService>, String>) -> String {
+    let services = match api_services {
+        Ok(s) => s,
+        Err(e) => return format!("(APIServices unavailable: {e})"),
+    };
+    let down: Vec<String> = services
+        .iter()
+        .filter(|s| !s.status.as_ref().and_then(|st| st.conditions.as_ref()).is_some_and(|c| c.iter().any(|c| c.type_ == "Available" && c.status == "True")))
+        .map(|s| format!("APISERVICE NOT AVAILABLE: {}", render_api_service(s)))
+        .collect();
+    if down.is_empty() {
+        format!("(all {} APIServices are available)", services.len())
+    } else {
+        down.join("\n")
+    }
+}
+
+/// Assembles a Namespace diagnosis, redacted.
+pub async fn build_namespace_diagnosis_payload(context_name: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_namespace_diagnostics(context_name, name).await?;
+    let status = redact::redact(&render_ns_status(&d.namespace, chrono::Utc::now()));
+    let quotas = redact::redact(&render_ns_quotas(&d.quotas, &d.limit_ranges));
+    let limits = redact::redact(&render_ns_limit_ranges(&d.limit_ranges));
+    let leftovers = d.leftovers.as_ref().map(|l| redact::redact(&render_ns_leftovers(&d.namespace, l)));
+    let api_services = d.api_services.as_ref().map(|a| redact::redact(&render_ns_api_services(a)));
+    let warnings = redact::redact(&render_nap_events(&d.warnings, "(no Warning events in it)", true, 25));
+    let manifest = redact::redact(&d.manifest);
+    let mut parts = vec![&status, &quotas, &limits, &warnings, &manifest];
+    parts.extend(leftovers.as_ref());
+    parts.extend(api_services.as_ref());
+    let redaction_summary = redact::Redacted::merge(parts).summary();
+
+    let terminating = match (&leftovers, &api_services) {
+        (Some(l), Some(a)) => format!("## What is still in it\n{}\n\n## APIServices\n{}\n\n", l.text, a.text),
+        _ => String::new(),
+    };
+    let prompt = format!(
+        "Namespace {name}.\n\n\
+         ## Status\n{}\n\n\
+         ## ResourceQuotas\n{}\n\n\
+         ## LimitRanges\n{}\n\n\
+         {terminating}\
+         ## Warning events in it\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        status.text, quotas.text, limits.text, warnings.text, manifest.text,
+    );
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
 /// How many resources from a release's inventory go into a diagnosis.
 ///
 /// The inventory is cheap — one short line each, 66 for the largest release
@@ -4352,7 +4721,8 @@ fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBud
             };
             // No disruption allowed stops the eviction of healthy pods; an
             // unready one may still go, as its unhealthyPodEvictionPolicy says.
-            let blocks = if st.disruptions_allowed > 0 {
+            // A budget over no pods blocks nothing, whatever it allows.
+            let blocks = if st.disruptions_allowed > 0 || st.expected_pods == 0 {
                 String::new()
             } else {
                 let unready = match spec.unhealthy_pod_eviction_policy.as_deref() {
@@ -4371,7 +4741,11 @@ fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBud
             format!(
                 "{}: {limit}; covers {}; healthy {} of {} expected, {} needed; disruptions allowed {}{blocks}",
                 b.metadata.name.as_deref().unwrap_or_default(),
-                covered.as_deref().map(sts_pod_list).unwrap_or_else(|| "the pod template (no pod to check)".to_string()),
+                match covered.as_deref() {
+                    None => "the pod template (no pod to check)".to_string(),
+                    Some([]) => "no pods".to_string(),
+                    Some(c) => sts_pod_list(c),
+                },
                 st.current_healthy,
                 st.expected_pods,
                 st.desired_healthy,
@@ -5353,6 +5727,228 @@ fn render_deploy_sections(d: &k8s::DeploymentDiagnostics) -> String {
     )
 }
 
+/// A PodDisruptionBudget's own line — its budget, counts and what it lets a
+/// drain do — with its selector, conditions and whether its status is
+/// current.
+fn render_pdb_budget(
+    pdb: &k8s_openapi::api::policy::v1::PodDisruptionBudget,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+) -> String {
+    let covered = pods.as_ref().ok().map(|p| p.iter().filter_map(|p| p.metadata.name.clone()).collect::<Vec<_>>());
+    let selector = pdb.spec.as_ref().and_then(|s| s.selector.as_ref());
+    let mut lines = vec![render_pdbs(&Ok(vec![(pdb.clone(), covered.clone())]))];
+    lines.push(match selector {
+        None => "selector: (none)".to_string(),
+        Some(sel) => {
+            let q = k8s::label_selector_query(sel);
+            format!("selector: {}", if q.is_empty() { "(empty: every pod in its namespace)".to_string() } else { q })
+        }
+    });
+    let status = pdb.status.clone().unwrap_or_default();
+    for c in status.conditions.iter().flatten() {
+        let message: String = c.message.chars().take(300).collect();
+        lines.push(format!("condition {}={} ({}){}", c.type_, c.status, c.reason, if message.is_empty() { String::new() } else { format!(": {message}") }));
+    }
+    if let (Some(g), Some(o)) = (pdb.metadata.generation, status.observed_generation) {
+        if g > o {
+            lines.push(format!("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation {g}, observed {o}, so the counts above may be stale"));
+        }
+    }
+    match (selector, covered.as_deref()) {
+        (None, _) => lines.push("NO SELECTOR: a budget without one selects no pods, so it protects nothing".to_string()),
+        (Some(_), Some([])) => lines.push("SELECTS NO PODS: no pod in its namespace has the labels it selects, so it protects nothing".to_string()),
+        _ => {}
+    }
+    lines.join("\n")
+}
+
+/// The pods a budget covers, with their readiness and nodes, and whether a
+/// drain is waiting on them.
+fn render_pdb_pods(
+    pdb: &k8s_openapi::api::policy::v1::PodDisruptionBudget,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+    nodes: &[(String, Result<Option<k8s_openapi::api::core::v1::Node>, String>)],
+) -> String {
+    const SHOWN: usize = 15;
+    let pods = match pods {
+        Ok(p) if p.is_empty() => return "(none)".to_string(),
+        Ok(p) => p,
+        Err(e) => return format!("(pods unavailable: {e})"),
+    };
+    let allowed = pdb.status.as_ref().map(|s| s.disruptions_allowed).unwrap_or(0);
+    let mut lines = vec![format!("{} pods, {} ready", pods.len(), pods.iter().filter(|p| pod_is_ready(p)).count())];
+    let mut cordoned: Vec<String> = Vec::new();
+    for (i, p) in pods.iter().enumerate() {
+        let node = p.spec.as_ref().and_then(|s| s.node_name.clone()).unwrap_or_default();
+        // A node can be both NotReady and cordoned; each is said.
+        let note = match nodes.iter().find(|(n, _)| *n == node).map(|(_, r)| r) {
+            Some(Ok(None)) => " (NODE NO LONGER EXISTS)".to_string(),
+            Some(Ok(Some(n))) => {
+                let mut note = String::new();
+                if !k8s::node_is_ready(n) {
+                    note.push_str(" (node NOT READY)");
+                }
+                if n.spec.as_ref().and_then(|s| s.unschedulable) == Some(true) {
+                    if !cordoned.contains(&node) {
+                        cordoned.push(node.clone());
+                    }
+                    note.push_str(" (node CORDONED)");
+                }
+                note
+            }
+            Some(Err(e)) => format!(" (node unavailable: {e})"),
+            None => String::new(),
+        };
+        if i < SHOWN {
+            let phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_else(|| "Unknown".into());
+            lines.push(format!(
+                "{}: {}{}; {}{note}",
+                p.metadata.name.as_deref().unwrap_or_default(),
+                if pod_is_ready(p) { "ready" } else { "NOT READY" },
+                if phase == "Running" { String::new() } else { format!(", {phase}") },
+                if node.is_empty() { "not scheduled".to_string() } else { format!("on {node}") }
+            ));
+        }
+    }
+    if pods.len() > SHOWN {
+        lines.push(format!("and {} more", pods.len() - SHOWN));
+    }
+    if !cordoned.is_empty() {
+        let on: Vec<&k8s_openapi::api::core::v1::Pod> =
+            pods.iter().filter(|p| p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some_and(|n| cordoned.contains(n))).collect();
+        let on_cordoned = on.len();
+        // Nothing allowed stops a ready pod's eviction; an unready one may
+        // still go, as the eviction policy in the budget's line says.
+        let ready_on = on.iter().filter(|p| pod_is_ready(p)).count();
+        let unready_on = on_cordoned - ready_on;
+        lines.push(if allowed == 0 && ready_on > 0 {
+            format!(
+                "A DRAIN IS WAITING ON THIS BUDGET: {ready_on} ready pod{} on cordoned nodes ({}) cannot be evicted while it allows no disruption{}",
+                if ready_on == 1 { "" } else { "s" },
+                sts_pod_list(&cordoned),
+                if unready_on > 0 {
+                    format!("; {unready_on} not ready there may still be, as its unhealthyPodEvictionPolicy decides")
+                } else {
+                    String::new()
+                }
+            )
+        } else if allowed == 0 {
+            format!(
+                "{unready_on} of its pods on cordoned nodes ({}) {} not ready: whether a drain can evict {} while it allows no disruption is up to its unhealthyPodEvictionPolicy",
+                sts_pod_list(&cordoned),
+                if unready_on == 1 { "is" } else { "are" },
+                if unready_on == 1 { "it" } else { "them" }
+            )
+        } else {
+            format!(
+                "{on_cordoned} of its pods {} on cordoned nodes ({}); it allows {allowed} disruption{} now, so a drain can evict {}",
+                if on_cordoned == 1 { "is" } else { "are" },
+                sts_pod_list(&cordoned),
+                if allowed == 1 { "" } else { "s" },
+                if on_cordoned == 1 { "it" } else { "them" }
+            )
+        });
+    }
+    lines.join("\n")
+}
+
+/// The controllers behind a budget's pods, and whether the budget can ever
+/// allow a disruption given the pods they ask for.
+fn render_pdb_owners(pdb: &k8s_openapi::api::policy::v1::PodDisruptionBudget, owners: &Result<Vec<k8s::PdbOwner>, String>) -> String {
+    let owners = match owners {
+        Ok(o) if o.is_empty() => return "(no pods, so no controller)".to_string(),
+        Ok(o) => o,
+        Err(e) => return format!("(controllers unavailable: {e})"),
+    };
+    let mut lines: Vec<String> = owners
+        .iter()
+        .map(|o| {
+            if o.kind.is_empty() {
+                format!("{} pod{} with no controller: an evicted one is not recreated", o.pods, if o.pods == 1 { "" } else { "s" })
+            } else {
+                format!(
+                    "{} {}: {} of its pods covered; {}",
+                    o.kind,
+                    o.name,
+                    o.pods,
+                    match &o.desired {
+                        Ok(Some(d)) => format!("asks for {d}"),
+                        Ok(None) => "asks for an unknown number".to_string(),
+                        Err(e) => format!("its desired count is unavailable: {e}"),
+                    }
+                )
+            }
+        })
+        .collect();
+    // Measured as the disruption controller does: against the pods the
+    // controllers ask for. Only when every one of them says.
+    let spec = pdb.spec.clone().unwrap_or_default();
+    // Pods with no controller count toward an integer minAvailable but ask
+    // for no replicas, so with any of them the comparison is not made.
+    let managed: Vec<&k8s::PdbOwner> = owners.iter().filter(|o| !o.kind.is_empty()).collect();
+    let desired: Option<i32> = if managed.is_empty() || managed.len() < owners.len() {
+        None
+    } else {
+        managed.iter().map(|o| o.desired.clone().ok().flatten()).sum()
+    };
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    let never = match (&spec.min_available, &spec.max_unavailable) {
+        (Some(IntOrString::String(s)), _) if s.trim() == "100%" => Some(format!("minAvailable {s} keeps every pod")),
+        (Some(IntOrString::Int(m)), _) => desired.filter(|d| m >= d).map(|d| format!("minAvailable {m} with {d} pod{} asked for", if d == 1 { "" } else { "s" })),
+        (_, Some(IntOrString::Int(0))) => Some("maxUnavailable 0".to_string()),
+        (_, Some(IntOrString::String(s))) if s.trim() == "0%" => Some(format!("maxUnavailable {s}")),
+        _ => None,
+    };
+    if let Some(why) = never {
+        lines.push(format!("THE BUDGET CAN NEVER ALLOW A DISRUPTION: {why}, so a drain waits until there are more replicas or the budget is relaxed"));
+    }
+    lines.join("\n")
+}
+
+/// The other budgets over any of these pods: the eviction API refuses to
+/// evict a pod covered by more than one.
+fn render_pdb_others(others: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBudget, Option<Vec<String>>)>, String>) -> String {
+    match others {
+        Err(e) => format!("(other budgets unavailable: {e})"),
+        Ok(o) if o.is_empty() => "(no other budget in its namespace covers any of its pods)".to_string(),
+        Ok(o) => o
+            .iter()
+            .map(|(b, shared)| {
+                format!(
+                    "OVERLAPS WITH {} ON {}: the eviction API refuses to evict a pod covered by more than one budget",
+                    b.metadata.name.as_deref().unwrap_or_default(),
+                    shared.as_deref().map(sts_pod_list).unwrap_or_else(|| "its pods".to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Assembles a PodDisruptionBudget diagnosis, redacted.
+pub async fn build_pdb_diagnosis_payload(context_name: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_pdb_diagnostics(context_name, namespace, name).await?;
+    let budget = redact::redact(&render_pdb_budget(&d.pdb, &d.pods));
+    let pods = redact::redact(&render_pdb_pods(&d.pdb, &d.pods, &d.nodes));
+    let owners = redact::redact(&render_pdb_owners(&d.pdb, &d.owners));
+    let others = redact::redact(&render_pdb_others(&d.others));
+    let events = redact::redact(&render_nap_events(&d.events, "(no events for this budget)", false, 25));
+    let manifest = redact::redact(&d.manifest);
+    let redaction_summary = redact::Redacted::merge([&budget, &pods, &owners, &others, &events, &manifest]).summary();
+
+    let prompt = format!(
+        "PodDisruptionBudget {namespace}/{name}.\n\n\
+         ## Budget\n{}\n\n\
+         ## Pods it covers\n{}\n\n\
+         ## Their controllers\n{}\n\n\
+         ## Other budgets over these pods\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        budget.text, pods.text, owners.text, others.text, events.text, manifest.text,
+    );
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
 /// Assembles everything a workload diagnosis needs, redacted and trimmed.
 ///
 /// Shaped like `build_diagnosis_payload` but a controller sees a different
@@ -5847,8 +6443,10 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "HorizontalPodAutoscaler" => DIAGNOSE_HPA_SYSTEM,
         "ScaledObject" | "ScaledJob" => DIAGNOSE_KEDA_SYSTEM,
         "Service" => DIAGNOSE_SERVICE_SYSTEM,
+        "Namespace" => DIAGNOSE_NAMESPACE_SYSTEM,
         "Ingress" => DIAGNOSE_INGRESS_SYSTEM,
         "PersistentVolumeClaim" => DIAGNOSE_PVC_SYSTEM,
+        "PodDisruptionBudget" => DIAGNOSE_PDB_SYSTEM,
         "StatefulSet" => DIAGNOSE_STATEFULSET_SYSTEM,
         "Job" | "CronJob" => DIAGNOSE_JOB_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
@@ -7943,6 +8541,193 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(render_cronjob(&all_failed, Some(&Ok(vec![run("report-1", "Failed")])), now).ends_with("ITS LAST 1 RUN FAILED; NO RUN HAS SUCCEEDED"));
     }
 
+    fn budget(v: serde_json::Value) -> k8s_openapi::api::policy::v1::PodDisruptionBudget {
+        let mut base = serde_json::json!({
+            "metadata": { "name": "web", "namespace": "ns", "generation": 2 },
+            "spec": { "minAvailable": 1, "selector": { "matchLabels": { "app": "web" } } },
+            "status": { "currentHealthy": 1, "desiredHealthy": 1, "expectedPods": 1, "disruptionsAllowed": 0, "observedGeneration": 2,
+                "conditions": [{ "type": "DisruptionAllowed", "status": "False", "reason": "InsufficientPods", "message": "", "lastTransitionTime": "2026-11-09T10:00:00Z" }] }
+        });
+        json_merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn owner(kind: &str, name: &str, desired: Option<i32>, pods: usize) -> k8s::PdbOwner {
+        k8s::PdbOwner { kind: kind.into(), name: name.into(), desired: Ok(desired), pods }
+    }
+
+    #[test]
+    fn a_budget_says_whether_a_drain_can_get_past_it() {
+        let pods = || Ok(vec![labelled_pod("web-1", serde_json::json!({ "app": "web" }), true, serde_json::json!({}))]);
+        assert_eq!(
+            render_pdb_budget(&budget(serde_json::json!({})), &pods()),
+            "web: minAvailable 1; covers web-1; healthy 1 of 1 expected, 1 needed; disruptions allowed 0 — NO HEALTHY POD MAY BE EVICTED: a drain waits on any node running one of its ready pods; the budget is met, so a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy IfHealthyBudget, the default)\n\
+             selector: app=web\n\
+             condition DisruptionAllowed=False (InsufficientPods)"
+        );
+        let none = render_pdb_budget(&budget(serde_json::json!({ "spec": { "selector": null }, "status": { "expectedPods": 0, "currentHealthy": 0 } })), &Ok(vec![]));
+        assert!(!none.contains("NO HEALTHY POD MAY BE EVICTED"), "{none}");
+        assert!(none.contains("covers no pods") && none.contains("selector: (none)") && none.ends_with("NO SELECTOR: a budget without one selects no pods, so it protects nothing"), "{none}");
+        let misses = render_pdb_budget(&budget(serde_json::json!({ "metadata": { "generation": 3 } })), &Ok(vec![]));
+        assert!(misses.contains("THE CONTROLLER HAS NOT YET ACTED ON THE LATEST SPEC: generation 3, observed 2") && misses.ends_with("SELECTS NO PODS: no pod in its namespace has the labels it selects, so it protects nothing"), "{misses}");
+
+        // A drain waiting: a covered pod on a cordoned node, nothing allowed.
+        let node = |name: &str, ready: &str, cordoned: bool| -> k8s_openapi::api::core::v1::Node {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": name }, "spec": { "unschedulable": cordoned },
+                "status": { "conditions": [{ "type": "Ready", "status": ready }] } })).unwrap()
+        };
+        let p = |name: &str, on: &str, ready: bool| labelled_pod(name, serde_json::json!({ "app": "web" }), ready, serde_json::json!({ "spec": { "nodeName": on } }));
+        let nodes = vec![
+            ("n1".to_string(), Ok(Some(node("n1", "True", true)))),
+            ("n2".to_string(), Ok(None)),
+            ("n3".to_string(), Ok(Some(node("n3", "False", false)))),
+            ("n4".to_string(), Ok(Some(node("n4", "False", true)))),
+        ];
+        assert_eq!(
+            render_pdb_pods(&budget(serde_json::json!({})), &Ok(vec![p("web-1", "n1", true), p("web-2", "n2", false), p("web-3", "n3", false), p("web-4", "n4", false)]), &nodes),
+            "4 pods, 1 ready\n\
+             web-1: ready; on n1 (node CORDONED)\n\
+             web-2: NOT READY; on n2 (NODE NO LONGER EXISTS)\n\
+             web-3: NOT READY; on n3 (node NOT READY)\n\
+             web-4: NOT READY; on n4 (node NOT READY) (node CORDONED)\n\
+             A DRAIN IS WAITING ON THIS BUDGET: 1 ready pod on cordoned nodes (n1, n4) cannot be evicted while it allows no disruption; 1 not ready there may still be, as its unhealthyPodEvictionPolicy decides"
+        );
+        // Only unready pods on the cordoned node: not called blocked.
+        let unready_only = render_pdb_pods(&budget(serde_json::json!({})), &Ok(vec![p("web-4", "n4", false)]), &nodes);
+        assert!(unready_only.ends_with("1 of its pods on cordoned nodes (n4) is not ready: whether a drain can evict it while it allows no disruption is up to its unhealthyPodEvictionPolicy") && !unready_only.contains("WAITING"), "{unready_only}");
+        let loose = budget(serde_json::json!({ "status": { "disruptionsAllowed": 2 } }));
+        assert!(render_pdb_pods(&loose, &Ok(vec![p("web-1", "n1", true)]), &nodes).ends_with("1 of its pods is on cordoned nodes (n1); it allows 2 disruptions now, so a drain can evict it"));
+        assert_eq!(render_pdb_pods(&loose, &Err("forbidden".into()), &[]), "(pods unavailable: forbidden)");
+    }
+
+    #[test]
+    fn a_budget_tighter_than_its_replicas_and_overlaps_are_named() {
+        let tight = render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("Deployment", "web", Some(1), 1)]));
+        assert_eq!(
+            tight,
+            "Deployment web: 1 of its pods covered; asks for 1\n\
+             THE BUDGET CAN NEVER ALLOW A DISRUPTION: minAvailable 1 with 1 pod asked for, so a drain waits until there are more replicas or the budget is relaxed"
+        );
+        assert!(!render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("Deployment", "web", Some(3), 3)])).contains("NEVER"));
+        assert!(render_pdb_owners(&budget(serde_json::json!({ "spec": { "minAvailable": null, "maxUnavailable": 0 } })), &Ok(vec![owner("StatefulSet", "db", Some(3), 3)]))
+            .contains("THE BUDGET CAN NEVER ALLOW A DISRUPTION: maxUnavailable 0"));
+        assert!(render_pdb_owners(&budget(serde_json::json!({ "spec": { "minAvailable": "100%" } })), &Ok(vec![owner("Deployment", "web", Some(5), 5)]))
+            .contains("minAvailable 100% keeps every pod"));
+        // Unmanaged pods are said, and give no replica count to measure against.
+        let bare = render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("", "", None, 2)]));
+        assert_eq!(bare, "2 pods with no controller: an evicted one is not recreated");
+        // An unmanaged pod counts toward minAvailable without asking for a
+        // replica, so a Deployment of 1 plus one bare pod is not called stuck.
+        assert!(!render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![owner("Deployment", "web", Some(1), 1), owner("", "", None, 1)])).contains("NEVER"));
+        assert_eq!(render_pdb_owners(&budget(serde_json::json!({})), &Ok(vec![])), "(no pods, so no controller)");
+
+        assert_eq!(render_pdb_others(&Ok(vec![])), "(no other budget in its namespace covers any of its pods)");
+        assert_eq!(
+            render_pdb_others(&Ok(vec![(budget(serde_json::json!({ "metadata": { "name": "web-extra" } })), Some(vec!["web-1".to_string()]))])),
+            "OVERLAPS WITH web-extra ON web-1: the eviction API refuses to evict a pod covered by more than one budget"
+        );
+        assert_eq!(render_pdb_others(&Err("not checked: the budget's pods could not be read".into())), "(other budgets unavailable: not checked: the budget's pods could not be read)");
+    }
+
+    fn namespace(v: serde_json::Value) -> k8s_openapi::api::core::v1::Namespace {
+        let mut base = serde_json::json!({ "metadata": { "name": "team" }, "spec": { "finalizers": ["kubernetes"] }, "status": { "phase": "Active" } });
+        json_merge(&mut base, v);
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn a_namespace_says_what_holds_its_deletion() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(render_ns_status(&namespace(serde_json::json!({})), now), "phase: Active\nspec.finalizers: kubernetes");
+        let stuck = namespace(serde_json::json!({
+            "metadata": { "deletionTimestamp": "2026-11-09T10:00:00Z" },
+            "status": { "phase": "Terminating", "conditions": [
+                { "type": "NamespaceDeletionDiscoveryFailure", "status": "True", "reason": "DiscoveryFailed", "message": "Discovery failed for some groups, 1 failing: unable to retrieve the complete list of server APIs: metrics.k8s.io/v1beta1: stale GroupVersion discovery" },
+                { "type": "NamespaceContentRemaining", "status": "False", "reason": "ContentRemoved" }] }
+        }));
+        assert_eq!(
+            render_ns_status(&stuck, now),
+            "phase: Terminating\n\
+             spec.finalizers: kubernetes\n\
+             TERMINATING since 2026-11-09T10:00:00+00:00 (120 min)\n\
+             DELETION BLOCKED: NamespaceDeletionDiscoveryFailure (DiscoveryFailed): Discovery failed for some groups, 1 failing: unable to retrieve the complete list of server APIs: metrics.k8s.io/v1beta1: stale GroupVersion discovery\n\
+             condition NamespaceContentRemaining=False (ContentRemoved)"
+        );
+
+        let leftovers = k8s::NamespaceLeftovers {
+            kinds: vec![
+                k8s::LeftoverKind { kind: "Certificate".into(), group: "cert-manager.io".into(), count: 2, more: false, with_finalizers: vec![("web-tls".into(), vec!["cert-manager.io/finalizer".into()])] },
+                k8s::LeftoverKind { kind: "ConfigMap".into(), group: "".into(), count: 5020, more: true, with_finalizers: vec![] },
+            ],
+            discovery_failures: vec![("metrics.k8s.io/v1beta1".into(), "the server is currently unable to handle the request".into())],
+            list_failures: vec![],
+            kinds_checked: 84,
+        };
+        assert_eq!(
+            render_ns_leftovers(&stuck, &leftovers),
+            "84 namespaced kinds listed; 2 still have objects in it\n\
+             Certificate (cert-manager.io): 2; held by finalizers: web-tls [cert-manager.io/finalizer]\n\
+             ConfigMap: 5020 or more\n\
+             OBJECTS STILL HOLDING FINALIZERS (Certificate): the controller that removes each is gone or failing, so the namespace cannot finish\n\
+             DISCOVERY FAILED FOR metrics.k8s.io/v1beta1 (the server is currently unable to handle the request): the namespace controller cannot list what it cannot discover, so it never finishes"
+        );
+        let empty = k8s::NamespaceLeftovers { kinds: vec![], discovery_failures: vec![], list_failures: vec![], kinds_checked: 84 };
+        assert!(render_ns_leftovers(&stuck, &empty).ends_with("NOTHING IS LEFT IN IT: only its own finalizers (kubernetes) remain, which the namespace controller removes once it has finished"));
+
+        let api = |name: &str, status: &str| -> k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": name }, "spec": { "service": { "namespace": "kube-system", "name": "metrics-server" } },
+                "status": { "conditions": [{ "type": "Available", "status": status, "reason": "FailedDiscoveryCheck", "message": "no response" }] } })).unwrap()
+        };
+        assert_eq!(render_ns_api_services(&Ok(vec![api("v1.apps", "True")])), "(all 1 APIServices are available)");
+        assert!(render_ns_api_services(&Ok(vec![api("v1.apps", "True"), api("v1beta1.metrics.k8s.io", "False")]))
+            .starts_with("APISERVICE NOT AVAILABLE: v1beta1.metrics.k8s.io Available=False (FailedDiscoveryCheck), served by kube-system/metrics-server"));
+    }
+
+    #[test]
+    fn a_namespaces_quotas_say_what_they_refuse() {
+        let quota = |hard: serde_json::Value, used: serde_json::Value| -> k8s_openapi::api::core::v1::ResourceQuota {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": "compute" }, "spec": { "hard": hard.clone() }, "status": { "hard": hard, "used": used } })).unwrap()
+        };
+        let limits = |v: serde_json::Value| -> k8s_openapi::api::core::v1::LimitRange { serde_json::from_value(serde_json::json!({ "metadata": { "name": "defaults" }, "spec": { "limits": [v] } })).unwrap() };
+        let q = quota(serde_json::json!({ "pods": "10", "requests.cpu": "4", "requests.memory": "8Gi" }), serde_json::json!({ "pods": "10", "requests.cpu": "3800m", "requests.memory": "2Gi" }));
+        assert_eq!(
+            render_ns_quotas(&Ok(vec![q.clone()]), &Ok(vec![])),
+            "compute:\n  \
+             pods: used 10 of 10 (100%) — EXHAUSTED: a new object asking for more is refused\n  \
+             requests.cpu: used 3800m of 4 (95%) — NEARLY EXHAUSTED\n  \
+             requests.memory: used 2Gi of 8Gi (25%)\n\
+             A QUOTA ON requests.cpu, requests.memory WITH NO LIMITRANGE DEFAULT FOR IT: a pod whose containers do not set them is refused"
+        );
+        let defaulted = Ok(vec![limits(serde_json::json!({ "type": "Container", "defaultRequest": { "cpu": "100m", "memory": "128Mi" }, "max": { "memory": "2Gi" } }))]);
+        assert!(!render_ns_quotas(&Ok(vec![q]), &defaulted).contains("NO LIMITRANGE DEFAULT"));
+        // Defaults are per resource, and a request default does not set a limit.
+        let partly = Ok(vec![limits(serde_json::json!({ "type": "Container", "defaultRequest": { "cpu": "100m" } }))]);
+        let both = quota(serde_json::json!({ "requests.cpu": "4", "requests.memory": "8Gi", "limits.cpu": "8" }), serde_json::json!({ "requests.cpu": "1", "requests.memory": "1Gi", "limits.cpu": "1" }));
+        assert!(render_ns_quotas(&Ok(vec![both]), &partly).ends_with("A QUOTA ON limits.cpu, requests.memory WITH NO LIMITRANGE DEFAULT FOR IT: a pod whose containers do not set them is refused"));
+        // Storage and object counts are not a pod's to declare, and every
+        // quantity suffix compares: 1k pods, a count/ key, 2Ti of storage.
+        let other = quota(
+            serde_json::json!({ "requests.storage": "2Ti", "pods": "1k", "count/csistoragecapacities.storage.k8s.io": "10" }),
+            serde_json::json!({ "requests.storage": "512Gi", "pods": "10", "count/csistoragecapacities.storage.k8s.io": "1" }),
+        );
+        assert_eq!(
+            render_ns_quotas(&Ok(vec![other]), &Ok(vec![])),
+            "compute:\n  \
+             count/csistoragecapacities.storage.k8s.io: used 1 of 10 (10%)\n  \
+             pods: used 10 of 1k (1%)\n  \
+             requests.storage: used 512Gi of 2Ti (25%)"
+        );
+        let scoped: k8s_openapi::api::core::v1::ResourceQuota = serde_json::from_value(serde_json::json!({ "metadata": { "name": "high" },
+            "spec": { "hard": { "pods": "2" }, "scopeSelector": { "matchExpressions": [{ "scopeName": "PriorityClass", "operator": "In", "values": ["high"] }] } },
+            "status": { "hard": { "pods": "2" }, "used": { "pods": "2" } } })).unwrap();
+        assert!(render_ns_quotas(&Ok(vec![scoped]), &Ok(vec![])).starts_with("high (only pods matching: PriorityClass In (high)):\n  pods: used 2 of 2 (100%) — EXHAUSTED"));
+        assert_eq!(render_ns_limit_ranges(&defaulted), "defaults (Container): defaultRequest cpu=100m, memory=128Mi; max memory=2Gi");
+        assert_eq!(render_ns_quotas(&Ok(vec![]), &Ok(vec![])), "(no ResourceQuota: nothing in it is capped)");
+        assert_eq!(render_ns_limit_ranges(&Ok(vec![])), "(none)");
+        let fresh = quota(serde_json::json!({ "pods": "10" }), serde_json::json!({}));
+        assert!(render_ns_quotas(&Ok(vec![fresh]), &Ok(vec![])).contains("pods: hard 10 (used not reported yet)"));
+    }
+
     #[test]
     fn a_volume_bound_elsewhere_or_pinned_to_a_zone_is_said() {
         let pv: k8s_openapi::api::core::v1::PersistentVolume = serde_json::from_value(serde_json::json!({
@@ -8609,6 +9394,95 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(built > 0, "no Job to diagnose");
         assert_eq!(unavailable, 0);
         assert_eq!(explained, unhealthy);
+    }
+
+    /// Builds a diagnosis for every PodDisruptionBudget on a live cluster.
+    /// Prints counts only.
+    ///
+    ///   PDB_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml pdb_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set PDB_DIAG_TEST_CONTEXT to run"]
+    async fn pdb_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("PDB_DIAG_TEST_CONTEXT") else { return };
+        let all = crate::resources::get_pdbs(&ctx).await.expect("pdbs");
+        let (mut built, mut unavailable, mut largest, mut blocks, mut listed_blocking) = (0, 0, 0, 0, 0);
+        let (mut no_pods, mut never, mut overlap, mut drain_waiting, mut unmanaged, mut count_mismatch) = (0, 0, 0, 0, 0, 0);
+        for b in &all {
+            let payload = build_pdb_diagnosis_payload(&ctx, &b.namespace, &b.name).await.expect("payload");
+            let p = &payload.prompt;
+            built += 1;
+            unavailable += p.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            blocks += p.contains("NO HEALTHY POD MAY BE EVICTED") as usize;
+            listed_blocking += (b.disruptions_allowed == 0 && b.expected_pods > 0) as usize;
+            no_pods += (p.contains("SELECTS NO PODS") || p.contains("NO SELECTOR:")) as usize;
+            never += p.contains("CAN NEVER ALLOW A DISRUPTION") as usize;
+            overlap += p.contains("OVERLAPS WITH") as usize;
+            drain_waiting += p.contains("A DRAIN IS WAITING") as usize;
+            unmanaged += p.contains("with no controller") as usize;
+            // The pods it covers, read here, against the controller's own count.
+            let read = p
+                .split("## Pods it covers\n")
+                .nth(1)
+                .and_then(|s| s.split(" pods, ").next())
+                .and_then(|n| n.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            count_mismatch += (read != b.expected_pods) as usize;
+        }
+        println!(
+            "pdbs={} built={built} unavailable_sections={unavailable} largest_tokens={largest} blocks={blocks} listed_blocking={listed_blocking} no_pods={no_pods} never={never} overlap={overlap} drain_waiting={drain_waiting} unmanaged={unmanaged} count_mismatch={count_mismatch}",
+            all.len()
+        );
+        assert!(built > 0, "no PodDisruptionBudget to diagnose");
+        assert_eq!(unavailable, 0);
+        assert_eq!(blocks, listed_blocking);
+    }
+
+    /// Builds a diagnosis for every namespace on a live cluster, and reads
+    /// what is in one active namespace the way a stuck one's is read, to
+    /// exercise per-group discovery. Prints counts only.
+    ///
+    ///   NAMESPACE_DIAG_TEST_CONTEXT=aks-dev-example \
+    ///   cargo test --manifest-path src-tauri/Cargo.toml namespace_diagnosis_against_a_live_cluster -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set NAMESPACE_DIAG_TEST_CONTEXT to run"]
+    async fn namespace_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("NAMESPACE_DIAG_TEST_CONTEXT") else { return };
+        let all = crate::resources::get_namespaces(&ctx).await.expect("namespaces");
+        let (mut built, mut unavailable, mut largest, mut terminating, mut quotas, mut exhausted, mut nearly, mut undeclared, mut limit_ranges, mut with_warnings) =
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        for n in &all {
+            let payload = build_namespace_diagnosis_payload(&ctx, &n.name).await.expect("payload");
+            let p = &payload.prompt;
+            built += 1;
+            unavailable += p.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            terminating += p.contains("TERMINATING since") as usize;
+            quotas += !p.contains("(no ResourceQuota") as usize;
+            exhausted += p.contains("— EXHAUSTED") as usize;
+            nearly += p.contains("NEARLY EXHAUSTED") as usize;
+            undeclared += p.contains("WITH NO LIMITRANGE DEFAULT FOR IT") as usize;
+            limit_ranges += !p.contains("## LimitRanges\n(none)") as usize;
+            with_warnings += !p.contains("(no Warning events in it)") as usize;
+        }
+        // What is left in a namespace, read as for a stuck one, on the first
+        // active namespace: discovery and listing work, nothing is changed.
+        let client = crate::kubeconfig::client_for_context(&ctx).await.expect("client");
+        let probe = all.iter().find(|n| n.status == "Active").map(|n| n.name.clone()).expect("an active namespace");
+        let l = k8s::namespace_leftovers(&client, &probe).await;
+        println!(
+            "namespaces={} built={built} unavailable_sections={unavailable} largest_tokens={largest} terminating={terminating} with_quota={quotas} exhausted={exhausted} nearly={nearly} undeclared={undeclared} with_limit_range={limit_ranges} with_warnings={with_warnings} probe_kinds_checked={} probe_kinds_with_objects={} probe_with_finalizers={} probe_discovery_failures={} probe_list_failures={}",
+            all.len(),
+            l.kinds_checked,
+            l.kinds.len(),
+            l.kinds.iter().filter(|k| !k.with_finalizers.is_empty()).count(),
+            l.discovery_failures.len(),
+            l.list_failures.len()
+        );
+        assert!(built > 0, "no namespace to diagnose");
+        assert_eq!(unavailable, 0);
+        assert!(l.kinds_checked > 20, "discovery found too few namespaced kinds");
     }
 
     /// Builds workload diagnoses for unhealthy workloads and checks the logs
