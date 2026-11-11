@@ -835,6 +835,11 @@ pub async fn get_service_accounts(context_name: String) -> Result<Vec<ServiceAcc
 }
 
 #[tauri::command]
+pub async fn get_jobs(context_name: String) -> Result<Vec<JobInfo>, String> {
+    with_retry(&context_name, || resources::get_jobs(&context_name)).await
+}
+
+#[tauri::command]
 pub async fn get_pdbs(context_name: String) -> Result<Vec<PdbInfo>, String> {
     with_retry(&context_name, || resources::get_pdbs(&context_name)).await
 }

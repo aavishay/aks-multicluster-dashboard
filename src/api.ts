@@ -47,6 +47,7 @@ import type {
   ResourceKind,
   ConfigMapInfo,
   PdbInfo,
+  JobInfo,
   SecretStoresResult,
   ServiceAccountInfo,
   ConfigMapEntry,
@@ -269,6 +270,7 @@ export const api = {
     invoke<EventInfo[]>("get_object_events", { contextName, kind, namespace, name, uid }),
   getServiceAccounts: (contextName: string) => invoke<ServiceAccountInfo[]>("get_service_accounts", { contextName }),
   getPdbs: (contextName: string) => invoke<PdbInfo[]>("get_pdbs", { contextName }),
+  getJobs: (contextName: string) => invoke<JobInfo[]>("get_jobs", { contextName }),
   getExternalSecretDetail: (contextName: string, namespace: string, name: string) =>
     invoke<ExternalSecretDetail>("get_external_secret_detail", { contextName, namespace, name }),
   getExternalSecretEvents: (contextName: string, namespace: string, name: string) =>

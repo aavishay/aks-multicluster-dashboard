@@ -22,6 +22,7 @@ import type {
   PodReference,
   ConfigMapInfo,
   PdbInfo,
+  JobInfo,
   SecretStoreInfo,
   SecretStoresResult,
   ServiceAccountInfo,
@@ -850,6 +851,7 @@ interface AppState {
   configmaps: Map<string, ConfigMapInfo[]>;
   serviceAccounts: Map<string, ServiceAccountInfo[]>;
   pdbs: Map<string, PdbInfo[]>;
+  jobs: Map<string, JobInfo[]>;
   secretStores: Map<string, SecretStoresResult>;
   keda: Map<string, KedaResult>;
   gitops: Map<string, GitOpsResult>;
@@ -984,6 +986,7 @@ const state: AppState = {
   configmaps: new Map(),
   serviceAccounts: new Map(),
   pdbs: new Map(),
+  jobs: new Map(),
   secretStores: new Map(),
   keda: new Map(),
   gitops: new Map(),
@@ -1876,6 +1879,7 @@ const TAB_GROUPS: { id: string; label: string; tabs: { id: TabId; label: string 
     tabs: [
       { id: "workloads", label: "Workloads" },
       { id: "pods", label: "Pods" },
+      { id: "jobs", label: "Jobs" },
       { id: "hpa", label: "HPA" },
       { id: "keda", label: "KEDA" },
       { id: "pdbs", label: "PDB" },
@@ -2168,6 +2172,9 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
     case "pdbs":
       state.pdbs.set(ctx, await api.getPdbs(ctx));
       break;
+    case "jobs":
+      state.jobs.set(ctx, await api.getJobs(ctx));
+      break;
     case "namespaces":
       state.namespaces.set(ctx, await api.getNamespaces(ctx));
       break;
@@ -2227,6 +2234,8 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
       return state.serviceAccounts.has(ctx);
     case "pdbs":
       return state.pdbs.has(ctx);
+    case "jobs":
+      return state.jobs.has(ctx);
     case "namespaces":
       return state.namespaces.has(ctx);
     case "services":
@@ -2540,6 +2549,7 @@ const TAB_PALETTE_INFO: Record<TabId, { hint: string; aliases: string[] }> = {
   secretstores: { hint: "Where ExternalSecrets read from", aliases: ["clustersecretstore", "store", "eso", "keyvault", "vault", "provider"] },
   serviceaccounts: { hint: "Workload identity and pull secrets", aliases: ["sa", "identity", "workload identity", "imagepullsecrets", "rbac"] },
   pdbs: { hint: "Pod disruption budgets, and what blocks a drain", aliases: ["poddisruptionbudget", "disruption", "drain", "eviction", "budget"] },
+  jobs: { hint: "Jobs and CronJobs: schedules, runs and failures", aliases: ["job", "cronjob", "cron", "batch", "schedule"] },
   cost: { hint: "Billing — not wired up yet", aliases: ["billing", "spend"] },
 };
 
@@ -2668,6 +2678,10 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
     case "pdbs":
       r = across(state.pdbs, (list) => n(list, (x) => !pdbIsHealthy(x)));
       label = "blocking evictions";
+      break;
+    case "jobs":
+      r = across(state.jobs, (list) => n(list, jobNeedsAttention));
+      label = "failed";
       break;
     case "namespaces":
       r = across(state.namespaces, (list) => n(list, (x) => !namespaceIsHealthy(x)));
@@ -5767,6 +5781,8 @@ function setMetricsRange(minutes: number) {
   selectTab,
   selectTabGroup,
   viewPodsForWorkload,
+  viewPodsForCronJob,
+  viewPodsForJob,
   viewPodsForNode,
   openPodDetail,
   closePodDetail,
@@ -7446,6 +7462,8 @@ function renderTabContentBody(): string {
       return renderServiceAccounts();
     case "pdbs":
       return renderPdbs();
+    case "jobs":
+      return renderJobs();
     case "namespaces":
       return renderNamespaces();
     case "services":
@@ -9811,7 +9829,9 @@ function renderPodOverviewView(pd: PodDetailState): string {
   const owner = ownerKind
     ? workloadKinds.has(ownerKind)
       ? `<button type="button" onclick="window.__app.openWorkloadDetail(${jsArg(ctx)},${jsArg(ownerKind)},${jsArg(namespace)},${jsArg(ownerName)})" class="text-series-blue hover:underline">${esc(ownerKind)}/${esc(ownerName)}</button>`
-      : `${esc(ownerKind)}/${esc(ownerName)}`
+      : ownerKind === "Job"
+        ? `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Job',${jsArg(namespace)},${jsArg(ownerName)})" class="text-series-blue hover:underline">${esc(ownerKind)}/${esc(ownerName)}</button>`
+        : `${esc(ownerKind)}/${esc(ownerName)}`
     : '<span class="text-ink-muted">none</span>';
 
   const facts = [
@@ -12257,6 +12277,8 @@ const PANEL_LINKABLE: Record<string, string> = {
   ExternalSecret: "external-secrets.io",
   ServiceAccount: "",
   PodDisruptionBudget: "policy",
+  Job: "batch",
+  CronJob: "batch",
   SecretStore: "external-secrets.io",
   ClusterSecretStore: "external-secrets.io",
   Node: "",
@@ -13715,6 +13737,110 @@ function renderPdbs(): string {
   });
 }
 
+/**
+ * A failed Job that is not a CronJob's run, or a CronJob whose newest run
+ * failed: what the badge counts. A CronJob's old failed runs stay red in the
+ * table but are counted once, through their CronJob.
+ */
+function jobNeedsAttention(j: JobInfo): boolean {
+  return !j.healthy && !j.owner.startsWith("CronJob/");
+}
+
+/** A run's length: seconds stay seconds. */
+function jobDuration(seconds: number | null): string {
+  return seconds === null ? "—" : formatSpan(seconds * 1000);
+}
+
+/** What a Job did: succeeded of desired, and failed attempts. */
+function jobCompletionsText(j: JobInfo): string {
+  if (j.kind === "CronJob") return j.jobs.length ? `${j.jobs.length} run${j.jobs.length === 1 ? "" : "s"} kept` : "no runs kept";
+  const done = j.completions === null ? `${j.succeeded} succeeded` : `${j.succeeded}/${j.completions}`;
+  return j.failed > 0 ? `${done} · ${j.failed} failed` : done;
+}
+
+function renderJobs(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; j: JobInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.jobs.get(ctx) ?? []).map((j) => ({ ctx, j })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No Jobs or CronJobs found.</div>`;
+  const rows = state.unhealthyOnly.jobs ? allRows.filter((r) => !r.j.healthy) : allRows;
+  // A CronJob's schedule, or what made a Job.
+  const detail = (j: JobInfo) => (j.kind === "CronJob" ? `${j.schedule}${j.time_zone ? ` (${j.time_zone})` : ""}` : j.owner);
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "kind", label: "Kind", value: (r) => r.j.kind, filter: "enum" },
+    { key: "namespace", label: "Namespace", value: (r) => r.j.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.j.name, filter: "string" },
+    { key: "status", label: "Status", value: (r) => r.j.status, filter: "enum" },
+    { key: "detail", label: "Schedule / owner", value: (r) => detail(r.j), filter: "string" },
+    { key: "completions", label: "Completions", value: (r) => (r.j.kind === "Job" ? r.j.succeeded : r.j.jobs.length), filter: "number", copyText: (r) => jobCompletionsText(r.j) },
+    {
+      key: "last",
+      label: "Last run",
+      value: (r) => r.j.last_schedule_time ?? "",
+      sortValue: (r) => (r.j.last_schedule_time ? Date.parse(r.j.last_schedule_time) : 0),
+      copyText: (r) => r.j.last_schedule_time ?? "",
+    },
+    { key: "duration", label: "Duration", value: (r) => r.j.duration_seconds ?? -1, filter: "number", copyText: (r) => jobDuration(r.j.duration_seconds) },
+    resourceAgeColumn((r) => r.j),
+  ];
+  return resourceTable({
+    tab: "jobs",
+    noun: "Jobs and CronJobs",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.j.kind}:${r.j.namespace}:${r.j.name}`,
+    health: { healthy: (r) => r.j.healthy, unhealthyLabel: "failed", statusText: (r) => r.j.failure_message ?? r.j.status },
+    renderRow: ({ ctx, j }) => `
+      <tr>
+        ${rowCheckboxCell("jobs", `${ctx}:${j.kind}:${j.namespace}:${j.name}`)}
+        <td title="${esc(j.failure_message ?? j.status)}">${statusDot(j.healthy, j.status === "Pending" || j.status === "Suspended")}</td>
+        ${multi ? resourceClusterCell("jobs", ctx) : ""}
+        <td class="text-ink-secondary">${esc(j.kind)}</td>
+        ${resourceNamespaceCell("jobs", j.namespace)}
+        ${resourceNameCell(ctx, j.kind, j.namespace, j.name)}
+        <td class="${j.healthy ? "" : "text-status-critical"}" title="${esc(j.failure_message ?? "")}">${esc(j.status)}</td>
+        <td class="truncate font-mono text-xs text-ink-secondary">${
+          j.kind === "Job" && j.owner.startsWith("CronJob/")
+            ? `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'CronJob',${jsArg(j.namespace)},${jsArg(j.owner.slice("CronJob/".length))})" class="hover:text-series-blue hover:underline">${esc(j.owner)}</button>`
+            : esc(detail(j)) || '<span class="text-ink-muted">—</span>'
+        }</td>
+        <td class="tabular">${esc(jobCompletionsText(j))}</td>
+        <td class="text-ink-secondary" title="${esc(timeTitle("Last scheduled", j.last_schedule_time))}">${j.last_schedule_time ? esc(relativeTime(j.last_schedule_time)) : '<span class="text-ink-muted">—</span>'}</td>
+        <td class="tabular">${esc(jobDuration(j.duration_seconds))}</td>
+        ${resourceAgeCell(j)}
+      </tr>`,
+  });
+}
+
+/** The Pods tab, filtered to a Job's pods, leaving its panel for Back to restore. */
+function viewPodsForJob(ctx: string, namespace: string, name: string) {
+  viewPodsForWorkload(ctx, "Job", namespace, name);
+  closeResourceDetail();
+}
+
+/** The Pods tab, filtered to a CronJob's runs: its pods are its Jobs'. */
+function viewPodsForCronJob(ctx: string, namespace: string, name: string) {
+  const cj = state.jobs.get(ctx)?.find((j) => j.kind === "CronJob" && j.namespace === namespace && j.name === name);
+  pushViewHistory(["pods"]);
+  // After the history entry, so Back reopens the panel; before the switch,
+  // so it does not cover the Pods table.
+  resourceDetailToken += 1;
+  state.resourceDetail = null;
+  state.yamlEdit = null;
+  state.filterState.pods = {
+    cluster: { enumValues: new Set([ctx]) },
+    namespace: { enumValues: new Set([namespace]) },
+    owner: { enumValues: new Set((cj?.jobs ?? []).map((job) => `Job/${job}`)) },
+  };
+  state.unhealthyOnly.pods = false;
+  state.activeTab = "pods";
+  render();
+  loadTabData();
+}
+
 function renderSecretStores(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
@@ -13844,6 +13970,8 @@ const RESOURCE_KIND_TAB: Record<ResourceKind, TabId> = {
   ConfigMap: "configmaps",
   ServiceAccount: "serviceaccounts",
   PodDisruptionBudget: "pdbs",
+  Job: "jobs",
+  CronJob: "jobs",
   SecretStore: "secretstores",
   ClusterSecretStore: "secretstores",
   Event: "events",
@@ -14164,6 +14292,60 @@ function renderResourceOverview(rd: ResourceDetailState): string {
     );
     if (p.reason) rows.push(overviewRow("Condition", `${esc(p.reason)}${p.message ? ` <span class="text-xs text-ink-muted">· ${esc(p.message)}</span>` : ""}`));
     rows.push(overviewRow("Created", created(p)));
+    return `${banner}<div>${rows.join("")}</div>`;
+  } else if (kind === "Job" || kind === "CronJob") {
+    const j = state.jobs.get(ctx)?.find((x) => x.kind === kind && x.namespace === namespace && x.name === name);
+    if (!j) return gone;
+    const banner = j.healthy
+      ? ""
+      : `<div class="mb-3 rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(j.failure_message ?? "Failed")}</div>`;
+    const when = (iso: string | null) => (iso ? `${esc(relativeTime(iso))} <span class="text-xs text-ink-muted">· ${esc(exactTime(iso).replace("\n", " · "))}</span>` : '<span class="text-ink-muted">never</span>');
+    rows.push(overviewRow("Status", `<span class="${j.healthy ? "" : "text-status-critical"}">${esc(j.status)}</span>`));
+    if (j.kind === "Job") {
+      rows.push(overviewRow("Completions", `<span class="tabular">${esc(jobCompletionsText(j))}</span>${j.active ? ` <span class="text-xs text-ink-muted">· ${j.active} running</span>` : ""}`));
+      rows.push(overviewRow("Duration", `<span class="tabular">${esc(jobDuration(j.duration_seconds))}</span>`));
+      if (j.owner) {
+        const [ownerKind, ownerName] = [j.owner.slice(0, j.owner.indexOf("/")), j.owner.slice(j.owner.indexOf("/") + 1)];
+        rows.push(
+          overviewRow(
+            "Made by",
+            ownerKind === "CronJob"
+              ? `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'CronJob',${jsArg(namespace)},${jsArg(ownerName)})" class="text-series-blue hover:underline">${esc(j.owner)}</button>`
+              : esc(j.owner),
+          ),
+        );
+      }
+      rows.push(
+        overviewRow(
+          "Pods",
+          `<button type="button" onclick="window.__app.viewPodsForJob(${jsArg(ctx)},${jsArg(namespace)},${jsArg(name)})" class="text-series-blue hover:underline">view its pods</button>`,
+        ),
+      );
+    } else {
+      rows.push(overviewRow("Schedule", `<span class="font-mono text-xs">${esc(j.schedule)}</span>${j.time_zone ? ` <span class="text-xs text-ink-muted">· ${esc(j.time_zone)}</span>` : ' <span class="text-xs text-ink-muted">· the controller\'s time zone</span>'}`));
+      if (j.suspend) rows.push(overviewRow("Suspended", '<span class="text-status-warning">yes — no new runs start</span>'));
+      rows.push(overviewRow("Last scheduled", when(j.last_schedule_time)));
+      rows.push(overviewRow("Last succeeded", when(j.last_successful_time)));
+      if (j.active) rows.push(overviewRow("Running", `<span class="tabular">${j.active}</span> run${j.active === 1 ? "" : "s"}`));
+      rows.push(overviewRow("Newest run took", `<span class="tabular">${esc(jobDuration(j.duration_seconds))}</span>`));
+      const runs = (state.jobs.get(ctx) ?? []).filter((x) => x.kind === "Job" && x.namespace === namespace && x.owner === `CronJob/${name}`);
+      const runRow = (job: string) => {
+        const r = runs.find((x) => x.name === job);
+        return `<div class="flex items-center gap-2">${r ? statusDot(r.healthy, r.status === "Pending" || r.status === "Suspended") : ""}<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Job',${jsArg(namespace)},${jsArg(job)})" class="text-series-blue hover:underline">${esc(job)}</button>${
+          r ? ` <span class="text-xs text-ink-muted">${esc(r.status)} · ${esc(jobDuration(r.duration_seconds))}</span>` : ""
+        }</div>`;
+      };
+      rows.push(overviewRow("Runs kept", j.jobs.length ? j.jobs.map(runRow).join("") : '<span class="text-ink-muted">none</span>'));
+      if (j.jobs.length) {
+        rows.push(
+          overviewRow(
+            "Pods",
+            `<button type="button" onclick="window.__app.viewPodsForCronJob(${jsArg(ctx)},${jsArg(namespace)},${jsArg(name)})" class="text-series-blue hover:underline">view its runs' pods</button>`,
+          ),
+        );
+      }
+    }
+    rows.push(overviewRow("Created", created(j)));
     return `${banner}<div>${rows.join("")}</div>`;
   } else if (kind === "SecretStore" || kind === "ClusterSecretStore") {
     const st = state.secretStores.get(ctx)?.stores.find((x) => x.kind === kind && x.namespace === namespace && x.name === name);
