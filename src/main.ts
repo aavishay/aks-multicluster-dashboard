@@ -2026,6 +2026,24 @@ async function refreshSidebarBadgesInner() {
 }
 
 /** Fetches one tab's data for one cluster and stores it in the matching cache Map — the one place that knows which API call backs which tab, shared by the foreground loader and the background prefetcher below. */
+/**
+ * One get_jobs per cluster at a time. Jobs, CronJobs, the background prefetch
+ * and a Job's or CronJob's panel all read the same list (a CronJob's row is
+ * worked out from its Jobs), so a read already under way is joined rather
+ * than repeated. A failed read is dropped like a finished one, so the next
+ * asks again.
+ */
+const jobsInFlight = new Map<string, Promise<JobInfo[]>>();
+
+function getJobsShared(ctx: string): Promise<JobInfo[]> {
+  let read = jobsInFlight.get(ctx);
+  if (!read) {
+    read = api.getJobs(ctx).finally(() => jobsInFlight.delete(ctx));
+    jobsInFlight.set(ctx, read);
+  }
+  return read;
+}
+
 async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
   switch (tab) {
     case "overview":
@@ -2175,8 +2193,7 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       break;
     case "jobs":
     case "cronjobs":
-      // One read lists both: a CronJob's row is worked out from its Jobs.
-      state.jobs.set(ctx, await api.getJobs(ctx));
+      state.jobs.set(ctx, await getJobsShared(ctx));
       break;
     case "namespaces":
       state.namespaces.set(ctx, await api.getNamespaces(ctx));
@@ -3114,11 +3131,23 @@ function goForwardView(): boolean {
   return true;
 }
 
+/** Tabs that each show part of one list, read once for all of them. */
+const SHARED_LIST_TABS: TabId[][] = [["jobs", "cronjobs"]];
+
+function sharesList(a: TabId, b: TabId): boolean {
+  return SHARED_LIST_TABS.some((g) => g.includes(a) && g.includes(b));
+}
+
 function selectTab(tab: TabId) {
   if (state.activeTab === tab) return;
+  const from = state.activeTab;
   pushViewHistory();
   state.activeTab = tab;
   render();
+  // A sibling showing the same list: what was just loaded, or is loading, is
+  // this tab's too. Auto-refresh and Refresh now still read it again, and a
+  // cluster whose read failed is read again here.
+  if (sharesList(from, tab) && (state.tabLoading || selectedContextsList().every((ctx) => tabHasDataForContext(tab, ctx)))) return;
   loadTabData();
 }
 
