@@ -76,7 +76,7 @@ fn conditions<C>(list: Option<&Vec<C>>, read: impl Fn(&C) -> PodConditionInfo) -
 }
 
 pub(crate) fn deployment_detail(d: &Deployment) -> WorkloadDetail {
-    let spec = d.spec.as_ref();
+    let spec = Some(&d.spec);
     let status = d.status.as_ref();
     let strategy = spec.and_then(|s| s.strategy.as_ref());
     let detail = WorkloadDetail {
@@ -99,8 +99,8 @@ pub(crate) fn deployment_detail(d: &Deployment) -> WorkloadDetail {
         observed_generation: status.and_then(|s| s.observed_generation).unwrap_or_default(),
         paused: spec.and_then(|s| s.paused).unwrap_or(false),
         conditions: conditions(status.and_then(|s| s.conditions.as_ref()), |c| PodConditionInfo {
-            condition_type: c.type_.clone(),
-            status: c.status.clone(),
+            condition_type: c.type_.clone().unwrap_or_default(),
+            status: c.status.clone().unwrap_or_default(),
             reason: c.reason.clone().unwrap_or_default(),
             message: c.message.clone().unwrap_or_default(),
             last_transition: created_at(&c.last_transition_time),
@@ -114,7 +114,7 @@ pub(crate) fn deployment_detail(d: &Deployment) -> WorkloadDetail {
 }
 
 pub(crate) fn statefulset_detail(s: &StatefulSet) -> WorkloadDetail {
-    let spec = s.spec.as_ref();
+    let spec = Some(&s.spec);
     let status = s.status.as_ref();
     let strategy = spec.and_then(|sp| sp.update_strategy.as_ref());
     let current = status.and_then(|st| st.current_revision.clone()).unwrap_or_default();
@@ -133,15 +133,15 @@ pub(crate) fn statefulset_detail(s: &StatefulSet) -> WorkloadDetail {
         revision: current,
         generation: s.metadata.generation.unwrap_or_default(),
         observed_generation: status.and_then(|st| st.observed_generation).unwrap_or_default(),
-        service_name: spec.map(|sp| sp.service_name.clone()).unwrap_or_default(),
+        service_name: spec.and_then(|sp| sp.service_name.clone()).unwrap_or_default(),
         pod_management_policy: spec.and_then(|sp| sp.pod_management_policy.clone()).unwrap_or_else(|| "OrderedReady".to_string()),
         volume_claim_templates: spec
             .and_then(|sp| sp.volume_claim_templates.as_ref())
             .map(|ts| ts.iter().filter_map(|t| t.metadata.name.clone()).collect())
             .unwrap_or_default(),
         conditions: conditions(status.and_then(|st| st.conditions.as_ref()), |c| PodConditionInfo {
-            condition_type: c.type_.clone(),
-            status: c.status.clone(),
+            condition_type: c.type_.clone().unwrap_or_default(),
+            status: c.status.clone().unwrap_or_default(),
             reason: c.reason.clone().unwrap_or_default(),
             message: c.message.clone().unwrap_or_default(),
             last_transition: created_at(&c.last_transition_time),
@@ -155,7 +155,7 @@ pub(crate) fn statefulset_detail(s: &StatefulSet) -> WorkloadDetail {
 }
 
 pub(crate) fn daemonset_detail(ds: &DaemonSet) -> WorkloadDetail {
-    let spec = ds.spec.as_ref();
+    let spec = Some(&ds.spec);
     let status = ds.status.as_ref();
     let strategy = spec.and_then(|s| s.update_strategy.as_ref());
     let detail = WorkloadDetail {
@@ -171,8 +171,8 @@ pub(crate) fn daemonset_detail(ds: &DaemonSet) -> WorkloadDetail {
         observed_generation: status.and_then(|s| s.observed_generation).unwrap_or_default(),
         misscheduled: status.map(|s| s.number_misscheduled).unwrap_or_default(),
         conditions: conditions(status.and_then(|s| s.conditions.as_ref()), |c| PodConditionInfo {
-            condition_type: c.type_.clone(),
-            status: c.status.clone(),
+            condition_type: c.type_.clone().unwrap_or_default(),
+            status: c.status.clone().unwrap_or_default(),
             reason: c.reason.clone().unwrap_or_default(),
             message: c.message.clone().unwrap_or_default(),
             last_transition: created_at(&c.last_transition_time),
@@ -222,7 +222,7 @@ mod tests {
                 annotations: Some(BTreeMap::from([("deployment.kubernetes.io/revision".to_string(), "12".to_string())])),
                 ..Default::default()
             },
-            spec: Some(DeploymentSpec {
+            spec: DeploymentSpec {
                 selector: LabelSelector {
                     match_labels: Some(BTreeMap::from([("app".to_string(), "api".to_string())])),
                     match_expressions: Some(vec![LabelSelectorRequirement {
@@ -240,12 +240,12 @@ mod tests {
                 }),
                 template: template(&[("app", "api"), ("tier", "web")]),
                 ..Default::default()
-            }),
+            },
             status: Some(DeploymentStatus {
                 observed_generation: Some(6),
                 conditions: Some(vec![DeploymentCondition {
-                    type_: "Progressing".into(),
-                    status: "False".into(),
+                    type_: Some("Progressing".into()),
+                    status: Some("False".into()),
                     reason: Some("ProgressDeadlineExceeded".into()),
                     ..Default::default()
                 }]),
@@ -266,8 +266,8 @@ mod tests {
     fn statefulset_revisions_claim_templates_and_partition() {
         let s = StatefulSet {
             metadata: ObjectMeta::default(),
-            spec: Some(StatefulSetSpec {
-                service_name: "db-headless".into(),
+            spec: StatefulSetSpec {
+                service_name: Some("db-headless".into()),
                 update_strategy: Some(StatefulSetUpdateStrategy {
                     type_: Some("RollingUpdate".into()),
                     rolling_update: Some(RollingUpdateStatefulSetStrategy { partition: Some(2), ..Default::default() }),
@@ -278,7 +278,7 @@ mod tests {
                 }]),
                 template: template(&[("app", "db")]),
                 ..Default::default()
-            }),
+            },
             status: Some(StatefulSetStatus {
                 current_revision: Some("db-5d".into()),
                 update_revision: Some("db-6f".into()),
@@ -296,11 +296,11 @@ mod tests {
     fn daemonset_on_delete_and_misscheduled() {
         let ds = DaemonSet {
             metadata: ObjectMeta::default(),
-            spec: Some(DaemonSetSpec {
+            spec: DaemonSetSpec {
                 update_strategy: Some(k8s_openapi::api::apps::v1::DaemonSetUpdateStrategy { type_: Some("OnDelete".into()), ..Default::default() }),
                 template: template(&[("app", "agent")]),
                 ..Default::default()
-            }),
+            },
             status: Some(DaemonSetStatus { number_misscheduled: 1, ..Default::default() }),
         };
         let w = daemonset_detail(&ds);

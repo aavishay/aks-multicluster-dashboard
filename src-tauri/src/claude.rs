@@ -6,6 +6,7 @@
 //! and runs everything through `redact`) and it should not change when a
 //! provider is added.
 
+use crate::k8s::Chrono;
 use crate::ai;
 use crate::models::{ClaudeDiagnosisPayload, PodInfo};
 use crate::{k8s, redact};
@@ -888,7 +889,7 @@ fn split_node_conditions(
                 line.push_str(&format!(" ({reason})"));
             }
             if let Some(at) = c.last_transition_time.as_ref() {
-                line.push_str(&format!(" since {}", at.0.to_rfc3339()));
+                line.push_str(&format!(" since {}", at.0.utc().to_rfc3339()));
             }
             if let Some(message) = c.message.as_deref().filter(|m| !m.is_empty()) {
                 line.push_str(&format!("\n  {message}"));
@@ -1241,7 +1242,7 @@ fn render_nap_claims(
                 .and_then(|c| c.iter().find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready")))
                 .and_then(|c| c.get("status").and_then(|s| s.as_str()))
                 == Some("True");
-            let deleting = c.metadata.deletion_timestamp.as_ref().map(|t| t.0.to_rfc3339());
+            let deleting = c.metadata.deletion_timestamp.as_ref().map(|t| t.0.utc().to_rfc3339());
             let mut line = format!(
                 "{}  {}  {}  {}",
                 c.metadata.name.clone().unwrap_or_default(),
@@ -1250,7 +1251,7 @@ fn render_nap_claims(
                 label("topology.kubernetes.io/zone"),
             );
             if let Some(created) = c.metadata.creation_timestamp.as_ref() {
-                line.push_str(&format!("  created {}", created.0.to_rfc3339()));
+                line.push_str(&format!("  created {}", created.0.utc().to_rfc3339()));
             }
             if let Some(at) = &deleting {
                 line.push_str(&format!("  TERMINATING since {at}"));
@@ -2252,7 +2253,7 @@ fn render_keda_health(
                     d.metadata.namespace.clone().unwrap_or_default(),
                     d.metadata.name.clone().unwrap_or_default(),
                     status.ready_replicas.unwrap_or(0),
-                    d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1)
+                    d.spec.replicas.unwrap_or(1)
                 )
             })
             .collect(),
@@ -2279,7 +2280,7 @@ fn render_keda_jobs(jobs: &Result<Vec<k8s_openapi::api::batch::v1::Job>, String>
     let (failed, complete) = (jobs.iter().filter(|j| finished(j, "Failed").is_some()).count(), jobs.iter().filter(|j| finished(j, "Complete").is_some()).count());
     let mut out = format!("{} Job(s): {complete} complete, {failed} failed, {} running", jobs.len(), jobs.len() - complete - failed);
     for j in jobs.iter().take(DIAGNOSE_KEDA_JOBS) {
-        let created = j.metadata.creation_timestamp.as_ref().map(|t| t.0.to_rfc3339()).unwrap_or_default();
+        let created = j.metadata.creation_timestamp.as_ref().map(|t| t.0.utc().to_rfc3339()).unwrap_or_default();
         let state = match (finished(j, "Failed"), finished(j, "Complete")) {
             (Some(c), _) => format!("Failed ({}): {}", c.reason.unwrap_or_default(), c.message.unwrap_or_default()),
             (_, Some(_)) => "Complete".to_string(),
@@ -2476,7 +2477,7 @@ fn render_service_endpoints(slices: &Result<Vec<k8s_openapi::api::discovery::v1:
         Ok(s) => s,
         Err(e) => return format!("(EndpointSlices unavailable: {e})"),
     };
-    let endpoints: Vec<&k8s_openapi::api::discovery::v1::Endpoint> = slices.iter().flat_map(|s| s.endpoints.iter()).collect();
+    let endpoints: Vec<&k8s_openapi::api::discovery::v1::Endpoint> = slices.iter().flat_map(|s| s.endpoints.iter().flatten()).collect();
     if endpoints.is_empty() {
         return if slices.is_empty() && !has_selector {
             "(no EndpointSlices: nothing has written any for this selector-less Service, so it routes nowhere)".to_string()
@@ -3208,9 +3209,9 @@ fn render_ingress_backends(ing: &k8s_openapi::api::networking::v1::Ingress, back
                             None => true,
                         })
                         .collect();
-                    let endpoints: Vec<&k8s_openapi::api::discovery::v1::Endpoint> = serving.iter().flat_map(|s| s.endpoints.iter()).collect();
+                    let endpoints: Vec<&k8s_openapi::api::discovery::v1::Endpoint> = serving.iter().flat_map(|s| s.endpoints.iter().flatten()).collect();
                     let ready = endpoints.iter().filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)).count();
-                    let all: usize = slices.iter().map(|s| s.endpoints.len()).sum();
+                    let all: usize = slices.iter().map(|s| s.endpoints.as_ref().map_or(0, Vec::len)).sum();
                     match (ready, endpoints.len()) {
                         (0, 0) if all > 0 => line.push_str(&format!("; NO ENDPOINT SERVES THIS PORT ({all} endpoints serve its other ports — the target port resolves on none of the pods)")),
                         (0, 0) => line.push_str("; NO ENDPOINTS — nothing is behind it"),
@@ -3705,7 +3706,7 @@ fn render_pvc_attachments(attachments: &Result<Vec<k8s_openapi::api::storage::v1
             );
             for (what, err) in [("attach", &status.attach_error), ("detach", &status.detach_error)] {
                 if let Some(e) = err {
-                    line.push_str(&format!("\n  {what} error{}: {}", e.time.as_ref().map(|t| format!(" at {}", t.0.to_rfc3339())).unwrap_or_default(), e.message.as_deref().unwrap_or_default()));
+                    line.push_str(&format!("\n  {what} error{}: {}", e.time.as_ref().map(|t| format!(" at {}", t.0.utc().to_rfc3339())).unwrap_or_default(), e.message.as_deref().unwrap_or_default()));
                 }
             }
             line
@@ -3827,10 +3828,10 @@ fn render_ns_status(ns: &k8s_openapi::api::core::v1::Namespace, now: chrono::Dat
         lines.push(format!("metadata.finalizers: {}", meta_finalizers.join(", ")));
     }
     if let Some(t) = &ns.metadata.deletion_timestamp {
-        let mins = (now - t.0).num_minutes();
+        let mins = (now - t.0.utc()).num_minutes();
         lines.push(format!(
             "TERMINATING since {} ({})",
-            t.0.to_rfc3339(),
+            t.0.utc().to_rfc3339(),
             if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }
         ));
     }
@@ -4374,7 +4375,7 @@ fn diagnosis_pod_priority(p: &PodInfo) -> (bool, bool, i32) {
 /// A StatefulSet's replica counts, revisions and update strategy, and
 /// whether a rollout is under way and what governs its pace.
 fn render_sts_spec(sts: &k8s_openapi::api::apps::v1::StatefulSet) -> String {
-    let spec = sts.spec.clone().unwrap_or_default();
+    let spec = sts.spec.clone();
     let status = sts.status.clone().unwrap_or_default();
     let desired = spec.replicas.unwrap_or(1);
     let mut lines = vec![format!(
@@ -4440,7 +4441,7 @@ fn render_sts_spec(sts: &k8s_openapi::api::apps::v1::StatefulSet) -> String {
 
 /// The desired ordinals: from `ordinals.start`, `replicas` of them.
 fn sts_ordinals(sts: &k8s_openapi::api::apps::v1::StatefulSet) -> std::ops::Range<i32> {
-    let spec = sts.spec.as_ref();
+    let spec = Some(&sts.spec);
     let start = spec.and_then(|s| s.ordinals.as_ref()).and_then(|o| o.start).unwrap_or(0);
     start..start + spec.and_then(|s| s.replicas).unwrap_or(1)
 }
@@ -4462,7 +4463,7 @@ fn render_sts_ordinals(
     let current = status.current_revision.unwrap_or_default();
     let update = status.update_revision.unwrap_or_default();
     let rolling = update != current && !update.is_empty() && !current.is_empty();
-    let spec = sts.spec.clone().unwrap_or_default();
+    let spec = sts.spec.clone();
     let ordered = spec.pod_management_policy.as_deref().unwrap_or("OrderedReady") == "OrderedReady";
     let on_delete = spec.update_strategy.as_ref().and_then(|u| u.type_.as_deref()) == Some("OnDelete");
     let partition = spec.update_strategy.as_ref().and_then(|u| u.rolling_update.as_ref()).and_then(|r| r.partition).unwrap_or(0);
@@ -4517,8 +4518,8 @@ fn render_sts_ordinals(
             }
         }
         if let Some(t) = p.metadata.deletion_timestamp.as_ref() {
-            let mins = (now - t.0).num_minutes();
-            line.push_str(&format!("; TERMINATING since {} ({})", t.0.to_rfc3339(), if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }));
+            let mins = (now - t.0.utc()).num_minutes();
+            line.push_str(&format!("; TERMINATING since {} ({})", t.0.utc().to_rfc3339(), if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }));
             if let Some(why) = bad_node {
                 findings.push(format!(
                     "{pod_name} IS STUCK TERMINATING ON A NODE THAT IS {why}: a StatefulSet never runs two pods with one identity, so it does not recreate {pod_name} until the pod object is gone"
@@ -4604,7 +4605,7 @@ fn render_sts_claims(
     claims: &Result<Vec<k8s_openapi::api::core::v1::PersistentVolumeClaim>, String>,
     pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
 ) -> String {
-    let templates = sts.spec.as_ref().and_then(|s| s.volume_claim_templates.clone()).unwrap_or_default();
+    let templates = sts.spec.volume_claim_templates.clone().unwrap_or_default();
     if templates.is_empty() {
         return "(no volumeClaimTemplates: its pods keep no volume of their own)".to_string();
     }
@@ -4688,14 +4689,13 @@ fn render_sts_service(
     service: &Option<Result<Option<k8s_openapi::api::core::v1::Service>, String>>,
     pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
 ) -> String {
-    let spec = sts.spec.clone().unwrap_or_default();
+    let service_name = sts.spec.service_name.clone().unwrap_or_default();
     let svc = match service {
         None => return "(serviceName is empty: its pods get no per-pod DNS names)".to_string(),
         Some(Err(e)) => return format!("(Service unavailable: {e})"),
         Some(Ok(None)) => {
             return format!(
-                "GOVERNING SERVICE {} DOES NOT EXIST: the pods run, but get no per-pod DNS names (<pod>.{})",
-                spec.service_name, spec.service_name
+                "GOVERNING SERVICE {service_name} DOES NOT EXIST: the pods run, but get no per-pod DNS names (<pod>.{service_name})"
             )
         }
         Some(Ok(Some(s))) => s,
@@ -4704,7 +4704,7 @@ fn render_sts_service(
     let ip = s_spec.cluster_ip.clone().unwrap_or_default();
     let mut lines = vec![format!(
         "{}: {}",
-        spec.service_name,
+        service_name,
         if ip == "None" { "headless".to_string() } else { format!("NOT HEADLESS (clusterIP {ip}): per-pod DNS names exist only for a headless Service") }
     )];
     // Checked against the pods' own labels: a selector may use one the
@@ -4756,6 +4756,8 @@ fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBud
         .map(|(b, covered)| {
             let spec = b.spec.clone().unwrap_or_default();
             let st = b.status.clone().unwrap_or_default();
+            let (healthy, desired, expected, allowed) =
+                (st.current_healthy.unwrap_or(0), st.desired_healthy.unwrap_or(0), st.expected_pods.unwrap_or(0), st.disruptions_allowed.unwrap_or(0));
             let limit = match (&spec.min_available, &spec.max_unavailable) {
                 (Some(m), _) => format!("minAvailable {}", int_or_string(m)),
                 (_, Some(m)) => format!("maxUnavailable {}", int_or_string(m)),
@@ -4764,14 +4766,14 @@ fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBud
             // No disruption allowed stops the eviction of healthy pods; an
             // unready one may still go, as its unhealthyPodEvictionPolicy says.
             // A budget over no pods blocks nothing, whatever it allows.
-            let blocks = if st.disruptions_allowed > 0 || st.expected_pods == 0 {
+            let blocks = if allowed > 0 || expected == 0 {
                 String::new()
             } else {
                 let unready = match spec.unhealthy_pod_eviction_policy.as_deref() {
                     Some("AlwaysAllow") => "a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy AlwaysAllow)".to_string(),
                     policy => {
                         let policy = if policy.is_some() { "IfHealthyBudget" } else { "IfHealthyBudget, the default" };
-                        if st.current_healthy >= st.desired_healthy {
+                        if healthy >= desired {
                             format!("the budget is met, so a running pod that is not ready can still be evicted (unhealthyPodEvictionPolicy {policy})")
                         } else {
                             format!("the budget is not met, so a running pod that is not ready cannot be evicted either (unhealthyPodEvictionPolicy {policy})")
@@ -4788,10 +4790,7 @@ fn render_pdbs(pdbs: &Result<Vec<(k8s_openapi::api::policy::v1::PodDisruptionBud
                     Some([]) => "no pods".to_string(),
                     Some(c) => sts_pod_list(c),
                 },
-                st.current_healthy,
-                st.expected_pods,
-                st.desired_healthy,
-                st.disruptions_allowed,
+                healthy, expected, desired, allowed,
             )
         })
         .collect();
@@ -4875,11 +4874,11 @@ fn render_job(job: &k8s_openapi::api::batch::v1::Job, now: chrono::DateTime<chro
         status.succeeded.unwrap_or(0),
         status.failed.unwrap_or(0)
     ));
-    let start = status.start_time.as_ref().map(|t| t.0);
+    let start = status.start_time.as_ref().map(|t| t.0.utc());
     let conditions: Vec<&k8s_openapi::api::batch::v1::JobCondition> = status.conditions.iter().flatten().filter(|c| c.status == "True").collect();
     let failed = conditions.iter().find(|c| c.type_ == "Failed");
     let complete = conditions.iter().any(|c| c.type_ == "Complete");
-    let end = status.completion_time.as_ref().map(|t| t.0).or_else(|| failed.and_then(|c| c.last_transition_time.as_ref()).map(|t| t.0));
+    let end = status.completion_time.as_ref().map(|t| t.0.utc()).or_else(|| failed.and_then(|c| c.last_transition_time.as_ref()).map(|t| t.0.utc()));
     match (start, end) {
         (Some(s), Some(e)) => lines.push(format!("started {}, finished after {}", s.to_rfc3339(), job_span((e - s).num_seconds()))),
         (Some(s), None) => lines.push(format!("started {}, running for {}", s.to_rfc3339(), job_span((now - s).num_seconds()))),
@@ -4985,7 +4984,7 @@ fn render_job_attempts(pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, Strin
             parts.push(format!("on {n}"));
         }
         if let Some(t) = &st.start_time {
-            parts.push(format!("started {}", t.0.to_rfc3339()));
+            parts.push(format!("started {}", t.0.utc().to_rfc3339()));
         }
         if i < SHOWN {
             lines.push(format!("{}: {}", p.metadata.name.as_deref().unwrap_or_default(), parts.join("; ")));
@@ -5016,7 +5015,7 @@ fn render_cronjob(
     runs: Option<&Result<Vec<k8s_openapi::api::batch::v1::Job>, String>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
-    let spec = cj.spec.clone().unwrap_or_default();
+    let spec = cj.spec.clone();
     let status = cj.status.clone().unwrap_or_default();
     let policy = spec.concurrency_policy.clone().unwrap_or_else(|| "Allow".into());
     let mut lines = vec![format!(
@@ -5027,7 +5026,7 @@ fn render_cronjob(
         spec.successful_jobs_history_limit.unwrap_or(3),
         spec.failed_jobs_history_limit.unwrap_or(1),
     )];
-    let ago = |t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time| format!("{} ({} ago)", t.0.to_rfc3339(), job_span((now - t.0).num_seconds()));
+    let ago = |t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time| format!("{} ({} ago)", t.0.utc().to_rfc3339(), job_span((now - t.0.utc()).num_seconds()));
     lines.push(format!("last scheduled: {}", status.last_schedule_time.as_ref().map(ago).unwrap_or_else(|| "never".into())));
     lines.push(format!("last succeeded: {}", status.last_successful_time.as_ref().map(ago).unwrap_or_else(|| "never".into())));
     let active: Vec<String> = status.active.iter().flatten().filter_map(|r| r.name.clone()).collect();
@@ -5059,7 +5058,7 @@ fn render_cronjob(
                         (_, Some(d)) => format!(" after {}", job_span(d)),
                         _ => String::new(),
                     },
-                    j.metadata.creation_timestamp.as_ref().map(|t| t.0.to_rfc3339()).unwrap_or_default()
+                    j.metadata.creation_timestamp.as_ref().map(|t| t.0.utc().to_rfc3339()).unwrap_or_default()
                 ));
                 if let Some(m) = &info.failure_message {
                     lines.push(format!("    {}", m.chars().take(300).collect::<String>()));
@@ -5463,7 +5462,7 @@ fn render_es_controller(controller: &Result<Vec<k8s_openapi::api::apps::v1::Depl
         Ok(d) => d
             .iter()
             .map(|d| {
-                let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+                let want = d.spec.replicas.unwrap_or(1);
                 let ready = d.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0);
                 let name = format!("{}/{}", d.metadata.namespace.as_deref().unwrap_or_default(), d.metadata.name.as_deref().unwrap_or_default());
                 if ready < want.max(1) {
@@ -5587,7 +5586,7 @@ fn render_sts_sections(d: &k8s::StatefulSetDiagnostics, now: chrono::DateTime<ch
 /// A DaemonSet's node counts, update strategy and latest revision, and
 /// whether a rollout is under way.
 fn render_ds_spec(ds: &k8s_openapi::api::apps::v1::DaemonSet, latest: &Result<Option<String>, String>) -> String {
-    let spec = ds.spec.clone().unwrap_or_default();
+    let spec = ds.spec.clone();
     let status = ds.status.clone().unwrap_or_default();
     let desired = status.desired_number_scheduled;
     let updated = status.updated_number_scheduled.unwrap_or(0);
@@ -5656,7 +5655,7 @@ fn render_ds_nodes(
         Ok(p) => p,
         Err(e) => return format!("(pods unavailable: {e})"),
     };
-    let spec = ds.spec.clone().unwrap_or_default();
+    let spec = ds.spec.clone();
     let template = spec.template.spec.clone().unwrap_or_default();
     let latest = latest.as_ref().ok().cloned().flatten();
     let rolling_update = spec.update_strategy.as_ref().and_then(|u| u.type_.as_deref()).unwrap_or("RollingUpdate") == "RollingUpdate";
@@ -5808,8 +5807,8 @@ fn render_ds_nodes(
             line.push_str(&format!("; UNSCHEDULABLE: {msg}"));
         }
         if let Some(t) = p.metadata.deletion_timestamp.as_ref() {
-            let mins = (now - t.0).num_minutes();
-            line.push_str(&format!("; TERMINATING since {} ({})", t.0.to_rfc3339(), if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }));
+            let mins = (now - t.0.utc()).num_minutes();
+            line.push_str(&format!("; TERMINATING since {} ({})", t.0.utc().to_rfc3339(), if mins < 1 { "under a minute".to_string() } else { format!("{mins} min") }));
             if !note.is_empty() && note != " (node cordoned)" {
                 stuck.push((pod_name.to_string(), if note.contains("NO LONGER") { "GONE" } else { "NOT READY" }));
             }
@@ -5904,7 +5903,7 @@ fn render_ds_sections(d: &k8s::DaemonSetDiagnostics, now: chrono::DateTime<chron
 /// A Deployment's replica counts, strategy and conditions, and what its
 /// conditions say about its rollout.
 fn render_deploy_spec(dep: &k8s_openapi::api::apps::v1::Deployment) -> String {
-    let spec = dep.spec.clone().unwrap_or_default();
+    let spec = dep.spec.clone();
     let status = dep.status.clone().unwrap_or_default();
     let mut lines = vec![format!(
         "replicas: desired {}, updated {}, ready {}, available {}, unavailable {}",
@@ -5943,14 +5942,14 @@ fn render_deploy_spec(dep: &k8s_openapi::api::apps::v1::Deployment) -> String {
     let conditions = status.conditions.unwrap_or_default();
     for c in &conditions {
         let message: String = c.message.as_deref().unwrap_or_default().chars().take(300).collect();
-        lines.push(format!("condition {}={}{}{}", c.type_, c.status, c.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default(), if message.is_empty() { String::new() } else { format!(": {message}") }));
+        lines.push(format!("condition {}={}{}{}", c.type_.as_deref().unwrap_or("?"), c.status.as_deref().unwrap_or("?"), c.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default(), if message.is_empty() { String::new() } else { format!(": {message}") }));
     }
-    if conditions.iter().any(|c| c.type_ == "Progressing" && c.status == "False" && c.reason.as_deref() == Some("ProgressDeadlineExceeded")) {
+    if conditions.iter().any(|c| c.type_.as_deref() == Some("Progressing") && c.status.as_deref() == Some("False") && c.reason.as_deref() == Some("ProgressDeadlineExceeded")) {
         lines.push(format!(
             "ROLLOUT EXCEEDED ITS PROGRESS DEADLINE: it has not progressed for {deadline}s; this marks it failed, and the controller still keeps trying"
         ));
     }
-    if let Some(c) = conditions.iter().find(|c| c.type_ == "ReplicaFailure" && c.status == "True") {
+    if let Some(c) = conditions.iter().find(|c| c.type_.as_deref() == Some("ReplicaFailure") && c.status.as_deref() == Some("True")) {
         // The reason says which way it failed: FailedCreate or FailedDelete.
         lines.push(format!(
             "REPLICA FAILURE: {}: {}",
@@ -5979,7 +5978,7 @@ fn render_deploy_replicasets(
         Ok(r) => r,
         Err(e) => return format!("(ReplicaSets unavailable: {e})"),
     };
-    let spec = dep.spec.clone().unwrap_or_default();
+    let spec = dep.spec.clone();
     let desired = spec.replicas.unwrap_or(1);
     let recreate = spec.strategy.as_ref().and_then(|s| s.type_.as_deref()) == Some("Recreate");
     // Ready and total pods of a ReplicaSet, from its pods as read.
@@ -5996,7 +5995,7 @@ fn render_deploy_replicasets(
     // Its replica counts leave out pods that are terminating, so an old
     // ReplicaSet at zero may still own some; it is shown while it does.
     let holds = |rs: &k8s_openapi::api::apps::v1::ReplicaSet| {
-        rs.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0) > 0
+        rs.spec.replicas.unwrap_or(0) > 0
             || rs.status.as_ref().is_some_and(|s| s.replicas > 0)
             || pods_of(rs).is_some_and(|(_, total)| total > 0)
     };
@@ -6016,8 +6015,8 @@ fn render_deploy_replicasets(
         let st = rs.status.clone().unwrap_or_default();
         let images: Vec<String> = rs
             .spec
+            .template
             .as_ref()
-            .and_then(|s| s.template.as_ref())
             .and_then(|t| t.spec.as_ref())
             .map(|s| s.containers.iter().filter_map(|c| c.image.clone()).collect())
             .unwrap_or_default();
@@ -6026,7 +6025,7 @@ fn render_deploy_replicasets(
             rs.metadata.name.as_deref().unwrap_or_default(),
             k8s::rs_revision(rs),
             if i == 0 { " (newest)" } else { "" },
-            rs.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0),
+            rs.spec.replicas.unwrap_or(0),
             st.ready_replicas.unwrap_or(0),
             st.available_replicas.unwrap_or(0)
         );
@@ -6036,7 +6035,7 @@ fn render_deploy_replicasets(
         if !images.is_empty() {
             line.push_str(&format!("; images {}", images.join(", ")));
         }
-        if let Some(c) = st.conditions.iter().flatten().find(|c| c.type_ == "ReplicaFailure" && c.status == "True") {
+        if let Some(c) = st.conditions.iter().flatten().find(|c| c.type_.as_deref() == Some("ReplicaFailure") && c.status.as_deref() == Some("True")) {
             let message = c.message.as_deref().unwrap_or("(no message)");
             let reason = c.reason.as_deref().unwrap_or("no reason");
             line.push_str(&format!("; REPLICA FAILURE ({reason}): {message}"));
@@ -6102,7 +6101,7 @@ fn render_deploy_hpas(hpas: &Result<Vec<k8s_openapi::api::autoscaling::v2::Horiz
     let mut lines: Vec<String> = hpas
         .iter()
         .map(|h| {
-            let spec = h.spec.clone().unwrap_or_default();
+            let spec = h.spec.clone();
             let st = h.status.clone().unwrap_or_default();
             let keda = h
                 .metadata
@@ -6206,7 +6205,7 @@ fn render_pdb_pods(
         Ok(p) => p,
         Err(e) => return format!("(pods unavailable: {e})"),
     };
-    let allowed = pdb.status.as_ref().map(|s| s.disruptions_allowed).unwrap_or(0);
+    let allowed = pdb.status.as_ref().and_then(|s| s.disruptions_allowed).unwrap_or(0);
     let mut lines = vec![format!("{} pods, {} ready", pods.len(), pods.iter().filter(|p| pod_is_ready(p)).count())];
     let mut cordoned: Vec<String> = Vec::new();
     for (i, p) in pods.iter().enumerate() {
@@ -7447,7 +7446,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         .unwrap();
         if deleting {
             obj.metadata.deletion_timestamp =
-                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()));
+                Some(crate::k8s::k8s_time(chrono::Utc::now()));
         }
         obj
     }
@@ -7836,7 +7835,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
     #[test]
     fn a_missing_scale_means_a_missing_target_only_when_the_target_is_missing_too() {
         let not_found = || {
-            kube::Error::Api(kube::core::ErrorResponse { status: "Failure".into(), message: "not found".into(), reason: "NotFound".into(), code: 404 })
+            kube::Error::Api(Box::new(kube::core::Status::failure("not found", "NotFound").with_code(404)))
         };
         let gone: Result<kube::api::DynamicObject, String> = Err("Rollout 'r' does not exist".into());
         assert_eq!(k8s::scale_error("Rollout", "r", &gone, not_found()), "Rollout 'r' does not exist");

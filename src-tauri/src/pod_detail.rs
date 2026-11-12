@@ -228,7 +228,7 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
 
     fn t(s: &str) -> Time {
-        Time(chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc))
+        crate::k8s::k8s_time(chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc))
     }
 
     #[test]

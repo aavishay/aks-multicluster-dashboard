@@ -9,7 +9,7 @@
 //! match instead, the same way the CRD-backed panels do, so all five kinds
 //! share one implementation rather than five near-copies.
 
-use crate::k8s::{age_days, age_seconds, created_at, event_to_info, list_events_sorted, object_manifest};
+use crate::k8s::{age_days, age_seconds, created_at, event_to_info, list_events_sorted, object_manifest, Chrono};
 use crate::kubeconfig::client_for_context;
 use crate::models::{
     ConfigMapEntry, ConfigMapInfo, ConfigMapKeyInfo, EventInfo, IngressInfo, IngressRuleInfo, JobInfo, NamespaceInfo, ObjectManifest,
@@ -142,7 +142,7 @@ pub(crate) fn endpoint_counts(slices: &[EndpointSlice]) -> HashMap<(String, Stri
         };
         let ns = slice.metadata.namespace.clone().unwrap_or_default();
         let entry = out.entry((ns, service.clone())).or_default();
-        for ep in &slice.endpoints {
+        for ep in slice.endpoints.iter().flatten() {
             entry.1 += 1;
             if ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true) {
                 entry.0 += 1;
@@ -451,10 +451,10 @@ pub(crate) fn pdb_info(pdb: PodDisruptionBudget) -> PdbInfo {
         min_available: spec.and_then(|s| s.min_available.as_ref()).map(int_or_string),
         max_unavailable: spec.and_then(|s| s.max_unavailable.as_ref()).map(int_or_string),
         selector: selector_terms(spec.and_then(|s| s.selector.as_ref())),
-        current_healthy: status.map_or(0, |s| s.current_healthy),
-        desired_healthy: status.map_or(0, |s| s.desired_healthy),
-        expected_pods: status.map_or(0, |s| s.expected_pods),
-        disruptions_allowed: status.map_or(0, |s| s.disruptions_allowed),
+        current_healthy: status.and_then(|s| s.current_healthy).unwrap_or(0),
+        desired_healthy: status.and_then(|s| s.desired_healthy).unwrap_or(0),
+        expected_pods: status.and_then(|s| s.expected_pods).unwrap_or(0),
+        disruptions_allowed: status.and_then(|s| s.disruptions_allowed).unwrap_or(0),
         unhealthy_pod_eviction_policy: spec
             .and_then(|s| s.unhealthy_pod_eviction_policy.clone())
             .unwrap_or_else(|| "IfHealthyBudget".to_string()),
@@ -497,8 +497,8 @@ pub(crate) fn job_info(job: &Job, now: chrono::DateTime<chrono::Utc>) -> JobInfo
     } else {
         "Pending"
     };
-    let start = status.start_time.as_ref().map(|t| t.0);
-    let end = status.completion_time.as_ref().map(|t| t.0).or_else(|| failed_condition.and_then(|c| c.last_transition_time.as_ref()).map(|t| t.0));
+    let start = status.start_time.as_ref().map(|t| t.0.utc());
+    let end = status.completion_time.as_ref().map(|t| t.0.utc()).or_else(|| failed_condition.and_then(|c| c.last_transition_time.as_ref()).map(|t| t.0.utc()));
     JobInfo {
         kind: "Job".into(),
         namespace: job.metadata.namespace.clone().unwrap_or_default(),
@@ -535,7 +535,7 @@ pub(crate) fn failure_superseded(job: &Job, last_success: Option<&k8s_openapi::a
 /// A CronJob, judged by its newest Job: `jobs` is every Job it owns, by
 /// controller UID, newest first.
 pub(crate) fn cronjob_info(cj: &CronJob, jobs: &[&Job], now: chrono::DateTime<chrono::Utc>) -> JobInfo {
-    let spec = cj.spec.clone().unwrap_or_default();
+    let spec = cj.spec.clone();
     let status = cj.status.clone().unwrap_or_default();
     let active = status.active.as_ref().map_or(0, |a| a.len()) as i32;
     let newest = jobs.first();
@@ -567,8 +567,8 @@ pub(crate) fn cronjob_info(cj: &CronJob, jobs: &[&Job], now: chrono::DateTime<ch
         schedule: spec.schedule.clone(),
         time_zone: spec.time_zone.clone(),
         suspend: spec.suspend == Some(true),
-        last_schedule_time: status.last_schedule_time.as_ref().map(|t| t.0.to_rfc3339()),
-        last_successful_time: status.last_successful_time.as_ref().map(|t| t.0.to_rfc3339()),
+        last_schedule_time: status.last_schedule_time.as_ref().map(|t| t.0.utc().to_rfc3339()),
+        last_successful_time: status.last_successful_time.as_ref().map(|t| t.0.utc().to_rfc3339()),
         jobs: jobs.iter().filter_map(|j| j.metadata.name.clone()).collect(),
         age_days: age_days(cj.metadata.creation_timestamp.clone()),
         age_seconds: age_seconds(cj.metadata.creation_timestamp.clone()),
@@ -799,7 +799,7 @@ mod tests {
         // before it failed. The failure is the newer outcome and stands.
         let mut overlap = since;
         overlap.status.as_mut().unwrap().last_successful_time =
-            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::DateTime::parse_from_rfc3339("2026-11-09T11:30:00Z").unwrap().with_timezone(&chrono::Utc)));
+            Some(crate::k8s::k8s_time(chrono::DateTime::parse_from_rfc3339("2026-11-09T11:30:00Z").unwrap().with_timezone(&chrono::Utc)));
         let late = job(serde_json::json!({ "metadata": { "name": "report-3", "uid": "report-3-uid", "creationTimestamp": "2026-11-09T11:00:00Z",
             "ownerReferences": [{ "apiVersion": "batch/v1", "kind": "CronJob", "name": "report", "uid": "cj-uid", "controller": true }] },
             "status": { "conditions": [{ "type": "Failed", "status": "True", "reason": "BackoffLimitExceeded", "message": "", "lastTransitionTime": "2026-11-09T11:45:00Z" }] } }));
@@ -822,10 +822,12 @@ mod tests {
                 labels: Some(BTreeMap::from([("kubernetes.io/service-name".to_string(), service.to_string())])),
                 ..Default::default()
             },
-            endpoints: ready
-                .iter()
-                .map(|r| Endpoint { conditions: Some(EndpointConditions { ready: *r, ..Default::default() }), ..Default::default() })
-                .collect(),
+            endpoints: Some(
+                ready
+                    .iter()
+                    .map(|r| Endpoint { conditions: Some(EndpointConditions { ready: *r, ..Default::default() }), ..Default::default() })
+                    .collect(),
+            ),
             ..Default::default()
         }
     }
