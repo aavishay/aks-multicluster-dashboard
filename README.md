@@ -360,11 +360,12 @@ template runs and reads. Pods is a live pod table with restarts and per-pod CPU/
 panel opens on an Overview — each container's state, restarts, why it last
 exited (OOMKilled, exit code), image and resources, the pod's conditions, its
 node and owner, and every ConfigMap, Secret and PVC it uses, each a link.
-Jobs lists Jobs and CronJobs together, failed first: a Job's status,
-completions and how long it ran, with the CronJob that made it; a CronJob's
-schedule and when it last ran. A CronJob counts as failed when its newest
-run did, and its older runs are not counted again. A Job's panel links to
-its pods; a CronJob's lists the runs it keeps, each opening its own.
+Jobs lists every Job, failed first: its status, completions and how long it
+ran, with the CronJob that made it. CronJobs lists each CronJob's schedule,
+when it last ran and last succeeded, and the runs it keeps. A CronJob counts
+as failed when its newest run did; its failed runs stay red under Jobs but
+are counted once, on the CronJobs badge. A Job's panel links to its pods; a
+CronJob's lists the runs it keeps, each opening its own.
 Resource
 Usage rolls the fleet's CPU/memory usage-vs-allocatable into two bars.
 Namespaces lists each namespace with its status, flagging any stuck
@@ -380,8 +381,8 @@ open one, where a Data view shows each key's value with a filter over names
 and values. Those six share one panel: an Overview of what the row means, the
 YAML, and the object's events.
 Events surfaces recent cluster events, defaulting to warnings only; an
-event's object opens its own panel when the app has one for that kind (Jobs,
-CronJobs, policies and the like stay plain text), a ReplicaSet's opens the
+event's object opens its own panel when the app has one for that kind
+(policies and the like stay plain text), a ReplicaSet's opens the
 Deployment its name belongs to when the Workloads list has it, and the funnel
 beside it narrows the table to that object. An event's reason or message opens
 its own panel — the full message, the object and the field within it, how often

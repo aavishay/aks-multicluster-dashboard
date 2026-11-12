@@ -779,6 +779,7 @@ export type TabId =
   | "secretstores"
   | "pdbs"
   | "jobs"
+  | "cronjobs"
   | "cost";
 
 /** Azure Node Auto Provisioning (managed Karpenter). `installed: false` means the CRDs aren't registered, i.e. NAP is off for this cluster. */

@@ -1880,6 +1880,7 @@ const TAB_GROUPS: { id: string; label: string; tabs: { id: TabId; label: string 
       { id: "workloads", label: "Workloads" },
       { id: "pods", label: "Pods" },
       { id: "jobs", label: "Jobs" },
+      { id: "cronjobs", label: "CronJobs" },
       { id: "hpa", label: "HPA" },
       { id: "keda", label: "KEDA" },
       { id: "pdbs", label: "PDB" },
@@ -2173,6 +2174,8 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       state.pdbs.set(ctx, await api.getPdbs(ctx));
       break;
     case "jobs":
+    case "cronjobs":
+      // One read lists both: a CronJob's row is worked out from its Jobs.
       state.jobs.set(ctx, await api.getJobs(ctx));
       break;
     case "namespaces":
@@ -2235,6 +2238,7 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
     case "pdbs":
       return state.pdbs.has(ctx);
     case "jobs":
+    case "cronjobs":
       return state.jobs.has(ctx);
     case "namespaces":
       return state.namespaces.has(ctx);
@@ -2549,7 +2553,8 @@ const TAB_PALETTE_INFO: Record<TabId, { hint: string; aliases: string[] }> = {
   secretstores: { hint: "Where ExternalSecrets read from", aliases: ["clustersecretstore", "store", "eso", "keyvault", "vault", "provider"] },
   serviceaccounts: { hint: "Workload identity and pull secrets", aliases: ["sa", "identity", "workload identity", "imagepullsecrets", "rbac"] },
   pdbs: { hint: "Pod disruption budgets, and what blocks a drain", aliases: ["poddisruptionbudget", "disruption", "drain", "eviction", "budget"] },
-  jobs: { hint: "Jobs and CronJobs: schedules, runs and failures", aliases: ["job", "cronjob", "cron", "batch", "schedule"] },
+  jobs: { hint: "Jobs: completions, failures, and the CronJob that made each", aliases: ["job", "batch", "run"] },
+  cronjobs: { hint: "CronJobs: schedules, last runs and successes, suspended ones", aliases: ["cronjob", "cron", "schedule", "scheduled"] },
   cost: { hint: "Billing — not wired up yet", aliases: ["billing", "spend"] },
 };
 
@@ -2681,7 +2686,11 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
       break;
     case "jobs":
       r = across(state.jobs, (list) => n(list, jobNeedsAttention));
-      label = "failed";
+      label = "failed outside a CronJob";
+      break;
+    case "cronjobs":
+      r = across(state.jobs, (list) => n(list, cronJobNeedsAttention));
+      label = "failing";
       break;
     case "namespaces":
       r = across(state.namespaces, (list) => n(list, (x) => !namespaceIsHealthy(x)));
@@ -7472,6 +7481,8 @@ function renderTabContentBody(): string {
       return renderPdbs();
     case "jobs":
       return renderJobs();
+    case "cronjobs":
+      return renderCronJobs();
     case "namespaces":
       return renderNamespaces();
     case "services":
@@ -13755,12 +13766,17 @@ function renderPdbs(): string {
 }
 
 /**
- * A failed Job that is not a CronJob's run, or a CronJob whose newest run
- * failed: what the badge counts. A CronJob's old failed runs stay red in the
- * table but are counted once, through their CronJob.
+ * A failed Job that no CronJob made: what the Jobs badge counts. A CronJob's
+ * failed runs stay red in the Jobs table, but are counted once, as their
+ * CronJob, on the CronJobs badge.
  */
 function jobNeedsAttention(j: JobInfo): boolean {
-  return !j.healthy && !j.owner.startsWith("CronJob/");
+  return j.kind === "Job" && !j.healthy && !j.owner.startsWith("CronJob/");
+}
+
+/** A CronJob whose newest run failed: what the CronJobs badge counts. */
+function cronJobNeedsAttention(j: JobInfo): boolean {
+  return j.kind === "CronJob" && !j.healthy;
 }
 
 /** A run's length: seconds stay seconds. */
@@ -13770,62 +13786,122 @@ function jobDuration(seconds: number | null): string {
 
 /** What a Job did: succeeded of desired, and failed attempts. */
 function jobCompletionsText(j: JobInfo): string {
-  if (j.kind === "CronJob") return j.jobs.length ? `${j.jobs.length} run${j.jobs.length === 1 ? "" : "s"} kept` : "no runs kept";
   const done = j.completions === null ? `${j.succeeded} succeeded` : `${j.succeeded}/${j.completions}`;
   return j.failed > 0 ? `${done} · ${j.failed} failed` : done;
 }
 
+/** The runs a CronJob keeps, and how many are running. */
+function cronJobRunsText(j: JobInfo): string {
+  const kept = j.jobs.length ? `${j.jobs.length} kept` : "none kept";
+  return j.active > 0 ? `${kept} · ${j.active} running` : kept;
+}
+
+/** A time cell: how long ago, the exact time on hover, a dash for never. */
+function jobTimeCell(label: string, iso: string | null): string {
+  return `<td class="text-ink-secondary" title="${esc(iso ? timeTitle(label, iso) : `Never ${label.toLowerCase()}`)}">${iso ? esc(relativeTime(iso)) : '<span class="text-ink-muted">—</span>'}</td>`;
+}
+
+/** A time column, newest first when sorted descending; never sorts oldest. */
+function jobTimeColumn<R>(key: string, label: string, iso: (r: R) => string | null): ColumnDef<R> {
+  return {
+    key,
+    label,
+    value: (r) => iso(r) ?? "",
+    sortValue: (r) => {
+      const t = iso(r);
+      return t ? Date.parse(t) : 0;
+    },
+    copyText: (r) => iso(r) ?? "",
+  };
+}
+
+/** The Jobs tab: every Job, its CronJob's runs among them. */
 function renderJobs(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
   type Row = { ctx: string; j: JobInfo };
-  const allRows: Row[] = ctxs.flatMap((ctx) => (state.jobs.get(ctx) ?? []).map((j) => ({ ctx, j })));
-  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No Jobs or CronJobs found.</div>`;
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.jobs.get(ctx) ?? []).filter((j) => j.kind === "Job").map((j) => ({ ctx, j })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No Jobs found.</div>`;
   const rows = state.unhealthyOnly.jobs ? allRows.filter((r) => !r.j.healthy) : allRows;
-  // A CronJob's schedule, or what made a Job.
-  const detail = (j: JobInfo) => (j.kind === "CronJob" ? `${j.schedule}${j.time_zone ? ` (${j.time_zone})` : ""}` : j.owner);
   const columns: ColumnDef<Row>[] = [
     ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
-    { key: "kind", label: "Kind", value: (r) => r.j.kind, filter: "enum" },
     { key: "namespace", label: "Namespace", value: (r) => r.j.namespace, filter: "enum" },
     { key: "name", label: "Name", value: (r) => r.j.name, filter: "string" },
     { key: "status", label: "Status", value: (r) => r.j.status, filter: "enum" },
-    { key: "detail", label: "Schedule / owner", value: (r) => detail(r.j), filter: "string" },
-    { key: "completions", label: "Completions", value: (r) => (r.j.kind === "Job" ? r.j.succeeded : r.j.jobs.length), filter: "number", copyText: (r) => jobCompletionsText(r.j) },
-    {
-      key: "last",
-      label: "Last run",
-      value: (r) => r.j.last_schedule_time ?? "",
-      sortValue: (r) => (r.j.last_schedule_time ? Date.parse(r.j.last_schedule_time) : 0),
-      copyText: (r) => r.j.last_schedule_time ?? "",
-    },
+    { key: "owner", label: "Owner", value: (r) => r.j.owner, filter: "string" },
+    { key: "completions", label: "Completions", value: (r) => r.j.succeeded, filter: "number", copyText: (r) => jobCompletionsText(r.j) },
     { key: "duration", label: "Duration", value: (r) => r.j.duration_seconds ?? -1, filter: "number", copyText: (r) => jobDuration(r.j.duration_seconds) },
     resourceAgeColumn((r) => r.j),
   ];
   return resourceTable({
     tab: "jobs",
-    noun: "Jobs and CronJobs",
+    noun: "Jobs",
     allRows,
     rows,
     columns,
-    keyOf: (r) => `${r.ctx}:${r.j.kind}:${r.j.namespace}:${r.j.name}`,
+    keyOf: (r) => `${r.ctx}:Job:${r.j.namespace}:${r.j.name}`,
     health: { healthy: (r) => r.j.healthy, unhealthyLabel: "failed", statusText: (r) => r.j.failure_message ?? r.j.status },
     renderRow: ({ ctx, j }) => `
-      <tr data-diagnose-what="job" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="${esc(j.kind)}" data-diagnose-ns="${esc(j.namespace)}" data-diagnose-name="${esc(j.name)}">
-        ${rowCheckboxCell("jobs", `${ctx}:${j.kind}:${j.namespace}:${j.name}`)}
+      <tr data-diagnose-what="job" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="Job" data-diagnose-ns="${esc(j.namespace)}" data-diagnose-name="${esc(j.name)}">
+        ${rowCheckboxCell("jobs", `${ctx}:Job:${j.namespace}:${j.name}`)}
         <td title="${esc(j.failure_message ?? j.status)}">${statusDot(j.healthy, j.status === "Pending" || j.status === "Suspended")}</td>
         ${multi ? resourceClusterCell("jobs", ctx) : ""}
-        <td class="text-ink-secondary">${esc(j.kind)}</td>
         ${resourceNamespaceCell("jobs", j.namespace)}
-        ${resourceNameCell(ctx, j.kind, j.namespace, j.name)}
+        ${resourceNameCell(ctx, "Job", j.namespace, j.name)}
         <td class="${j.healthy ? "" : "text-status-critical"}" title="${esc(j.failure_message ?? "")}">${esc(j.status)}</td>
         <td class="truncate font-mono text-xs text-ink-secondary">${
-          j.kind === "Job" && j.owner.startsWith("CronJob/")
+          j.owner.startsWith("CronJob/")
             ? `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'CronJob',${jsArg(j.namespace)},${jsArg(j.owner.slice("CronJob/".length))})" class="hover:text-series-blue hover:underline">${esc(j.owner)}</button>`
-            : esc(detail(j)) || '<span class="text-ink-muted">—</span>'
+            : esc(j.owner) || '<span class="text-ink-muted">—</span>'
         }</td>
         <td class="tabular">${esc(jobCompletionsText(j))}</td>
-        <td class="text-ink-secondary" title="${esc(timeTitle("Last scheduled", j.last_schedule_time))}">${j.last_schedule_time ? esc(relativeTime(j.last_schedule_time)) : '<span class="text-ink-muted">—</span>'}</td>
+        <td class="tabular">${esc(jobDuration(j.duration_seconds))}</td>
+        ${resourceAgeCell(j)}
+      </tr>`,
+  });
+}
+
+/** The CronJobs tab: schedules, and how their runs went. */
+function renderCronJobs(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  type Row = { ctx: string; j: JobInfo };
+  const allRows: Row[] = ctxs.flatMap((ctx) => (state.jobs.get(ctx) ?? []).filter((j) => j.kind === "CronJob").map((j) => ({ ctx, j })));
+  if (allRows.length === 0 && !state.tabLoading) return `<div class="text-sm text-ink-muted">No CronJobs found.</div>`;
+  const rows = state.unhealthyOnly.cronjobs ? allRows.filter((r) => !r.j.healthy) : allRows;
+  const schedule = (j: JobInfo) => `${j.schedule}${j.time_zone ? ` (${j.time_zone})` : ""}`;
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.j.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.j.name, filter: "string" },
+    { key: "status", label: "Status", value: (r) => r.j.status, filter: "enum" },
+    { key: "schedule", label: "Schedule", value: (r) => schedule(r.j), filter: "string" },
+    jobTimeColumn<Row>("last", "Last run", (r) => r.j.last_schedule_time),
+    jobTimeColumn<Row>("success", "Last success", (r) => r.j.last_successful_time),
+    { key: "runs", label: "Runs", value: (r) => r.j.jobs.length, filter: "number", copyText: (r) => cronJobRunsText(r.j) },
+    { key: "duration", label: "Newest run took", value: (r) => r.j.duration_seconds ?? -1, filter: "number", copyText: (r) => jobDuration(r.j.duration_seconds) },
+    resourceAgeColumn((r) => r.j),
+  ];
+  return resourceTable({
+    tab: "cronjobs",
+    noun: "CronJobs",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:CronJob:${r.j.namespace}:${r.j.name}`,
+    health: { healthy: (r) => r.j.healthy, unhealthyLabel: "failed", statusText: (r) => r.j.failure_message ?? r.j.status },
+    renderRow: ({ ctx, j }) => `
+      <tr data-diagnose-what="job" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="CronJob" data-diagnose-ns="${esc(j.namespace)}" data-diagnose-name="${esc(j.name)}">
+        ${rowCheckboxCell("cronjobs", `${ctx}:CronJob:${j.namespace}:${j.name}`)}
+        <td title="${esc(j.failure_message ?? j.status)}">${statusDot(j.healthy, j.status === "Suspended")}</td>
+        ${multi ? resourceClusterCell("cronjobs", ctx) : ""}
+        ${resourceNamespaceCell("cronjobs", j.namespace)}
+        ${resourceNameCell(ctx, "CronJob", j.namespace, j.name)}
+        <td class="${j.healthy ? "" : "text-status-critical"}" title="${esc(j.failure_message ?? "")}">${esc(j.status)}</td>
+        <td class="truncate font-mono text-xs text-ink-secondary" title="${esc(j.time_zone ? `${j.schedule} in ${j.time_zone}` : `${j.schedule} in the controller's time zone`)}">${esc(schedule(j))}</td>
+        ${jobTimeCell("Last scheduled", j.last_schedule_time)}
+        ${jobTimeCell("Last succeeded", j.last_successful_time)}
+        <td class="tabular">${esc(cronJobRunsText(j))}</td>
         <td class="tabular">${esc(jobDuration(j.duration_seconds))}</td>
         ${resourceAgeCell(j)}
       </tr>`,
@@ -13988,7 +14064,7 @@ const RESOURCE_KIND_TAB: Record<ResourceKind, TabId> = {
   ServiceAccount: "serviceaccounts",
   PodDisruptionBudget: "pdbs",
   Job: "jobs",
-  CronJob: "jobs",
+  CronJob: "cronjobs",
   SecretStore: "secretstores",
   ClusterSecretStore: "secretstores",
   Event: "events",
