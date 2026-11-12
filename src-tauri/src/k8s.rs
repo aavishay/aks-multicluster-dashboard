@@ -153,7 +153,12 @@ pub(crate) trait Chrono {
 
 impl Chrono for k8s_openapi::jiff::Timestamp {
     fn utc(&self) -> chrono::DateTime<Utc> {
-        chrono::DateTime::from_timestamp(self.as_second(), self.subsec_nanosecond().max(0) as u32).unwrap_or_default()
+        // jiff gives the fraction the sign of the seconds (half a second
+        // before the epoch is (0, -500ms)); chrono wants it non-negative, so
+        // borrow from the preceding second rather than drop it.
+        let (secs, nanos) = (self.as_second(), self.subsec_nanosecond());
+        let (secs, nanos) = if nanos < 0 { (secs - 1, nanos + 1_000_000_000) } else { (secs, nanos) };
+        chrono::DateTime::from_timestamp(secs, nanos as u32).unwrap_or_default()
     }
 }
 
@@ -5951,6 +5956,16 @@ mod tests {
             let t = chrono::DateTime::parse_from_rfc3339("2026-04-29T19:37:04.6162361+03:00").unwrap().with_timezone(&Utc);
         assert_eq!(created_at(&Some(k8s_time(t))), Some("2026-04-29T16:37:04Z".to_string()));
         assert_eq!(created_at(&None), None);
+    }
+
+    #[test]
+    fn jiff_times_keep_their_fraction_before_the_epoch() {
+        let half_before = k8s_openapi::jiff::Timestamp::new(0, -500_000_000).unwrap();
+        assert_eq!(half_before.utc(), chrono::DateTime::parse_from_rfc3339("1969-12-31T23:59:59.5Z").unwrap());
+        for s in ["1969-12-31T23:59:59.5Z", "1960-06-01T12:00:00.000000001Z", "1970-01-01T00:00:00Z", "2026-04-29T16:37:04.6162361Z"] {
+            let t = chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+            assert_eq!(k8s_time(t).0.utc(), t, "{s}");
+        }
     }
 
     #[test]
