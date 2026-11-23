@@ -473,9 +473,21 @@ pub(crate) async fn get_store(client: &Client, kind: &str, namespace: &str, name
     Ok(None)
 }
 
+/// A `{{ … }}` expression that is a plain reference, safe to show: a field
+/// path or a name, piped through functions that take no argument
+/// (`{{ .password | b64dec }}`). Anything else may carry a literal —
+/// `{{ "hunter2" }}`, `{{ printf "%s" "token" }}` — and is not shown.
+fn simple_reference(expr: &str) -> bool {
+    static SIMPLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SIMPLE
+        .get_or_init(|| regex::Regex::new(r"^\{\{-?\s*[.A-Za-z_][A-Za-z0-9_.]*(\s*\|\s*[A-Za-z_][A-Za-z0-9_]*)*\s*-?\}\}$").unwrap())
+        .is_match(expr)
+}
+
 /// A template value with its literal text masked and its `{{ … }}`
 /// references kept: a template can hold credentials verbatim, which no
-/// pattern can tell from ordinary text.
+/// pattern can tell from ordinary text. Kept only when every expression in
+/// it is a plain reference; otherwise the whole value is masked.
 pub(crate) fn mask_template_text(text: &str) -> String {
     let mut refs = Vec::new();
     let mut rest = text;
@@ -484,7 +496,7 @@ pub(crate) fn mask_template_text(text: &str) -> String {
         refs.push(&rest[start..start + len + 2]);
         rest = &rest[start + len + 2..];
     }
-    if refs.is_empty() {
+    if refs.is_empty() || !refs.iter().all(|r| simple_reference(r)) {
         "[MASKED: literal]".to_string()
     } else {
         format!("[MASKED: literal around {}]", refs.join(" "))
@@ -746,9 +758,13 @@ pub async fn get_secret_store_diagnostics(context_name: &str, kind: &str, namesp
 
     // A cluster-scoped object's events land in whichever namespace its
     // reporter chose, usually default, so they are looked for everywhere.
+    // By UID too: a store deleted and recreated under the same name (to fix
+    // how it signs in, say) leaves its predecessor's events behind.
+    let uid = store.metadata.uid.clone();
     let events_fut = async {
         let in_ns = if cluster { String::new() } else { format!(",involvedObject.namespace={namespace}") };
-        let params = ListParams::default().fields(&format!("involvedObject.kind={kind},involvedObject.name={name}{in_ns}"));
+        let by_uid = uid.as_deref().map(|u| format!(",involvedObject.uid={u}")).unwrap_or_default();
+        let params = ListParams::default().fields(&format!("involvedObject.kind={kind},involvedObject.name={name}{in_ns}{by_uid}"));
         let api: Api<Event> = if cluster { Api::all(client.clone()) } else { Api::namespaced(client.clone(), namespace) };
         api.list(&params)
             .await

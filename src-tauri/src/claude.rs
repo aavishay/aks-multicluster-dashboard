@@ -10612,10 +10612,15 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         let mut store: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({ "apiVersion": "external-secrets.io/v1", "kind": "SecretStore", "metadata": { "name": "s", "namespace": "app" },
             "spec": { "provider": {
                 "fake": { "data": [{ "key": "db", "value": "hunter2" }, { "key": "map", "valueMap": { "user": "admin", "pass": "s3cret" } }] },
-                "webhook": { "url": "https://hook", "headers": { "Authorization": "Bearer abc.def", "X-Token": "{{ .auth.token }}" }, "body": "{\"key\": \"literal-key\"}" } } } })).unwrap();
+                "webhook": { "url": "https://hook",
+                    "headers": { "Authorization": "Bearer abc.def", "X-Token": "{{ .auth.token }}", "X-Quoted": "{{ \"hunter3\" }}", "X-Printf": "{{ printf \"%s\" \"tok3n\" }}" },
+                    "body": "{\"key\": \"literal-key\", \"ref\": \"{{ .remoteRef.key | toJson }}\"}" } } } })).unwrap();
         crate::external_secrets::mask_store_literals(&mut store);
         let text = serde_json::to_string(&store.data).unwrap();
-        assert!(!["hunter2", "admin", "s3cret", "abc.def", "literal-key"].iter().any(|v| text.contains(v)), "{text}");
+        assert!(!["hunter2", "hunter3", "tok3n", "admin", "s3cret", "abc.def", "literal-key"].iter().any(|v| text.contains(v)), "{text}");
+        // A literal inside an expression masks the whole value; a plain
+        // reference, piped through a function, is kept.
+        assert!(text.contains("\"X-Quoted\":\"[MASKED: literal]\"") && text.contains("[MASKED: literal around {{ .remoteRef.key | toJson }}]"), "{text}");
         assert!(text.contains("\"key\":\"db\"") && text.contains("[MASKED: literal around {{ .auth.token }}]") && text.contains("\"url\":\"https://hook\""), "{text}");
     }
 
