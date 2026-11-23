@@ -397,6 +397,59 @@ Some values are replaced with [REDACTED] or [MASKED] before you see them — \
 secrets and personal data are stripped deliberately. Do not speculate about \
 redacted contents, and do not ask for them.";
 
+const DIAGNOSE_SERVICE_ACCOUNT_SYSTEM: &str = "\
+You diagnose Kubernetes ServiceAccounts on AKS for an experienced SRE: \
+whether what runs as one can sign in where it needs to — to Azure through \
+Workload Identity, to the API server through its roles, to a registry \
+through its pull secrets.
+
+You are given the account: the Azure client ID it names, and the federated \
+credential that identity needs for this cluster (issuer, subject, audience); \
+the pods that run as it, each with whether it carries the \
+azure.workload.identity/use label, which containers the webhook injected \
+its token into, and whether the injected client ID is the account's current \
+one; the workloads whose pod template runs as it; the Workload Identity \
+webhook; excerpts of its pods' log lines about signing in to Azure or being \
+refused by RBAC; the roles bound to it; its image pull secrets; the Warning \
+events of its pods that are not ready; its events and manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the pod, the label, the \
+log excerpt, the binding, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- The pod never got a token: no azure.workload.identity/use=true label on \
+its pod template, a container skipped or not injected, the webhook missing \
+or down when the pod was created, or a pod created before the client-id \
+annotation changed. Fixed in Kubernetes: label the template, restart the \
+pods.
+- The token is refused by Entra ID: AADSTS70021 or AADSTS700213 means the \
+identity has no federated credential matching the issuer and subject \
+presented — compare them with the ones above and say which differs (a \
+namespace or account renamed, another cluster's issuer); AADSTS700016 means \
+no application with that client ID exists in the tenant, so the client ID \
+or tenant is wrong. Fixed in Azure: az identity federated-credential \
+create, with the exact issuer and subject.
+- Signed in but refused by the Azure resource (AuthorizationFailed, \
+\"Caller is not authorized\" from Key Vault): the identity lacks a role \
+assignment on that resource. Fixed in Azure RBAC.
+- Refused by the API server (forbidden: User \"system:serviceaccount:…\"): \
+no Role or ClusterRole bound to it allows that verb on that resource. Name \
+the verb, resource and namespace from the excerpt, and the binding to add.
+- Image pulls fail: a pull secret it lists is missing or of the wrong type.
+
+If nothing is wrong, say so plainly rather than inventing a problem. An \
+account no pod runs as is not a fault in itself.
+
+Be direct; assume fluency with kubectl and az. Prefer one well-supported \
+cause over a list of possibilities. If the evidence is genuinely \
+insufficient, say so and name what would settle it — usually the identity's \
+federated credentials: az identity federated-credential list.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -6335,6 +6388,265 @@ pub async fn build_secret_store_diagnosis_payload(context_name: &str, kind: &str
     Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
 }
 
+/// The account itself: the Azure identity it names, the federated
+/// credential that identity needs for this cluster, and whether its pods get
+/// an API token.
+fn render_sa_account(sa: &k8s_openapi::api::core::v1::ServiceAccount, issuer: &Result<String, String>) -> String {
+    let namespace = sa.metadata.namespace.as_deref().unwrap_or_default();
+    let name = sa.metadata.name.as_deref().unwrap_or_default();
+    let annotations = sa.metadata.annotations.clone().unwrap_or_default();
+    let mut lines = Vec::new();
+    match annotations.get("azure.workload.identity/client-id").filter(|c| !c.is_empty()) {
+        Some(client) => {
+            lines.push(format!("Workload Identity: signs in to Azure as client ID {client}"));
+            if let Some(t) = annotations.get("azure.workload.identity/tenant-id") {
+                lines.push(format!("tenant: {t} (overriding the cluster's)"));
+            }
+            if let Some(e) = annotations.get("azure.workload.identity/service-account-token-expiration") {
+                lines.push(format!("token expiration: {e}s"));
+            }
+            lines.push(format!(
+                "the federated credential that identity needs: issuer {}, subject system:serviceaccount:{namespace}:{name}, audience api://AzureADTokenExchange",
+                match issuer {
+                    Ok(i) => i.clone(),
+                    Err(e) => format!("(this cluster's issuer unavailable: {e})"),
+                }
+            ));
+        }
+        None => lines.push("no azure.workload.identity/client-id annotation: its pods do not sign in to Azure through Workload Identity".to_string()),
+    }
+    if sa.automount_service_account_token == Some(false) {
+        lines.push("automountServiceAccountToken: false — its pods get no API token unless their own spec asks for one".to_string());
+    }
+    let legacy = sa.secrets.as_ref().map_or(0, Vec::len);
+    if legacy > 0 {
+        lines.push(format!("{legacy} legacy token Secret{} listed on it", if legacy == 1 { "" } else { "s" }));
+    }
+    lines.join("\n")
+}
+
+/// How many of its pods to describe; the rest are counted.
+const DIAGNOSE_SA_PODS: usize = 15;
+
+fn render_sa_pods(pods: &Result<Vec<crate::service_accounts::PodIdentity>, String>, workload_identity: bool) -> String {
+    let pods = match pods {
+        Err(e) => return format!("(pods unavailable: {e})"),
+        Ok(p) if p.is_empty() => return "(no pod runs as it)".to_string(),
+        Ok(p) => p,
+    };
+    let ready = pods.iter().filter(|p| p.ready).count();
+    let completed = pods.iter().filter(|p| p.phase == "Succeeded").count();
+    let mut lines = vec![format!(
+        "{} pod{} run{} as it: {ready} ready{}",
+        pods.len(),
+        if pods.len() == 1 { "" } else { "s" },
+        if pods.len() == 1 { "s" } else { "" },
+        if completed > 0 { format!(", {completed} completed") } else { String::new() }
+    )];
+    for p in pods.iter().take(DIAGNOSE_SA_PODS) {
+        let mut facts: Vec<String> = Vec::new();
+        facts.push(match (p.ready, p.phase.as_str()) {
+            (true, _) => "ready".to_string(),
+            (false, "Succeeded") => "completed".to_string(),
+            (false, "") => "Unknown NOT READY".to_string(),
+            (false, phase) => format!("{phase} NOT READY"),
+        });
+        if !p.waiting.is_empty() {
+            facts.push(p.waiting.join(", "));
+        }
+        let labelled = p.use_label.as_deref() == Some("true");
+        if workload_identity {
+            // What the webhook did when the pod was created, and what its
+            // label says now, separately: a label removed since leaves the
+            // token in place until the pod is recreated.
+            match (p.injected.is_empty(), labelled) {
+                (false, _) => {
+                    facts.push(format!("token injected into {}", p.injected.join(", ")));
+                    if !p.not_injected.is_empty() {
+                        facts.push(format!("NOT INTO {}", p.not_injected.join(", ")));
+                    }
+                    if !labelled {
+                        facts.push("but it no longer carries azure.workload.identity/use=true: a pod recreated without the label gets no token".to_string());
+                    }
+                }
+                (true, false) => facts.push("NO azure.workload.identity/use=true LABEL, AND NO CONTAINER WAS INJECTED: it has no Azure token".to_string()),
+                (true, true) => facts.push("LABELLED, BUT NO CONTAINER WAS INJECTED: the webhook did not mutate it — was it down when the pod was created?".to_string()),
+            }
+            if !p.skipped.is_empty() {
+                facts.push(format!("skipped by annotation: {}", p.skipped.join(", ")));
+            }
+            if p.client_id_current == Some(false) {
+                facts.push("ITS INJECTED AZURE_CLIENT_ID IS NOT THE ACCOUNT'S CURRENT CLIENT ID: it was created before the annotation changed, and keeps the old one until recreated".to_string());
+            }
+        } else if labelled {
+            facts.push("labelled azure.workload.identity/use=true, but the account names no client ID".to_string());
+        }
+        lines.push(format!("- {}{}: {}", p.name, if p.owner.is_empty() { String::new() } else { format!(" ({})", p.owner) }, facts.join("; ")));
+    }
+    if pods.len() > DIAGNOSE_SA_PODS {
+        let rest = &pods[DIAGNOSE_SA_PODS..];
+        lines.push(format!("… and {} more, {} of them ready", rest.len(), rest.iter().filter(|p| p.ready).count()));
+    }
+    lines.join("\n")
+}
+
+fn render_sa_templates(templates: &Result<Vec<crate::service_accounts::TemplateIdentity>, String>, namespace: &str, workload_identity: bool) -> String {
+    let templates = match templates {
+        Err(e) => return format!("(workloads unavailable: {e})"),
+        Ok(t) if t.is_empty() => return format!("(no Deployment, StatefulSet, DaemonSet or CronJob in {namespace} runs as it)"),
+        Ok(t) => t,
+    };
+    templates
+        .iter()
+        .map(|t| {
+            let labelled = t.use_label.as_deref() == Some("true");
+            let note = match (workload_identity, labelled) {
+                (true, true) => ": its pod template is labelled azure.workload.identity/use=true",
+                (true, false) => ": ITS POD TEMPLATE LACKS azure.workload.identity/use=true, so its pods get no Azure token",
+                (false, _) => "",
+            };
+            format!("{} {}{note}", t.kind, t.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_sa_pull_secrets(secrets: &[(String, Result<Option<String>, String>)]) -> String {
+    if secrets.is_empty() {
+        return "(none: images are pulled anonymously, or with the node's own identity — on AKS, the kubelet identity's AcrPull)".to_string();
+    }
+    secrets
+        .iter()
+        .map(|(name, found)| match found {
+            Err(e) => format!("Secret {name}: (unavailable: {e})"),
+            Ok(None) => format!("SECRET {name} DOES NOT EXIST: pulls that need it fail"),
+            Ok(Some(t)) if t == "kubernetes.io/dockerconfigjson" || t == "kubernetes.io/dockercfg" => format!("Secret {name}: {t}"),
+            Ok(Some(t)) => format!("Secret {name} IS OF TYPE {t}, NOT kubernetes.io/dockerconfigjson: the kubelet cannot pull with it"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How many bindings to name.
+const DIAGNOSE_SA_BINDINGS: usize = 30;
+
+fn render_sa_bindings(bindings: &Result<Vec<crate::service_accounts::Binding>, String>, note: &Option<String>) -> String {
+    let text = render_sa_binding_lines(bindings);
+    match note {
+        Some(n) => format!("{text}\n({n})"),
+        None => text,
+    }
+}
+
+fn render_sa_binding_lines(bindings: &Result<Vec<crate::service_accounts::Binding>, String>) -> String {
+    let bindings = match bindings {
+        Err(e) => return format!("(bindings unavailable: {e})"),
+        Ok(b) => b,
+    };
+    // Every account has the defaults every authenticated user has; naming
+    // them on each says nothing.
+    let shown: Vec<&crate::service_accounts::Binding> =
+        bindings.iter().filter(|b| !(b.via.as_deref() == Some("system:authenticated") && b.name.starts_with("system:"))).collect();
+    if shown.is_empty() {
+        return "(no role is bound to it beyond the defaults every authenticated user has: an API request beyond discovery is forbidden)".to_string();
+    }
+    let mut lines: Vec<String> = shown
+        .iter()
+        .take(DIAGNOSE_SA_BINDINGS)
+        .map(|b| {
+            let at = if b.namespace.is_empty() { b.name.clone() } else { format!("{}/{}", b.namespace, b.name) };
+            format!("- {} {at} → {}{}", b.kind, b.role, b.via.as_ref().map(|g| format!(" (through group {g})")).unwrap_or_default())
+        })
+        .collect();
+    if shown.len() > DIAGNOSE_SA_BINDINGS {
+        lines.push(format!("… and {} more", shown.len() - DIAGNOSE_SA_BINDINGS));
+    }
+    lines.join("\n")
+}
+
+fn render_sa_webhook(webhook: &Result<Vec<String>, String>) -> String {
+    match webhook {
+        Err(e) => format!("(webhook unavailable: {e})"),
+        Ok(w) if w.is_empty() => {
+            "NO MUTATING WEBHOOK NAMED mutation.azure-workload-identity.io: nothing injects the token into its pods — the cluster's workload identity is not enabled".to_string()
+        }
+        Ok(w) => w.join("\n"),
+    }
+}
+
+/// How many distinct excerpts to show.
+const DIAGNOSE_SA_EXCERPTS: usize = 10;
+
+/// Its pods' log excerpts, each once with how often it occurred.
+fn render_sa_log_excerpts(excerpts: &Result<(usize, Vec<String>), String>) -> String {
+    let (pods, lines) = match excerpts {
+        Err(e) => return format!("(logs unavailable: {e})"),
+        Ok((0, _)) => return "(no pod of it is running, so there is no log to read)".to_string(),
+        Ok((pods, l)) if l.is_empty() => {
+            return format!("(the last hour of {pods} {} logs says nothing about signing in to Azure or being refused by RBAC)", if *pods == 1 { "pod's" } else { "pods'" })
+        }
+        Ok(x) => x,
+    };
+    let mut groups: Vec<(&String, usize)> = Vec::new();
+    for l in lines {
+        match groups.iter_mut().find(|(x, _)| *x == l) {
+            Some(g) => g.1 += 1,
+            None => groups.push((l, 1)),
+        }
+    }
+    groups.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut out = vec![format!("from the last hour of {pods} {} logs:", if *pods == 1 { "pod's" } else { "pods'" })];
+    out.extend(groups.iter().take(DIAGNOSE_SA_EXCERPTS).map(|(l, n)| format!("×{n} {l}")));
+    if groups.len() > DIAGNOSE_SA_EXCERPTS {
+        out.push(format!("… and {} other lines", groups.len() - DIAGNOSE_SA_EXCERPTS));
+    }
+    out.join("\n")
+}
+
+/// Assembles a ServiceAccount diagnosis, redacted.
+pub async fn build_service_account_diagnosis_payload(context_name: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = crate::service_accounts::get_service_account_diagnostics(context_name, namespace, name).await?;
+    let wi = d.webhook.is_some();
+    let account = redact::redact(&render_sa_account(&d.account, &d.issuer));
+    let pods = redact::redact(&render_sa_pods(&d.pods, wi));
+    let templates = redact::redact(&render_sa_templates(&d.templates, namespace, wi));
+    let webhook = redact::redact(&d.webhook.as_ref().map(render_sa_webhook).unwrap_or_else(|| "(not read: the account uses no Workload Identity)".to_string()));
+    let logs = redact::redact(&render_sa_log_excerpts(&d.log_excerpts));
+    let bindings = redact::redact(&render_sa_bindings(&d.bindings, &d.bindings_note));
+    let pull = redact::redact(&render_sa_pull_secrets(&d.pull_secrets));
+    let pod_events = redact::redact(&if let Err(e) = &d.pods {
+        format!("(pods unavailable: {e})")
+    } else if d.pods.as_ref().is_ok_and(Vec::is_empty) {
+        "(no pod runs as it)".to_string()
+    } else if d.pod_events.is_empty() {
+        "(every pod that runs as it is ready or has completed)".to_string()
+    } else {
+        d.pod_events.iter().map(|(p, e)| format!("pod {p}:\n{}", render_nap_events(e, "(no Warning events)", false, 10))).collect::<Vec<_>>().join("\n\n")
+    });
+    let events = redact::redact(&render_nap_events(&d.events, "(no events for this ServiceAccount)", false, 10));
+    let manifest = redact::redact(&d.manifest);
+
+    let prompt = format!(
+        "ServiceAccount {namespace}/{name}.\n\n\
+         ## The account\n{}\n\n\
+         ## Pods that run as it\n{}\n\n\
+         ## Workloads whose pod template runs as it\n{}\n\n\
+         ## Workload Identity webhook\n{}\n\n\
+         ## Its pods' log lines about signing in to Azure or RBAC refusals\n{}\n\n\
+         ## Roles bound to it\n{}\n\n\
+         ## Image pull secrets\n{}\n\n\
+         ## Warning events of its pods that are not ready\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        account.text, pods.text, templates.text, webhook.text, logs.text, bindings.text, pull.text, pod_events.text, events.text, manifest.text,
+    );
+    let whole = redact::redact(&prompt);
+    let redaction_summary =
+        redact::Redacted::merge([&account, &pods, &templates, &webhook, &logs, &bindings, &pull, &pod_events, &events, &manifest, &whole]).summary();
+    let prompt = whole.text.clone();
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
 /// The StatefulSet sections of a workload diagnosis.
 fn render_sts_sections(d: &k8s::StatefulSetDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
     let claim_events = if d.claim_events.is_empty() {
@@ -7659,6 +7971,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Job" | "CronJob" => DIAGNOSE_JOB_SYSTEM,
         "ExternalSecret" => DIAGNOSE_EXTERNALSECRET_SYSTEM,
         "SecretStore" | "ClusterSecretStore" => DIAGNOSE_SECRET_STORE_SYSTEM,
+        "ServiceAccount" => DIAGNOSE_SERVICE_ACCOUNT_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
         "Deployment" => DIAGNOSE_DEPLOYMENT_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
@@ -10250,6 +10563,71 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(
             render_es_credentials(&[unscoped], &Ok(Some(store))),
             "Secret sp (key client-secret): no namespace given, so ESO reads it in the namespace of each ExternalSecret that uses the store"
+        );
+    }
+
+    #[test]
+    fn a_service_account_says_what_its_pods_lack_to_sign_in() {
+        use crate::service_accounts::{Binding, PodIdentity, TemplateIdentity};
+        let sa: k8s_openapi::api::core::v1::ServiceAccount = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "web", "namespace": "app", "annotations": { "azure.workload.identity/client-id": "11111111-2222-3333-4444-555555555555" } },
+            "automountServiceAccountToken": false
+        })).unwrap();
+        assert_eq!(
+            render_sa_account(&sa, &Ok("https://oidc.example/abc/".into())),
+            "Workload Identity: signs in to Azure as client ID 11111111-2222-3333-4444-555555555555\n\
+             the federated credential that identity needs: issuer https://oidc.example/abc/, subject system:serviceaccount:app:web, audience api://AzureADTokenExchange\n\
+             automountServiceAccountToken: false — its pods get no API token unless their own spec asks for one"
+        );
+        let pod = |name: &str, ready: bool, label: Option<&str>, injected: &[&str], not: &[&str], current: Option<bool>| PodIdentity {
+            name: name.into(), owner: "ReplicaSet/web-5d8f".into(), ready, phase: "Running".into(), use_label: label.map(str::to_string),
+            injected: injected.iter().map(|s| s.to_string()).collect(), not_injected: not.iter().map(|s| s.to_string()).collect(), skipped: vec![],
+            client_id_current: current, waiting: if ready { vec![] } else { vec!["app: CrashLoopBackOff".into()] },
+        };
+        let pods = Ok(vec![
+            pod("web-1", false, None, &[], &["app"], None),
+            pod("web-2", false, Some("true"), &[], &["app"], None),
+            pod("web-3", true, Some("true"), &["app"], &["sidecar"], Some(false)),
+        ]);
+        assert_eq!(
+            render_sa_pods(&pods, true),
+            "3 pods run as it: 1 ready\n\
+             - web-1 (ReplicaSet/web-5d8f): Running NOT READY; app: CrashLoopBackOff; NO azure.workload.identity/use=true LABEL, AND NO CONTAINER WAS INJECTED: it has no Azure token\n\
+             - web-2 (ReplicaSet/web-5d8f): Running NOT READY; app: CrashLoopBackOff; LABELLED, BUT NO CONTAINER WAS INJECTED: the webhook did not mutate it — was it down when the pod was created?\n\
+             - web-3 (ReplicaSet/web-5d8f): ready; token injected into app; NOT INTO sidecar; ITS INJECTED AZURE_CLIENT_ID IS NOT THE ACCOUNT'S CURRENT CLIENT ID: it was created before the annotation changed, and keeps the old one until recreated"
+        );
+        // The label removed after the pod was created: its token is still there.
+        assert!(render_sa_pods(&Ok(vec![pod("web-4", true, None, &["app"], &[], Some(true))]), true)
+            .ends_with("ready; token injected into app; but it no longer carries azure.workload.identity/use=true: a pod recreated without the label gets no token"));
+        let mut done = pod("job-1", false, None, &[], &[], None);
+        done.phase = "Succeeded".into();
+        done.waiting.clear();
+        assert_eq!(render_sa_pods(&Ok(vec![done]), false), "1 pod runs as it: 0 ready, 1 completed\n- job-1 (ReplicaSet/web-5d8f): completed");
+        assert_eq!(
+            render_sa_templates(&Ok(vec![TemplateIdentity { kind: "Deployment".into(), name: "web".into(), use_label: None }]), "app", true),
+            "Deployment web: ITS POD TEMPLATE LACKS azure.workload.identity/use=true, so its pods get no Azure token"
+        );
+        let binding = |kind: &'static str, name: &str, role: &str, via: Option<&str>| Binding { kind, namespace: if kind == "RoleBinding" { "app".into() } else { String::new() }, name: name.into(), role: role.into(), via: via.map(str::to_string) };
+        assert_eq!(
+            render_sa_bindings(&Ok(vec![
+                binding("ClusterRoleBinding", "system:discovery", "ClusterRole system:discovery", Some("system:authenticated")),
+                binding("RoleBinding", "web-reader", "Role pod-reader", None),
+                binding("ClusterRoleBinding", "all-sa-view", "ClusterRole view", Some("system:serviceaccounts")),
+            ]), &None),
+            "- RoleBinding app/web-reader → Role pod-reader\n- ClusterRoleBinding all-sa-view → ClusterRole view (through group system:serviceaccounts)"
+        );
+        assert!(render_sa_bindings(&Ok(vec![binding("ClusterRoleBinding", "system:basic-user", "ClusterRole system:basic-user", Some("system:authenticated"))]), &None).starts_with("(no role is bound to it"));
+        assert!(render_sa_bindings(&Ok(vec![]), &Some("RoleBindings outside app could not be listed: forbidden".into())).ends_with("\n(RoleBindings outside app could not be listed: forbidden)"));
+        let aadsts = "WorkloadIdentityCredential authentication failed: AADSTS70021: No matching federated identity record found".to_string();
+        assert_eq!(
+            render_sa_log_excerpts(&Ok((2, vec![aadsts.clone(), "User \"system:serviceaccount:app:web\" cannot list resource \"pods\"".into(), aadsts.clone()]))),
+            format!("from the last hour of 2 pods' logs:\n×2 {aadsts}\n×1 User \"system:serviceaccount:app:web\" cannot list resource \"pods\"")
+        );
+        assert_eq!(render_sa_log_excerpts(&Ok((0, vec![]))), "(no pod of it is running, so there is no log to read)");
+        assert!(render_sa_webhook(&Ok(vec![])).starts_with("NO MUTATING WEBHOOK NAMED mutation.azure-workload-identity.io"));
+        assert_eq!(
+            render_sa_pull_secrets(&[("acr".into(), Ok(Some("kubernetes.io/dockerconfigjson".into()))), ("gone".into(), Ok(None)), ("plain".into(), Ok(Some("Opaque".into())))]),
+            "Secret acr: kubernetes.io/dockerconfigjson\nSECRET gone DOES NOT EXIST: pulls that need it fail\nSecret plain IS OF TYPE Opaque, NOT kubernetes.io/dockerconfigjson: the kubelet cannot pull with it"
         );
     }
 
