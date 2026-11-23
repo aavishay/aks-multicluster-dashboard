@@ -12,6 +12,7 @@ import type {
   GatewayInfo,
   RouteBackendInfo,
   RouteParentInfo,
+  RouteKind,
   RouteInfo,
   NamespaceInfo,
   PvcInfo,
@@ -5999,6 +6000,8 @@ function setMetricsRange(minutes: number) {
   diagnoseHpa,
   diagnoseService,
   diagnoseIngress,
+  diagnoseGateway,
+  diagnoseRoute,
   diagnoseNamespace,
   diagnosePvc,
   diagnoseJob,
@@ -7205,6 +7208,10 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Its budget, counts, eviction policy and conditions, the pods it covers with their readiness and nodes, the controllers behind them and the replicas each asks for, any other budget over the same pods, its events, and its manifest."
                   : d.kind === "Ingress"
                   ? "Its routes, TLS and address, whether its class exists and its controller is up, the controller's log lines about it, each backend Service with its port and ready endpoints, each TLS Secret (checked by key name and the certificate's public fields, never the key), cert-manager's view of them, other Ingresses on its hosts, its events, and its manifest."
+                  : d.kind === "Gateway"
+                  ? "Its conditions, listeners and addresses, its GatewayClass, each listener's certificate (checked by key name and the certificate's public fields, never the key) and any ReferenceGrant it needs, the proxies and Service its controller created for it, the routes attached to it, the controller's log lines about it, its events, and its manifest."
+                  : isRouteKind(d.kind)
+                  ? "Its hostnames and rules, each parent's verdict on it with every listener of its Gateways checked against it, each backend Service with its port and ready endpoints and any ReferenceGrant it needs, other routes claiming the same hostname and match, the controller's log lines about it, its events, and its manifest."
                   : d.kind === "Service"
                   ? "Its spec and endpoints, the pods its selector matches with their readiness and probes — or, when it matches none, the pods and workloads that nearly match — whether its target ports exist on them, the events of an unready pod, the Ingresses routing to it, its events, and its manifest."
                   : d.kind === "HorizontalPodAutoscaler"
@@ -8723,6 +8730,14 @@ function diagnoseService(ctx: string, namespace: string, name: string) {
  */
 function diagnoseIngress(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "Ingress", namespace, name, "", () => api.aiBuildIngressDiagnosis(ctx, namespace, name));
+}
+
+function diagnoseGateway(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "Gateway", namespace, name, "", () => api.aiBuildGatewayDiagnosis(ctx, namespace, name));
+}
+
+function diagnoseRoute(ctx: string, kind: string, namespace: string, name: string) {
+  startDiagnosis(ctx, kind, namespace, name, "", () => api.aiBuildRouteDiagnosis(ctx, kind, namespace, name));
 }
 
 function diagnoseNamespace(ctx: string, name: string) {
@@ -13599,6 +13614,12 @@ function renderIngresses(): string {
 
 const GATEWAY_API_GROUP = "gateway.networking.k8s.io";
 
+const ROUTE_KINDS: readonly RouteKind[] = ["HTTPRoute", "GRPCRoute", "TLSRoute", "TCPRoute", "UDPRoute"];
+
+function isRouteKind(kind: string): kind is RouteKind {
+  return (ROUTE_KINDS as readonly string[]).includes(kind);
+}
+
 /**
  * The Gateway API conditions with negative polarity, where True is the
  * fault: a listener's Conflicted and OverlappingTLSConfig, a route parent's
@@ -13739,7 +13760,7 @@ function renderGateways(): string {
     keyOf: (r) => `${r.ctx}:${r.g.namespace}:${r.g.name}`,
     health: { healthy: (r) => r.g.healthy, unhealthyLabel: "not programmed", statusText: (r) => r.g.problem ?? "Programmed" },
     renderRow: ({ ctx, g }) => `
-      <tr>
+      <tr data-diagnose-what="gateway" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(g.namespace)}" data-diagnose-name="${esc(g.name)}">
         ${rowCheckboxCell("gateways", `${ctx}:${g.namespace}:${g.name}`)}
         <td title="${esc(g.problem ?? "Accepted and programmed")}">${statusDot(g.healthy)}</td>
         ${multi ? resourceClusterCell("gateways", ctx) : ""}
@@ -13786,7 +13807,7 @@ function renderRoutes(): string {
     keyOf: (x) => `${x.ctx}:${x.r.kind}:${x.r.namespace}:${x.r.name}`,
     health: { healthy: (x) => x.r.healthy, unhealthyLabel: "with a failing condition", statusText: (x) => x.r.problem ?? "Accepted" },
     renderRow: ({ ctx, r }) => `
-      <tr>
+      <tr data-diagnose-what="route" data-diagnose-kind="${esc(r.kind)}" data-diagnose-ctx="${esc(ctx)}" data-diagnose-ns="${esc(r.namespace)}" data-diagnose-name="${esc(r.name)}">
         ${rowCheckboxCell("routes", `${ctx}:${r.kind}:${r.namespace}:${r.name}`)}
         <td title="${esc(r.problem ?? "Accepted by every parent")}">${statusDot(r.healthy)}</td>
         ${multi ? resourceClusterCell("routes", ctx) : ""}
@@ -14694,7 +14715,7 @@ function renderResourceOverview(rd: ResourceDetailState): string {
         )
       : "";
     return `${banner}<div>${rows.join("")}</div>${listeners}${routes}${renderConditionsSection(g.conditions, gatewayConditionOk)}`;
-  } else if (kind === "HTTPRoute" || kind === "GRPCRoute" || kind === "TLSRoute" || kind === "TCPRoute" || kind === "UDPRoute") {
+  } else if (isRouteKind(kind)) {
     const r = state.gatewayApi.get(ctx)?.routes.find((x) => x.kind === kind && x.namespace === namespace && x.name === name);
     if (!r) return gone;
     const banner = r.problem ? `<div class="mb-3 rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(r.problem)}</div>` : "";
@@ -15114,6 +15135,10 @@ function renderResourceDetailPanel(): string {
                 ? claudeDiagnoseButton(`window.__app.diagnoseService(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service")
                 : rd.kind === "Ingress"
                   ? claudeDiagnoseButton(`window.__app.diagnoseIngress(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "ingress")
+                  : rd.kind === "Gateway"
+                  ? claudeDiagnoseButton(`window.__app.diagnoseGateway(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "gateway")
+                  : isRouteKind(rd.kind)
+                  ? claudeDiagnoseButton(`window.__app.diagnoseRoute(${jsArg(rd.ctx)},${jsArg(rd.kind)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "route")
                   : rd.kind === "PersistentVolumeClaim"
                     ? claudeDiagnoseButton(`window.__app.diagnosePvc(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "volume claim")
                     : rd.kind === "Job" || rd.kind === "CronJob"
@@ -16544,6 +16569,12 @@ function diagnoseFocusedRow(): boolean {
       return true;
     case "ingress":
       diagnoseIngress(ctx, ns, name);
+      return true;
+    case "gateway":
+      diagnoseGateway(ctx, ns, name);
+      return true;
+    case "route":
+      diagnoseRoute(ctx, d.diagnoseKind ?? "HTTPRoute", ns, name);
       return true;
     case "pvc":
       diagnosePvc(ctx, ns, name);

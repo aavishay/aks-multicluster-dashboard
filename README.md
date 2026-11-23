@@ -167,7 +167,7 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, namespace, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, PVC, PodDisruptionBudget, ExternalSecret, HPA, KEDA
+Any node, namespace, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, Gateway, Gateway API route, PVC, PodDisruptionBudget, ExternalSecret, HPA, KEDA
 ScaledObject or ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
 and click **Diagnose** in its panel, or press `⌘D` on a focused row. An event about a workload offers its
 workload's diagnosis the same way; one about a ReplicaSet, its Deployment's, which covers its ReplicaSets.
@@ -187,6 +187,20 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   ready endpoints, and each TLS Secret — checked by key name and by the
   certificate's public fields (expiry, the hosts it names), never the private
   key — with cert-manager's view of it;
+- a Gateway: its GatewayClass and whether its controller accepted it, each
+  listener's certificate (checked the same way, with the ReferenceGrant one in
+  another namespace needs), the proxies and LoadBalancer Service its
+  controller created for it with that Service's events while it has no
+  address, the routes attached to it failing first, and the controller's own
+  log lines about it;
+- a route (HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute): each parent's
+  verdict on it, with every listener of its Gateways checked against it —
+  whether the parentRef picks it, whether its allowedRoutes admits the
+  route's namespace and kind, which of its hostnames it serves — each backend
+  Service, mirrored-to ones included, with its port and ready endpoints and
+  the ReferenceGrant one in another namespace needs, other routes on the same
+  listener claiming an overlapping hostname and the same match, and the
+  controller's own log lines about it;
 - a Job: its limits, status and conditions — why it failed (backoffLimit,
   activeDeadlineSeconds, its podFailurePolicy) — and its attempts with each
   container's exit code, OOM kills and evictions, with the logs of the worst

@@ -5005,9 +5005,86 @@ pub(crate) fn ingress_log_line_is_about(line: &str, namespace: &str, names: &[St
     names.iter().any(|n| qualified(n) || (in_namespace && tokens.contains(&n.as_str())))
 }
 
-pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<IngressDiagnostics, String> {
-    use k8s_openapi::api::core::v1::{Secret, Service};
+/// A Service something routes to, with its EndpointSlices.
+pub(crate) async fn read_service_backend(client: &kube::Client, namespace: &str, svc: &str) -> IngressBackend {
+    use k8s_openapi::api::core::v1::Service;
     use k8s_openapi::api::discovery::v1::EndpointSlice;
+    let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), namespace);
+    let params = ListParams::default().labels(&format!("kubernetes.io/service-name={svc}"));
+    let (service, slices) = tokio::join!(services.get(svc), slices.list(&params));
+    IngressBackend {
+        name: svc.to_string(),
+        service: service.map_err(|e| get_error("Service", svc, e)),
+        slices: slices.map(|l| l.items).map_err(|e| format!("Failed to list the EndpointSlices of '{svc}': {e}")),
+    }
+}
+
+/// A TLS Secret by its keys and its certificate's public fields only: the
+/// values are read here and dropped, and the private key is never parsed.
+pub(crate) async fn read_tls_secret(client: &kube::Client, namespace: &str, secret: &str) -> Result<IngressTlsSecret, String> {
+    use k8s_openapi::api::core::v1::Secret;
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    api.get(secret)
+        .await
+        .map(|s| IngressTlsSecret {
+            secret_type: s.type_.clone().unwrap_or_else(|| "Opaque".to_string()),
+            keys: s.data.iter().flatten().map(|(k, _)| k.clone()).collect(),
+            leaf: s
+                .data
+                .as_ref()
+                .and_then(|d| d.get("tls.crt"))
+                .and_then(|v| std::str::from_utf8(&v.0).ok())
+                .map(crate::x509::parse_pem_bundle)
+                .and_then(|all| crate::secrets::leaf_of(&all).cloned()),
+        })
+        .map_err(|e| get_error("Secret", secret, e))
+}
+
+/// The log lines a controller's pods wrote that `is_about` keeps, and how
+/// many pods were read; `None` when there is no controller to read. `params`
+/// bounds the read; each pod is read from the workload's own container, as a
+/// pod with an injected sidecar has several and a request without one is
+/// refused.
+pub(crate) async fn read_controller_logs(
+    client: &kube::Client,
+    workloads: &[&IngressControllerWorkload],
+    params: &LogParams,
+    is_about: impl Fn(&str) -> bool,
+) -> Option<Result<(usize, Vec<String>), String>> {
+    if workloads.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    let mut failure = None;
+    let mut read = 0;
+    for w in workloads {
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &w.namespace);
+        let list = match pods.list(&ListParams::default().labels(&w.selector)).await {
+            Ok(l) => l.items,
+            Err(e) => {
+                failure = Some(format!("Failed to list the pods of {}/{}: {e}", w.namespace, w.name));
+                continue;
+            }
+        };
+        for p in list {
+            let params = LogParams { container: Some(w.container.clone()), ..params.clone() };
+            match pods.logs(&p.name_any(), &params).await {
+                Ok(text) => {
+                    read += 1;
+                    lines.extend(text.lines().filter(|l| is_about(l)).map(str::to_string));
+                }
+                Err(e) => failure = Some(format!("Failed to read the log of {}/{}: {e}", w.namespace, p.name_any())),
+            }
+        }
+    }
+    Some(match failure {
+        Some(e) if lines.is_empty() => Err(e),
+        _ => Ok((read, lines)),
+    })
+}
+
+pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<IngressDiagnostics, String> {
     use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 
     let client = client_for_context(context_name).await?;
@@ -5034,43 +5111,10 @@ pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: 
     let event_params = ListParams::default().fields(&event_fields);
     let all = ListParams::default();
 
-    let backends_fut = futures::future::join_all(backend_names.iter().map(|svc| {
-        let client = client.clone();
-        async move {
-            let services: Api<Service> = Api::namespaced(client.clone(), namespace);
-            let slices: Api<EndpointSlice> = Api::namespaced(client, namespace);
-            let params = ListParams::default().labels(&format!("kubernetes.io/service-name={svc}"));
-            let (service, slices) = tokio::join!(services.get(svc), slices.list(&params));
-            IngressBackend {
-                name: svc.clone(),
-                service: service.map_err(|e| get_error("Service", svc, e)),
-                slices: slices.map(|l| l.items).map_err(|e| format!("Failed to list the EndpointSlices of '{svc}': {e}")),
-            }
-        }
-    }));
+    let backends_fut = futures::future::join_all(backend_names.iter().map(|svc| read_service_backend(&client, namespace, svc)));
     let tls_fut = futures::future::join_all(tls_secrets.iter().map(|secret| {
         let client = client.clone();
-        async move {
-            let api: Api<Secret> = Api::namespaced(client, namespace);
-            // Keys and the certificate's public fields only: the values are
-            // read here and dropped, and the private key is never parsed.
-            let read = api
-                .get(secret)
-                .await
-                .map(|s| IngressTlsSecret {
-                    secret_type: s.type_.clone().unwrap_or_else(|| "Opaque".to_string()),
-                    keys: s.data.iter().flatten().map(|(k, _)| k.clone()).collect(),
-                    leaf: s
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("tls.crt"))
-                        .and_then(|v| std::str::from_utf8(&v.0).ok())
-                        .map(crate::x509::parse_pem_bundle)
-                        .and_then(|all| crate::secrets::leaf_of(&all).cloned()),
-                })
-                .map_err(|e| get_error("Secret", secret, e));
-            (secret.clone(), read)
-        }
+        async move { (secret.clone(), read_tls_secret(&client, namespace, secret).await) }
     }));
     let certificates_fut = async {
         if tls_secrets.is_empty() {
@@ -5174,44 +5218,8 @@ pub async fn get_ingress_diagnostics(context_name: &str, namespace: &str, name: 
     about.extend(tls_secrets.iter().cloned());
     let named: Vec<&IngressControllerWorkload> =
         controllers.iter().flatten().filter(|w| w.matched_by != "name only" && !w.selector.is_empty()).collect();
-    let controller_logs = if named.is_empty() {
-        None
-    } else {
-        let mut lines = Vec::new();
-        let mut failure = None;
-        let mut read = 0;
-        for w in named {
-            let pods: Api<Pod> = Api::namespaced(client.clone(), &w.namespace);
-            let list = match pods.list(&ListParams::default().labels(&w.selector)).await {
-                Ok(l) => l.items,
-                Err(e) => {
-                    failure = Some(format!("Failed to list the pods of {}/{}: {e}", w.namespace, w.name));
-                    continue;
-                }
-            };
-            for p in list {
-                // Its own container: a pod with an injected sidecar has
-                // several, and a log request without one is refused.
-                let params = LogParams {
-                    container: Some(w.container.clone()),
-                    since_seconds: Some(INGRESS_CONTROLLER_LOG_SECONDS),
-                    limit_bytes: Some(INGRESS_CONTROLLER_LOG_BYTES),
-                    ..Default::default()
-                };
-                match pods.logs(&p.name_any(), &params).await {
-                    Ok(text) => {
-                        read += 1;
-                        lines.extend(text.lines().filter(|l| ingress_log_line_is_about(l, namespace, &about)).map(str::to_string));
-                    }
-                    Err(e) => failure = Some(format!("Failed to read the log of {}/{}: {e}", w.namespace, p.name_any())),
-                }
-            }
-        }
-        Some(match failure {
-            Some(e) if lines.is_empty() => Err(e),
-            _ => Ok((read, lines)),
-        })
-    };
+    let params = LogParams { since_seconds: Some(INGRESS_CONTROLLER_LOG_SECONDS), limit_bytes: Some(INGRESS_CONTROLLER_LOG_BYTES), ..Default::default() };
+    let controller_logs = read_controller_logs(&client, &named, &params, |l| ingress_log_line_is_about(l, namespace, &about)).await;
 
     let same_host = all_ingresses
         .map(|l| {
