@@ -87,23 +87,26 @@ fn to_info(obj: &DynamicObject) -> ExternalSecretInfo {
     }
 }
 
-pub async fn get_external_secrets(context_name: &str) -> Result<ExternalSecretsResult, String> {
-    let client = client_for_context(context_name).await?;
+/// Every ExternalSecret, at the newest version served; `None` when ESO is
+/// not installed.
+async fn list_external_secrets(client: &Client) -> Result<Option<Vec<ExternalSecretInfo>>, String> {
     for version in VERSIONS {
         let api: Api<DynamicObject> = Api::all_with(client.clone(), &resource(version));
         match api.list(&ListParams::default()).await {
-            Ok(list) => {
-                return Ok(ExternalSecretsResult {
-                    installed: true,
-                    error: None,
-                    external_secrets: list.items.iter().map(to_info).collect(),
-                })
-            }
+            Ok(list) => return Ok(Some(list.items.iter().map(to_info).collect())),
             Err(kube::Error::Api(resp)) if resp.code == 404 => continue,
             Err(e) => return Err(format!("Failed to list ExternalSecrets: {e}")),
         }
     }
-    Ok(ExternalSecretsResult { installed: false, error: None, external_secrets: Vec::new() })
+    Ok(None)
+}
+
+pub async fn get_external_secrets(context_name: &str) -> Result<ExternalSecretsResult, String> {
+    let client = client_for_context(context_name).await?;
+    Ok(match list_external_secrets(&client).await? {
+        Some(external_secrets) => ExternalSecretsResult { installed: true, error: None, external_secrets },
+        None => ExternalSecretsResult { installed: false, error: None, external_secrets: Vec::new() },
+    })
 }
 
 /// A store's provider, read generically: ESO has some thirty providers, each
@@ -366,6 +369,8 @@ pub struct ExternalSecretDiagnostics {
 /// never a value. `None` when it does not exist.
 pub struct StoreCredential {
     pub kind: &'static str,
+    /// Empty for a ClusterSecretStore's reference that names none: ESO then
+    /// reads it in each ExternalSecret's own namespace, so it is not read here.
     pub namespace: String,
     pub name: String,
     /// The Secret key the store reads.
@@ -398,6 +403,17 @@ pub(crate) fn eso_log_line_is_about(line: &str, namespace: &str, name: &str) -> 
     let named = json_str(Some(&fields), "controllerKind") == "ExternalSecret"
         && json_str(Some(&fields), "name") == name
         && json_str(Some(&fields), "namespace") == namespace;
+    keyed || named
+}
+
+/// Whether a line of ESO's controller log is about this store: keyed by its
+/// kind, as the store controllers key theirs, or naming it as the object
+/// reconciled. A ClusterSecretStore has no namespace.
+pub(crate) fn eso_log_line_is_about_store(line: &str, kind: &str, namespace: &str, name: &str) -> bool {
+    let Ok(fields) = serde_json::from_str::<Value>(line.trim()) else { return false };
+    let store = fields.get(kind);
+    let keyed = json_str(store, "name") == name && json_str(store, "namespace") == namespace;
+    let named = json_str(Some(&fields), "controllerKind") == kind && json_str(Some(&fields), "name") == name && json_str(Some(&fields), "namespace") == namespace;
     keyed || named
 }
 
@@ -496,6 +512,113 @@ pub(crate) fn mask_template_literals(obj: &mut DynamicObject) {
     }
 }
 
+/// A store with the values it can hold verbatim masked: the fake provider's
+/// `data` values (`value`, and each `valueMap` entry), and the webhook
+/// provider's header values and body, keeping any `{{ … }}` references.
+/// Names and keys stay.
+pub(crate) fn mask_store_literals(obj: &mut DynamicObject) {
+    if let Some(data) = obj.data.pointer_mut("/spec/provider/fake/data").and_then(Value::as_array_mut) {
+        for entry in data {
+            if entry.get("value").is_some_and(Value::is_string) {
+                entry["value"] = Value::String("[MASKED: literal]".to_string());
+            }
+            if let Some(map) = entry.get_mut("valueMap").and_then(Value::as_object_mut) {
+                for v in map.values_mut() {
+                    *v = Value::String("[MASKED: literal]".to_string());
+                }
+            }
+        }
+    }
+    if let Some(webhook) = obj.data.pointer_mut("/spec/provider/webhook") {
+        if let Some(headers) = webhook.get_mut("headers").and_then(Value::as_object_mut) {
+            for v in headers.values_mut() {
+                if let Some(text) = v.as_str() {
+                    *v = Value::String(mask_template_text(text));
+                }
+            }
+        }
+        if let Some(text) = webhook.get("body").and_then(Value::as_str).map(mask_template_text) {
+            webhook["body"] = Value::String(text);
+        }
+    }
+}
+
+/// ESO's controller Deployments, by its Helm chart's label: its webhook and
+/// certificate controller carry names of their own.
+async fn eso_controllers(client: &Client) -> Result<Vec<k8s_openapi::api::apps::v1::Deployment>, String> {
+    Api::<k8s_openapi::api::apps::v1::Deployment>::all(client.clone())
+        .list(&ListParams::default().labels("app.kubernetes.io/name=external-secrets"))
+        .await
+        .map(|l| l.items)
+        .map_err(|e| format!("Failed to list ESO's Deployments: {e}"))
+}
+
+/// Every ESO controller's log lines from the last hour that `is_about`
+/// keeps: with more than one installed (scoped to namespaces, or by
+/// controller class) the first need not be the one that reconciles it.
+async fn read_eso_logs(client: &Client, controller: &Result<Vec<k8s_openapi::api::apps::v1::Deployment>, String>, is_about: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::LogParams;
+    use kube::ResourceExt;
+    let deployments = controller.as_ref().map_err(|e| e.clone())?;
+    if deployments.is_empty() {
+        return Err("ESO's controller was not found by its Helm chart's label".to_string());
+    }
+    let mut lines = Vec::new();
+    for d in deployments {
+        let ns = d.namespace().unwrap_or_default();
+        let Some(selector) = d
+            .spec
+            .selector
+            .match_labels
+            .as_ref()
+            .map(|m| m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","))
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+        let controller_pods = pods.list(&ListParams::default().labels(&selector)).await.map_err(|e| format!("Failed to list ESO's controller pods: {e}"))?.items;
+        for p in &controller_pods {
+            let params = LogParams { container: eso_container(d), since_seconds: Some(ESO_LOG_SECONDS), limit_bytes: Some(ESO_LOG_BYTES), ..Default::default() };
+            match pods.logs(&p.name_any(), &params).await {
+                Ok(text) => lines.extend(text.lines().filter(|l| is_about(l)).map(str::to_string)),
+                Err(e) => return Err(format!("Failed to read ESO's controller log: {e}")),
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// The Secrets and ServiceAccounts a store signs in with, read for their key
+/// or annotation names only, never their values. A reference without a
+/// namespace is not read.
+async fn read_store_credentials(client: &Client, refs: Vec<(&'static str, String, String, Option<String>)>) -> Vec<StoreCredential> {
+    use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
+    futures::future::join_all(refs.into_iter().map(|(kind, ns, n, key)| {
+        let client = client.clone();
+        async move {
+            let found = if ns.is_empty() {
+                Ok(None)
+            } else if kind == "Secret" {
+                Api::<Secret>::namespaced(client, &ns)
+                    .get_opt(&n)
+                    .await
+                    .map(|got| got.map(|s| s.data.iter().flatten().map(|(k, _)| k.clone()).collect()))
+                    .map_err(|e| format!("Failed to get Secret '{n}': {e}"))
+            } else {
+                Api::<ServiceAccount>::namespaced(client, &ns)
+                    .get_opt(&n)
+                    .await
+                    .map(|got| got.map(|sa| sa.metadata.annotations.iter().flatten().map(|(k, _)| k.clone()).collect()))
+                    .map_err(|e| format!("Failed to get ServiceAccount '{n}': {e}"))
+            };
+            StoreCredential { kind, namespace: ns, name: n, key, found }
+        }
+    }))
+    .await
+}
+
 /// The container of ESO's controller in its pod: the one running its image,
 /// else the first. Named in the log request, since a pod with an injected
 /// sidecar refuses one that does not say.
@@ -509,10 +632,7 @@ fn eso_container(d: &k8s_openapi::api::apps::v1::Deployment) -> Option<String> {
 }
 
 pub async fn get_external_secret_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<ExternalSecretDiagnostics, String> {
-    use k8s_openapi::api::apps::v1::Deployment;
-    use k8s_openapi::api::core::v1::{Event, Pod, Secret, ServiceAccount};
-    use kube::api::LogParams;
-    use kube::ResourceExt;
+    use k8s_openapi::api::core::v1::{Event, Secret};
 
     let client = client_for_context(context_name).await?;
     let mut object = get_one(&client, namespace, name).await?;
@@ -568,80 +688,16 @@ pub async fn get_external_secret_diagnostics(context_name: &str, namespace: &str
             })
             .map_err(|e| format!("Failed to get Secret '{}': {e}", info.target_name))
     };
-    // The controller by its Helm chart's label: its webhook and certificate
-    // controller carry names of their own.
-    let controller_fut = async {
-        Api::<Deployment>::all(client.clone())
-            .list(&ListParams::default().labels("app.kubernetes.io/name=external-secrets"))
-            .await
-            .map(|l| l.items)
-            .map_err(|e| format!("Failed to list ESO's Deployments: {e}"))
-    };
-    let (events, store, target, controller) = tokio::join!(events_fut, store_fut, target_fut, controller_fut);
+    let (events, store, target, controller) = tokio::join!(events_fut, store_fut, target_fut, eso_controllers(&client));
 
     let credential_refs = match &store {
         Ok(Some(s)) => store_credential_refs(s.data.pointer("/spec/provider"), namespace),
         _ => Vec::new(),
     };
-    let credentials_fut = futures::future::join_all(credential_refs.into_iter().map(|(kind, ns, n, key)| {
-        let client = client.clone();
-        async move {
-            // Key and annotation names only, never their values.
-            let found = if kind == "Secret" {
-                Api::<Secret>::namespaced(client, &ns)
-                    .get_opt(&n)
-                    .await
-                    .map(|got| got.map(|s| s.data.iter().flatten().map(|(k, _)| k.clone()).collect()))
-                    .map_err(|e| format!("Failed to get Secret '{n}': {e}"))
-            } else {
-                Api::<ServiceAccount>::namespaced(client, &ns)
-                    .get_opt(&n)
-                    .await
-                    .map(|got| got.map(|sa| sa.metadata.annotations.iter().flatten().map(|(k, _)| k.clone()).collect()))
-                    .map_err(|e| format!("Failed to get ServiceAccount '{n}': {e}"))
-            };
-            StoreCredential { kind, namespace: ns, name: n, key, found }
-        }
-    }));
-    // Every ESO controller's log: with more than one installed (scoped to
-    // namespaces, or by controller class) the first need not be the one that
-    // reconciles this ExternalSecret.
-    let logs_fut = async {
-        let deployments = controller.as_ref().map_err(|e| e.clone())?;
-        if deployments.is_empty() {
-            return Err("ESO's controller was not found by its Helm chart's label".to_string());
-        }
-        let mut lines = Vec::new();
-        for d in deployments {
-            let ns = d.namespace().unwrap_or_default();
-            let Some(selector) = d
-                .spec
-                .selector
-                .match_labels
-                .as_ref()
-                .map(|m| m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","))
-                .filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
-            let controller_pods = pods.list(&ListParams::default().labels(&selector)).await.map_err(|e| format!("Failed to list ESO's controller pods: {e}"))?.items;
-            for p in &controller_pods {
-                let params = LogParams {
-                    container: eso_container(d),
-                    since_seconds: Some(ESO_LOG_SECONDS),
-                    limit_bytes: Some(ESO_LOG_BYTES),
-                    ..Default::default()
-                };
-                match pods.logs(&p.name_any(), &params).await {
-                    Ok(text) => lines.extend(text.lines().filter(|l| eso_log_line_is_about(l, namespace, name)).map(str::to_string)),
-                    Err(e) => return Err(format!("Failed to read ESO's controller log: {e}")),
-                }
-            }
-        }
-        Ok(lines)
-    };
-    let (credentials, controller_logs) = tokio::join!(credentials_fut, logs_fut);
+    let (credentials, controller_logs) = tokio::join!(
+        read_store_credentials(&client, credential_refs),
+        read_eso_logs(&client, &controller, |l| eso_log_line_is_about(l, namespace, name)),
+    );
 
     Ok(ExternalSecretDiagnostics {
         object,
@@ -655,6 +711,68 @@ pub async fn get_external_secret_diagnostics(context_name: &str, namespace: &str
         controller,
         controller_logs,
     })
+}
+
+/// What a SecretStore or ClusterSecretStore diagnosis reads. Only the store
+/// is required.
+pub struct SecretStoreDiagnostics {
+    /// The store as read, last-applied removed and literals masked.
+    pub store: DynamicObject,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// The Secrets and ServiceAccounts it signs in with.
+    pub credentials: Vec<StoreCredential>,
+    /// The ExternalSecrets that name it, failing first.
+    pub consumers: Result<Vec<ExternalSecretInfo>, String>,
+    pub controller: Result<Vec<k8s_openapi::api::apps::v1::Deployment>, String>,
+    /// The controller's log lines about the store, oldest first.
+    pub controller_logs: Result<Vec<String>, String>,
+}
+
+pub async fn get_secret_store_diagnostics(context_name: &str, kind: &str, namespace: &str, name: &str) -> Result<SecretStoreDiagnostics, String> {
+    use k8s_openapi::api::core::v1::Event;
+    if !matches!(kind, "SecretStore" | "ClusterSecretStore") {
+        return Err(format!("{kind} is not a secret store kind"));
+    }
+    let cluster = kind == "ClusterSecretStore";
+    let namespace = if cluster { "" } else { namespace };
+    let client = client_for_context(context_name).await?;
+    let mut store = get_store(&client, kind, namespace, name).await?.ok_or_else(|| format!("{kind} '{name}' not found"))?;
+    if let Some(a) = store.metadata.annotations.as_mut() {
+        a.remove(crate::k8s::LAST_APPLIED_ANNOTATION);
+    }
+    mask_store_literals(&mut store);
+    let manifest = object_manifest(store.clone())?.yaml_without_managed_fields;
+
+    // A cluster-scoped object's events land in whichever namespace its
+    // reporter chose, usually default, so they are looked for everywhere.
+    let events_fut = async {
+        let in_ns = if cluster { String::new() } else { format!(",involvedObject.namespace={namespace}") };
+        let params = ListParams::default().fields(&format!("involvedObject.kind={kind},involvedObject.name={name}{in_ns}"));
+        let api: Api<Event> = if cluster { Api::all(client.clone()) } else { Api::namespaced(client.clone(), namespace) };
+        api.list(&params)
+            .await
+            .map(|l| {
+                let mut items = l.items;
+                items.sort_by(|a, b| crate::k8s::event_last_seen(b).cmp(&crate::k8s::event_last_seen(a)));
+                items.into_iter().map(event_to_info).collect()
+            })
+            .map_err(|e| format!("Failed to list events for {kind} '{name}': {e}"))
+    };
+    let consumers_fut = async {
+        list_external_secrets(&client).await.map(|all| {
+            let mut using: Vec<ExternalSecretInfo> =
+                all.unwrap_or_default().into_iter().filter(|es| es.store_kind == kind && es.store_name == name && (cluster || es.namespace == namespace)).collect();
+            // Failing first, then by namespace and name.
+            using.sort_by(|a, b| a.ready.cmp(&b.ready).then_with(|| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name))));
+            using
+        })
+    };
+    let refs = store_credential_refs(store.data.pointer("/spec/provider"), namespace);
+    let (events, consumers, controller, credentials) = tokio::join!(events_fut, consumers_fut, eso_controllers(&client), read_store_credentials(&client, refs));
+    let controller_logs = read_eso_logs(&client, &controller, |l| eso_log_line_is_about_store(l, kind, namespace, name)).await;
+
+    Ok(SecretStoreDiagnostics { store, manifest, events, credentials, consumers, controller, controller_logs })
 }
 
 #[cfg(test)]
@@ -806,6 +924,46 @@ mod tests {
             "external_secrets={} not_ready={not_ready} templated={templated} non_default_policy={non_default_policy} unbound={unbound}",
             list.external_secrets.len()
         );
+    }
+
+    /// Builds the diagnosis payload of every store, printing counts only:
+    /// SECRET_STORE_DIAG_TEST_CONTEXT=<context> cargo test --lib
+    /// external_secrets::tests::secret_store_diagnosis_against_a_live_cluster -- --ignored --exact --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set SECRET_STORE_DIAG_TEST_CONTEXT to run"]
+    async fn secret_store_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("SECRET_STORE_DIAG_TEST_CONTEXT") else { return };
+        let stores = get_secret_stores(&ctx).await.expect("list");
+        let externals = get_external_secrets(&ctx).await.expect("list").external_secrets;
+        println!("installed={} stores={} (not ready {}) external_secrets={}", stores.installed, stores.stores.len(), stores.stores.iter().filter(|s| !s.ready).count(), externals.len());
+        let mut methods: std::collections::BTreeMap<(String, String, bool), usize> = std::collections::BTreeMap::new();
+        for s in &stores.stores {
+            *methods.entry((s.provider.clone(), s.auth.clone(), !s.identity.is_empty())).or_default() += 1;
+        }
+        println!("by (provider, auth method, names an identity): {methods:?}");
+        let sample = std::env::var("SECRET_STORE_DIAG_SAMPLE").ok().and_then(|n| n.parse().ok()).unwrap_or(usize::MAX);
+        for s in stores.stores.iter().rev().take(sample) {
+            let d = get_secret_store_diagnostics(&ctx, &s.kind, &s.namespace, &s.name).await.expect("diagnostics");
+            let p = crate::claude::build_secret_store_diagnosis_payload(&ctx, &s.kind, &s.namespace, &s.name).await.expect("payload");
+            let consumers = d.consumers.as_ref().expect("consumers");
+            println!(
+                "{}: ready={} credentials={} (read {}) consumers={} (failing {}) controllers={:?} log lines={:?} events={:?} tokens={} unavailable={}",
+                s.kind,
+                s.ready,
+                d.credentials.len(),
+                d.credentials.iter().filter(|c| matches!(c.found, Ok(Some(_)))).count(),
+                consumers.len(),
+                consumers.iter().filter(|e| !e.ready).count(),
+                d.controller.as_ref().map(Vec::len),
+                d.controller_logs.as_ref().map(Vec::len),
+                d.events.as_ref().map(Vec::len),
+                p.approx_tokens,
+                p.prompt.matches("unavailable").count(),
+            );
+            // Every ExternalSecret that names a store is counted under it.
+            let expected = externals.iter().filter(|e| e.store_kind == s.kind && e.store_name == s.name && (s.kind == "ClusterSecretStore" || e.namespace == s.namespace)).count();
+            assert_eq!(consumers.len(), expected);
+        }
     }
 
     #[test]

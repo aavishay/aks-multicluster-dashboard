@@ -167,7 +167,7 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, namespace, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, Gateway, Gateway API route, PVC, PodDisruptionBudget, ExternalSecret, HPA, KEDA
+Any node, namespace, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, Gateway, Gateway API route, PVC, PodDisruptionBudget, ExternalSecret, SecretStore, ClusterSecretStore, HPA, KEDA
 ScaledObject or ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
 and click **Diagnose** in its panel, or press `⌘D` on a focused row. An event offers the diagnosis of the
 object it is about the same way — for a pod, with the logs of the container the event names; for a
@@ -226,6 +226,14 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   admits the namespace), the Secrets and ServiceAccount the store signs in
   with, the target Secret's type, key names and owner — never a value — the
   mapped keys it lacks, and ESO's controller with its log lines about it;
+- a SecretStore or ClusterSecretStore: its provider, how it signs in and
+  whether it is ready, the Secrets and ServiceAccount it signs in with —
+  checked by key name, never a value — the ExternalSecrets that use it with
+  the failing ones grouped by their error (one error across all of them is
+  the store's; one on a few is theirs), the namespaces a ClusterSecretStore
+  refuses that some of them are in, and ESO's controller with its log lines
+  about the store. Literal values a store can hold (the fake provider's data,
+  a webhook's headers and body) are masked;
 - a PodDisruptionBudget: the pods it covers with their readiness and the
   state of their nodes — a drain waiting on it shows as covered pods on
   cordoned nodes — the controllers behind them and the replicas each asks

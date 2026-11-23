@@ -354,6 +354,49 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_SECRET_STORE_SYSTEM: &str = "\
+You diagnose External Secrets Operator SecretStores and ClusterSecretStores \
+for an experienced SRE.
+
+You are given the store's provider, where it points, how it signs in and \
+its Ready condition, and for a ClusterSecretStore which namespaces its \
+conditions admit; the Secrets and ServiceAccount it signs in with, checked \
+by key or annotation name only; the ExternalSecrets that use it, with the \
+failing ones grouped by their error; ESO's controller and its log lines \
+about the store; its events; and its manifest, literal values masked. \
+Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition message, \
+the credential, the log line, the grouped error, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- It cannot sign in (Ready False, InvalidProviderConfig or a validation \
+error): a credential Secret or a key it names is missing; the ServiceAccount \
+it uses lacks the identity annotation; or for Azure workload identity the \
+identity has no federated credential for that ServiceAccount's subject and \
+the cluster's issuer, or the wrong client or tenant ID. Name the side to \
+fix: Kubernetes, or the provider.
+- It signs in but is refused: the store is Ready but its ExternalSecrets \
+fail with the same permission error — the identity lacks a Key Vault RBAC \
+role or access policy, an IAM policy, a Vault policy. One error across all \
+of them is the store's identity; an error on a few is those ExternalSecrets' \
+own (a remote key that does not exist), not the store's.
+- A ClusterSecretStore that refuses namespaces: ExternalSecrets in a \
+namespace its conditions do not admit fail however healthy the store is.
+- Nothing reconciles it: ESO's controller is down, so its status is stale.
+- Unused: no ExternalSecret names it. Say so; it is not a fault.
+
+If it is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] or [MASKED] before you see them — \
+secrets and personal data are stripped deliberately. Do not speculate about \
+redacted contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -5921,7 +5964,18 @@ fn render_es_store(kind: &str, name: &str, namespace: &str, store: &Result<Optio
         }
         Ok(Some(s)) => s,
     };
+    let mut lines = render_store_lines(kind, s);
+    if kind == "ClusterSecretStore" && store_refuses_namespace(s, namespace) {
+        lines.push(format!("NOT ALLOWED FROM NAMESPACE {namespace}: its conditions do not admit it"));
+    }
+    lines.join("\n")
+}
+
+/// A store's provider, how it signs in, whether it is ready, and for a
+/// ClusterSecretStore which namespaces its conditions admit.
+fn render_store_lines(kind: &str, s: &kube::api::DynamicObject) -> Vec<String> {
     let info = crate::external_secrets::store_info(s, kind);
+    let name = &info.name;
     let mut lines = vec![format!(
         "{kind} {name}: provider {}{}; signs in with {}{}",
         info.provider,
@@ -5943,15 +5997,11 @@ fn render_es_store(kind: &str, name: &str, namespace: &str, store: &Result<Optio
     }
     // A ClusterSecretStore's conditions say which namespaces may use it.
     let conditions = s.data.pointer("/spec/conditions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    if kind == "ClusterSecretStore" && !conditions.is_empty() {
-        let mut only_lists = true;
-        let mut admitted = false;
+    if kind == "ClusterSecretStore" {
         for c in &conditions {
             let names: Vec<&str> = c.get("namespaces").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()).collect();
             let selector = c.get("namespaceSelector").filter(|v| !v.is_null());
             let regexes: Vec<&str> = c.get("namespaceRegexes").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()).collect();
-            only_lists &= selector.is_none() && regexes.is_empty();
-            admitted |= names.contains(&namespace);
             lines.push(format!(
                 "admits: {}",
                 [
@@ -5965,11 +6015,18 @@ fn render_es_store(kind: &str, name: &str, namespace: &str, store: &Result<Optio
                 .join("; ")
             ));
         }
-        if only_lists && !admitted {
-            lines.push(format!("NOT ALLOWED FROM NAMESPACE {namespace}: its conditions do not admit it"));
-        }
     }
-    lines.join("\n")
+    lines
+}
+
+/// Whether a ClusterSecretStore's conditions refuse a namespace. Judged only
+/// when every condition lists namespaces by name: a selector or a pattern
+/// cannot be checked from here, so then it is not called a refusal.
+fn store_refuses_namespace(s: &kube::api::DynamicObject, namespace: &str) -> bool {
+    let conditions = s.data.pointer("/spec/conditions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let only_lists = conditions.iter().all(|c| c.get("namespaceSelector").is_none_or(serde_json::Value::is_null) && c.get("namespaceRegexes").and_then(|v| v.as_array()).is_none_or(Vec::is_empty));
+    let admitted = conditions.iter().any(|c| c.get("namespaces").and_then(|v| v.as_array()).into_iter().flatten().any(|v| v.as_str() == Some(namespace)));
+    !conditions.is_empty() && only_lists && !admitted
 }
 
 /// The Secrets and ServiceAccounts a store signs in with, by name and key —
@@ -5989,6 +6046,14 @@ fn render_es_credentials(credentials: &[crate::external_secrets::StoreCredential
     credentials
         .iter()
         .map(|c| {
+            if c.namespace.is_empty() {
+                return format!(
+                    "{} {}{}: no namespace given, so ESO reads it in the namespace of each ExternalSecret that uses the store",
+                    c.kind,
+                    c.name,
+                    c.key.as_deref().map(|k| format!(" (key {k})")).unwrap_or_default()
+                );
+            }
             let what = format!("{} {}/{}", c.kind, c.namespace, c.name);
             match (&c.found, c.kind, &c.key) {
                 (Err(e), _, _) => format!("{what}: (unavailable: {e})"),
@@ -6177,6 +6242,95 @@ pub async fn build_external_secret_diagnosis_payload(context_name: &str, namespa
     let whole = redact::redact(&prompt);
     let redaction_summary =
         redact::Redacted::merge([&status, &mappings, &store, &credentials, &target, &controller, &logs, &events, &manifest, &whole]).summary();
+    let prompt = whole.text.clone();
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
+/// How many distinct errors among a store's failing ExternalSecrets to show,
+/// and how many of each error's ExternalSecrets to name.
+const DIAGNOSE_STORE_ERRORS: usize = 8;
+const DIAGNOSE_STORE_ERROR_NAMES: usize = 5;
+
+/// The ExternalSecrets that use a store: how many are synced, and the
+/// failing ones grouped by their error — one error shared by all of them is
+/// the store's, one shared by a few is theirs. For a ClusterSecretStore,
+/// those in namespaces its conditions refuse.
+fn render_store_consumers(kind: &str, store: &kube::api::DynamicObject, consumers: &Result<Vec<crate::models::ExternalSecretInfo>, String>) -> String {
+    let consumers = match consumers {
+        Err(e) => return format!("(ExternalSecrets unavailable: {e})"),
+        Ok(c) if c.is_empty() => return "(no ExternalSecret names it)".to_string(),
+        Ok(c) => c,
+    };
+    let failing: Vec<&crate::models::ExternalSecretInfo> = consumers.iter().filter(|e| !e.ready).collect();
+    let mut lines = vec![format!(
+        "{} ExternalSecret{} use{} it: {} synced, {}",
+        consumers.len(),
+        if consumers.len() == 1 { "" } else { "s" },
+        if consumers.len() == 1 { "s" } else { "" },
+        consumers.len() - failing.len(),
+        if failing.is_empty() { "none failing".to_string() } else { format!("{} FAILING", failing.len()) }
+    )];
+    let mut groups: Vec<((String, String), Vec<String>)> = Vec::new();
+    for e in &failing {
+        let key = (e.reason.clone(), e.message.chars().take(400).collect::<String>());
+        let who = format!("{}/{}", e.namespace, e.name);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, names)) => names.push(who),
+            None => groups.push((key, vec![who])),
+        }
+    }
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    for ((reason, message), names) in groups.iter().take(DIAGNOSE_STORE_ERRORS) {
+        let why = match (reason.is_empty(), message.is_empty()) {
+            (true, true) => "no Ready condition yet: ESO has not reconciled it".to_string(),
+            (false, true) => reason.clone(),
+            (true, false) => message.clone(),
+            (false, false) => format!("{reason}: {message}"),
+        };
+        let shown = names.iter().take(DIAGNOSE_STORE_ERROR_NAMES).cloned().collect::<Vec<_>>().join(", ");
+        let more = names.len().saturating_sub(DIAGNOSE_STORE_ERROR_NAMES);
+        lines.push(format!("- ×{} {why} — {shown}{}", names.len(), if more > 0 { format!(", and {more} more") } else { String::new() }));
+    }
+    if groups.len() > DIAGNOSE_STORE_ERRORS {
+        lines.push(format!("… and {} other errors", groups.len() - DIAGNOSE_STORE_ERRORS));
+    }
+    if kind == "ClusterSecretStore" {
+        let mut refused: Vec<&str> = consumers.iter().map(|e| e.namespace.as_str()).filter(|ns| store_refuses_namespace(store, ns)).collect();
+        refused.sort();
+        refused.dedup();
+        if !refused.is_empty() {
+            lines.push(format!("IN NAMESPACES ITS CONDITIONS DO NOT ADMIT: {}", refused.join(", ")));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Assembles a SecretStore or ClusterSecretStore diagnosis, redacted.
+pub async fn build_secret_store_diagnosis_payload(context_name: &str, kind: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = crate::external_secrets::get_secret_store_diagnostics(context_name, kind, namespace, name).await?;
+    let state = redact::redact(&render_store_lines(kind, &d.store).join("\n"));
+    let credentials = redact::redact(&render_es_credentials(&d.credentials, &Ok(Some(d.store.clone()))));
+    let consumers = redact::redact(&render_store_consumers(kind, &d.store, &d.consumers));
+    let controller = redact::redact(&render_es_controller(&d.controller));
+    let logs = redact::redact(&render_es_logs(&d.controller_logs));
+    let events = redact::redact(&render_nap_events(&d.events, &format!("(no events for this {kind})"), false, 20));
+    let manifest = redact::redact(&d.manifest);
+
+    let what = if kind == "ClusterSecretStore" { format!("ClusterSecretStore {name}") } else { format!("SecretStore {namespace}/{name}") };
+    let prompt = format!(
+        "{what}.\n\n\
+         ## Provider and status\n{}\n\n\
+         ## How it signs in\n{}\n\n\
+         ## ExternalSecrets that use it\n{}\n\n\
+         ## ESO's controller\n{}\n\n\
+         ## Controller log lines about it (last hour)\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted, literal values masked)\n```yaml\n{}\n```",
+        state.text, credentials.text, consumers.text, controller.text, logs.text, events.text, manifest.text,
+    );
+    // The headings carry the namespace and name, which no section did.
+    let whole = redact::redact(&prompt);
+    let redaction_summary = redact::Redacted::merge([&state, &credentials, &consumers, &controller, &logs, &events, &manifest, &whole]).summary();
     let prompt = whole.text.clone();
     Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
 }
@@ -7504,6 +7658,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "StatefulSet" => DIAGNOSE_STATEFULSET_SYSTEM,
         "Job" | "CronJob" => DIAGNOSE_JOB_SYSTEM,
         "ExternalSecret" => DIAGNOSE_EXTERNALSECRET_SYSTEM,
+        "SecretStore" | "ClusterSecretStore" => DIAGNOSE_SECRET_STORE_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
         "Deployment" => DIAGNOSE_DEPLOYMENT_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
@@ -10056,6 +10211,73 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         let tls = external_secret(serde_json::json!({ "spec": { "target": { "template": { "type": "kubernetes.io/tls", "data": { "tls.crt": "", "tls.key": "" } } } } }));
         let out = render_es_target(&tls, &Ok(Some(target(&["tls.crt", "tls.key"], Some(("ExternalSecret", "db", "es-uid")), "Opaque"))));
         assert!(out.contains("TYPE Opaque, NOT THE TEMPLATE'S kubernetes.io/tls") && !out.contains("MISSING KEYS"), "{out}");
+    }
+
+    #[test]
+    fn a_store_groups_its_failing_external_secrets_by_error() {
+        let es = |ns: &str, name: &str, ready: bool, reason: &str, message: &str| crate::models::ExternalSecretInfo {
+            namespace: ns.into(), name: name.into(), store_kind: "ClusterSecretStore".into(), store_name: "kv".into(), target_name: name.into(), target_type: "Opaque".into(),
+            refresh_interval: "1h".into(), data_count: 1, data_from_count: 0, ready, reason: reason.into(), message: message.into(), last_refresh: None,
+            age_days: 1, age_seconds: 86400, created_at: None,
+        };
+        let store: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({ "apiVersion": "external-secrets.io/v1", "kind": "ClusterSecretStore", "metadata": { "name": "kv" },
+            "spec": { "provider": { "azurekv": { "vaultUrl": "https://kv.example", "authType": "WorkloadIdentity", "serviceAccountRef": { "name": "eso", "namespace": "eso" } } },
+                "conditions": [{ "namespaces": ["a", "b", "c"] }] },
+            "status": { "conditions": [{ "type": "Ready", "status": "True", "reason": "Valid", "message": "store validated" }] } })).unwrap();
+        let forbidden = "could not get secret data from provider: 403 Forbidden";
+        let consumers = Ok(vec![
+            es("a", "one", false, "SecretSyncedError", forbidden),
+            es("b", "two", false, "SecretSyncedError", forbidden),
+            es("c", "three", false, "SecretSyncedError", "key \"gone\" not found"),
+            es("z", "four", false, "", ""),
+            es("a", "five", true, "SecretSynced", "secret synced"),
+        ]);
+        assert_eq!(
+            render_store_consumers("ClusterSecretStore", &store, &consumers),
+            "5 ExternalSecrets use it: 1 synced, 4 FAILING\n\
+             - ×2 SecretSyncedError: could not get secret data from provider: 403 Forbidden — a/one, b/two\n\
+             - ×1 SecretSyncedError: key \"gone\" not found — c/three\n\
+             - ×1 no Ready condition yet: ESO has not reconciled it — z/four\n\
+             IN NAMESPACES ITS CONDITIONS DO NOT ADMIT: z"
+        );
+        assert_eq!(render_store_consumers("SecretStore", &store, &Ok(vec![])), "(no ExternalSecret names it)");
+        assert_eq!(
+            render_store_lines("ClusterSecretStore", &store).join("\n"),
+            "ClusterSecretStore kv: provider azurekv at https://kv.example; signs in with WorkloadIdentity as eso\nReady: store validated\nadmits: namespaces a, b, c"
+        );
+        // A ClusterSecretStore's reference without a namespace is each consumer's own.
+        let unscoped = crate::external_secrets::StoreCredential { kind: "Secret", namespace: String::new(), name: "sp".into(), key: Some("client-secret".into()), found: Ok(None) };
+        assert_eq!(
+            render_es_credentials(&[unscoped], &Ok(Some(store))),
+            "Secret sp (key client-secret): no namespace given, so ESO reads it in the namespace of each ExternalSecret that uses the store"
+        );
+    }
+
+    #[test]
+    fn a_stores_log_lines_are_matched_and_its_literals_masked() {
+        let keyed = |kind: &str, ns: Option<&str>, name: &str| {
+            let mut who = serde_json::json!({ "name": name });
+            if let Some(ns) = ns {
+                who["namespace"] = serde_json::json!(ns);
+            }
+            serde_json::json!({ "level": "error", "msg": "could not validate provider", kind: who }).to_string()
+        };
+        use crate::external_secrets::eso_log_line_is_about_store as about;
+        assert!(about(&keyed("ClusterSecretStore", None, "kv"), "ClusterSecretStore", "", "kv"));
+        assert!(about(&keyed("SecretStore", Some("app"), "kv"), "SecretStore", "app", "kv"));
+        assert!(!about(&keyed("SecretStore", Some("other"), "kv"), "SecretStore", "app", "kv"));
+        assert!(!about(&keyed("SecretStore", Some("app"), "kv"), "ClusterSecretStore", "", "kv"), "a namespaced store of the same name is another store");
+        let named = serde_json::json!({ "msg": "Reconciler error", "controllerKind": "ClusterSecretStore", "name": "kv", "error": "x" }).to_string();
+        assert!(about(&named, "ClusterSecretStore", "", "kv"));
+
+        let mut store: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({ "apiVersion": "external-secrets.io/v1", "kind": "SecretStore", "metadata": { "name": "s", "namespace": "app" },
+            "spec": { "provider": {
+                "fake": { "data": [{ "key": "db", "value": "hunter2" }, { "key": "map", "valueMap": { "user": "admin", "pass": "s3cret" } }] },
+                "webhook": { "url": "https://hook", "headers": { "Authorization": "Bearer abc.def", "X-Token": "{{ .auth.token }}" }, "body": "{\"key\": \"literal-key\"}" } } } })).unwrap();
+        crate::external_secrets::mask_store_literals(&mut store);
+        let text = serde_json::to_string(&store.data).unwrap();
+        assert!(!["hunter2", "admin", "s3cret", "abc.def", "literal-key"].iter().any(|v| text.contains(v)), "{text}");
+        assert!(text.contains("\"key\":\"db\"") && text.contains("[MASKED: literal around {{ .auth.token }}]") && text.contains("\"url\":\"https://hook\""), "{text}");
     }
 
     #[test]

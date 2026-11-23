@@ -6009,6 +6009,7 @@ function setMetricsRange(minutes: number) {
   diagnosePdb,
   diagnoseKeda,
   diagnoseSubject,
+  diagnoseSecretStore,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -7212,7 +7213,7 @@ function renderClaudeDiagnosePanel(): string {
                   : d.kind === "Gateway"
                   ? "Its conditions, listeners and addresses, its GatewayClass, each listener's certificate (checked by key name and the certificate's public fields, never the key) and any ReferenceGrant it needs, the proxies and Service its controller created for it, the routes attached to it, the controller's log lines about it, its events, and its manifest."
                   : isRouteKind(d.kind)
-                  ? "Its hostnames and rules, each parent's verdict on it with every listener of its Gateways checked against it, each backend Service with its port and ready endpoints and any ReferenceGrant it needs, other routes claiming the same hostname and match, the controller's log lines about it, its events, and its manifest."
+                  ? "Its hostnames and rules, each parent's verdict on it with every listener of its Gateways checked against it, each backend Service with its port and ready endpoints and any ReferenceGrant it needs, other routes on the same listener claiming an overlapping hostname and the same match, the controller's log lines about it, its events, and its manifest."
                   : d.kind === "Service"
                   ? "Its spec and endpoints, the pods its selector matches with their readiness and probes — or, when it matches none, the pods and workloads that nearly match — whether its target ports exist on them, the events of an unready pod, the Ingresses routing to it, its events, and its manifest."
                   : d.kind === "HorizontalPodAutoscaler"
@@ -7221,6 +7222,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
                   : d.kind === "ExternalSecret"
                   ? "Its store, target, policies, refresh and conditions, what it maps from the provider, its store with how it signs in and whether it is ready, the Secrets and ServiceAccount the store signs in with (checked by key name, never value), the target Secret's type, key names and owner (never its values), ESO's controller and its log lines about it, its events, and its manifest."
+                  : d.kind === "SecretStore" || d.kind === "ClusterSecretStore"
+                  ? "Its provider, how it signs in and whether it is ready (and for a ClusterSecretStore, which namespaces it admits), the Secrets and ServiceAccount it signs in with (checked by key name, never value), the ExternalSecrets that use it with the failing ones grouped by error, ESO's controller and its log lines about it, its events, and its manifest with literal values masked."
                   : d.kind === "CronJob"
                   ? "Its schedule, policies and recent runs, its newest failed run (or newest run) with its limits, status and conditions, that run's attempts with each container's exit code and node, the events of the CronJob, the run and its worst attempt, that attempt's logs (and its previous instance's when it restarted), and its manifest."
                   : d.kind === "Job"
@@ -8754,6 +8757,10 @@ function diagnosePvc(ctx: string, namespace: string, name: string) {
 
 function diagnoseExternalSecret(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "ExternalSecret", namespace, name, "", () => api.aiBuildExternalSecretDiagnosis(ctx, namespace, name));
+}
+
+function diagnoseSecretStore(ctx: string, kind: string, namespace: string, name: string) {
+  startDiagnosis(ctx, kind, namespace, name, "", () => api.aiBuildSecretStoreDiagnosis(ctx, kind, namespace, name));
 }
 
 function diagnoseJob(ctx: string, kind: string, namespace: string, name: string) {
@@ -12846,6 +12853,8 @@ function eventDiagnosisTable(): Record<string, EventDiagnosis> {
     NodePool: { group: "karpenter.sh", what: "nodepool", label: "node pool", listed: (ctx, ns, n) => listedIn(state.nap.get(ctx)?.node_pools, ns, n) },
     Application: { group: "argoproj.io", what: "application", label: "application", listed: (ctx, ns, n) => listedIn(state.gitops.get(ctx)?.apps, ns, n) },
     ExternalSecret: { group: "external-secrets.io", what: "externalsecret", label: "external secret", listed: (ctx, ns, n) => listedIn(state.externalSecrets.get(ctx)?.external_secrets, ns, n) },
+    SecretStore: { group: "external-secrets.io", what: "secretstore", label: "secret store", listed: (ctx, ns, n, k) => listedIn(state.secretStores.get(ctx)?.stores, ns, n, (x) => x.kind === k) },
+    ClusterSecretStore: { group: "external-secrets.io", what: "secretstore", label: "secret store", listed: (ctx, ns, n, k) => listedIn(state.secretStores.get(ctx)?.stores, ns, n, (x) => x.kind === k) },
   };
 }
 
@@ -14382,7 +14391,7 @@ function renderSecretStores(): string {
     keyOf: (r) => `${r.ctx}:${r.s.kind}:${r.s.namespace}:${r.s.name}`,
     health: { healthy: (r) => r.s.ready, unhealthyLabel: "not ready", statusText: (r) => status(r.s) },
     renderRow: ({ ctx, s }) => `
-      <tr>
+      <tr${diagnoseAttrs({ what: "secretstore", ctx, kind: s.kind, namespace: s.namespace, name: s.name, container: "" })}>
         ${rowCheckboxCell("secretstores", `${ctx}:${s.kind}:${s.namespace}:${s.name}`)}
         <td title="${esc([status(s), s.message].filter(Boolean).join(": "))}">${statusDot(s.ready)}</td>
         ${multi ? resourceClusterCell("secretstores", ctx) : ""}
@@ -15217,6 +15226,8 @@ function renderResourceDetailPanel(): string {
                     ? claudeDiagnoseButton(`window.__app.diagnoseJob(${jsArg(rd.ctx)},${jsArg(rd.kind)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, rd.kind === "Job" ? "job" : "cron job")
                     : rd.kind === "PodDisruptionBudget"
                     ? claudeDiagnoseButton(`window.__app.diagnosePdb(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "disruption budget")
+                    : rd.kind === "SecretStore" || rd.kind === "ClusterSecretStore"
+                    ? claudeDiagnoseButton(`window.__app.diagnoseSecretStore(${jsArg(rd.ctx)},${jsArg(rd.kind)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "secret store")
                     : evDiagnosis
                       ? claudeDiagnoseButton(`window.__app.diagnoseSubject(${jsArg(JSON.stringify(evDiagnosis.subject))})`, evDiagnosis.label)
                       : ""
@@ -16685,6 +16696,9 @@ function runDiagnosis(s: DiagnoseSubject): boolean {
       return true;
     case "externalsecret":
       diagnoseExternalSecret(ctx, ns, name);
+      return true;
+    case "secretstore":
+      diagnoseSecretStore(ctx, s.kind || "SecretStore", ns, name);
       return true;
     case "job":
       diagnoseJob(ctx, s.kind || "Job", ns, name);
