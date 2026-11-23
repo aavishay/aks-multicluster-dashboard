@@ -12808,6 +12808,22 @@ function listedIn<T extends { name: string; namespace?: string }>(list: readonly
   return list === undefined ? undefined : list.some((x) => (x.namespace ?? "") === namespace && x.name === name && also(x));
 }
 
+/**
+ * The same, for a list that comes with an `error`: one that could not list
+ * some of what it covers (a kind RBAC forbids, say) leaves the rest out, so
+ * an object missing from it is not known to be gone.
+ */
+function listedInResult<R extends { error: string | null }, T extends { name: string; namespace?: string }>(
+  result: R | undefined,
+  list: (r: R) => readonly T[],
+  namespace: string,
+  name: string,
+  also: (x: T) => boolean = () => true,
+): boolean | undefined {
+  if (result === undefined) return undefined;
+  return listedIn(list(result), namespace, name, also) || (result.error ? undefined : false);
+}
+
 interface EventDiagnosis {
   group: string;
   what: string;
@@ -12837,24 +12853,24 @@ function eventDiagnosisTable(): Record<string, EventDiagnosis> {
     Service: { group: "", what: "service", label: "service", listed: (ctx, ns, n) => listedIn(state.services.get(ctx), ns, n) },
     PersistentVolumeClaim: { group: "", what: "pvc", label: "volume claim", listed: (ctx, ns, n) => listedIn(state.pvcs.get(ctx), ns, n) },
     Ingress: { group: "networking.k8s.io", what: "ingress", label: "ingress", listed: (ctx, ns, n) => listedIn(state.ingresses.get(ctx), ns, n) },
-    Gateway: { group: GATEWAY_API_GROUP, what: "gateway", label: "gateway", listed: (ctx, ns, n) => listedIn(state.gatewayApi.get(ctx)?.gateways, ns, n) },
+    Gateway: { group: GATEWAY_API_GROUP, what: "gateway", label: "gateway", listed: (ctx, ns, n) => listedInResult(state.gatewayApi.get(ctx), (r) => r.gateways, ns, n) },
     ...Object.fromEntries(
       ROUTE_KINDS.map((k) => [
         k,
-        { group: GATEWAY_API_GROUP, what: "route", label: "route", listed: (ctx: string, ns: string, n: string, kind: string) => listedIn(state.gatewayApi.get(ctx)?.routes, ns, n, (r) => r.kind === kind) },
+        { group: GATEWAY_API_GROUP, what: "route", label: "route", listed: (ctx: string, ns: string, n: string, kind: string) => listedInResult(state.gatewayApi.get(ctx), (r) => r.routes, ns, n, (r) => r.kind === kind) },
       ]),
     ),
     HorizontalPodAutoscaler: { group: "autoscaling", what: "hpa", label: "autoscaler", listed: (ctx, ns, n) => listedIn(state.hpa.get(ctx), ns, n) },
-    ScaledObject: { group: "keda.sh", what: "keda", label: "scaled object", listed: (ctx, ns, n, k) => listedIn(state.keda.get(ctx)?.scaled_objects, ns, n, (o) => o.kind === k) },
-    ScaledJob: { group: "keda.sh", what: "keda", label: "scaled job", listed: (ctx, ns, n, k) => listedIn(state.keda.get(ctx)?.scaled_objects, ns, n, (o) => o.kind === k) },
+    ScaledObject: { group: "keda.sh", what: "keda", label: "scaled object", listed: (ctx, ns, n, k) => listedInResult(state.keda.get(ctx), (r) => r.scaled_objects, ns, n, (o) => o.kind === k) },
+    ScaledJob: { group: "keda.sh", what: "keda", label: "scaled job", listed: (ctx, ns, n, k) => listedInResult(state.keda.get(ctx), (r) => r.scaled_objects, ns, n, (o) => o.kind === k) },
     Job: { group: "batch", what: "job", label: "job", listed: (ctx, ns, n, k) => listedIn(state.jobs.get(ctx), ns, n, (j) => j.kind === k) },
     CronJob: { group: "batch", what: "job", label: "cron job", listed: (ctx, ns, n, k) => listedIn(state.jobs.get(ctx), ns, n, (j) => j.kind === k) },
     PodDisruptionBudget: { group: "policy", what: "pdb", label: "disruption budget", listed: (ctx, ns, n) => listedIn(state.pdbs.get(ctx), ns, n) },
-    NodePool: { group: "karpenter.sh", what: "nodepool", label: "node pool", listed: (ctx, ns, n) => listedIn(state.nap.get(ctx)?.node_pools, ns, n) },
-    Application: { group: "argoproj.io", what: "application", label: "application", listed: (ctx, ns, n) => listedIn(state.gitops.get(ctx)?.apps, ns, n) },
-    ExternalSecret: { group: "external-secrets.io", what: "externalsecret", label: "external secret", listed: (ctx, ns, n) => listedIn(state.externalSecrets.get(ctx)?.external_secrets, ns, n) },
-    SecretStore: { group: "external-secrets.io", what: "secretstore", label: "secret store", listed: (ctx, ns, n, k) => listedIn(state.secretStores.get(ctx)?.stores, ns, n, (x) => x.kind === k) },
-    ClusterSecretStore: { group: "external-secrets.io", what: "secretstore", label: "secret store", listed: (ctx, ns, n, k) => listedIn(state.secretStores.get(ctx)?.stores, ns, n, (x) => x.kind === k) },
+    NodePool: { group: "karpenter.sh", what: "nodepool", label: "node pool", listed: (ctx, ns, n) => listedInResult(state.nap.get(ctx), (r) => r.node_pools, ns, n) },
+    Application: { group: "argoproj.io", what: "application", label: "application", listed: (ctx, ns, n) => listedInResult(state.gitops.get(ctx), (r) => r.apps, ns, n) },
+    ExternalSecret: { group: "external-secrets.io", what: "externalsecret", label: "external secret", listed: (ctx, ns, n) => listedInResult(state.externalSecrets.get(ctx), (r) => r.external_secrets, ns, n) },
+    SecretStore: { group: "external-secrets.io", what: "secretstore", label: "secret store", listed: (ctx, ns, n, k) => listedInResult(state.secretStores.get(ctx), (r) => r.stores, ns, n, (x) => x.kind === k) },
+    ClusterSecretStore: { group: "external-secrets.io", what: "secretstore", label: "secret store", listed: (ctx, ns, n, k) => listedInResult(state.secretStores.get(ctx), (r) => r.stores, ns, n, (x) => x.kind === k) },
   };
 }
 
