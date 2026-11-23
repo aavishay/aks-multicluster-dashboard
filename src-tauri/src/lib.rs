@@ -3,6 +3,7 @@ mod claude;
 mod commands;
 mod exec;
 mod external_secrets;
+mod gateway_api;
 mod gitops_detail;
 mod helm;
 mod hpa_detail;
@@ -163,6 +164,7 @@ pub fn run() {
             commands::get_namespaces,
             commands::get_services,
             commands::get_ingresses,
+            commands::get_gateway_api,
             commands::get_pvcs,
             commands::get_pvs,
             commands::get_configmaps,

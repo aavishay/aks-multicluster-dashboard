@@ -1,7 +1,8 @@
 //! The object kinds behind the Namespaces, Services, Ingress, PVC, PV,
 //! ConfigMaps, ServiceAccounts, Jobs and PDB tabs: one list per kind, and a single
 //! manifest/events pair shared by their detail panels — and by the
-//! SecretStores tab's, whose list lives with the rest of ESO.
+//! SecretStores tab's, whose list lives with the rest of ESO, and the
+//! Gateways and Routes tabs', whose list lives in `gateway_api.rs`.
 //!
 //! Lists go through the typed k8s-openapi structs, so the mapping into each
 //! row is ordinary field access and can be unit-tested on hand-built objects.
@@ -45,6 +46,13 @@ enum Kind {
     SecretStore,
     ClusterSecretStore,
     Event,
+    GatewayClass,
+    Gateway,
+    HTTPRoute,
+    GRPCRoute,
+    TLSRoute,
+    TCPRoute,
+    UDPRoute,
 }
 
 impl Kind {
@@ -63,17 +71,31 @@ impl Kind {
             "SecretStore" => Ok(Self::SecretStore),
             "ClusterSecretStore" => Ok(Self::ClusterSecretStore),
             "Event" => Ok(Self::Event),
+            "GatewayClass" => Ok(Self::GatewayClass),
+            "Gateway" => Ok(Self::Gateway),
+            "HTTPRoute" => Ok(Self::HTTPRoute),
+            "GRPCRoute" => Ok(Self::GRPCRoute),
+            "TLSRoute" => Ok(Self::TLSRoute),
+            "TCPRoute" => Ok(Self::TCPRoute),
+            "UDPRoute" => Ok(Self::UDPRoute),
             other => Err(format!("Unknown resource kind '{other}'")),
         }
     }
 
     /// Where to fetch it, newest version first. One for a built-in kind; ESO's
-    /// stores are served at `v1` or only at `v1beta1` depending on its version.
+    /// stores are served at `v1` or only at `v1beta1` depending on its version,
+    /// and a Gateway API kind at whichever its channel and release reached.
     fn api_resources(self) -> Vec<ApiResource> {
         let eso = |kind: &str, plural: &str| {
             crate::external_secrets::VERSIONS
                 .iter()
                 .map(|v| ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(crate::external_secrets::GROUP, v, kind), plural))
+                .collect()
+        };
+        let gateway = |kind: &str, plural: &str| {
+            crate::gateway_api::VERSIONS
+                .iter()
+                .map(|v| ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(crate::gateway_api::GROUP, v, kind), plural))
                 .collect()
         };
         match self {
@@ -90,11 +112,18 @@ impl Kind {
             Self::SecretStore => eso("SecretStore", "secretstores"),
             Self::ClusterSecretStore => eso("ClusterSecretStore", "clustersecretstores"),
             Self::Event => vec![ApiResource::erase::<k8s_openapi::api::core::v1::Event>(&())],
+            Self::GatewayClass => gateway("GatewayClass", "gatewayclasses"),
+            Self::Gateway => gateway("Gateway", "gateways"),
+            Self::HTTPRoute => gateway("HTTPRoute", "httproutes"),
+            Self::GRPCRoute => gateway("GRPCRoute", "grpcroutes"),
+            Self::TLSRoute => gateway("TLSRoute", "tlsroutes"),
+            Self::TCPRoute => gateway("TCPRoute", "tcproutes"),
+            Self::UDPRoute => gateway("UDPRoute", "udproutes"),
         }
     }
 
     fn namespaced(self) -> bool {
-        !matches!(self, Self::Namespace | Self::PersistentVolume | Self::ClusterSecretStore)
+        !matches!(self, Self::Namespace | Self::PersistentVolume | Self::ClusterSecretStore | Self::GatewayClass)
     }
 }
 

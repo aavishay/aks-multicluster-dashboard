@@ -373,7 +373,16 @@ Terminating. Services shows type, cluster IP, external address, ports and
 ready endpoints, flagging a LoadBalancer still waiting for an address and a
 selector that matches no ready pod. Ingress shows class, hosts, the address
 its controller published, TLS and backends, flagging one no controller has
-picked up. PVC and PV list claims and volumes with status, capacity, access
+picked up. Where the Gateway API is installed, Gateways lists each Gateway
+with its class, address, listeners and how many routes attach to it, above
+a line naming the GatewayClasses and their controllers; Routes lists
+HTTPRoutes, GRPCRoutes and the experimental TLS, TCP and UDP routes with
+their hostnames, the Gateways they attach to and the backends they send to.
+Both flag any condition that is not True, the controller's own included
+(Envoy Gateway's BackendsAvailable, when a backend has no ready endpoints).
+A route's panel shows each Gateway's verdict on it and its rules' matches,
+filters and backends, each Service a link; a Gateway's shows its listeners
+and the routes attached to it, failing first. PVC and PV list claims and volumes with status, capacity, access
 modes and storage class, each linking to the other; a claim not Bound and a
 volume Failed or Pending are flagged. ConfigMaps lists each ConfigMap's keys,
 total size and whether it is immutable; its values are fetched only when you
