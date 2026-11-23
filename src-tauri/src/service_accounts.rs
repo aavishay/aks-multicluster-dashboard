@@ -94,6 +94,9 @@ pub struct ServiceAccountDiagnostics {
     /// Each imagePullSecret and its type; `None` inside when it does not exist.
     pub pull_secrets: Vec<(String, Result<Option<String>, String>)>,
     pub bindings: Result<Vec<Binding>, String>,
+    /// Why RoleBindings outside the account's namespace could not be read,
+    /// when only its own namespace's were.
+    pub bindings_note: Option<String>,
     /// The Workload Identity webhook's configurations and whether its
     /// Deployment is ready; `None` when the account names no client ID.
     pub webhook: Option<Result<Vec<String>, String>>,
@@ -188,6 +191,21 @@ pub(crate) fn binds(subjects: &[k8s_openapi::api::rbac::v1::Subject], binding_ns
 /// trace and correlation IDs and timestamp Entra ID appends, which differ on
 /// every attempt and would keep one error from grouping with its repeats.
 pub(crate) fn log_excerpt(line: &str, namespace: &str, name: &str) -> Option<String> {
+    // A JSON logger writes the refusal inside a string, its quotes escaped:
+    // taken to the end of that string, and unescaped.
+    let escaped = format!("User \\\"system:serviceaccount:{namespace}:{name}\\\"");
+    if let Some(at) = line.find(&escaped) {
+        let rest = &line[at..];
+        let mut end = rest.len();
+        let bytes = rest.as_bytes();
+        for i in escaped.len()..bytes.len() {
+            if bytes[i] == b'"' && bytes[i - 1] != b'\\' {
+                end = i;
+                break;
+            }
+        }
+        return Some(cap(&rest[..end].replace("\\\"", "\"")));
+    }
     let user = format!("User \"system:serviceaccount:{namespace}:{name}\"");
     const MARKERS: &[&str] = &[
         "AADSTS",
@@ -203,11 +221,14 @@ pub(crate) fn log_excerpt(line: &str, namespace: &str, name: &str) -> Option<Str
     let start = line.find(&user).or_else(|| MARKERS.iter().filter_map(|m| line.find(m)).min())?;
     let rest = &line[start..];
     let end = [" Trace ID:", " Correlation ID:", " Timestamp:"].iter().filter_map(|m| rest.find(m)).min().unwrap_or(rest.len());
-    let excerpt = rest[..end].trim_end();
-    Some(match excerpt.char_indices().nth(EXCERPT_CHARS) {
+    Some(cap(rest[..end].trim_end()))
+}
+
+fn cap(excerpt: &str) -> String {
+    match excerpt.char_indices().nth(EXCERPT_CHARS) {
         Some((at, _)) => format!("{} …", &excerpt[..at]),
         None => excerpt.to_string(),
-    })
+    }
 }
 
 async fn events_of(client: &Client, kind: &str, namespace: &str, name: &str, warnings_only: bool) -> Result<Vec<EventInfo>, String> {
@@ -324,46 +345,92 @@ async fn read_templates(client: &Client, namespace: &str, name: &str) -> Result<
     Ok(out)
 }
 
-async fn read_bindings(client: &Client, namespace: &str, name: &str) -> Result<Vec<Binding>, String> {
+/// The roles bound to the account: by RoleBindings in any namespace — one
+/// in another namespace can grant it access there — and ClusterRoleBindings.
+/// Where RoleBindings cannot be listed everywhere, its own namespace's are
+/// read, and the note says what was left out.
+async fn read_bindings(client: &Client, namespace: &str, name: &str) -> (Result<Vec<Binding>, String>, Option<String>) {
     use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
     let params = ListParams::default();
-    let (role_api, cluster_api) = (Api::<RoleBinding>::namespaced(client.clone(), namespace), Api::<ClusterRoleBinding>::all(client.clone()));
+    let (role_api, cluster_api) = (Api::<RoleBinding>::all(client.clone()), Api::<ClusterRoleBinding>::all(client.clone()));
     let (roles, cluster) = tokio::join!(role_api.list(&params), cluster_api.list(&params));
-    let mut out = Vec::new();
-    for b in roles.map_err(|e| format!("Failed to list RoleBindings: {e}"))?.items {
-        if let Some(via) = binds(b.subjects.as_deref().unwrap_or_default(), namespace, namespace, name) {
-            out.push(Binding { kind: "RoleBinding", namespace: namespace.to_string(), name: b.metadata.name.unwrap_or_default(), role: format!("{} {}", b.role_ref.kind, b.role_ref.name), via });
+    let (roles, note) = match roles {
+        Ok(l) => (Ok(l.items), None),
+        Err(everywhere) => {
+            let own = Api::<RoleBinding>::namespaced(client.clone(), namespace).list(&params).await;
+            (own.map(|l| l.items).map_err(|e| format!("Failed to list RoleBindings: {e}")), Some(format!("RoleBindings outside {namespace} could not be listed: {everywhere}")))
         }
-    }
-    for b in cluster.map_err(|e| format!("Failed to list ClusterRoleBindings: {e}"))?.items {
-        if let Some(via) = binds(b.subjects.as_deref().unwrap_or_default(), "", namespace, name) {
-            out.push(Binding { kind: "ClusterRoleBinding", namespace: String::new(), name: b.metadata.name.unwrap_or_default(), role: format!("{} {}", b.role_ref.kind, b.role_ref.name), via });
+    };
+    let result = (|| {
+        let mut out = Vec::new();
+        for b in roles? {
+            let binding_ns = b.metadata.namespace.clone().unwrap_or_default();
+            if let Some(via) = binds(b.subjects.as_deref().unwrap_or_default(), &binding_ns, namespace, name) {
+                out.push(Binding { kind: "RoleBinding", namespace: binding_ns, name: b.metadata.name.unwrap_or_default(), role: format!("{} {}", b.role_ref.kind, b.role_ref.name), via });
+            }
         }
-    }
-    Ok(out)
+        for b in cluster.map_err(|e| format!("Failed to list ClusterRoleBindings: {e}"))?.items {
+            if let Some(via) = binds(b.subjects.as_deref().unwrap_or_default(), "", namespace, name) {
+                out.push(Binding { kind: "ClusterRoleBinding", namespace: String::new(), name: b.metadata.name.unwrap_or_default(), role: format!("{} {}", b.role_ref.kind, b.role_ref.name), via });
+            }
+        }
+        Ok(out)
+    })();
+    (result, note)
 }
 
-/// Excerpts from the last hour of the logs of its pods, not-ready first,
-/// every container but the skipped.
+/// Which log of each of a pod's containers to read, init containers too:
+/// the current instance's, or for one waiting to restart — crash-looping on
+/// the sign-in it cannot make — its previous instance's.
+pub(crate) fn logs_to_read(p: &Pod) -> Vec<(String, bool)> {
+    let status = p.status.clone().unwrap_or_default();
+    status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .filter_map(|c| {
+            let waiting = c.state.as_ref().is_some_and(|s| s.waiting.is_some());
+            let crashed = c.last_state.as_ref().is_some_and(|l| l.terminated.is_some());
+            match (waiting, crashed) {
+                (false, _) => Some((c.name.clone(), false)),
+                (true, true) => Some((c.name.clone(), true)),
+                (true, false) => None,
+            }
+        })
+        .collect()
+}
+
+/// Excerpts from the logs of its pods, active not-ready ones first. A pod
+/// counts as read when at least one of its logs could be.
 async fn read_log_excerpts(client: &Client, namespace: &str, name: &str, pods: &[Pod]) -> Result<(usize, Vec<String>), String> {
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let mut excerpts = Vec::new();
     let mut read = 0;
     for p in pods.iter().take(PODS_LOGGED) {
         let pod = p.metadata.name.clone().unwrap_or_default();
-        let running: Vec<String> = p.status.iter().flat_map(|s| s.container_statuses.iter().flatten()).filter(|c| c.state.as_ref().is_some_and(|s| s.waiting.is_none())).map(|c| c.name.clone()).collect();
-        for container in running {
-            let params = LogParams { container: Some(container), since_seconds: Some(LOG_SECONDS), limit_bytes: Some(LOG_BYTES), ..Default::default() };
+        let mut any = false;
+        for (container, previous) in logs_to_read(p) {
+            // A previous instance ended when it ended, which may be more
+            // than the hour ago the current one's window starts.
+            let params = LogParams { container: Some(container), previous, since_seconds: (!previous).then_some(LOG_SECONDS), limit_bytes: Some(LOG_BYTES), ..Default::default() };
             match api.logs(&pod, &params).await {
-                Ok(text) => excerpts.extend(text.lines().filter_map(|l| log_excerpt(l, namespace, name))),
+                Ok(text) => {
+                    any = true;
+                    excerpts.extend(text.lines().filter_map(|l| log_excerpt(l, namespace, name)));
+                }
                 // A container that has not written yet, or a pod gone meanwhile.
                 Err(kube::Error::Api(r)) if r.code == 400 || r.code == 404 => {}
                 Err(e) => return Err(format!("Failed to read the log of pod '{pod}': {e}")),
             }
         }
-        read += 1;
+        read += usize::from(any);
     }
     Ok((read, excerpts))
+}
+
+fn completed(p: &Pod) -> bool {
+    p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Succeeded")
 }
 
 pub async fn get_service_account_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<ServiceAccountDiagnostics, String> {
@@ -380,7 +447,9 @@ pub async fn get_service_account_diagnostics(context_name: &str, namespace: &str
     let pods_fut = async {
         Api::<Pod>::namespaced(client.clone(), namespace).list(&ListParams::default()).await.map_err(|e| format!("Failed to list pods: {e}")).map(|l| {
             let mut mine: Vec<Pod> = l.items.into_iter().filter(|p| runs_as(p.spec.as_ref()) == name).collect();
-            mine.sort_by_key(|p| (pod_ready(p), p.metadata.name.clone()));
+            // A completed Job's pod is not ready either, but has nothing to say:
+            // active pods first, not-ready before ready, completed last.
+            mine.sort_by_key(|p| (completed(p), pod_ready(p), p.metadata.name.clone()));
             mine
         })
     };
@@ -402,7 +471,7 @@ pub async fn get_service_account_diagnostics(context_name: &str, namespace: &str
             None => None,
         }
     };
-    let (pods, templates, pull_secrets, bindings, webhook, issuer, events) = tokio::join!(
+    let (pods, templates, pull_secrets, (bindings, bindings_note), webhook, issuer, events) = tokio::join!(
         pods_fut,
         read_templates(&client, namespace, name),
         pull_fut,
@@ -414,7 +483,7 @@ pub async fn get_service_account_diagnostics(context_name: &str, namespace: &str
 
     let (log_excerpts, pod_events) = match &pods {
         Ok(list) => {
-            let unready: Vec<&Pod> = list.iter().filter(|p| !pod_ready(p)).take(3).collect();
+            let unready: Vec<&Pod> = list.iter().filter(|p| !pod_ready(p) && !completed(p)).take(3).collect();
             let events_fut = futures::future::join_all(unready.iter().map(|p| {
                 let pod = p.metadata.name.clone().unwrap_or_default();
                 let client = client.clone();
@@ -429,7 +498,7 @@ pub async fn get_service_account_diagnostics(context_name: &str, namespace: &str
     };
     let pods = pods.map(|list| list.iter().map(|p| pod_identity(p, client_id.as_deref())).collect());
 
-    Ok(ServiceAccountDiagnostics { account, manifest, events, pods, templates, pull_secrets, bindings, webhook, issuer, log_excerpts, pod_events })
+    Ok(ServiceAccountDiagnostics { account, manifest, events, pods, templates, pull_secrets, bindings, bindings_note, webhook, issuer, log_excerpts, pod_events })
 }
 
 #[cfg(test)]
@@ -465,6 +534,23 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_looping_containers_previous_log_is_read_and_init_containers_too() {
+        let status = |name: &str, state: serde_json::Value, last: serde_json::Value| json!({ "name": name, "ready": false, "restartCount": 1, "image": "i", "imageID": "", "state": state, "lastState": last });
+        let p = pod(json!({
+            "metadata": { "name": "web-1" }, "spec": { "containers": [] },
+            "status": {
+                "initContainerStatuses": [status("token-check", json!({ "terminated": { "exitCode": 1 } }), json!({}))],
+                "containerStatuses": [
+                    status("app", json!({ "waiting": { "reason": "CrashLoopBackOff" } }), json!({ "terminated": { "exitCode": 1 } })),
+                    status("fresh", json!({ "waiting": { "reason": "ContainerCreating" } }), json!({})),
+                    status("sidecar", json!({ "running": {} }), json!({}))
+                ]
+            }
+        }));
+        assert_eq!(logs_to_read(&p), vec![("token-check".to_string(), false), ("app".to_string(), true), ("sidecar".to_string(), false)]);
+    }
+
+    #[test]
     fn a_binding_grants_the_account_directly_or_through_its_groups() {
         use k8s_openapi::api::rbac::v1::Subject;
         let sa = |ns: Option<&str>| Subject { kind: "ServiceAccount".into(), name: "web".into(), namespace: ns.map(str::to_string), api_group: None };
@@ -486,6 +572,10 @@ mod tests {
         let rbac = r#"E1123 10:00:00 reflector.go:1] pods is forbidden: User "system:serviceaccount:app:web" cannot list resource "pods" in API group "" in the namespace "app""#;
         assert_eq!(log_excerpt(rbac, "app", "web").as_deref(), Some(r#"User "system:serviceaccount:app:web" cannot list resource "pods" in API group "" in the namespace "app""#));
         assert_eq!(log_excerpt(r#"pods is forbidden: User "system:serviceaccount:app:other" cannot list"#, "app", "web"), None, "another account's refusal");
+        // The same refusal from a JSON logger.
+        let json = r#"{"level":"error","msg":"list failed","error":"pods is forbidden: User \"system:serviceaccount:app:web\" cannot list resource \"pods\" in API group \"\" in the namespace \"app\"","ts":1}"#;
+        assert_eq!(log_excerpt(json, "app", "web").as_deref(), Some(r#"User "system:serviceaccount:app:web" cannot list resource "pods" in API group "" in the namespace "app""#));
+        assert_eq!(log_excerpt(&json.replace("app:web", "app:other"), "app", "web"), None);
         assert_eq!(log_excerpt("GET /healthz 200", "app", "web"), None);
         let long = format!("AADSTS50000: {}", "x".repeat(1000));
         assert!(log_excerpt(&long, "app", "web").unwrap().ends_with(" …"));

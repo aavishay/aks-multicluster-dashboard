@@ -423,11 +423,12 @@ its pod template, a container skipped or not injected, the webhook missing \
 or down when the pod was created, or a pod created before the client-id \
 annotation changed. Fixed in Kubernetes: label the template, restart the \
 pods.
-- The token is refused by Entra ID: AADSTS70021 means the identity has no \
-federated credential matching the issuer and subject presented — compare \
-them with the ones above and say which differs (a namespace or account \
-renamed, another cluster's issuer); AADSTS700016 or AADSTS700213 point at \
-the client ID or tenant. Fixed in Azure: az identity federated-credential \
+- The token is refused by Entra ID: AADSTS70021 or AADSTS700213 means the \
+identity has no federated credential matching the issuer and subject \
+presented — compare them with the ones above and say which differs (a \
+namespace or account renamed, another cluster's issuer); AADSTS700016 means \
+no application with that client ID exists in the tenant, so the client ID \
+or tenant is wrong. Fixed in Azure: az identity federated-credential \
 create, with the exact issuer and subject.
 - Signed in but refused by the Azure resource (AuthorizationFailed, \
 \"Caller is not authorized\" from Key Vault): the identity lacks a role \
@@ -6434,24 +6435,42 @@ fn render_sa_pods(pods: &Result<Vec<crate::service_accounts::PodIdentity>, Strin
         Ok(p) => p,
     };
     let ready = pods.iter().filter(|p| p.ready).count();
-    let mut lines = vec![format!("{} pod{} run{} as it: {ready} ready", pods.len(), if pods.len() == 1 { "" } else { "s" }, if pods.len() == 1 { "s" } else { "" })];
+    let completed = pods.iter().filter(|p| p.phase == "Succeeded").count();
+    let mut lines = vec![format!(
+        "{} pod{} run{} as it: {ready} ready{}",
+        pods.len(),
+        if pods.len() == 1 { "" } else { "s" },
+        if pods.len() == 1 { "s" } else { "" },
+        if completed > 0 { format!(", {completed} completed") } else { String::new() }
+    )];
     for p in pods.iter().take(DIAGNOSE_SA_PODS) {
         let mut facts: Vec<String> = Vec::new();
-        facts.push(if p.ready { "ready".to_string() } else { format!("{} NOT READY", if p.phase.is_empty() { "Unknown" } else { &p.phase }) });
+        facts.push(match (p.ready, p.phase.as_str()) {
+            (true, _) => "ready".to_string(),
+            (false, "Succeeded") => "completed".to_string(),
+            (false, "") => "Unknown NOT READY".to_string(),
+            (false, phase) => format!("{phase} NOT READY"),
+        });
         if !p.waiting.is_empty() {
             facts.push(p.waiting.join(", "));
         }
         let labelled = p.use_label.as_deref() == Some("true");
         if workload_identity {
-            if !labelled {
-                facts.push("NO azure.workload.identity/use=true LABEL: the webhook leaves it alone, so it gets no Azure token".to_string());
-            } else if p.injected.is_empty() {
-                facts.push("LABELLED, BUT NO CONTAINER WAS INJECTED: the webhook did not mutate it — was it down when the pod was created?".to_string());
-            } else {
-                facts.push(format!("token injected into {}", p.injected.join(", ")));
-                if !p.not_injected.is_empty() {
-                    facts.push(format!("NOT INTO {}", p.not_injected.join(", ")));
+            // What the webhook did when the pod was created, and what its
+            // label says now, separately: a label removed since leaves the
+            // token in place until the pod is recreated.
+            match (p.injected.is_empty(), labelled) {
+                (false, _) => {
+                    facts.push(format!("token injected into {}", p.injected.join(", ")));
+                    if !p.not_injected.is_empty() {
+                        facts.push(format!("NOT INTO {}", p.not_injected.join(", ")));
+                    }
+                    if !labelled {
+                        facts.push("but it no longer carries azure.workload.identity/use=true: a pod recreated without the label gets no token".to_string());
+                    }
                 }
+                (true, false) => facts.push("NO azure.workload.identity/use=true LABEL, AND NO CONTAINER WAS INJECTED: it has no Azure token".to_string()),
+                (true, true) => facts.push("LABELLED, BUT NO CONTAINER WAS INJECTED: the webhook did not mutate it — was it down when the pod was created?".to_string()),
             }
             if !p.skipped.is_empty() {
                 facts.push(format!("skipped by annotation: {}", p.skipped.join(", ")));
@@ -6511,7 +6530,15 @@ fn render_sa_pull_secrets(secrets: &[(String, Result<Option<String>, String>)]) 
 /// How many bindings to name.
 const DIAGNOSE_SA_BINDINGS: usize = 30;
 
-fn render_sa_bindings(bindings: &Result<Vec<crate::service_accounts::Binding>, String>) -> String {
+fn render_sa_bindings(bindings: &Result<Vec<crate::service_accounts::Binding>, String>, note: &Option<String>) -> String {
+    let text = render_sa_binding_lines(bindings);
+    match note {
+        Some(n) => format!("{text}\n({n})"),
+        None => text,
+    }
+}
+
+fn render_sa_binding_lines(bindings: &Result<Vec<crate::service_accounts::Binding>, String>) -> String {
     let bindings = match bindings {
         Err(e) => return format!("(bindings unavailable: {e})"),
         Ok(b) => b,
@@ -6585,10 +6612,14 @@ pub async fn build_service_account_diagnosis_payload(context_name: &str, namespa
     let templates = redact::redact(&render_sa_templates(&d.templates, namespace, wi));
     let webhook = redact::redact(&d.webhook.as_ref().map(render_sa_webhook).unwrap_or_else(|| "(not read: the account uses no Workload Identity)".to_string()));
     let logs = redact::redact(&render_sa_log_excerpts(&d.log_excerpts));
-    let bindings = redact::redact(&render_sa_bindings(&d.bindings));
+    let bindings = redact::redact(&render_sa_bindings(&d.bindings, &d.bindings_note));
     let pull = redact::redact(&render_sa_pull_secrets(&d.pull_secrets));
-    let pod_events = redact::redact(&if d.pod_events.is_empty() {
-        "(every pod that runs as it is ready)".to_string()
+    let pod_events = redact::redact(&if let Err(e) = &d.pods {
+        format!("(pods unavailable: {e})")
+    } else if d.pods.as_ref().is_ok_and(Vec::is_empty) {
+        "(no pod runs as it)".to_string()
+    } else if d.pod_events.is_empty() {
+        "(every pod that runs as it is ready or has completed)".to_string()
     } else {
         d.pod_events.iter().map(|(p, e)| format!("pod {p}:\n{}", render_nap_events(e, "(no Warning events)", false, 10))).collect::<Vec<_>>().join("\n\n")
     });
@@ -10561,10 +10592,17 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(
             render_sa_pods(&pods, true),
             "3 pods run as it: 1 ready\n\
-             - web-1 (ReplicaSet/web-5d8f): Running NOT READY; app: CrashLoopBackOff; NO azure.workload.identity/use=true LABEL: the webhook leaves it alone, so it gets no Azure token\n\
+             - web-1 (ReplicaSet/web-5d8f): Running NOT READY; app: CrashLoopBackOff; NO azure.workload.identity/use=true LABEL, AND NO CONTAINER WAS INJECTED: it has no Azure token\n\
              - web-2 (ReplicaSet/web-5d8f): Running NOT READY; app: CrashLoopBackOff; LABELLED, BUT NO CONTAINER WAS INJECTED: the webhook did not mutate it — was it down when the pod was created?\n\
              - web-3 (ReplicaSet/web-5d8f): ready; token injected into app; NOT INTO sidecar; ITS INJECTED AZURE_CLIENT_ID IS NOT THE ACCOUNT'S CURRENT CLIENT ID: it was created before the annotation changed, and keeps the old one until recreated"
         );
+        // The label removed after the pod was created: its token is still there.
+        assert!(render_sa_pods(&Ok(vec![pod("web-4", true, None, &["app"], &[], Some(true))]), true)
+            .ends_with("ready; token injected into app; but it no longer carries azure.workload.identity/use=true: a pod recreated without the label gets no token"));
+        let mut done = pod("job-1", false, None, &[], &[], None);
+        done.phase = "Succeeded".into();
+        done.waiting.clear();
+        assert_eq!(render_sa_pods(&Ok(vec![done]), false), "1 pod runs as it: 0 ready, 1 completed\n- job-1 (ReplicaSet/web-5d8f): completed");
         assert_eq!(
             render_sa_templates(&Ok(vec![TemplateIdentity { kind: "Deployment".into(), name: "web".into(), use_label: None }]), "app", true),
             "Deployment web: ITS POD TEMPLATE LACKS azure.workload.identity/use=true, so its pods get no Azure token"
@@ -10575,10 +10613,11 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
                 binding("ClusterRoleBinding", "system:discovery", "ClusterRole system:discovery", Some("system:authenticated")),
                 binding("RoleBinding", "web-reader", "Role pod-reader", None),
                 binding("ClusterRoleBinding", "all-sa-view", "ClusterRole view", Some("system:serviceaccounts")),
-            ])),
+            ]), &None),
             "- RoleBinding app/web-reader → Role pod-reader\n- ClusterRoleBinding all-sa-view → ClusterRole view (through group system:serviceaccounts)"
         );
-        assert!(render_sa_bindings(&Ok(vec![binding("ClusterRoleBinding", "system:basic-user", "ClusterRole system:basic-user", Some("system:authenticated"))])).starts_with("(no role is bound to it"));
+        assert!(render_sa_bindings(&Ok(vec![binding("ClusterRoleBinding", "system:basic-user", "ClusterRole system:basic-user", Some("system:authenticated"))]), &None).starts_with("(no role is bound to it"));
+        assert!(render_sa_bindings(&Ok(vec![]), &Some("RoleBindings outside app could not be listed: forbidden".into())).ends_with("\n(RoleBindings outside app could not be listed: forbidden)"));
         let aadsts = "WorkloadIdentityCredential authentication failed: AADSTS70021: No matching federated identity record found".to_string();
         assert_eq!(
             render_sa_log_excerpts(&Ok((2, vec![aadsts.clone(), "User \"system:serviceaccount:app:web\" cannot list resource \"pods\"".into(), aadsts.clone()]))),
