@@ -6008,6 +6008,7 @@ function setMetricsRange(minutes: number) {
   diagnoseExternalSecret,
   diagnosePdb,
   diagnoseKeda,
+  diagnoseSubject,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -12722,14 +12723,10 @@ function renderEvents(): string {
             .map(
               (row) => {
                 const { ctx, e } = row;
-                // Cmd+D on a row diagnoses the workload the event is about.
+                // Cmd+D on a row diagnoses the object the event is about.
                 const diagnosis = eventDiagnosis(ctx, e);
                 return `
-            <tr${
-              diagnosis
-                ? ` data-diagnose-what="workload" data-diagnose-ctx="${esc(ctx)}" data-diagnose-kind="${esc(diagnosis.kind)}" data-diagnose-ns="${esc(diagnosis.namespace)}" data-diagnose-name="${esc(diagnosis.name)}"`
-                : ""
-            }>
+            <tr${diagnosis ? diagnoseAttrs(diagnosis.subject) : ""}>
               ${rowCheckboxCell("events", keyOf(row))}
               ${
                 multi
@@ -12797,18 +12794,109 @@ function eventObjectCall(ctx: string, e: EventInfo): { call: string | null; owne
 }
 
 /**
- * The workload diagnosis an event leads to: a Deployment's, StatefulSet's or
- * DaemonSet's own, or for a ReplicaSet its Deployment's, which covers its
- * ReplicaSets — a ReplicaSet has no diagnosis of its own, as it has no panel.
- * Only for a workload the Workloads list confirms exists; null otherwise.
+ * Whether a list holds the object: undefined while the list is not loaded,
+ * which is not the same as the object being gone.
  */
-function eventDiagnosis(ctx: string, e: EventInfo): { kind: string; namespace: string; name: string; what: string } | null {
+function listedIn<T extends { name: string; namespace?: string }>(list: readonly T[] | undefined, namespace: string, name: string, also: (x: T) => boolean = () => true): boolean | undefined {
+  return list === undefined ? undefined : list.some((x) => (x.namespace ?? "") === namespace && x.name === name && also(x));
+}
+
+/**
+ * The same, for a list that comes with an `error`: one that could not list
+ * some of what it covers (a kind RBAC forbids, say) leaves the rest out, so
+ * an object missing from it is not known to be gone.
+ */
+function listedInResult<R extends { error: string | null }, T extends { name: string; namespace?: string }>(
+  result: R | undefined,
+  list: (r: R) => readonly T[],
+  namespace: string,
+  name: string,
+  also: (x: T) => boolean = () => true,
+): boolean | undefined {
+  if (result === undefined) return undefined;
+  return listedIn(list(result), namespace, name, also) || (result.error ? undefined : false);
+}
+
+interface EventDiagnosis {
+  group: string;
+  what: string;
+  label: string;
+  listed: (ctx: string, namespace: string, name: string, kind: string) => boolean | undefined;
+}
+
+let eventDiagnosesByKind: Map<string, EventDiagnosis> | undefined;
+
+/**
+ * The kinds other than a workload whose events lead to their own diagnosis:
+ * the API group the kind must be in (a same-named CRD is not it), the
+ * diagnosis, how its button names it, and whether the list behind its tab
+ * holds it. Built on first use: it names constants declared further down.
+ */
+function eventDiagnoses(): Map<string, EventDiagnosis> {
+  eventDiagnosesByKind ??= new Map(Object.entries(eventDiagnosisTable()));
+  return eventDiagnosesByKind;
+}
+
+function eventDiagnosisTable(): Record<string, EventDiagnosis> {
+  return {
+    // Streamed in pages: a list still arriving says nothing about one pod.
+    Pod: { group: "", what: "pod", label: "pod", listed: (ctx, ns, n) => (state.podsLoadedComplete.has(ctx) ? listedIn(state.pods.get(ctx), ns, n) : undefined) },
+    Node: { group: "", what: "node", label: "node", listed: (ctx, ns, n) => listedIn(state.nodes.get(ctx), ns, n) },
+    Namespace: { group: "", what: "namespace", label: "namespace", listed: (ctx, ns, n) => listedIn(state.namespaces.get(ctx), ns, n) },
+    Service: { group: "", what: "service", label: "service", listed: (ctx, ns, n) => listedIn(state.services.get(ctx), ns, n) },
+    PersistentVolumeClaim: { group: "", what: "pvc", label: "volume claim", listed: (ctx, ns, n) => listedIn(state.pvcs.get(ctx), ns, n) },
+    Ingress: { group: "networking.k8s.io", what: "ingress", label: "ingress", listed: (ctx, ns, n) => listedIn(state.ingresses.get(ctx), ns, n) },
+    Gateway: { group: GATEWAY_API_GROUP, what: "gateway", label: "gateway", listed: (ctx, ns, n) => listedInResult(state.gatewayApi.get(ctx), (r) => r.gateways, ns, n) },
+    ...Object.fromEntries(
+      ROUTE_KINDS.map((k) => [
+        k,
+        { group: GATEWAY_API_GROUP, what: "route", label: "route", listed: (ctx: string, ns: string, n: string, kind: string) => listedInResult(state.gatewayApi.get(ctx), (r) => r.routes, ns, n, (r) => r.kind === kind) },
+      ]),
+    ),
+    HorizontalPodAutoscaler: { group: "autoscaling", what: "hpa", label: "autoscaler", listed: (ctx, ns, n) => listedIn(state.hpa.get(ctx), ns, n) },
+    ScaledObject: { group: "keda.sh", what: "keda", label: "scaled object", listed: (ctx, ns, n, k) => listedInResult(state.keda.get(ctx), (r) => r.scaled_objects, ns, n, (o) => o.kind === k) },
+    ScaledJob: { group: "keda.sh", what: "keda", label: "scaled job", listed: (ctx, ns, n, k) => listedInResult(state.keda.get(ctx), (r) => r.scaled_objects, ns, n, (o) => o.kind === k) },
+    Job: { group: "batch", what: "job", label: "job", listed: (ctx, ns, n, k) => listedIn(state.jobs.get(ctx), ns, n, (j) => j.kind === k) },
+    CronJob: { group: "batch", what: "job", label: "cron job", listed: (ctx, ns, n, k) => listedIn(state.jobs.get(ctx), ns, n, (j) => j.kind === k) },
+    PodDisruptionBudget: { group: "policy", what: "pdb", label: "disruption budget", listed: (ctx, ns, n) => listedIn(state.pdbs.get(ctx), ns, n) },
+    NodePool: { group: "karpenter.sh", what: "nodepool", label: "node pool", listed: (ctx, ns, n) => listedInResult(state.nap.get(ctx), (r) => r.node_pools, ns, n) },
+    Application: { group: "argoproj.io", what: "application", label: "application", listed: (ctx, ns, n) => listedInResult(state.gitops.get(ctx), (r) => r.apps, ns, n) },
+    ExternalSecret: { group: "external-secrets.io", what: "externalsecret", label: "external secret", listed: (ctx, ns, n) => listedInResult(state.externalSecrets.get(ctx), (r) => r.external_secrets, ns, n) },
+  };
+}
+
+/** `spec.containers{api}` → `api`: the container an event is about, if it names one. */
+function eventContainer(fieldPath: string): string {
+  return /^spec\.(?:initContainers|containers|ephemeralContainers)\{([^}]+)\}/.exec(fieldPath)?.[1] ?? "";
+}
+
+/**
+ * The diagnosis an event leads to: its object's own, or for a ReplicaSet its
+ * Deployment's, which covers its ReplicaSets — a ReplicaSet has no diagnosis
+ * of its own, as it has no panel. A workload only when the Workloads list
+ * confirms it exists; any other kind unless its tab's list, once loaded,
+ * says it is gone, as the object of an hour-old event often is. For a pod,
+ * the container the event names, else the one the pod list says is failing,
+ * is the one whose logs are read. Null for a kind without a diagnosis.
+ */
+function eventDiagnosis(ctx: string, e: EventInfo): { subject: DiagnoseSubject; label: string } | null {
   const { owner } = eventObjectCall(ctx, e);
-  if (owner) return { kind: "Deployment", namespace: owner.namespace, name: owner.name, what: `deployment ${owner.name}, which owns this ReplicaSet,` };
-  if (e.object_api_version === "" || apiGroup(e.object_api_version) !== "apps") return null;
-  const namespace = e.object_namespace || e.namespace;
-  const w = state.workloads.get(ctx)?.find((w) => w.kind === e.object_kind && w.namespace === namespace && w.name === e.object_name);
-  return w ? { kind: w.kind, namespace: w.namespace, name: w.name, what: `${w.kind.toLowerCase()} ${w.name}` } : null;
+  const subject = (what: string, kind: string, namespace: string, name: string, container = ""): DiagnoseSubject => ({ what, ctx, kind, namespace, name, container });
+  if (owner) return { subject: subject("workload", "Deployment", owner.namespace, owner.name), label: `deployment ${owner.name}, which owns this ReplicaSet,` };
+  if (e.object_api_version === "") return null;
+  const group = apiGroup(e.object_api_version);
+  const namespace = e.object_namespace || (CLUSTER_SCOPED_KINDS.has(e.object_kind) ? "" : e.namespace);
+  if (group === "apps") {
+    const w = state.workloads.get(ctx)?.find((w) => w.kind === e.object_kind && w.namespace === namespace && w.name === e.object_name);
+    return w ? { subject: subject("workload", w.kind, w.namespace, w.name), label: `${w.kind.toLowerCase()} ${w.name}` } : null;
+  }
+  const d = eventDiagnoses().get(e.object_kind);
+  if (!d || d.group !== group || d.listed(ctx, namespace, e.object_name, e.object_kind) === false) return null;
+  const container =
+    e.object_kind === "Pod"
+      ? eventContainer(e.field_path) || (state.pods.get(ctx)?.find((p) => p.namespace === namespace && p.name === e.object_name)?.failure_container ?? "")
+      : "";
+  return { subject: subject(d.what, e.object_kind, namespace, e.object_name, container), label: `${d.label} ${e.object_name}` };
 }
 
 /**
@@ -15146,10 +15234,7 @@ function renderResourceDetailPanel(): string {
                     : rd.kind === "PodDisruptionBudget"
                     ? claudeDiagnoseButton(`window.__app.diagnosePdb(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "disruption budget")
                     : evDiagnosis
-                      ? claudeDiagnoseButton(
-                          `window.__app.diagnoseWorkload(${jsArg(rd.ctx)},${jsArg(evDiagnosis.kind)},${jsArg(evDiagnosis.namespace)},${jsArg(evDiagnosis.name)})`,
-                          evDiagnosis.what,
-                        )
+                      ? claudeDiagnoseButton(`window.__app.diagnoseSubject(${jsArg(JSON.stringify(evDiagnosis.subject))})`, evDiagnosis.label)
                       : ""
             }
             ${writeModeToggle(true)}
@@ -16546,12 +16631,47 @@ function activateFocusedRowName(): boolean {
  * an unhealthy row, whereas the detail panel offers Diagnose for any row. The
  * shortcut agrees with the panel rather than with a button that is gone.
  */
+/**
+ * What a Diagnose leads to: which diagnosis (`what`, as a row carries it in
+ * `data-diagnose-what`) and its subject.
+ */
+interface DiagnoseSubject {
+  what: string;
+  ctx: string;
+  /** The object's kind, where one diagnosis serves several: workloads, routes, Jobs and CronJobs, KEDA. */
+  kind: string;
+  namespace: string;
+  name: string;
+  /** For a pod, the container whose logs to read; empty for none. */
+  container: string;
+}
+
+/** The row attributes `diagnoseFocusedRow` reads a subject back from. */
+function diagnoseAttrs(s: DiagnoseSubject): string {
+  return ` data-diagnose-what="${esc(s.what)}" data-diagnose-ctx="${esc(s.ctx)}" data-diagnose-kind="${esc(s.kind)}" data-diagnose-ns="${esc(s.namespace)}" data-diagnose-name="${esc(s.name)}" data-diagnose-container="${esc(s.container)}"`;
+}
+
 function diagnoseFocusedRow(): boolean {
   const d = focusedRowElement()?.dataset;
-  const ctx = d?.diagnoseCtx ?? "";
-  const ns = d?.diagnoseNs ?? "";
-  const name = d?.diagnoseName ?? "";
-  switch (d?.diagnoseWhat) {
+  return runDiagnosis({
+    what: d?.diagnoseWhat ?? "",
+    ctx: d?.diagnoseCtx ?? "",
+    kind: d?.diagnoseKind ?? "",
+    namespace: d?.diagnoseNs ?? "",
+    name: d?.diagnoseName ?? "",
+    container: d?.diagnoseContainer ?? "",
+  });
+}
+
+/** A subject passed through an onclick, as JSON. */
+function diagnoseSubject(json: string): void {
+  runDiagnosis(JSON.parse(json) as DiagnoseSubject);
+}
+
+/** Starts the diagnosis a subject names; false for none. */
+function runDiagnosis(s: DiagnoseSubject): boolean {
+  const { ctx, namespace: ns, name } = s;
+  switch (s.what) {
     case "node":
       diagnoseNode(ctx, name);
       return true;
@@ -16574,7 +16694,7 @@ function diagnoseFocusedRow(): boolean {
       diagnoseGateway(ctx, ns, name);
       return true;
     case "route":
-      diagnoseRoute(ctx, d.diagnoseKind ?? "HTTPRoute", ns, name);
+      diagnoseRoute(ctx, s.kind || "HTTPRoute", ns, name);
       return true;
     case "pvc":
       diagnosePvc(ctx, ns, name);
@@ -16583,19 +16703,19 @@ function diagnoseFocusedRow(): boolean {
       diagnoseExternalSecret(ctx, ns, name);
       return true;
     case "job":
-      diagnoseJob(ctx, d.diagnoseKind ?? "Job", ns, name);
+      diagnoseJob(ctx, s.kind || "Job", ns, name);
       return true;
     case "pdb":
       diagnosePdb(ctx, ns, name);
       return true;
     case "keda":
-      diagnoseKeda(ctx, ns, d.diagnoseKind ?? "ScaledObject", name);
+      diagnoseKeda(ctx, ns, s.kind || "ScaledObject", name);
       return true;
     case "pod":
-      diagnosePod(ctx, ns, name, d.diagnoseContainer ?? "");
+      diagnosePod(ctx, ns, name, s.container);
       return true;
     case "workload":
-      diagnoseWorkload(ctx, d.diagnoseKind ?? "", ns, name);
+      diagnoseWorkload(ctx, s.kind, ns, name);
       return true;
     case "application":
       diagnoseGitOpsApp(ctx, ns, name);
