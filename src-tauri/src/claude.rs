@@ -680,6 +680,113 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_GATEWAY_SYSTEM: &str = "\
+You diagnose Kubernetes Gateway API Gateways for an experienced SRE.
+
+You are given the Gateway's conditions, listeners and addresses; its \
+GatewayClass and whether its controller accepted it; each listener's TLS \
+certificate, checked by key name and by the public fields of its \
+certificate, with the ReferenceGrant a certificate in another namespace \
+needs; the data plane its controller created for it — the proxy workloads, \
+their pods, and the Service in front of them with its address and, while it \
+has none, its events; the routes attached to it, failing first; the \
+controller's workloads and its own log lines from the last hour about this \
+Gateway; its events; and its manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition, the \
+listener, the certificate, the pod, the Service, the log line, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Read conditions as the Gateway API defines them: True is healthy, except \
+Conflicted, OverlappingTLSConfig and PartiallyInvalid, where True is the \
+fault. Unknown with reason Pending means no controller has picked the object \
+up; Unknown with reason Stale means the controller has not yet reported on \
+its current spec, which is either a moment's lag or a controller that has \
+stopped.
+
+Say which of these you are looking at, because the fixes differ:
+- Not accepted: its GatewayClass does not exist or is not accepted, or the \
+controller it names is not running — nothing programs a Gateway no \
+controller claims.
+- Accepted but not programmed: the data plane is not up — proxy pods not \
+ready, or the LoadBalancer Service has no address. That Service's events say \
+why: a quota, a static IP or subnet that does not exist, an annotation the \
+cloud rejects.
+- A listener in trouble: its certificate Secret is missing, lacks tls.crt or \
+tls.key, has expired or does not cover the listener's hostname; a \
+certificate in another namespace has no ReferenceGrant (RefNotPermitted); \
+two listeners conflict on port, protocol and hostname; or the protocol is \
+one the implementation does not support.
+- The Gateway is healthy but routes on it are failing: say so, name what \
+they have in common (no ready endpoints, a refused reference), and point at \
+them — each route has its own diagnosis.
+
+If the Gateway is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
+const DIAGNOSE_ROUTE_SYSTEM: &str = "\
+You diagnose Kubernetes Gateway API routes — HTTPRoute, GRPCRoute, TLSRoute, \
+TCPRoute and UDPRoute — for an experienced SRE.
+
+You are given the route's hostnames and rules; for each parent it names, the \
+verdict its controller reported and, for a Gateway, the Gateway's own state \
+and each of its listeners checked against the route: whether the parentRef \
+selects it, whether its allowedRoutes admits the route's namespace and kind, \
+and which of the route's hostnames it serves. Then each backend, with a \
+Service's port and ready endpoints and the ReferenceGrant a backend in \
+another namespace needs; other routes on the same Gateway with one of its \
+hostnames and the same match; the controller's workloads and its own log lines from the last \
+hour about this route and its Services; its events; and its manifest. \
+Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the condition, the \
+listener, the backend, the log line, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Read conditions as the Gateway API defines them: True is healthy, except \
+Conflicted, OverlappingTLSConfig and PartiallyInvalid, where True is the \
+fault. Unknown with reason Pending, or no status at all for a parent, means \
+no controller has picked it up; Unknown with reason Stale means the \
+controller has not yet reported on the current spec.
+
+Say which of these you are looking at, because the fixes differ:
+- Not attached (Accepted False, or nothing reported): the parent does not \
+exist or is misnamed — its namespace, sectionName or port; no listener \
+admits the route — NotAllowedByListeners when allowedRoutes refuses its \
+namespace or kind, NoMatchingListenerHostname when none of its hostnames \
+falls under a listener's; or the Gateway itself is not programmed. The \
+listener check says which.
+- Attached but a reference does not resolve (ResolvedRefs False): a backend \
+Service that does not exist (BackendNotFound), a port that is not one of its \
+ports, a kind the controller does not support (InvalidKind), or a Service in \
+another namespace that no ReferenceGrant lets it use (RefNotPermitted).
+- Attached and resolved but requests fail: no ready endpoint behind a \
+backend — Envoy Gateway then reports BackendsAvailable False and answers \
+503 — a weight of 0, or matches that the requests sent do not meet (path \
+type, method, headers).
+- Partially invalid (PartiallyInvalid True): some rules were dropped and the \
+message says which.
+- A conflict: another route on the same Gateway claims the same hostname and \
+match. The API's precedence decides: the more specific match, then the \
+older route, then the one first in namespace/name order.
+
+If the route is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_NAMESPACE_SYSTEM: &str = "\
 You diagnose Kubernetes namespaces for an experienced SRE.
 
@@ -3035,17 +3142,25 @@ fn render_ingress_class(ing: &k8s_openapi::api::networking::v1::Ingress, classes
 
 /// The workloads taken for the controller, and whether they are up.
 fn render_ingress_controllers(controllers: &Result<Vec<k8s::IngressControllerWorkload>, String>) -> String {
+    render_controller_workloads(
+        controllers,
+        "(no Deployment or DaemonSet names this class or its controller in its args, and none is called ingress)",
+        "nothing is serving this class, and the address in the Ingress's status is left over from when something did",
+    )
+}
+
+fn render_controller_workloads(controllers: &Result<Vec<k8s::IngressControllerWorkload>, String>, none: &str, scaled_to_zero: &str) -> String {
     match controllers {
-        Ok(c) if c.is_empty() => "(no Deployment or DaemonSet names this class or its controller in its args, and none is called ingress)".to_string(),
+        Ok(c) if c.is_empty() => none.to_string(),
         Ok(c) => c
             .iter()
             .map(|w| {
                 let health = if w.desired == 0 {
-                    " — SCALED TO ZERO: nothing is serving this class, and the address in the Ingress's status is left over from when something did"
+                    format!(" — SCALED TO ZERO: {scaled_to_zero}")
                 } else if w.ready < w.desired {
-                    " — NOT ALL READY"
+                    " — NOT ALL READY".to_string()
                 } else {
-                    ""
+                    String::new()
                 };
                 format!("{} {}/{}: {} desired, {} ready{health} (matched by {})", w.kind, w.namespace, w.name, w.desired, w.ready, w.matched_by)
             })
@@ -3062,18 +3177,45 @@ fn render_ingress_controllers(controllers: &Result<Vec<k8s::IngressControllerWor
 /// pulled out of whichever it is, so the same error at a different time
 /// counts as one.
 fn render_ingress_controller_logs(lines: &Option<Result<(usize, Vec<String>), String>>) -> String {
-    let lines = match lines {
-        None => return "(no workload's args name this Ingress's class or controller, so there is no controller log to read)".to_string(),
-        Some(Ok((0, _))) => return "(the controller has no pods, so there is no log to read)".to_string(),
-        Some(Ok((_, l))) if l.is_empty() => return "(the controller logged nothing about this Ingress, its Services or its Secrets in the last hour)".to_string(),
-        Some(Ok((_, l))) => l,
-        Some(Err(e)) => return format!("(controller log unavailable: {e})"),
-    };
+    match lines {
+        None => "(no workload's args name this Ingress's class or controller, so there is no controller log to read)".to_string(),
+        Some(Ok((0, _))) => "(the controller has no pods, so there is no log to read)".to_string(),
+        Some(Ok((_, l))) if l.is_empty() => "(the controller logged nothing about this Ingress, its Services or its Secrets in the last hour)".to_string(),
+        Some(Ok((_, l))) => render_log_groups(l),
+        Some(Err(e)) => format!("(controller log unavailable: {e})"),
+    }
+}
+
+/// The zap console encoder's line, as controller-runtime controllers such as
+/// Envoy Gateway write it: time, level, logger, caller, message and a JSON
+/// object of fields, separated by tabs. The level, time and message, with
+/// the fields' `error` appended.
+fn zap_console_line(line: &str) -> Option<(String, String, String)> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    let level = fields.get(1)?;
+    if fields.len() < 4 || !["debug", "info", "warn", "error", "dpanic", "panic", "fatal"].contains(&level.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    // The message follows the caller (`file.go:12`), which a logger without
+    // caller info leaves out.
+    let at = if fields.get(3).is_some_and(|c| c.contains(".go:")) { 4 } else { 3 };
+    let mut message = fields.get(at).copied().unwrap_or_default().to_string();
+    if let Some(error) = fields.get(at + 1).and_then(|f| serde_json::from_str::<serde_json::Value>(f).ok()).and_then(|j| j.get("error").and_then(|e| e.as_str()).map(str::to_string)) {
+        message.push_str(&format!(": {error}"));
+    }
+    Some((level.to_uppercase(), fields[0].to_string(), message))
+}
+
+/// Log lines collapsed on what they say: the same error at a different time
+/// counts once, with how often and when last, newest first.
+fn render_log_groups(lines: &[String]) -> String {
     // (level, message) → (count, last time)
     let mut groups: Vec<((String, String), usize, String)> = Vec::new();
     for line in lines {
         let klog = line.len() > 5 && line.as_bytes()[0].is_ascii_alphabetic() && line.as_bytes()[1..5].iter().all(u8::is_ascii_digit);
-        let (level, time, message) = if klog {
+        let (level, time, message) = if let Some(zap) = zap_console_line(line) {
+            zap
+        } else if klog {
             let level = match &line[..1] {
                 "E" => "ERROR",
                 "W" => "WARN",
@@ -3140,7 +3282,14 @@ fn render_ingress_controller_logs(lines: &Option<Result<(usize, Vec<String>), St
             None => groups.push((key, 1, time)),
         }
     }
-    groups.sort_by(|a, b| b.2.cmp(&a.2));
+    // Errors, then warnings, then the rest, each newest first: a controller
+    // that logs every object it processes would otherwise bury its one error.
+    let rank = |level: &str| match level {
+        "ERROR" | "FATAL" | "DPANIC" | "PANIC" | "CRITICAL" => 0,
+        "WARN" | "WARNING" => 1,
+        _ => 2,
+    };
+    groups.sort_by(|a, b| rank(&a.0 .0).cmp(&rank(&b.0 .0)).then_with(|| b.2.cmp(&a.2)));
     let mut out = groups
         .iter()
         .take(DIAGNOSE_INGRESS_LOG_ENTRIES)
@@ -3152,7 +3301,7 @@ fn render_ingress_controller_logs(lines: &Option<Result<(usize, Vec<String>), St
         .collect::<Vec<_>>()
         .join("\n");
     if groups.len() > DIAGNOSE_INGRESS_LOG_ENTRIES {
-        out.push_str(&format!("\n… and {} older distinct entries", groups.len() - DIAGNOSE_INGRESS_LOG_ENTRIES));
+        out.push_str(&format!("\n… and {} more distinct entries, less severe or older", groups.len() - DIAGNOSE_INGRESS_LOG_ENTRIES));
     }
     out
 }
@@ -3167,64 +3316,68 @@ fn render_ingress_backends(ing: &k8s_openapi::api::networking::v1::Ingress, back
     let mut lines = Vec::new();
     for (svc, port) in refs {
         let Some(b) = backends.iter().find(|b| b.name == svc) else { continue };
-        let service = match &b.service {
-            Ok(s) => s,
-            Err(e) => {
-                lines.push(format!("Service {svc}:{port}: {}", read_failure("Service", e)));
-                continue;
-            }
-        };
-        let spec = service.spec.clone().unwrap_or_default();
-        let ports = spec.ports.clone().unwrap_or_default();
-        let found = ports.iter().find(|p| p.name.as_deref() == Some(port.as_str()) || p.port.to_string() == port);
-        let have = ports
-            .iter()
-            .map(|p| match &p.name {
-                Some(n) if !n.is_empty() => format!("{}/{n}", p.port),
-                _ => p.port.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut line = format!("Service {svc}:{port} ({})", spec.type_.as_deref().unwrap_or("ClusterIP"));
-        match found {
-            Some(p) => line.push_str(&format!(
-                ": port exists, → target port {}",
-                p.target_port.as_ref().map(int_or_string).unwrap_or_else(|| p.port.to_string())
-            )),
-            None => line.push_str(&format!(": PORT {port} IS NOT A PORT OF THE SERVICE (it has {})", if have.is_empty() { "none".to_string() } else { have })),
-        }
-        if spec.type_.as_deref() == Some("ExternalName") {
-            line.push_str(&format!("; an ExternalName to {}", spec.external_name.as_deref().unwrap_or_default()));
-        } else {
-            match &b.slices {
-                Ok(slices) => {
-                    // Counted for this Service port: a slice lists the ports
-                    // its endpoints serve by the Service port's name, and a
-                    // multi-port Service can have endpoints for one and not another.
-                    let port_name = found.map(|p| p.name.clone().unwrap_or_default());
-                    let serving: Vec<&k8s_openapi::api::discovery::v1::EndpointSlice> = slices
-                        .iter()
-                        .filter(|s| match &port_name {
-                            Some(n) => s.ports.iter().flatten().any(|sp| sp.name.clone().unwrap_or_default() == *n),
-                            None => true,
-                        })
-                        .collect();
-                    let endpoints: Vec<&k8s_openapi::api::discovery::v1::Endpoint> = serving.iter().flat_map(|s| s.endpoints.iter().flatten()).collect();
-                    let ready = endpoints.iter().filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)).count();
-                    let all: usize = slices.iter().map(|s| s.endpoints.as_ref().map_or(0, Vec::len)).sum();
-                    match (ready, endpoints.len()) {
-                        (0, 0) if all > 0 => line.push_str(&format!("; NO ENDPOINT SERVES THIS PORT ({all} endpoints serve its other ports — the target port resolves on none of the pods)")),
-                        (0, 0) => line.push_str("; NO ENDPOINTS — nothing is behind it"),
-                        (0, total) => line.push_str(&format!("; NO READY ENDPOINT (0 of {total})")),
-                        (ready, total) => line.push_str(&format!("; {ready} of {total} endpoints ready")),
-                    }
-                }
-                Err(e) => line.push_str(&format!("; endpoints unavailable: {e}")),
-            }
-        }
-        lines.push(line);
+        lines.push(render_service_backend(&svc, &port, b));
     }
     lines.join("\n")
+}
+
+/// One Service something routes to, by the port it names (a number or a
+/// port name): whether the Service exists, whether that is one of its ports,
+/// and how many endpoints behind that port are ready.
+fn render_service_backend(svc: &str, port: &str, b: &k8s::IngressBackend) -> String {
+    let service = match &b.service {
+        Ok(s) => s,
+        Err(e) => return format!("Service {svc}:{port}: {}", read_failure("Service", e)),
+    };
+    let spec = service.spec.clone().unwrap_or_default();
+    let ports = spec.ports.clone().unwrap_or_default();
+    let found = ports.iter().find(|p| p.name.as_deref() == Some(port) || p.port.to_string() == port);
+    let have = ports
+        .iter()
+        .map(|p| match &p.name {
+            Some(n) if !n.is_empty() => format!("{}/{n}", p.port),
+            _ => p.port.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut line = format!("Service {svc}:{port} ({})", spec.type_.as_deref().unwrap_or("ClusterIP"));
+    match found {
+        Some(p) => line.push_str(&format!(
+            ": port exists, → target port {}",
+            p.target_port.as_ref().map(int_or_string).unwrap_or_else(|| p.port.to_string())
+        )),
+        None => line.push_str(&format!(": PORT {port} IS NOT A PORT OF THE SERVICE (it has {})", if have.is_empty() { "none".to_string() } else { have })),
+    }
+    if spec.type_.as_deref() == Some("ExternalName") {
+        line.push_str(&format!("; an ExternalName to {}", spec.external_name.as_deref().unwrap_or_default()));
+    } else {
+        match &b.slices {
+            Ok(slices) => {
+                // Counted for this Service port: a slice lists the ports
+                // its endpoints serve by the Service port's name, and a
+                // multi-port Service can have endpoints for one and not another.
+                let port_name = found.map(|p| p.name.clone().unwrap_or_default());
+                let serving: Vec<&k8s_openapi::api::discovery::v1::EndpointSlice> = slices
+                    .iter()
+                    .filter(|s| match &port_name {
+                        Some(n) => s.ports.iter().flatten().any(|sp| sp.name.clone().unwrap_or_default() == *n),
+                        None => true,
+                    })
+                    .collect();
+                let endpoints: Vec<&k8s_openapi::api::discovery::v1::Endpoint> = serving.iter().flat_map(|s| s.endpoints.iter().flatten()).collect();
+                let ready = endpoints.iter().filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)).count();
+                let all: usize = slices.iter().map(|s| s.endpoints.as_ref().map_or(0, Vec::len)).sum();
+                match (ready, endpoints.len()) {
+                    (0, 0) if all > 0 => line.push_str(&format!("; NO ENDPOINT SERVES THIS PORT ({all} endpoints serve its other ports — the target port resolves on none of the pods)")),
+                    (0, 0) => line.push_str("; NO ENDPOINTS — nothing is behind it"),
+                    (0, total) => line.push_str(&format!("; NO READY ENDPOINT (0 of {total})")),
+                    (ready, total) => line.push_str(&format!("; {ready} of {total} endpoints ready")),
+                }
+            }
+            Err(e) => line.push_str(&format!("; endpoints unavailable: {e}")),
+        }
+    }
+    line
 }
 
 /// Whether a certificate name covers a host: exactly, or by a wildcard for
@@ -3262,44 +3415,47 @@ fn render_ingress_tls(
             Some((_, r)) => r,
             None => continue,
         };
-        let s = match read {
-            Ok(s) => s,
-            Err(e) => {
-                lines.push(format!("Secret {secret}: {}", read_failure("Secret", e)));
-                continue;
-            }
-        };
-        let mut line = format!("Secret {secret} ({})", s.secret_type);
-        let missing: Vec<&str> = ["tls.crt", "tls.key"].into_iter().filter(|k| !s.keys.iter().any(|have| have == k)).collect();
-        if !missing.is_empty() {
-            line.push_str(&format!(": MISSING KEY {}", missing.join(" and ")));
-        }
-        match &s.leaf {
-            None => line.push_str("\n  no certificate could be read from tls.crt"),
-            Some(c) => {
-                line.push_str(&format!("\n  certificate: subject {}, issuer {}", c.subject, c.issuer));
-                if let Some(after) = c.not_after.as_deref() {
-                    // Compared before rounding: a certificate that expired an
-                    // hour ago is expired, though zero whole days have passed.
-                    match chrono::DateTime::parse_from_rfc3339(after).ok().map(|t| t.with_timezone(&chrono::Utc)) {
-                        Some(t) if t <= now => match (now - t).num_days() {
-                            0 => line.push_str(&format!("\n  EXPIRED on {after}, less than a day ago")),
-                            d => line.push_str(&format!("\n  EXPIRED on {after}, {d} days ago")),
-                        },
-                        Some(t) => line.push_str(&format!("\n  valid until {after} ({} days left)", (t - now).num_days())),
-                        None => line.push_str(&format!("\n  valid until {after}")),
-                    }
-                }
-                for h in &hosts {
-                    if !c.sans.iter().any(|san| san_covers(san, h)) {
-                        line.push_str(&format!("\n  DOES NOT COVER {h} (it names {})", c.sans.join(", ")));
-                    }
-                }
-            }
-        }
-        lines.push(line);
+        lines.push(render_tls_secret(secret, read, &hosts, now));
     }
     lines.join("\n")
+}
+
+/// A TLS Secret: there, of the right type, with both keys, and holding a
+/// certificate that is in date and names every host it serves.
+fn render_tls_secret(secret: &str, read: &Result<k8s::IngressTlsSecret, String>, hosts: &[String], now: chrono::DateTime<chrono::Utc>) -> String {
+    let s = match read {
+        Ok(s) => s,
+        Err(e) => return format!("Secret {secret}: {}", read_failure("Secret", e)),
+    };
+    let mut line = format!("Secret {secret} ({})", s.secret_type);
+    let missing: Vec<&str> = ["tls.crt", "tls.key"].into_iter().filter(|k| !s.keys.iter().any(|have| have == k)).collect();
+    if !missing.is_empty() {
+        line.push_str(&format!(": MISSING KEY {}", missing.join(" and ")));
+    }
+    match &s.leaf {
+        None => line.push_str("\n  no certificate could be read from tls.crt"),
+        Some(c) => {
+            line.push_str(&format!("\n  certificate: subject {}, issuer {}", c.subject, c.issuer));
+            if let Some(after) = c.not_after.as_deref() {
+                // Compared before rounding: a certificate that expired an
+                // hour ago is expired, though zero whole days have passed.
+                match chrono::DateTime::parse_from_rfc3339(after).ok().map(|t| t.with_timezone(&chrono::Utc)) {
+                    Some(t) if t <= now => match (now - t).num_days() {
+                        0 => line.push_str(&format!("\n  EXPIRED on {after}, less than a day ago")),
+                        d => line.push_str(&format!("\n  EXPIRED on {after}, {d} days ago")),
+                    },
+                    Some(t) => line.push_str(&format!("\n  valid until {after} ({} days left)", (t - now).num_days())),
+                    None => line.push_str(&format!("\n  valid until {after}")),
+                }
+            }
+            for h in hosts {
+                if !c.sans.iter().any(|san| san_covers(san, h)) {
+                    line.push_str(&format!("\n  DOES NOT COVER {h} (it names {})", c.sans.join(", ")));
+                }
+            }
+        }
+    }
+    line
 }
 
 /// cert-manager's view of the TLS Secrets, when it issues them.
@@ -3435,6 +3591,433 @@ pub async fn build_ingress_diagnosis_payload(context_name: &str, namespace: &str
         redaction_summary,
         log_note: None,
     })
+}
+
+/// Conditions in one line each way: a healthy one briefly, a fault or an
+/// undecided one in capitals with why.
+fn render_gateway_conditions(conditions: &[crate::models::PodConditionInfo]) -> String {
+    if conditions.is_empty() {
+        return "NONE REPORTED".to_string();
+    }
+    conditions
+        .iter()
+        .map(|c| {
+            let status = if c.status.is_empty() { "Unknown" } else { c.status.as_str() };
+            if crate::gateway_api::condition_ok(c) {
+                if c.reason.is_empty() || c.reason == c.condition_type { format!("{} {status}", c.condition_type) } else { format!("{} {status} ({})", c.condition_type, c.reason) }
+            } else {
+                let why: Vec<&str> = [c.reason.as_str(), c.message.as_str()].into_iter().filter(|s| !s.is_empty()).collect();
+                let why = if why.len() == 2 && why[0] == why[1] { why[0].to_string() } else { why.join(" — ") };
+                format!("{}: {}{}", c.condition_type, status.to_uppercase(), if why.is_empty() { String::new() } else { format!(" ({why})") })
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The Gateway's own state: its conditions, addresses and listeners.
+fn render_gateway_state(g: &crate::models::GatewayInfo) -> String {
+    let mut lines = vec![
+        format!("class: {}", if g.class.is_empty() { "(none)" } else { &g.class }),
+        format!(
+            "addresses: {}",
+            if g.addresses.is_empty() { "NONE — its controller has not published one".to_string() } else { g.addresses.join(", ") }
+        ),
+        format!("conditions: {}", render_gateway_conditions(&g.conditions)),
+        format!("routes attached, as its listeners count them: {}", g.attached_routes),
+        "listeners:".to_string(),
+    ];
+    for l in &g.listeners {
+        let tls = if l.tls_mode.is_empty() {
+            String::new()
+        } else if l.certificates.is_empty() {
+            format!(", TLS {}", l.tls_mode)
+        } else {
+            format!(", TLS {} with {}", l.tls_mode, l.certificates.join(", "))
+        };
+        lines.push(format!(
+            "- {} {}:{}{}{tls}, routes from {} namespaces, {} attached: {}",
+            l.name,
+            l.protocol,
+            l.port,
+            if l.hostname.is_empty() { ", any hostname".to_string() } else { format!(" {}", l.hostname) },
+            l.allowed_namespaces,
+            l.attached_routes.map_or("?".to_string(), |n| n.to_string()),
+            render_gateway_conditions(&l.conditions),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_gateway_class(class_name: &str, class: &Option<crate::models::GatewayClassInfo>, read_error: &Option<String>) -> String {
+    match class {
+        Some(c) => format!("{}: controller {}; {}", c.name, c.controller, render_gateway_conditions(&c.conditions)),
+        None if read_error.is_some() => format!("(GatewayClass {class_name} unavailable: {})", read_error.as_deref().unwrap_or_default()),
+        None => format!("NO GATEWAYCLASS NAMED {class_name} EXISTS: no controller will program this Gateway"),
+    }
+}
+
+/// A reference into another namespace: permitted by a ReferenceGrant, or not.
+fn render_grant(grant: &Option<Result<Option<String>, String>>, namespace: &str) -> String {
+    match grant {
+        None => String::new(),
+        Some(Ok(Some(g))) => format!("; in another namespace, permitted by ReferenceGrant {namespace}/{g}"),
+        Some(Ok(None)) => format!("; IN ANOTHER NAMESPACE, AND NO REFERENCEGRANT IN {namespace} PERMITS IT"),
+        Some(Err(e)) => format!("; in another namespace (ReferenceGrants unavailable: {e})"),
+    }
+}
+
+fn render_gateway_certificates(certs: &[crate::gateway_api::GatewayCertificate], namespace: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    if certs.is_empty() {
+        return "(no listener names a certificate)".to_string();
+    }
+    certs
+        .iter()
+        .map(|c| {
+            let label = if c.namespace == namespace { c.name.clone() } else { format!("{}/{}", c.namespace, c.name) };
+            let hosts: Vec<String> = if c.hostname.is_empty() { Vec::new() } else { vec![c.hostname.clone()] };
+            let body = match &c.secret {
+                Some(read) => render_tls_secret(&label, read, &hosts, now),
+                None => format!("{} {label}: not a Secret; its controller must support this kind", c.kind),
+            };
+            let (first, rest) = body.split_once('\n').map_or((body.as_str(), ""), |(a, b)| (a, b));
+            let rest = if rest.is_empty() { String::new() } else { format!("\n{rest}") };
+            format!("listener {}: {first}{}{rest}", c.listener, render_grant(&c.grant, &c.namespace))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_gateway_data_plane(dp: &crate::gateway_api::GatewayDataPlane) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for w in &dp.workloads {
+        let health = if w.desired == 0 { " — SCALED TO ZERO" } else if w.ready < w.desired { " — NOT ALL READY" } else { "" };
+        lines.push(format!("{} {}/{}: {} desired, {} ready{health}", w.kind, w.namespace, w.name, w.desired, w.ready));
+    }
+    for svc in &dp.services {
+        let spec = svc.spec.clone().unwrap_or_default();
+        let kind = spec.type_.clone().unwrap_or_else(|| "ClusterIP".to_string());
+        let ports = spec
+            .ports
+            .iter()
+            .flatten()
+            .map(|p| format!("{}/{}→{}", p.port, p.protocol.as_deref().unwrap_or("TCP"), p.target_port.as_ref().map(int_or_string).unwrap_or_else(|| p.port.to_string())))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ingress: Vec<String> = svc
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|l| l.ingress.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.ip.clone().or_else(|| i.hostname.clone()))
+            .collect();
+        let address = match (kind.as_str(), ingress.is_empty()) {
+            ("LoadBalancer", true) => ", LOADBALANCER WITH NO ADDRESS".to_string(),
+            ("LoadBalancer", false) => format!(", address {}", ingress.join(", ")),
+            _ => String::new(),
+        };
+        lines.push(format!(
+            "Service {}/{}: {kind}{address}, ports {}",
+            svc.metadata.namespace.as_deref().unwrap_or_default(),
+            svc.metadata.name.as_deref().unwrap_or_default(),
+            if ports.is_empty() { "none".to_string() } else { ports }
+        ));
+    }
+    if !dp.service_events.is_empty() {
+        lines.push(format!("events of the Service without an address:\n{}", render_nap_events(&Ok(dp.service_events.clone()), "", false, 10)));
+    }
+    let unready: Vec<&k8s_openapi::api::core::v1::Pod> = dp.pods.iter().filter(|p| !pod_is_ready(p)).collect();
+    if !dp.pods.is_empty() {
+        lines.push(format!("pods: {} of {} ready", dp.pods.len() - unready.len(), dp.pods.len()));
+        lines.extend(unready.iter().take(10).map(|p| format!("- {}", render_service_pod(p))));
+    }
+    for e in &dp.errors {
+        lines.push(format!("({e})"));
+    }
+    if dp.workloads.is_empty() && dp.services.is_empty() && dp.pods.is_empty() && dp.errors.is_empty() {
+        return "(nothing carries the labels Envoy Gateway, Istio, NGINX Gateway Fabric, Cilium or Contour put on a Gateway's proxies: its controller may serve it from shared proxies or from outside the cluster, or has not created any)".to_string();
+    }
+    lines.join("\n")
+}
+
+/// How many routes to name; the rest are counted.
+const DIAGNOSE_GATEWAY_ROUTES: usize = 20;
+
+fn render_gateway_routes(routes: &[crate::models::RouteInfo]) -> String {
+    if routes.is_empty() {
+        return "(no route names this Gateway as a parent)".to_string();
+    }
+    let failing = routes.iter().filter(|r| !r.healthy).count();
+    let mut lines = vec![format!("{} routes, {failing} failing", routes.len())];
+    for r in routes.iter().take(DIAGNOSE_GATEWAY_ROUTES) {
+        lines.push(match &r.problem {
+            Some(p) => format!("- {} {}/{}: FAILING — {p}", r.kind, r.namespace, r.name),
+            None => format!("- {} {}/{}: accepted", r.kind, r.namespace, r.name),
+        });
+    }
+    // Failing first, so the rest are failing only when all those shown are.
+    let rest = routes.get(DIAGNOSE_GATEWAY_ROUTES..).unwrap_or_default();
+    match rest.iter().filter(|r| !r.healthy).count() {
+        _ if rest.is_empty() => {}
+        0 => lines.push(format!("… and {} more, all accepted", rest.len())),
+        n => lines.push(format!("… and {} more, {n} of them failing", rest.len())),
+    }
+    lines.join("\n")
+}
+
+fn render_gateway_controller_logs(lines: &Option<Result<(usize, Vec<String>), String>>, what: &str) -> String {
+    match lines {
+        None => "(no controller workload was found, so there is no controller log to read)".to_string(),
+        Some(Ok((0, _))) => "(the controller has no pods, so there is no log to read)".to_string(),
+        Some(Ok((_, l))) if l.is_empty() => format!("(the controller logged nothing about {what} in the last hour)"),
+        Some(Ok((_, l))) => render_log_groups(l),
+        Some(Err(e)) => format!("(controller log unavailable: {e})"),
+    }
+}
+
+/// A Gateway is a request to its class's controller for a data plane:
+/// what can be wrong is a class no controller accepts, a data plane that is
+/// not up or has no address, or a listener whose certificate or
+/// configuration the controller refuses.
+pub async fn build_gateway_diagnosis_payload(context_name: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = crate::gateway_api::get_gateway_diagnostics(context_name, namespace, name).await?;
+
+    let state = redact::redact(&render_gateway_state(&d.gateway));
+    let class = redact::redact(&render_gateway_class(&d.gateway.class, &d.class, &d.read_error));
+    let certificates = redact::redact(&render_gateway_certificates(&d.certificates, namespace, chrono::Utc::now()));
+    let data_plane = redact::redact(&render_gateway_data_plane(&d.data_plane));
+    let routes = redact::redact(&render_gateway_routes(&d.routes));
+    let none = if d.controller.is_empty() {
+        "(its class could not be read, so its controller is not known)".to_string()
+    } else {
+        format!("(no Deployment names {} in its args or runs a known image for it: it may run outside the cluster)", d.controller)
+    };
+    let controllers = redact::redact(&render_controller_workloads(&d.controllers, &none, "nothing reconciles Gateways of its class, so nothing it reports is current"));
+    let logs = redact::redact(&render_gateway_controller_logs(&d.controller_logs, "this Gateway or its certificates"));
+    let events = redact::redact(&render_nap_events(&d.events, "(no events for this Gateway)", false, 25));
+    let manifest = redact::redact(&d.manifest);
+
+    let redaction_summary = redact::Redacted::merge([&state, &class, &certificates, &data_plane, &routes, &controllers, &logs, &events, &manifest]).summary();
+
+    let prompt = format!(
+        "Gateway {namespace}/{name}.\n\n\
+         ## State\n{}\n\n\
+         ## GatewayClass\n{}\n\n\
+         ## Listener certificates\n{}\n\n\
+         ## Data plane (what its controller created for it)\n{}\n\n\
+         ## Routes attached\n{}\n\n\
+         ## Controller\n{}\n\n\
+         ## Controller log (last hour, lines about this Gateway and its certificates)\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        state.text, class.text, certificates.text, data_plane.text, routes.text, controllers.text, logs.text, events.text, manifest.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
+fn render_route_spec(r: &crate::models::RouteInfo) -> String {
+    let mut lines = vec![format!(
+        "hostnames: {}",
+        if r.hostnames.is_empty() { "none — it takes those of the listeners it attaches to".to_string() } else { r.hostnames.join(", ") }
+    )];
+    if r.rules.is_empty() {
+        lines.push("rules: none".to_string());
+    }
+    for (i, rule) in r.rules.iter().enumerate() {
+        let name = if rule.name.is_empty() { String::new() } else { format!(" ({})", rule.name) };
+        let backends = rule
+            .backends
+            .iter()
+            .map(|b| {
+                let ns = if b.namespace == r.namespace { String::new() } else { format!("{}/", b.namespace) };
+                let kind = if b.group.is_empty() && b.kind == "Service" { String::new() } else if b.group.is_empty() { format!("{}/", b.kind) } else { format!("{}.{}/", b.kind, b.group) };
+                let port = b.port.map_or(String::new(), |p| format!(":{p}"));
+                let weight = match b.weight {
+                    Some(0) => " WEIGHT 0 (gets no traffic)".to_string(),
+                    Some(w) if rule.backends.len() > 1 => format!(" weight {w}"),
+                    _ => String::new(),
+                };
+                format!("{ns}{kind}{}{port}{weight}", b.name)
+            })
+            .collect::<Vec<_>>();
+        lines.push(format!(
+            "rule {}{name}: {}{}; backends: {}",
+            i + 1,
+            if rule.matches.is_empty() { "matches everything".to_string() } else { format!("matches {}", rule.matches.join(" | ")) },
+            if rule.filters.is_empty() { String::new() } else { format!("; filters {}", rule.filters.join(", ")) },
+            if backends.is_empty() { "none".to_string() } else { backends.join(", ") },
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_route_parents(parents: &[crate::gateway_api::ParentFit]) -> String {
+    if parents.is_empty() {
+        return "NONE: it names no parent, so nothing serves it".to_string();
+    }
+    let mut lines = Vec::new();
+    for f in parents {
+        let p = &f.parent;
+        let section = if p.section.is_empty() { String::new() } else { format!(", {}", p.section) };
+        let what = if p.group == crate::gateway_api::GROUP && p.kind == "Gateway" {
+            format!("Gateway {}/{}", p.namespace, p.name)
+        } else if p.group.is_empty() || p.group == crate::gateway_api::GROUP {
+            format!("{} {}/{}", p.kind, p.namespace, p.name)
+        } else {
+            format!("{}.{} {}/{}", p.kind, p.group, p.namespace, p.name)
+        };
+        lines.push(format!("{what}{section}"));
+        let verdict = if p.conditions.is_empty() {
+            "NO CONTROLLER HAS REPORTED ON THIS PARENT".to_string()
+        } else {
+            format!("{}: {}", if p.controller.is_empty() { "its controller" } else { &p.controller }, render_gateway_conditions(&p.conditions))
+        };
+        lines.push(format!("  verdict: {verdict}"));
+        if f.missing {
+            lines.push("  NO SUCH GATEWAY EXISTS".to_string());
+            continue;
+        }
+        if let Some(e) = &f.read_error {
+            lines.push(format!("  (the Gateway unavailable: {e})"));
+        }
+        if let Some(g) = &f.gateway {
+            let state = match &g.problem {
+                None => "accepted and programmed".to_string(),
+                Some(problem) => format!("NOT HEALTHY: {problem}"),
+            };
+            lines.push(format!("  the Gateway: {state}; class {}; addresses {}", g.class, if g.addresses.is_empty() { "none".to_string() } else { g.addresses.join(", ") }));
+        }
+        if !f.listeners.is_empty() {
+            for l in &f.listeners {
+                let head = format!("{} {}:{}{}", l.name, l.protocol, l.port, if l.hostname.is_empty() { String::new() } else { format!(" {}", l.hostname) });
+                let verdict = if !l.selected {
+                    "not the listener its parentRef names".to_string()
+                } else if let Some(r) = &l.refusal {
+                    format!("REFUSES IT: {r}")
+                } else if let Some(r) = &l.hostname_refusal {
+                    format!("NO HOSTNAME IN COMMON: {r}")
+                } else if l.hostnames.is_empty() {
+                    "admits it".to_string()
+                } else {
+                    format!("admits it, for {}", l.hostnames.join(", "))
+                };
+                lines.push(format!("  - listener {head}: {verdict}"));
+            }
+            if !f.listeners.iter().any(|l| l.selected && l.refusal.is_none() && l.hostname_refusal.is_none()) {
+                lines.push("  NO LISTENER OF THIS GATEWAY ADMITS THE ROUTE".to_string());
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_route_backends(route_ns: &str, backends: &[crate::gateway_api::RouteBackendCheck]) -> String {
+    if backends.is_empty() {
+        return "(its rules name no backend: fine for a redirect or a fixed response; otherwise requests get a 500)".to_string();
+    }
+    backends
+        .iter()
+        .map(|c| {
+            let b = &c.backend;
+            let label = if b.namespace == route_ns { b.name.clone() } else { format!("{}/{}", b.namespace, b.name) };
+            let body = match (&c.service, b.port) {
+                (Some(svc), Some(port)) => render_service_backend(&label, &port.to_string(), svc),
+                (Some(_), None) => format!("Service {label}: NO PORT — a Service backend must name one"),
+                (None, _) => {
+                    let kind = if b.group.is_empty() { b.kind.clone() } else { format!("{}.{}", b.kind, b.group) };
+                    format!("{kind} {label}: not a core Service; whether it resolves is its controller's call (ResolvedRefs)")
+                }
+            };
+            format!("{body}{}", render_grant(&c.grant, &b.namespace))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How many routes claiming the same traffic to show.
+const DIAGNOSE_ROUTE_SAME_HOSTNAME: usize = 10;
+
+/// The other routes on its Gateways with one of its hostnames and the same
+/// match, which claim the same requests; the others sharing a hostname are
+/// only counted, as one host split by path is the ordinary case.
+fn render_route_same_hostname(route: &crate::models::RouteInfo, others: &[crate::models::RouteInfo], sharing: usize) -> String {
+    let rest = match sharing.saturating_sub(others.len()) {
+        0 => String::new(),
+        1 => "1 other route on its Gateways shares one of its hostnames with different matches".to_string(),
+        n => format!("{n} other routes on its Gateways share one of its hostnames with different matches"),
+    };
+    if others.is_empty() {
+        return if rest.is_empty() { "(no other route on its Gateways has one of its hostnames)".to_string() } else { format!("(none with the same match; {rest})") };
+    }
+    let mut lines: Vec<String> = others
+        .iter()
+        .take(DIAGNOSE_ROUTE_SAME_HOSTNAME)
+        .map(|o| {
+            let shared: Vec<&String> = o.hostnames.iter().filter(|h| route.hostnames.iter().any(|x| x.eq_ignore_ascii_case(h))).collect();
+            let matches: Vec<&String> = o.rules.iter().flat_map(|r| &r.matches).collect();
+            format!(
+                "- {} {}/{} (shares {}): {}{}",
+                o.kind,
+                o.namespace,
+                o.name,
+                shared.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", "),
+                if matches.is_empty() { "matches everything".to_string() } else { format!("matches {}", matches.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" | ")) },
+                if o.healthy { String::new() } else { " (itself failing)".to_string() },
+            )
+        })
+        .collect();
+    if others.len() > DIAGNOSE_ROUTE_SAME_HOSTNAME {
+        lines.push(format!("… and {} more", others.len() - DIAGNOSE_ROUTE_SAME_HOSTNAME));
+    }
+    if !rest.is_empty() {
+        lines.push(format!("({rest})"));
+    }
+    lines.join("\n")
+}
+
+/// A route is a request to its parents' controllers: what can be wrong is a
+/// parent that does not exist or will not admit it, a backend that does not
+/// resolve or has nothing ready behind it, or another route claiming the
+/// same traffic.
+pub async fn build_route_diagnosis_payload(context_name: &str, kind: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = crate::gateway_api::get_route_diagnostics(context_name, kind, namespace, name).await?;
+
+    let spec = redact::redact(&render_route_spec(&d.route));
+    let mut parents_text = render_route_parents(&d.parents);
+    if let Some(e) = &d.read_error {
+        parents_text.push_str(&format!("\n(some Gateway API kinds could not be listed: {e})"));
+    }
+    let parents = redact::redact(&parents_text);
+    let backends = redact::redact(&render_route_backends(namespace, &d.backends));
+    let same_hostname = redact::redact(&render_route_same_hostname(&d.route, &d.same_match, d.sharing_hostname));
+    let controllers = redact::redact(&render_controller_workloads(
+        &d.controllers,
+        "(no Deployment names its Gateways' controller in its args or runs a known image for it: it may run outside the cluster)",
+        "nothing reconciles its Gateways' class, so nothing it reports is current",
+    ));
+    let logs = redact::redact(&render_gateway_controller_logs(&d.controller_logs, "this route or its Services"));
+    let events = redact::redact(&render_nap_events(&d.events, &format!("(no events for this {kind})"), false, 25));
+    let manifest = redact::redact(&d.manifest);
+
+    let redaction_summary = redact::Redacted::merge([&spec, &parents, &backends, &same_hostname, &controllers, &logs, &events, &manifest]).summary();
+
+    let prompt = format!(
+        "{kind} {namespace}/{name}.\n\n\
+         ## Hostnames and rules\n{}\n\n\
+         ## Parents, and each Gateway listener checked against the route\n{}\n\n\
+         ## Backends\n{}\n\n\
+         ## Other routes on its Gateways with one of its hostnames and the same match\n{}\n\n\
+         ## Controller\n{}\n\n\
+         ## Controller log (last hour, lines about this route and its Services)\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        spec.text, parents.text, backends.text, same_hostname.text, controllers.text, logs.text, events.text, manifest.text,
+    );
+
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
 }
 
 /// A volume this full is called out: most filesystems slow or fail before 100%.
@@ -6875,6 +7458,8 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "Service" => DIAGNOSE_SERVICE_SYSTEM,
         "Namespace" => DIAGNOSE_NAMESPACE_SYSTEM,
         "Ingress" => DIAGNOSE_INGRESS_SYSTEM,
+        "Gateway" => DIAGNOSE_GATEWAY_SYSTEM,
+        "HTTPRoute" | "GRPCRoute" | "TLSRoute" | "TCPRoute" | "UDPRoute" => DIAGNOSE_ROUTE_SYSTEM,
         "PersistentVolumeClaim" => DIAGNOSE_PVC_SYSTEM,
         "PodDisruptionBudget" => DIAGNOSE_PDB_SYSTEM,
         "StatefulSet" => DIAGNOSE_STATEFULSET_SYSTEM,
@@ -8258,6 +8843,89 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(!san_covers("*.example.com", "example.com"));
         assert!(render_ingress_spec(&ing).contains("hosts in the rules but in no TLS entry: plain.example.com"));
         assert!(render_ingress_spec(&ing).contains("address: none published"));
+    }
+
+    #[test]
+    fn zap_console_lines_collapse_on_their_message() {
+        let line = |t: &str, level: &str, msg: &str, fields: &str| format!("2026-11-23T10:0{t}:00.000Z\t{level}\tgateway-api\tgatewayapi/route.go:12\t{msg}\t{fields}");
+        let lines = vec![
+            line("1", "info", "setting 503 direct response in routes due to no ready endpoints", r#"{"routes":["httproute/app/web/rule/0"]}"#),
+            line("2", "info", "setting 503 direct response in routes due to no ready endpoints", r#"{"routes":["httproute/app/web/rule/0"]}"#),
+            line("3", "error", "failed to translate", r#"{"error":"backend app/web: service not found"}"#),
+        ];
+        assert_eq!(
+            render_log_groups(&lines),
+            "ERROR failed to translate: backend app/web: service not found (×1, last 2026-11-23T10:03:00.000Z)\n\
+             INFO setting 503 direct response in routes due to no ready endpoints (×2, last 2026-11-23T10:02:00.000Z)"
+        );
+        // Not zap: no tab-separated level.
+        assert!(zap_console_line("I1102 10:00:00.000000 7 file.go:12] msg").is_none());
+        assert!(zap_console_line(r#"{"level":"info","msg":"m"}"#).is_none());
+    }
+
+    #[test]
+    fn gateway_conditions_read_faults_in_capitals() {
+        let c = |t: &str, s: &str, r: &str, m: &str| crate::models::PodConditionInfo { condition_type: t.into(), status: s.into(), reason: r.into(), message: m.into(), last_transition: None };
+        assert_eq!(
+            render_gateway_conditions(&[
+                c("Accepted", "True", "Accepted", ""),
+                c("Conflicted", "False", "NoConflicts", ""),
+                c("BackendsAvailable", "False", "EndpointsNotFound", "no ready endpoints for app/web"),
+                c("Programmed", "Unknown", "Pending", "Pending"),
+            ]),
+            "Accepted True; Conflicted False (NoConflicts); BackendsAvailable: FALSE (EndpointsNotFound — no ready endpoints for app/web); Programmed: UNKNOWN (Pending)"
+        );
+        assert_eq!(render_gateway_conditions(&[]), "NONE REPORTED");
+    }
+
+    #[test]
+    fn a_routes_parents_say_which_listener_admits_it_and_why_others_do_not() {
+        use crate::gateway_api::{ListenerFit, ParentFit};
+        let listener = |name: &str, selected: bool, refusal: Option<&str>, hostname_refusal: Option<&str>, hostnames: &[&str]| ListenerFit {
+            name: name.into(),
+            protocol: "HTTPS".into(),
+            port: 443,
+            hostname: "*.dev.example.com".into(),
+            selected,
+            refusal: refusal.map(str::to_string),
+            hostnames: hostnames.iter().map(|h| h.to_string()).collect(),
+            hostname_refusal: hostname_refusal.map(str::to_string),
+        };
+        let parent = |name: &str, conditions: Vec<crate::models::PodConditionInfo>| crate::models::RouteParentInfo {
+            group: crate::gateway_api::GROUP.into(),
+            kind: "Gateway".into(),
+            namespace: "infra".into(),
+            name: name.into(),
+            section: String::new(),
+            controller: "gateway.envoyproxy.io/gatewayclass-controller".into(),
+            conditions,
+            problem: None,
+        };
+        let refused = crate::models::PodConditionInfo { condition_type: "Accepted".into(), status: "False".into(), reason: "NotAllowedByListeners".into(), message: String::new(), last_transition: None };
+        let out = render_route_parents(&[
+            ParentFit {
+                parent: parent("gw", vec![refused]),
+                gateway: None,
+                missing: false,
+                read_error: None,
+                listeners: vec![
+                    listener("https", true, Some("it admits routes from its own namespace (infra) only, and the route is in app"), None, &[]),
+                    listener("http", false, None, None, &[]),
+                ],
+            },
+            ParentFit { parent: parent("gone", vec![]), gateway: None, missing: true, read_error: None, listeners: vec![] },
+        ]);
+        assert_eq!(
+            out,
+            "Gateway infra/gw\n  \
+             verdict: gateway.envoyproxy.io/gatewayclass-controller: Accepted: FALSE (NotAllowedByListeners)\n  \
+             - listener https HTTPS:443 *.dev.example.com: REFUSES IT: it admits routes from its own namespace (infra) only, and the route is in app\n  \
+             - listener http HTTPS:443 *.dev.example.com: not the listener its parentRef names\n  \
+             NO LISTENER OF THIS GATEWAY ADMITS THE ROUTE\n\
+             Gateway infra/gone\n  \
+             verdict: NO CONTROLLER HAS REPORTED ON THIS PARENT\n  \
+             NO SUCH GATEWAY EXISTS"
+        );
     }
 
     #[test]

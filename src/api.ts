@@ -216,6 +216,10 @@ export const api = {
     invoke<ClaudeDiagnosisPayload>("ai_build_service_diagnosis", { contextName, namespace, name }),
   aiBuildIngressDiagnosis: (contextName: string, namespace: string, name: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_ingress_diagnosis", { contextName, namespace, name }),
+  aiBuildGatewayDiagnosis: (contextName: string, namespace: string, name: string) =>
+    invoke<ClaudeDiagnosisPayload>("ai_build_gateway_diagnosis", { contextName, namespace, name }),
+  aiBuildRouteDiagnosis: (contextName: string, kind: string, namespace: string, name: string) =>
+    invoke<ClaudeDiagnosisPayload>("ai_build_route_diagnosis", { contextName, kind, namespace, name }),
   aiBuildNamespaceDiagnosis: (contextName: string, name: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_namespace_diagnosis", { contextName, name }),
   aiBuildPvcDiagnosis: (contextName: string, namespace: string, name: string) =>

@@ -198,6 +198,8 @@ pub fn run() {
             commands::ai_build_hpa_diagnosis,
             commands::ai_build_service_diagnosis,
             commands::ai_build_ingress_diagnosis,
+            commands::ai_build_gateway_diagnosis,
+            commands::ai_build_route_diagnosis,
             commands::ai_build_namespace_diagnosis,
             commands::ai_build_pvc_diagnosis,
             commands::ai_build_pdb_diagnosis,
