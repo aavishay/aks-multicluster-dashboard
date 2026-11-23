@@ -1307,6 +1307,136 @@ pub struct IngressInfo {
     pub created_at: Option<String>,
 }
 
+/// Everything the Gateways and Routes tabs show for one cluster, read at
+/// once. Mirrors `GatewayApiResult` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct GatewayApiResult {
+    /// The `gateway.networking.k8s.io` group is served at all.
+    pub installed: bool,
+    /// Kinds that are served but failed to list, one line each; the others
+    /// are still here.
+    pub error: Option<String>,
+    pub classes: Vec<GatewayClassInfo>,
+    pub gateways: Vec<GatewayInfo>,
+    pub routes: Vec<RouteInfo>,
+}
+
+/// A GatewayClass. Mirrors `GatewayClassInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct GatewayClassInfo {
+    pub name: String,
+    /// `spec.controllerName`: the implementation that runs its Gateways.
+    pub controller: String,
+    pub description: String,
+    pub conditions: Vec<PodConditionInfo>,
+    pub healthy: bool,
+    /// The first condition that is not True, or why there are none.
+    pub problem: Option<String>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// A Gateway. Mirrors `GatewayInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct GatewayInfo {
+    pub namespace: String,
+    pub name: String,
+    pub class: String,
+    /// `status.addresses`: what the controller published. Empty until then.
+    pub addresses: Vec<String>,
+    pub listeners: Vec<GatewayListenerInfo>,
+    /// Summed over its listeners, as each listener's status counts them.
+    pub attached_routes: i64,
+    pub conditions: Vec<PodConditionInfo>,
+    pub healthy: bool,
+    /// Its own first condition that is not True, else a listener's.
+    pub problem: Option<String>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// One listener of a Gateway: its spec, and what its status says.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct GatewayListenerInfo {
+    pub name: String,
+    pub protocol: String,
+    pub port: i64,
+    pub hostname: String,
+    /// `Terminate` or `Passthrough`; empty without TLS.
+    pub tls_mode: String,
+    /// Certificate references by name (`ns/name` across namespaces); never
+    /// their contents.
+    pub certificates: Vec<String>,
+    /// `allowedRoutes.namespaces.from`: Same, All or Selector.
+    pub allowed_namespaces: String,
+    /// None when the controller has not reported on this listener.
+    pub attached_routes: Option<i64>,
+    pub conditions: Vec<PodConditionInfo>,
+    pub problem: Option<String>,
+}
+
+/// An HTTPRoute, GRPCRoute, TLSRoute, TCPRoute or UDPRoute. Mirrors
+/// `RouteInfo` in types.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct RouteInfo {
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub hostnames: Vec<String>,
+    pub parents: Vec<RouteParentInfo>,
+    pub rules: Vec<RouteRuleInfo>,
+    pub healthy: bool,
+    /// The first parent's problem, named by the parent.
+    pub problem: Option<String>,
+    pub age_days: i64,
+    pub age_seconds: i64,
+    pub created_at: Option<String>,
+}
+
+/// A parent a route attaches to (a Gateway, usually), and what that parent's
+/// controller reported about the attachment.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct RouteParentInfo {
+    /// `gateway.networking.k8s.io` unless the route names another group.
+    pub group: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    /// `sectionName` and/or `port`: the listener it picks. Empty for all.
+    pub section: String,
+    pub controller: String,
+    pub conditions: Vec<PodConditionInfo>,
+    /// The first condition that is not True, or that nothing reported.
+    pub problem: Option<String>,
+}
+
+/// One rule of a route: what it matches, what it does, where it sends.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct RouteRuleInfo {
+    pub name: String,
+    /// Each match on its own line: `GET PathPrefix /api header x-env=canary`.
+    /// Empty for the kinds that have none (TLS, TCP, UDP).
+    pub matches: Vec<String>,
+    /// Filter types: RequestRedirect, URLRewrite, RequestHeaderModifier, …
+    pub filters: Vec<String>,
+    pub backends: Vec<RouteBackendInfo>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct RouteBackendInfo {
+    /// Empty, the core group, unless the route names another.
+    pub group: String,
+    /// `Service` unless the route names another kind.
+    pub kind: String,
+    /// The route's own namespace unless it names another.
+    pub namespace: String,
+    pub name: String,
+    pub port: Option<i64>,
+    pub weight: Option<i64>,
+}
+
 /// A PersistentVolumeClaim. Mirrors `PvcInfo` in types.ts.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct PvcInfo {

@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::{ai, claude, external_secrets, helm, k8s, kubeconfig, metrics_backend, mutate, resources, retry, secrets};
+use crate::{ai, claude, external_secrets, gateway_api, helm, k8s, kubeconfig, metrics_backend, mutate, resources, retry, secrets};
 use std::future::Future;
 use std::time::Duration;
 
@@ -804,6 +804,13 @@ pub async fn get_services(context_name: String) -> Result<Vec<ServiceInfo>, Stri
 #[tauri::command]
 pub async fn get_ingresses(context_name: String) -> Result<Vec<IngressInfo>, String> {
     with_retry(&context_name, || resources::get_ingresses(&context_name)).await
+}
+
+/// GatewayClasses, Gateways and every route kind, read together: the
+/// Gateways and Routes tabs share it.
+#[tauri::command]
+pub async fn get_gateway_api(context_name: String) -> Result<GatewayApiResult, String> {
+    with_retry(&context_name, || gateway_api::get_gateway_api(&context_name)).await
 }
 
 #[tauri::command]

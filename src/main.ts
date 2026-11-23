@@ -7,6 +7,12 @@ import { exactTime, formatAgeDetailed, formatBytes, formatKi, formatMillicores, 
 import type {
   AiAuthState,
   IngressInfo,
+  GatewayApiResult,
+  GatewayClassInfo,
+  GatewayInfo,
+  RouteBackendInfo,
+  RouteParentInfo,
+  RouteInfo,
   NamespaceInfo,
   PvcInfo,
   PvInfo,
@@ -846,6 +852,7 @@ interface AppState {
   namespaces: Map<string, NamespaceInfo[]>;
   services: Map<string, ServiceInfo[]>;
   ingresses: Map<string, IngressInfo[]>;
+  gatewayApi: Map<string, GatewayApiResult>;
   pvcs: Map<string, PvcInfo[]>;
   pvs: Map<string, PvInfo[]>;
   configmaps: Map<string, ConfigMapInfo[]>;
@@ -981,6 +988,7 @@ const state: AppState = {
   namespaces: new Map(),
   services: new Map(),
   ingresses: new Map(),
+  gatewayApi: new Map(),
   pvcs: new Map(),
   pvs: new Map(),
   configmaps: new Map(),
@@ -1228,6 +1236,12 @@ interface ColumnDef<T> {
    * two pods both under a day old don't tie. Defaults to `value`.
    */
   sortValue?: (row: T) => string | number;
+  /**
+   * For an "enum" column whose cell lists several values (a route's
+   * Gateways): each one, for the dropdown to offer and the filter to match
+   * exactly. A row passes when any of them is selected. Defaults to `value`.
+   */
+  values?: (row: T) => string[];
 }
 
 interface ColumnFilterState {
@@ -1748,8 +1762,11 @@ function applyFilters<T>(tab: TabId, rows: T[], columns: ColumnDef<T>[]): T[] {
           if (f.max !== undefined && !(num <= f.max)) return false;
           return true;
         }
-        case "enum":
-          return !f.enumValues || f.enumValues.size === 0 || f.enumValues.has(String(v));
+        case "enum": {
+          if (!f.enumValues || f.enumValues.size === 0) return true;
+          const selected = f.enumValues;
+          return col.values ? col.values(row).some((x) => selected.has(x)) : selected.has(String(v));
+        }
         case "string":
         default:
           return !f.text || String(v).toLowerCase().includes(f.text.toLowerCase());
@@ -1784,7 +1801,7 @@ function filterRowCells<T>(tab: TabId, columns: ColumnDef<T>[], allRows: T[]): s
       }
 
       if (col.filter === "enum") {
-        const distinct = Array.from(new Set(allRows.map((r) => String(col.value(r))))).sort((a, b) =>
+        const distinct = Array.from(new Set(allRows.flatMap((r) => (col.values ? col.values(r) : [String(col.value(r))])))).sort((a, b) =>
           a.localeCompare(b),
         );
         const selected = current?.enumValues;
@@ -1892,6 +1909,8 @@ const TAB_GROUPS: { id: string; label: string; tabs: { id: TabId; label: string 
     tabs: [
       { id: "services", label: "Services" },
       { id: "ingresses", label: "Ingress" },
+      { id: "gateways", label: "Gateways" },
+      { id: "routes", label: "Routes" },
     ],
   },
   {
@@ -2025,24 +2044,26 @@ async function refreshSidebarBadgesInner() {
   );
 }
 
-/** Fetches one tab's data for one cluster and stores it in the matching cache Map — the one place that knows which API call backs which tab, shared by the foreground loader and the background prefetcher below. */
 /**
- * One get_jobs per cluster at a time. Jobs, CronJobs, the background prefetch
- * and a Job's or CronJob's panel all read the same list (a CronJob's row is
- * worked out from its Jobs), so a read already under way is joined rather
- * than repeated. A failed read is dropped like a finished one, so the next
- * asks again.
+ * One read per list and cluster at a time, for the lists several tabs share:
+ * Jobs and CronJobs read get_jobs (a CronJob's row is worked out from its
+ * Jobs), Gateways and Routes read get_gateway_api. The tab, the background
+ * prefetch and an object's panel all ask for the same list, so a read
+ * already under way is joined rather than repeated. A failed read is dropped
+ * like a finished one, so the next asks again.
  */
-const jobsInFlight = new Map<string, Promise<JobInfo[]>>();
+const readsInFlight = new Map<string, Promise<unknown>>();
 
-function getJobsShared(ctx: string): Promise<JobInfo[]> {
-  let read = jobsInFlight.get(ctx);
-  if (!read) {
-    read = api.getJobs(ctx).finally(() => jobsInFlight.delete(ctx));
-    jobsInFlight.set(ctx, read);
+function joinRead<T>(key: string, read: () => Promise<T>): Promise<T> {
+  let pending = readsInFlight.get(key) as Promise<T> | undefined;
+  if (!pending) {
+    pending = read().finally(() => readsInFlight.delete(key));
+    readsInFlight.set(key, pending);
   }
-  return read;
+  return pending;
 }
+
+/** Fetches one tab's data for one cluster and stores it in the matching cache Map — the one place that knows which API call backs which tab, shared by the foreground loader and the background prefetcher below. */
 
 async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
   switch (tab) {
@@ -2193,7 +2214,7 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       break;
     case "jobs":
     case "cronjobs":
-      state.jobs.set(ctx, await getJobsShared(ctx));
+      state.jobs.set(ctx, await joinRead(`jobs:${ctx}`, () => api.getJobs(ctx)));
       break;
     case "namespaces":
       state.namespaces.set(ctx, await api.getNamespaces(ctx));
@@ -2203,6 +2224,10 @@ async function fetchTabDataForContext(tab: TabId, ctx: string): Promise<void> {
       break;
     case "ingresses":
       state.ingresses.set(ctx, await api.getIngresses(ctx));
+      break;
+    case "gateways":
+    case "routes":
+      state.gatewayApi.set(ctx, await joinRead(`gateway-api:${ctx}`, () => api.getGatewayApi(ctx)));
       break;
     case "pvcs":
       state.pvcs.set(ctx, await api.getPvcs(ctx));
@@ -2263,6 +2288,9 @@ function tabHasDataForContext(tab: TabId, ctx: string): boolean {
       return state.services.has(ctx);
     case "ingresses":
       return state.ingresses.has(ctx);
+    case "gateways":
+    case "routes":
+      return state.gatewayApi.has(ctx);
     case "pvcs":
       return state.pvcs.has(ctx);
     case "pvs":
@@ -2551,7 +2579,9 @@ const TAB_PALETTE_INFO: Record<TabId, { hint: string; aliases: string[] }> = {
   nodes: { hint: "Capacity, readiness, cordon and drain", aliases: ["vm", "machines", "cordon", "drain"] },
   namespaces: { hint: "Namespaces and their status", aliases: ["ns", "project", "tenant"] },
   services: { hint: "Types, ports and ready endpoints", aliases: ["svc", "endpoints", "loadbalancer", "clusterip", "nodeport"] },
-  ingresses: { hint: "Hosts, paths and addresses", aliases: ["ingresses", "routes", "hosts", "tls", "nginx"] },
+  ingresses: { hint: "Hosts, paths and addresses", aliases: ["ingresses", "hosts", "tls", "nginx"] },
+  gateways: { hint: "Gateway API Gateways and classes: listeners, addresses, attached routes", aliases: ["gateway", "gatewayclass", "gateway api", "listener", "envoy"] },
+  routes: { hint: "Gateway API routes: HTTPRoutes, GRPCRoutes and the rest, their hostnames, Gateways and backends", aliases: ["httproute", "grpcroute", "tlsroute", "tcproute", "udproute", "gateway api"] },
   pvcs: { hint: "Persistent volume claims", aliases: ["persistentvolumeclaim", "claims", "storage", "disk"] },
   pvs: { hint: "Persistent volumes", aliases: ["persistentvolume", "volumes", "storage", "disk", "reclaim"] },
   configmaps: { hint: "Keys, sizes and values", aliases: ["cm", "config", "configuration", "settings", "env"] },
@@ -2720,6 +2750,14 @@ function tabProblemCount(tab: TabId): { count: number; loaded: number; total: nu
     case "ingresses":
       r = across(state.ingresses, (list) => n(list, (x) => !ingressIsHealthy(x)));
       label = "without an address";
+      break;
+    case "gateways":
+      r = across(state.gatewayApi, (res) => n(res.gateways, (x) => !x.healthy) + n(res.classes, (x) => !x.healthy));
+      label = "not accepted or not programmed";
+      break;
+    case "routes":
+      r = across(state.gatewayApi, (res) => n(res.routes, (x) => !x.healthy));
+      label = "with a failing condition";
       break;
     case "pvcs":
       r = across(state.pvcs, (list) => n(list, (x) => !pvcIsHealthy(x)));
@@ -3132,7 +3170,10 @@ function goForwardView(): boolean {
 }
 
 /** Tabs that each show part of one list, read once for all of them. */
-const SHARED_LIST_TABS: TabId[][] = [["jobs", "cronjobs"]];
+const SHARED_LIST_TABS: TabId[][] = [
+  ["jobs", "cronjobs"],
+  ["gateways", "routes"],
+];
 
 function sharesList(a: TabId, b: TabId): boolean {
   return SHARED_LIST_TABS.some((g) => g.includes(a) && g.includes(b));
@@ -5820,6 +5861,7 @@ function setMetricsRange(minutes: number) {
   selectTabGroup,
   viewPodsForWorkload,
   viewPodsForCronJob,
+  viewRoutesForGateway,
   viewPodsForJob,
   viewPodsForNode,
   openPodDetail,
@@ -7518,6 +7560,10 @@ function renderTabContentBody(): string {
       return renderServices();
     case "ingresses":
       return renderIngresses();
+    case "gateways":
+      return renderGateways();
+    case "routes":
+      return renderRoutes();
     case "pvcs":
       return renderPvcs();
     case "pvs":
@@ -12328,6 +12374,13 @@ const PANEL_LINKABLE: Record<string, string> = {
   PersistentVolume: "",
   Namespace: "",
   Ingress: "networking.k8s.io",
+  GatewayClass: "gateway.networking.k8s.io",
+  Gateway: "gateway.networking.k8s.io",
+  HTTPRoute: "gateway.networking.k8s.io",
+  GRPCRoute: "gateway.networking.k8s.io",
+  TLSRoute: "gateway.networking.k8s.io",
+  TCPRoute: "gateway.networking.k8s.io",
+  UDPRoute: "gateway.networking.k8s.io",
   HorizontalPodAutoscaler: "autoscaling",
   ScaledObject: "keda.sh",
   ScaledJob: "keda.sh",
@@ -13544,6 +13597,235 @@ function renderIngresses(): string {
   });
 }
 
+const GATEWAY_API_GROUP = "gateway.networking.k8s.io";
+
+/**
+ * The Gateway API conditions with negative polarity, where True is the
+ * fault: a listener's Conflicted and OverlappingTLSConfig, a route parent's
+ * PartiallyInvalid. Mirrors `NEGATIVE` in gateway_api.rs.
+ */
+const GATEWAY_NEGATIVE_CONDITIONS = new Set(["Conflicted", "OverlappingTLSConfig", "PartiallyInvalid"]);
+
+/** Whether a Gateway API condition says all is well. */
+function gatewayConditionOk(c: PodConditionInfo): boolean {
+  return c.status === (GATEWAY_NEGATIVE_CONDITIONS.has(c.condition_type) ? "False" : "True");
+}
+
+/** A core Service: the one kind of backend the app has a panel for. */
+function isCoreService(b: RouteBackendInfo): boolean {
+  return b.kind === "Service" && b.group === "";
+}
+
+/** A Gateway API Gateway, as opposed to another group's kind of that name. */
+function isGatewayParent(p: RouteParentInfo): boolean {
+  return p.kind === "Gateway" && p.group === GATEWAY_API_GROUP;
+}
+
+/**
+ * A route's backend as text: `svc:80`, `other-ns/svc:80`, `Kind/name` for
+ * another core kind, `Kind.group/name` for another group's.
+ */
+function routeBackendText(b: RouteBackendInfo, routeNamespace: string): string {
+  const ns = b.namespace !== routeNamespace ? `${b.namespace}/` : "";
+  const kind = isCoreService(b) ? "" : `${b.kind}${b.group ? `.${b.group}` : ""}/`;
+  return `${ns}${kind}${b.name}${b.port !== null ? `:${b.port}` : ""}`;
+}
+
+/** Every backend a route sends to, once each. */
+function routeBackends(r: RouteInfo): string[] {
+  return [...new Set(r.rules.flatMap((rule) => rule.backends.map((b) => routeBackendText(b, r.namespace))))];
+}
+
+/**
+ * A parent as `ns/name` for a Gateway, `Kind/ns/name` for another kind and
+ * `Kind.group/ns/name` for another group's: one text per parent, which the
+ * Routes tab's Gateways filter matches exactly.
+ */
+function routeParentText(p: RouteParentInfo): string {
+  if (isGatewayParent(p)) return `${p.namespace}/${p.name}`;
+  return `${p.kind}${p.group && p.group !== GATEWAY_API_GROUP ? `.${p.group}` : ""}/${p.namespace}/${p.name}`;
+}
+
+/** The first condition that is not well, short: `BackendsAvailable False: EndpointsNotFound`. */
+function firstFailingCondition(conditions: PodConditionInfo[]): string | null {
+  const c = conditions.find((x) => !gatewayConditionOk(x));
+  return c ? `${c.condition_type} ${c.status || "Unknown"}${c.reason ? `: ${c.reason}` : ""}` : null;
+}
+
+function gatewayStatus(g: GatewayInfo): string {
+  if (g.healthy) return "Programmed";
+  if (g.conditions.length === 0) return "Not reported";
+  const own = firstFailingCondition(g.conditions);
+  if (own) return own;
+  const l = g.listeners.find((x) => x.problem);
+  return l ? `Listener ${l.name}: ${firstFailingCondition(l.conditions) ?? "not reported"}` : "Unknown";
+}
+
+function routeStatus(r: RouteInfo): string {
+  if (r.healthy) return "Accepted";
+  if (r.parents.length === 0) return "No parent";
+  const p = r.parents.find((x) => x.problem);
+  if (!p) return "Unknown";
+  return p.conditions.length === 0 ? "Not reported" : (firstFailingCondition(p.conditions) ?? "Unknown");
+}
+
+/**
+ * The partial cases the two Gateway API tabs share: some selected clusters
+ * without it, and some kind that is served but would not list.
+ */
+function gatewayApiNotices(results: { ctx: string; result: GatewayApiResult | undefined }[], multi: boolean): string {
+  const answered = results.filter((r) => r.result);
+  const notInstalled = answered.filter((r) => !r.result!.installed).map((r) => r.ctx);
+  const errors = answered
+    .filter((r) => r.result!.error)
+    .map((r) => `<div class="mb-3 rounded-md border border-status-warning/40 bg-status-warning/10 px-3 py-2 text-xs text-status-warning">${multi ? `${esc(r.ctx)}: ` : ""}${esc(r.result!.error!)}</div>`)
+    .join("");
+  return `${addonPartialNotice("Gateway API", notInstalled)}${errors}`;
+}
+
+/** Every selected cluster answered and none has the Gateway API. */
+function gatewayApiMissingEverywhere(results: { ctx: string; result: GatewayApiResult | undefined }[]): boolean {
+  const answered = results.filter((r) => r.result);
+  return answered.length > 0 && answered.length === results.length && answered.every((r) => !r.result!.installed);
+}
+
+function renderGateways(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  const results = ctxs.map((ctx) => ({ ctx, result: state.gatewayApi.get(ctx) }));
+  type Row = { ctx: string; g: GatewayInfo };
+  const allRows: Row[] = results.flatMap((r) => (r.result?.gateways ?? []).map((g) => ({ ctx: r.ctx, g })));
+  const classes = results.flatMap((r) => (r.result?.classes ?? []).map((c) => ({ ctx: r.ctx, c })));
+  // The classes are few — usually one per controller — so a line above the
+  // table rather than a tab of their own.
+  const classLine = classes.length
+    ? `<div class="mb-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs">
+        <span class="text-ink-muted">GatewayClass${classes.length === 1 ? "" : "es"}</span>
+        ${classes
+          .map(
+            ({ ctx, c }: { ctx: string; c: GatewayClassInfo }) => `
+          <span class="inline-flex items-center gap-1.5" title="${esc(c.problem ?? "Accepted")}">
+            ${statusDot(c.healthy)}
+            <button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'GatewayClass','',${jsArg(c.name)})" class="text-ink-primary hover:text-series-blue hover:underline">${multi ? `<span class="text-ink-muted">${esc(ctx)}/</span>` : ""}${esc(c.name)}</button>
+            <span class="font-mono text-ink-muted">${esc(c.controller)}</span>
+          </span>`,
+          )
+          .join("")}
+      </div>`
+    : "";
+  if (allRows.length === 0 && !state.tabLoading) {
+    if (gatewayApiMissingEverywhere(results)) return addonNotInstalledPanel("Gateway API not installed", "Gateway API", "gateways.gateway.networking.k8s.io", multi);
+    return `${gatewayApiNotices(results, multi)}${classLine}<div class="text-sm text-ink-muted">No Gateways found.</div>`;
+  }
+  const rows = state.unhealthyOnly.gateways ? allRows.filter((r) => !r.g.healthy) : allRows;
+  const listeners = (g: GatewayInfo) => g.listeners.map((l) => `${l.protocol}:${l.port}`).join(", ");
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (r: Row) => r.ctx, filter: "enum" as const }] : []),
+    { key: "namespace", label: "Namespace", value: (r) => r.g.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (r) => r.g.name, filter: "string" },
+    { key: "class", label: "Class", value: (r) => r.g.class, filter: "enum" },
+    { key: "status", label: "Status", value: (r) => gatewayStatus(r.g), filter: "enum" },
+    { key: "address", label: "Address", value: (r) => r.g.addresses.join(", "), filter: "string" },
+    { key: "listeners", label: "Listeners", value: (r) => listeners(r.g), filter: "string" },
+    { key: "routes", label: "Routes", value: (r) => r.g.attached_routes, filter: "number" },
+    resourceAgeColumn((r) => r.g),
+  ];
+  return `${gatewayApiNotices(results, multi)}${classLine}${resourceTable({
+    tab: "gateways",
+    noun: "Gateways",
+    allRows,
+    rows,
+    columns,
+    keyOf: (r) => `${r.ctx}:${r.g.namespace}:${r.g.name}`,
+    health: { healthy: (r) => r.g.healthy, unhealthyLabel: "not programmed", statusText: (r) => r.g.problem ?? "Programmed" },
+    renderRow: ({ ctx, g }) => `
+      <tr>
+        ${rowCheckboxCell("gateways", `${ctx}:${g.namespace}:${g.name}`)}
+        <td title="${esc(g.problem ?? "Accepted and programmed")}">${statusDot(g.healthy)}</td>
+        ${multi ? resourceClusterCell("gateways", ctx) : ""}
+        ${resourceNamespaceCell("gateways", g.namespace)}
+        ${resourceNameCell(ctx, "Gateway", g.namespace, g.name)}
+        <td><button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'GatewayClass','',${jsArg(g.class)})" class="hover:text-series-blue hover:underline">${esc(g.class)}</button></td>
+        <td class="truncate ${g.healthy ? "" : "text-status-critical"}" title="${esc(g.problem ?? "")}">${esc(gatewayStatus(g))}</td>
+        <td class="truncate tabular ${g.addresses.length ? "" : "text-ink-muted"}" title="${esc(g.addresses.join("\n"))}">${esc(g.addresses.join(", ")) || "none yet"}</td>
+        <td class="truncate font-mono text-xs text-ink-secondary" title="${esc(g.listeners.map((l) => `${l.name}: ${l.protocol}:${l.port}${l.hostname ? ` ${l.hostname}` : ""}`).join("\n"))}">${esc(listeners(g))}</td>
+        <td class="tabular">${g.attached_routes}</td>
+        ${resourceAgeCell(g)}
+      </tr>`,
+  })}`;
+}
+
+function renderRoutes(): string {
+  const ctxs = selectedContextsList();
+  const multi = ctxs.length > 1;
+  const results = ctxs.map((ctx) => ({ ctx, result: state.gatewayApi.get(ctx) }));
+  type Row = { ctx: string; r: RouteInfo };
+  const allRows: Row[] = results.flatMap((x) => (x.result?.routes ?? []).map((r) => ({ ctx: x.ctx, r })));
+  if (allRows.length === 0 && !state.tabLoading) {
+    if (gatewayApiMissingEverywhere(results)) return addonNotInstalledPanel("Gateway API not installed", "Gateway API", "httproutes.gateway.networking.k8s.io", multi);
+    return `${gatewayApiNotices(results, multi)}<div class="text-sm text-ink-muted">No routes found.</div>`;
+  }
+  const rows = state.unhealthyOnly.routes ? allRows.filter((x) => !x.r.healthy) : allRows;
+  const columns: ColumnDef<Row>[] = [
+    ...(multi ? [{ key: "cluster", label: "Cluster", value: (x: Row) => x.ctx, filter: "enum" as const }] : []),
+    { key: "kind", label: "Kind", value: (x) => x.r.kind, filter: "enum" },
+    { key: "namespace", label: "Namespace", value: (x) => x.r.namespace, filter: "enum" },
+    { key: "name", label: "Name", value: (x) => x.r.name, filter: "string" },
+    { key: "hostnames", label: "Hostnames", value: (x) => x.r.hostnames.join(", "), filter: "string" },
+    { key: "parents", label: "Gateways", value: (x) => x.r.parents.map(routeParentText).join(", "), values: (x) => x.r.parents.map(routeParentText), filter: "enum" },
+    { key: "backends", label: "Backends", value: (x) => routeBackends(x.r).join(", "), filter: "string" },
+    { key: "status", label: "Status", value: (x) => routeStatus(x.r), filter: "enum" },
+    resourceAgeColumn((x) => x.r),
+  ];
+  return `${gatewayApiNotices(results, multi)}${resourceTable({
+    tab: "routes",
+    noun: "routes",
+    allRows,
+    rows,
+    columns,
+    keyOf: (x) => `${x.ctx}:${x.r.kind}:${x.r.namespace}:${x.r.name}`,
+    health: { healthy: (x) => x.r.healthy, unhealthyLabel: "with a failing condition", statusText: (x) => x.r.problem ?? "Accepted" },
+    renderRow: ({ ctx, r }) => `
+      <tr>
+        ${rowCheckboxCell("routes", `${ctx}:${r.kind}:${r.namespace}:${r.name}`)}
+        <td title="${esc(r.problem ?? "Accepted by every parent")}">${statusDot(r.healthy)}</td>
+        ${multi ? resourceClusterCell("routes", ctx) : ""}
+        <td class="text-ink-secondary">${esc(r.kind)}</td>
+        ${resourceNamespaceCell("routes", r.namespace)}
+        ${resourceNameCell(ctx, r.kind, r.namespace, r.name)}
+        <td class="truncate" title="${esc(r.hostnames.join("\n"))}">${esc(r.hostnames.join(", ")) || '<span class="text-ink-muted">any</span>'}</td>
+        <td class="truncate" title="${esc(r.parents.map((p) => `${routeParentText(p)}${p.section ? ` (${p.section})` : ""}`).join("\n"))}">${
+          r.parents
+            .map((p) =>
+              isGatewayParent(p)
+                ? `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Gateway',${jsArg(p.namespace)},${jsArg(p.name)})" class="hover:text-series-blue hover:underline"><span class="text-ink-muted">${esc(p.namespace)}/</span>${esc(p.name)}</button>`
+                : esc(routeParentText(p)),
+            )
+            .join(", ") || '<span class="text-status-critical">none</span>'
+        }</td>
+        <td class="truncate font-mono text-xs text-ink-secondary" title="${esc(routeBackends(r).join("\n"))}">${esc(routeBackends(r).join(", ")) || '<span class="text-ink-muted">—</span>'}</td>
+        <td class="truncate ${r.healthy ? "" : "text-status-critical"}" title="${esc(r.problem ?? "")}">${esc(routeStatus(r))}</td>
+        ${resourceAgeCell(r)}
+      </tr>`,
+  })}`;
+}
+
+/** The Routes tab, filtered to the routes attached to one Gateway, leaving its panel for Back to restore. */
+function viewRoutesForGateway(ctx: string, namespace: string, name: string) {
+  pushViewHistory(["routes"]);
+  resourceDetailToken += 1;
+  state.resourceDetail = null;
+  state.yamlEdit = null;
+  state.filterState.routes = {
+    cluster: { enumValues: new Set([ctx]) },
+    parents: { enumValues: new Set([`${namespace}/${name}`]) },
+  };
+  state.unhealthyOnly.routes = false;
+  state.activeTab = "routes";
+  render();
+  loadTabData();
+}
+
 function renderPvcs(): string {
   const ctxs = selectedContextsList();
   const multi = ctxs.length > 1;
@@ -14087,6 +14369,13 @@ const RESOURCE_KIND_TAB: Record<ResourceKind, TabId> = {
   Namespace: "namespaces",
   Service: "services",
   Ingress: "ingresses",
+  GatewayClass: "gateways",
+  Gateway: "gateways",
+  HTTPRoute: "routes",
+  GRPCRoute: "routes",
+  TLSRoute: "routes",
+  TCPRoute: "routes",
+  UDPRoute: "routes",
   PersistentVolumeClaim: "pvcs",
   PersistentVolume: "pvs",
   ConfigMap: "configmaps",
@@ -14340,6 +14629,123 @@ function renderResourceOverview(rd: ResourceDetailState): string {
         </table>`
       : "";
     return `<div>${rows.join("")}</div>${rules}`;
+  } else if (kind === "GatewayClass") {
+    const res = state.gatewayApi.get(ctx);
+    const c = res?.classes.find((x) => x.name === name);
+    if (!c) return gone;
+    const banner = c.problem ? `<div class="mb-3 rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(c.problem)}</div>` : "";
+    rows.push(overviewRow("Controller", `<span class="font-mono text-xs">${esc(c.controller)}</span>`));
+    if (c.description) rows.push(overviewRow("Description", esc(c.description)));
+    const gateways = (res?.gateways ?? []).filter((g) => g.class === name);
+    rows.push(
+      overviewRow(
+        "Gateways",
+        gateways.length
+          ? gateways.map((g) => `<div class="flex items-center gap-2">${statusDot(g.healthy)}${link(`${g.namespace}/${g.name}`, "Gateway", g.namespace, g.name)}</div>`).join("")
+          : '<span class="text-ink-muted">none use it</span>',
+      ),
+    );
+    rows.push(overviewRow("Created", created(c)));
+    return `${banner}<div>${rows.join("")}</div>${renderConditionsSection(c.conditions, gatewayConditionOk)}`;
+  } else if (kind === "Gateway") {
+    const res = state.gatewayApi.get(ctx);
+    const g = res?.gateways.find((x) => x.namespace === namespace && x.name === name);
+    if (!g) return gone;
+    const banner = g.problem ? `<div class="mb-3 rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(g.problem)}</div>` : "";
+    rows.push(overviewRow("Status", `<span class="${g.healthy ? "" : "text-status-critical"}">${esc(gatewayStatus(g))}</span>`));
+    rows.push(overviewRow("Class", g.class ? link(g.class, "GatewayClass", "", g.class) : '<span class="text-ink-muted">—</span>'));
+    rows.push(overviewRow("Addresses", g.addresses.length ? overviewChips(g.addresses) : '<span class="text-status-critical">none yet — its controller has not published one</span>'));
+    rows.push(overviewRow("Created", created(g)));
+    const listeners = overviewSection(
+      "Listeners",
+      `<table class="w-full text-left text-sm">
+        <thead class="text-xs text-ink-muted"><tr><th class="py-1 pr-3 font-normal">Name</th><th class="py-1 pr-3 font-normal">Port</th><th class="py-1 pr-3 font-normal">Hostname</th><th class="py-1 pr-3 font-normal">TLS</th><th class="py-1 pr-3 font-normal">Routes from</th><th class="py-1 pr-3 text-right font-normal">Routes</th><th class="py-1 font-normal">Status</th></tr></thead>
+        <tbody>${g.listeners
+          .map(
+            (l) => `
+          <tr class="border-t border-gridline/60">
+            <td class="py-1.5 pr-3">${esc(l.name)}</td>
+            <td class="py-1.5 pr-3 font-mono text-xs">${esc(l.protocol)}:${l.port}</td>
+            <td class="py-1.5 pr-3 font-mono text-xs">${esc(l.hostname) || '<span class="text-ink-muted">any</span>'}</td>
+            <td class="py-1.5 pr-3 text-xs" title="${esc(l.certificates.join("\n"))}">${l.tls_mode ? `${esc(l.tls_mode)}${l.certificates.length ? ` <span class="text-ink-muted">· ${esc(l.certificates.join(", "))}</span>` : ""}` : '<span class="text-ink-muted">—</span>'}</td>
+            <td class="py-1.5 pr-3 text-xs">${esc(l.allowed_namespaces)}</td>
+            <td class="py-1.5 pr-3 text-right tabular">${l.attached_routes ?? "—"}</td>
+            <td class="py-1.5 text-xs ${l.problem ? "text-status-critical" : "text-status-good"}" title="${esc(l.problem ?? "")}">${esc(l.problem ? (firstFailingCondition(l.conditions) ?? "not reported") : "Programmed")}</td>
+          </tr>`,
+          )
+          .join("")}</tbody>
+      </table>`,
+    );
+    // Attached as the routes' own status says, failing first.
+    const attached = (res?.routes ?? [])
+      .filter((r) => r.parents.some((p) => isGatewayParent(p) && p.namespace === namespace && p.name === name))
+      .sort((a, b) => Number(a.healthy) - Number(b.healthy) || a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name));
+    const shown = attached.slice(0, 15);
+    const routes = attached.length
+      ? overviewSection(
+          `Routes (${attached.length})`,
+          `${shown
+            .map(
+              (r) =>
+                `<div class="flex items-center gap-2 text-sm" title="${esc(r.problem ?? "Accepted")}">${statusDot(r.healthy)}${link(`${r.namespace}/${r.name}`, r.kind, r.namespace, r.name)}<span class="text-xs text-ink-muted">${esc(r.kind)}${r.healthy ? "" : ` · ${esc(routeStatus(r))}`}</span></div>`,
+            )
+            .join("")}
+          <div><button type="button" onclick="window.__app.viewRoutesForGateway(${jsArg(ctx)},${jsArg(namespace)},${jsArg(name)})" class="text-sm text-series-blue hover:underline">${attached.length > shown.length ? `all ${attached.length} in the Routes tab` : "view in the Routes tab"}</button></div>`,
+        )
+      : "";
+    return `${banner}<div>${rows.join("")}</div>${listeners}${routes}${renderConditionsSection(g.conditions, gatewayConditionOk)}`;
+  } else if (kind === "HTTPRoute" || kind === "GRPCRoute" || kind === "TLSRoute" || kind === "TCPRoute" || kind === "UDPRoute") {
+    const r = state.gatewayApi.get(ctx)?.routes.find((x) => x.kind === kind && x.namespace === namespace && x.name === name);
+    if (!r) return gone;
+    const banner = r.problem ? `<div class="mb-3 rounded-md border border-status-critical/40 bg-status-critical/10 p-3 text-sm text-status-critical">${esc(r.problem)}</div>` : "";
+    rows.push(overviewRow("Status", `<span class="${r.healthy ? "" : "text-status-critical"}">${esc(routeStatus(r))}</span>`));
+    if (kind !== "TCPRoute" && kind !== "UDPRoute") rows.push(overviewRow("Hostnames", r.hostnames.length ? overviewChips(r.hostnames) : '<span class="text-ink-muted">any its Gateway listens for</span>'));
+    rows.push(overviewRow("Created", created(r)));
+    const parents = overviewSection(
+      "Gateways",
+      r.parents.length
+        ? r.parents
+            .map(
+              (p) => `
+          <div class="rounded-md border border-gridline/60 px-3 py-2 text-sm">
+            <div class="flex items-center gap-2">${statusDot(!p.problem)}${isGatewayParent(p) ? link(`${p.namespace}/${p.name}`, "Gateway", p.namespace, p.name) : esc(routeParentText(p))}${p.section ? `<span class="text-xs text-ink-muted">${esc(p.section)}</span>` : ""}</div>
+            ${
+              p.conditions.length
+                ? `<div class="mt-1 flex flex-col gap-0.5 text-xs">${p.conditions
+                    .map((c) => `<div class="${conditionTone(gatewayConditionOk(c))}">${esc(c.condition_type)} ${esc(c.status)}<span class="text-ink-secondary">${gatewayConditionOk(c) ? "" : esc([c.reason, c.message].filter(Boolean).map((x) => ` · ${x}`).join(""))}</span></div>`)
+                    .join("")}</div>`
+                : `<div class="mt-1 text-xs text-status-critical">${esc(p.problem ?? "")}</div>`
+            }
+          </div>`,
+            )
+            .join("")
+        : '<div class="text-sm text-status-critical">It names no parent, so no Gateway serves it.</div>',
+    );
+    // A Service opens its panel; a weight is shown where a rule splits traffic.
+    const backendCell = (b: RouteBackendInfo, split: boolean) => {
+      const label = routeBackendText(b, namespace);
+      const weight = split && b.weight !== null ? ` <span class="text-ink-muted">weight ${b.weight}</span>` : "";
+      return `${isCoreService(b) ? link(label, "Service", b.namespace, b.name) : esc(label)}${weight}`;
+    };
+    const rules = r.rules.length
+      ? overviewSection(
+          `Rules (${r.rules.length})`,
+          `<table class="w-full text-left text-sm">
+            <thead class="text-xs text-ink-muted"><tr>${r.rules.some((x) => x.matches.length) ? '<th class="py-1 pr-3 font-normal">Matches</th>' : ""}<th class="py-1 pr-3 font-normal">Filters</th><th class="py-1 font-normal">Backends</th></tr></thead>
+            <tbody>${r.rules
+              .map(
+                (rule) => `
+              <tr class="border-t border-gridline/60 align-top">
+                ${r.rules.some((x) => x.matches.length) ? `<td class="py-1.5 pr-3 font-mono text-xs">${rule.matches.map((m) => `<div>${esc(m)}</div>`).join("")}</td>` : ""}
+                <td class="py-1.5 pr-3 text-xs">${rule.filters.map((f) => `<div>${esc(f)}</div>`).join("") || '<span class="text-ink-muted">—</span>'}</td>
+                <td class="py-1.5 font-mono text-xs">${rule.backends.map((b) => `<div>${backendCell(b, rule.backends.length > 1)}</div>`).join("") || '<span class="text-ink-muted">none</span>'}</td>
+              </tr>`,
+              )
+              .join("")}</tbody>
+          </table>`,
+        )
+      : "";
+    return `${banner}<div>${rows.join("")}</div>${parents}${rules}`;
   } else if (kind === "PersistentVolumeClaim") {
     const c = state.pvcs.get(ctx)?.find((x) => x.namespace === namespace && x.name === name);
     if (!c) return gone;
@@ -15156,6 +15562,7 @@ const CLUSTER_SCOPED_KINDS = new Set([
   "APIService",
   "ClusterIssuer",
   "ClusterSecretStore",
+  "GatewayClass",
 ]);
 
 /** How many rendered objects the Overview lists before the Manifest tab takes over. */

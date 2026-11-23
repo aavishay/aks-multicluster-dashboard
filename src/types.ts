@@ -762,6 +762,8 @@ export type TabId =
   | "pods"
   | "services"
   | "ingresses"
+  | "gateways"
+  | "routes"
   | "pvcs"
   | "pvs"
   | "resources"
@@ -938,6 +940,110 @@ export interface IngressRuleInfo {
   backend: string;
 }
 
+/** Everything the Gateways and Routes tabs show for one cluster. Mirrors `GatewayApiResult` in models.rs. */
+export interface GatewayApiResult {
+  /** The gateway.networking.k8s.io group is served at all. */
+  installed: boolean;
+  /** Kinds that are served but failed to list; the others are still here. */
+  error: string | null;
+  classes: GatewayClassInfo[];
+  gateways: GatewayInfo[];
+  routes: RouteInfo[];
+}
+
+export interface GatewayClassInfo {
+  name: string;
+  /** The implementation that runs its Gateways. */
+  controller: string;
+  description: string;
+  conditions: PodConditionInfo[];
+  healthy: boolean;
+  problem: string | null;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+export interface GatewayInfo {
+  namespace: string;
+  name: string;
+  class: string;
+  /** What the controller published; empty until then. */
+  addresses: string[];
+  listeners: GatewayListenerInfo[];
+  attached_routes: number;
+  conditions: PodConditionInfo[];
+  healthy: boolean;
+  /** Its own first condition that is not True, else a listener's. */
+  problem: string | null;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+export interface GatewayListenerInfo {
+  name: string;
+  protocol: string;
+  port: number;
+  hostname: string;
+  /** Terminate or Passthrough; empty without TLS. */
+  tls_mode: string;
+  /** Certificate references by name, never their contents. */
+  certificates: string[];
+  /** Same, All or Selector. */
+  allowed_namespaces: string;
+  /** Null when the controller has not reported on this listener. */
+  attached_routes: number | null;
+  conditions: PodConditionInfo[];
+  problem: string | null;
+}
+
+export interface RouteInfo {
+  kind: RouteKind;
+  namespace: string;
+  name: string;
+  hostnames: string[];
+  parents: RouteParentInfo[];
+  rules: RouteRuleInfo[];
+  healthy: boolean;
+  /** The first parent's problem, named by the parent. */
+  problem: string | null;
+  age_days: number;
+  age_seconds: number;
+  created_at: string | null;
+}
+
+export interface RouteParentInfo {
+  /** gateway.networking.k8s.io unless the route names another group. */
+  group: string;
+  kind: string;
+  namespace: string;
+  name: string;
+  /** sectionName and/or port: the listener it picks. Empty for all. */
+  section: string;
+  controller: string;
+  conditions: PodConditionInfo[];
+  problem: string | null;
+}
+
+export interface RouteRuleInfo {
+  name: string;
+  /** One line per match; empty for TLS, TCP and UDP routes. */
+  matches: string[];
+  filters: string[];
+  backends: RouteBackendInfo[];
+}
+
+export interface RouteBackendInfo {
+  /** Empty, the core group, unless the route names another. */
+  group: string;
+  kind: string;
+  namespace: string;
+  name: string;
+  port: number | null;
+  weight: number | null;
+}
+
 /** An Ingress. Mirrors `IngressInfo` in models.rs. */
 export interface IngressInfo {
   namespace: string;
@@ -1006,7 +1112,12 @@ export type ResourceKind =
   | "CronJob"
   | "SecretStore"
   | "ClusterSecretStore"
-  | "Event";
+  | "Event"
+  | GatewayApiKind;
+
+/** The Gateway API kinds with a panel: the class, the Gateway, and the route kinds. */
+export type GatewayApiKind = "GatewayClass" | "Gateway" | RouteKind;
+export type RouteKind = "HTTPRoute" | "GRPCRoute" | "TLSRoute" | "TCPRoute" | "UDPRoute";
 
 /** A ServiceAccount. Mirrors `ServiceAccountInfo` in models.rs. */
 export interface ServiceAccountInfo {
