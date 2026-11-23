@@ -228,6 +228,8 @@ export const api = {
     invoke<ClaudeDiagnosisPayload>("ai_build_job_diagnosis", { contextName, kind, namespace, name }),
   aiBuildExternalSecretDiagnosis: (contextName: string, namespace: string, name: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_external_secret_diagnosis", { contextName, namespace, name }),
+  aiBuildServiceAccountDiagnosis: (contextName: string, namespace: string, name: string) =>
+    invoke<ClaudeDiagnosisPayload>("ai_build_service_account_diagnosis", { contextName, namespace, name }),
   aiBuildSecretStoreDiagnosis: (contextName: string, kind: string, namespace: string, name: string) =>
     invoke<ClaudeDiagnosisPayload>("ai_build_secret_store_diagnosis", { contextName, kind, namespace, name }),
   aiBuildPdbDiagnosis: (contextName: string, namespace: string, name: string) =>

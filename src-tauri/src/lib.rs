@@ -20,6 +20,7 @@ mod redact;
 mod resources;
 mod retry;
 mod secrets;
+mod service_accounts;
 mod workload_detail;
 mod x509;
 
@@ -207,6 +208,7 @@ pub fn run() {
             commands::ai_build_job_diagnosis,
             commands::ai_build_external_secret_diagnosis,
             commands::ai_build_secret_store_diagnosis,
+            commands::ai_build_service_account_diagnosis,
             commands::ai_diagnose,
             commands::kubeconfig_path,
             commands::get_write_enabled,

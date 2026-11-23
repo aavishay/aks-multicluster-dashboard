@@ -6010,6 +6010,7 @@ function setMetricsRange(minutes: number) {
   diagnoseKeda,
   diagnoseSubject,
   diagnoseSecretStore,
+  diagnoseServiceAccount,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -7222,6 +7223,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
                   : d.kind === "ExternalSecret"
                   ? "Its store, target, policies, refresh and conditions, what it maps from the provider, its store with how it signs in and whether it is ready, the Secrets and ServiceAccount the store signs in with (checked by key name, never value), the target Secret's type, key names and owner (never its values), ESO's controller and its log lines about it, its events, and its manifest."
+                  : d.kind === "ServiceAccount"
+                  ? "The Azure identity it names and the federated credential that identity needs for this cluster, the pods that run as it with whether each got its Workload Identity token, the workloads whose pod template runs as it, the Workload Identity webhook, excerpts of its pods' log lines about signing in to Azure or RBAC refusals, the roles bound to it, its image pull secrets (by type, never value), the Warning events of its pods that are not ready, its events, and its manifest."
                   : d.kind === "SecretStore" || d.kind === "ClusterSecretStore"
                   ? "Its provider, how it signs in and whether it is ready (and for a ClusterSecretStore, which namespaces it admits), the Secrets and ServiceAccount it signs in with (checked by key name, never value), the ExternalSecrets that use it with the failing ones grouped by error, ESO's controller and its log lines about it, its events, and its manifest with literal values masked."
                   : d.kind === "CronJob"
@@ -8757,6 +8760,10 @@ function diagnosePvc(ctx: string, namespace: string, name: string) {
 
 function diagnoseExternalSecret(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "ExternalSecret", namespace, name, "", () => api.aiBuildExternalSecretDiagnosis(ctx, namespace, name));
+}
+
+function diagnoseServiceAccount(ctx: string, namespace: string, name: string) {
+  startDiagnosis(ctx, "ServiceAccount", namespace, name, "", () => api.aiBuildServiceAccountDiagnosis(ctx, namespace, name));
 }
 
 function diagnoseSecretStore(ctx: string, kind: string, namespace: string, name: string) {
@@ -12835,6 +12842,7 @@ function eventDiagnosisTable(): Record<string, EventDiagnosis> {
     Node: { group: "", what: "node", label: "node", listed: (ctx, ns, n) => listedIn(state.nodes.get(ctx), ns, n) },
     Namespace: { group: "", what: "namespace", label: "namespace", listed: (ctx, ns, n) => listedIn(state.namespaces.get(ctx), ns, n) },
     Service: { group: "", what: "service", label: "service", listed: (ctx, ns, n) => listedIn(state.services.get(ctx), ns, n) },
+    ServiceAccount: { group: "", what: "serviceaccount", label: "service account", listed: (ctx, ns, n) => listedIn(state.serviceAccounts.get(ctx), ns, n) },
     PersistentVolumeClaim: { group: "", what: "pvc", label: "volume claim", listed: (ctx, ns, n) => listedIn(state.pvcs.get(ctx), ns, n) },
     Ingress: { group: "networking.k8s.io", what: "ingress", label: "ingress", listed: (ctx, ns, n) => listedIn(state.ingresses.get(ctx), ns, n) },
     Gateway: { group: GATEWAY_API_GROUP, what: "gateway", label: "gateway", listed: (ctx, ns, n) => listedIn(state.gatewayApi.get(ctx)?.gateways, ns, n) },
@@ -14102,7 +14110,7 @@ function renderServiceAccounts(): string {
     columns,
     keyOf: (r) => `${r.ctx}:${r.a.namespace}:${r.a.name}`,
     renderRow: ({ ctx, a }) => `
-      <tr>
+      <tr${diagnoseAttrs({ what: "serviceaccount", ctx, kind: "ServiceAccount", namespace: a.namespace, name: a.name, container: "" })}>
         ${rowCheckboxCell("serviceaccounts", `${ctx}:${a.namespace}:${a.name}`)}
         ${multi ? resourceClusterCell("serviceaccounts", ctx) : ""}
         ${resourceNamespaceCell("serviceaccounts", a.namespace)}
@@ -15226,6 +15234,8 @@ function renderResourceDetailPanel(): string {
                     ? claudeDiagnoseButton(`window.__app.diagnoseJob(${jsArg(rd.ctx)},${jsArg(rd.kind)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, rd.kind === "Job" ? "job" : "cron job")
                     : rd.kind === "PodDisruptionBudget"
                     ? claudeDiagnoseButton(`window.__app.diagnosePdb(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "disruption budget")
+                    : rd.kind === "ServiceAccount"
+                    ? claudeDiagnoseButton(`window.__app.diagnoseServiceAccount(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service account")
                     : rd.kind === "SecretStore" || rd.kind === "ClusterSecretStore"
                     ? claudeDiagnoseButton(`window.__app.diagnoseSecretStore(${jsArg(rd.ctx)},${jsArg(rd.kind)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "secret store")
                     : evDiagnosis
@@ -16699,6 +16709,9 @@ function runDiagnosis(s: DiagnoseSubject): boolean {
       return true;
     case "secretstore":
       diagnoseSecretStore(ctx, s.kind || "SecretStore", ns, name);
+      return true;
+    case "serviceaccount":
+      diagnoseServiceAccount(ctx, ns, name);
       return true;
     case "job":
       diagnoseJob(ctx, s.kind || "Job", ns, name);
