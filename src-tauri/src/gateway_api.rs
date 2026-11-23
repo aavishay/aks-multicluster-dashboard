@@ -139,12 +139,17 @@ pub(crate) fn class_info(obj: &DynamicObject) -> GatewayClassInfo {
 }
 
 /// A certificate reference by name: `name`, `ns/name` across namespaces, or
-/// `Kind/name` for something other than a Secret.
+/// `Kind/name` (`Kind.group/name` outside the core group) for something
+/// other than a core Secret.
 fn certificate_ref(r: &Value, own_ns: &str) -> String {
     let kind = json_str(Some(r), "kind");
     let ns = json_str(Some(r), "namespace");
     let name = json_str(Some(r), "name");
-    let base = if kind.is_empty() || kind == "Secret" { name.to_string() } else { format!("{kind}/{name}") };
+    let base = match (json_str(Some(r), "group"), if kind.is_empty() { "Secret" } else { kind }) {
+        ("", "Secret") => name.to_string(),
+        ("", kind) => format!("{kind}/{name}"),
+        (group, kind) => format!("{kind}.{group}/{name}"),
+    };
     if ns.is_empty() || ns == own_ns {
         base
     } else {
@@ -230,6 +235,11 @@ fn parent_ref(r: Option<&Value>, route_ns: &str) -> ParentRef {
     }
 }
 
+/// A route's parent as listed, back as the reference its spec gave.
+fn parent_ref_of(p: &RouteParentInfo) -> ParentRef {
+    ParentRef { group: p.group.clone(), kind: p.kind.clone(), namespace: p.namespace.clone(), name: p.name.clone(), section: p.section_name.clone(), port: p.port }
+}
+
 /// `GET PathPrefix /api header x-env=canary query v=2`; an empty match is
 /// the API's default, every path.
 fn http_match(m: &Value) -> String {
@@ -263,6 +273,44 @@ fn grpc_match(m: &Value) -> String {
     parts.join(" ")
 }
 
+/// A match's headers or query parameters as sorted `type name=value`, with
+/// the names lowercased where they are header names, which compare without
+/// regard to case.
+fn predicate_keys(m: &Value, key: &str, fold_names: bool) -> String {
+    let mut keys: Vec<String> = items(Some(m), key)
+        .iter()
+        .map(|h| {
+            let kind = json_str(Some(h), "type");
+            let name = json_str(Some(h), "name");
+            let name = if fold_names { name.to_ascii_lowercase() } else { name.to_string() };
+            format!("{} {name}={}", if kind.is_empty() { "Exact" } else { kind }, json_str(Some(h), "value"))
+        })
+        .collect();
+    keys.sort();
+    keys.join(",")
+}
+
+/// An HTTPRoute match as a key that two matches selecting the same requests
+/// share, however their headers and query parameters are ordered, their
+/// header names cased, or their defaults spelled out. A PathPrefix ignores a
+/// trailing `/`, as the API defines it.
+fn http_match_key(m: &Value) -> String {
+    let path = m.get("path");
+    let kind = Some(json_str(path, "type")).filter(|k| !k.is_empty()).unwrap_or("PathPrefix");
+    let mut value = Some(json_str(path, "value")).filter(|v| !v.is_empty()).unwrap_or("/");
+    if kind == "PathPrefix" {
+        value = Some(value.trim_end_matches('/')).filter(|v| !v.is_empty()).unwrap_or("/");
+    }
+    format!("{}|{kind} {value}|{}|{}", json_str(Some(m), "method"), predicate_keys(m, "headers", true), predicate_keys(m, "queryParams", false))
+}
+
+/// A GRPCRoute match as a key, as `http_match_key` is.
+fn grpc_match_key(m: &Value) -> String {
+    let method = m.get("method");
+    let kind = Some(json_str(method, "type")).filter(|k| !k.is_empty()).unwrap_or("Exact");
+    format!("{kind} {}/{}|{}", json_str(method, "service"), json_str(method, "method"), predicate_keys(m, "headers", true))
+}
+
 fn header_matches(m: &Value, key: &str, label: &str) -> Vec<String> {
     items(Some(m), key)
         .iter()
@@ -284,6 +332,18 @@ fn backend(b: &Value, route_ns: &str) -> RouteBackendInfo {
         port: b.get("port").and_then(Value::as_i64),
         weight: b.get("weight").and_then(Value::as_i64),
     }
+}
+
+/// The backends a rule mirrors requests to, by its own RequestMirror filters
+/// and its backends'.
+fn mirror_backends(rule: &Value, route_ns: &str) -> Vec<RouteBackendInfo> {
+    let of_backends: Vec<Value> = items(Some(rule), "backendRefs").iter().flat_map(|b| items(Some(b), "filters")).collect();
+    items(Some(rule), "filters")
+        .into_iter()
+        .chain(of_backends)
+        .filter(|f| json_str(Some(f), "type") == "RequestMirror")
+        .filter_map(|f| f.get("requestMirror").and_then(|m| m.get("backendRef")).map(|b| backend(b, route_ns)))
+        .collect()
 }
 
 fn filter_text(f: &Value) -> String {
@@ -330,6 +390,8 @@ pub(crate) fn route_info(kind: &str, obj: &DynamicObject) -> RouteInfo {
                 problem: failing(&conditions, "No controller has reported on it: the parent may not exist, or its controller is not running"),
                 conditions,
                 section,
+                section_name: r.section.clone(),
+                port: r.port,
                 group: r.group,
                 kind: r.kind,
                 namespace: r.namespace,
@@ -349,6 +411,15 @@ pub(crate) fn route_info(kind: &str, obj: &DynamicObject) -> RouteInfo {
                     "GRPCRoute" if matches.is_empty() => vec!["any method".to_string()],
                     "GRPCRoute" => matches.iter().map(grpc_match).collect(),
                     _ => Vec::new(),
+                },
+                match_keys: match kind {
+                    "HTTPRoute" if matches.is_empty() => vec![http_match_key(&Value::Null)],
+                    "HTTPRoute" => matches.iter().map(http_match_key).collect(),
+                    "GRPCRoute" if matches.is_empty() => vec![grpc_match_key(&Value::Null)],
+                    "GRPCRoute" => matches.iter().map(grpc_match_key).collect(),
+                    // A TLS, TCP or UDP rule takes every connection its
+                    // listener gives it.
+                    _ => vec!["*".to_string()],
                 },
                 filters: items(Some(rule), "filters").iter().map(filter_text).collect(),
                 backends: items(Some(rule), "backendRefs").iter().map(|b| backend(b, &namespace)).collect(),
@@ -514,6 +585,8 @@ pub struct GatewayCertificate {
     /// The hostname the listener serves, which the certificate must cover;
     /// empty for any.
     pub hostname: String,
+    /// Empty for the core group.
+    pub group: String,
     pub kind: String,
     pub namespace: String,
     pub name: String,
@@ -553,7 +626,9 @@ pub struct ListenerFit {
     pub selected: bool,
     /// Why its allowedRoutes refuses the route's namespace or kind.
     pub refusal: Option<String>,
-    /// The route's hostnames it serves (all of them where either has none).
+    /// The hostnames the route is served for on it, each the narrower of the
+    /// route's and the listener's; `""` is any host. Empty for a TCP or UDP
+    /// route, which has none to match.
     pub hostnames: Vec<String>,
     /// Why it serves none of the route's hostnames.
     pub hostname_refusal: Option<String>,
@@ -574,11 +649,23 @@ pub struct ParentFit {
 /// A backend a route sends to, read.
 pub struct RouteBackendCheck {
     pub backend: RouteBackendInfo,
+    /// Only a RequestMirror filter sends to it: requests are copied to it
+    /// and its answers dropped.
+    pub mirror: bool,
     /// The Service and its endpoints, for a core Service.
     pub service: Option<k8s::IngressBackend>,
     /// For a backend in another namespace: the ReferenceGrant that permits
     /// it, `None` inside if none does.
     pub grant: Option<Result<Option<String>, String>>,
+}
+
+/// Another route on a listener that admits this one, for a hostname both
+/// are served for.
+pub struct SharedRoute {
+    pub route: RouteInfo,
+    /// Each such listener, as `namespace/gateway listener name`, with the
+    /// hostnames both are served for on it (`""`: any host).
+    pub listeners: Vec<(String, Vec<String>)>,
 }
 
 /// Everything a route diagnosis reads. Only the route is required.
@@ -588,11 +675,15 @@ pub struct RouteDiagnostics {
     pub read_error: Option<String>,
     pub parents: Vec<ParentFit>,
     pub backends: Vec<RouteBackendCheck>,
-    /// Other routes on one of its Gateways with a hostname and a match it
-    /// also has: the ones claiming the same traffic.
-    pub same_match: Vec<RouteInfo>,
-    /// How many other routes on its Gateways share a hostname at all.
+    /// Other routes a listener that admits this one also admits, for a
+    /// hostname both are served for, with a match this one also has: the
+    /// ones claiming the same requests.
+    pub same_match: Vec<SharedRoute>,
+    /// How many other routes share such a listener and hostname at all.
     pub sharing_hostname: usize,
+    /// Why routes in other namespaces could not be checked against a
+    /// listener that admits namespaces by label.
+    pub sharing_error: Option<String>,
     pub controllers: Result<Vec<k8s::IngressControllerWorkload>, String>,
     pub controller_logs: Option<Result<(usize, Vec<String>), String>>,
     pub events: Result<Vec<EventInfo>, String>,
@@ -609,6 +700,34 @@ pub(crate) fn hostnames_intersect(a: &str, b: &str) -> bool {
         (None, Some(suffix)) => a.ends_with(suffix),
         (Some(x), Some(y)) => x.ends_with(y) || y.ends_with(x),
     }
+}
+
+/// The hosts two hostnames both name, as the narrower of the two: `""` is
+/// any host. `None` when they name none in common.
+pub(crate) fn hostname_overlap(a: &str, b: &str) -> Option<String> {
+    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    if a.is_empty() || b.is_empty() {
+        return Some(if a.is_empty() { b } else { a });
+    }
+    if !hostnames_intersect(&a, &b) {
+        return None;
+    }
+    Some(match (a.starts_with('*'), b.starts_with('*')) {
+        (true, false) => b,
+        (false, _) => a,
+        (true, true) => if a.len() >= b.len() { a } else { b },
+    })
+}
+
+/// Each host both lists name, once.
+fn hostnames_overlap(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in a.iter().flat_map(|x| b.iter().filter_map(move |y| hostname_overlap(x, y))) {
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    out
 }
 
 /// Why a listener's `allowedRoutes.namespaces` refuses a route, if it does.
@@ -652,17 +771,28 @@ fn kind_refusal(allowed: Option<&Value>, status: Option<&Value>, protocol: &str,
     (!kinds.iter().any(|k| k == kind)).then(|| format!("{source} ({}) do not include {kind}", if kinds.is_empty() { "none".to_string() } else { kinds.join(", ") }))
 }
 
-/// The route's hostnames a listener serves, or why it serves none of them.
-/// A route without hostnames takes the listener's, and one with them is
-/// served the names under the listener's hostname; TCP and UDP routes have
-/// no hostnames to match.
+/// The hostnames a route is served for on a listener, or why there are
+/// none: each of the route's narrowed to the listener's (`*.example.com`
+/// under `a.example.com` is served for `a.example.com`), or the listener's
+/// own for a route that names none, `""` being any host. TCP and UDP routes
+/// have no hostnames to match.
 fn hostname_fit(listener: &str, route: &[String], kind: &str) -> (Vec<String>, Option<String>) {
-    if !matches!(kind, "HTTPRoute" | "GRPCRoute" | "TLSRoute") || listener.is_empty() || route.is_empty() {
-        return (route.to_vec(), None);
+    if !matches!(kind, "HTTPRoute" | "GRPCRoute" | "TLSRoute") {
+        return (Vec::new(), None);
     }
-    let fit: Vec<String> = route.iter().filter(|h| hostnames_intersect(listener, h)).cloned().collect();
+    if route.is_empty() {
+        return (vec![listener.to_ascii_lowercase()], None);
+    }
+    let fit = hostnames_overlap(&[listener.to_string()], route);
     let refusal = fit.is_empty().then(|| format!("none of the route's hostnames is under its hostname {listener}"));
     (fit, refusal)
+}
+
+/// Whether a listener admits routes from namespaces by their labels.
+fn selects_namespaces(gateway: &DynamicObject, listener: &str) -> bool {
+    items(gateway.data.get("spec"), "listeners")
+        .iter()
+        .any(|l| json_str(Some(l), "name") == listener && json_str(l.get("allowedRoutes").and_then(|a| a.get("namespaces")), "from") == "Selector")
 }
 
 /// Each listener of a parent Gateway, checked against the route.
@@ -921,6 +1051,87 @@ async fn served_and_get(client: &kube::Client, kind: &str, namespace: &str, name
     Ok((served, obj))
 }
 
+fn admits(l: &ListenerFit) -> bool {
+    l.selected && l.refusal.is_none() && l.hostname_refusal.is_none()
+}
+
+fn object_key(o: &DynamicObject) -> (&str, &str) {
+    (o.metadata.namespace.as_deref().unwrap_or_default(), o.metadata.name.as_deref().unwrap_or_default())
+}
+
+/// Each parent Gateway that was read, with its listeners that admit the
+/// route; a Gateway two parentRefs name is listed once.
+fn admitting_listeners<'a>(parents: &'a [ParentFit], gateways: &'a [Result<Option<DynamicObject>, String>]) -> Vec<(&'a DynamicObject, Vec<&'a ListenerFit>)> {
+    let mut ours: Vec<(&DynamicObject, Vec<&ListenerFit>)> = Vec::new();
+    for (f, raw) in parents.iter().zip(gateways) {
+        let Ok(Some(g)) = raw else { continue };
+        let admitting = f.listeners.iter().filter(|l| admits(l));
+        match ours.iter_mut().find(|(x, _)| object_key(x) == object_key(g)) {
+            Some((_, listeners)) => {
+                for l in admitting {
+                    if !listeners.iter().any(|x| x.name == l.name) {
+                        listeners.push(l);
+                    }
+                }
+            }
+            None => ours.push((g, admitting.collect())),
+        }
+    }
+    ours.retain(|(_, listeners)| !listeners.is_empty());
+    ours
+}
+
+/// The Gateway and admitting listeners a parent of another route names, if
+/// it is one of these.
+fn on_gateway<'a, 'b>(ours: &'b [(&'a DynamicObject, Vec<&'a ListenerFit>)], p: &RouteParentInfo) -> Option<&'b (&'a DynamicObject, Vec<&'a ListenerFit>)> {
+    if p.group != GROUP || p.kind != "Gateway" {
+        return None;
+    }
+    ours.iter().find(|(g, _)| object_key(g) == (p.namespace.as_str(), p.name.as_str()))
+}
+
+/// The other routes that claim a route's traffic: on a listener that admits
+/// it, admitted there themselves, and served there for a host it is too.
+/// Each with whether it has one of the route's matches, which makes the two
+/// claim the same requests. `labels` are the route's namespace's;
+/// `namespace_labels` the others', read when a listener admits by label.
+fn shared_routes(
+    route: &RouteInfo,
+    ours: &[(&DynamicObject, Vec<&ListenerFit>)],
+    candidates: &[&RouteInfo],
+    labels: &Result<BTreeMap<String, String>, String>,
+    namespace_labels: &Result<BTreeMap<String, BTreeMap<String, String>>, String>,
+) -> Vec<(SharedRoute, bool)> {
+    let any_host = |l: &ListenerFit| if l.hostnames.is_empty() { vec![String::new()] } else { l.hostnames.clone() };
+    let match_keys: Vec<&String> = route.rules.iter().flat_map(|r| &r.match_keys).collect();
+    let mut sharing: Vec<(SharedRoute, bool)> = Vec::new();
+    for o in candidates {
+        let their_labels = match (namespace_labels, o.namespace == route.namespace) {
+            (_, true) => labels.clone(),
+            (Ok(all), false) => Ok(all.get(&o.namespace).cloned().unwrap_or_default()),
+            (Err(e), false) => Err(e.clone()),
+        };
+        let mut on: Vec<(String, Vec<String>)> = Vec::new();
+        for p in &o.parents {
+            let Some((g, mine)) = on_gateway(ours, p) else { continue };
+            let theirs = listener_fits(g, &parent_ref_of(p), &o.kind, &o.namespace, &their_labels, &o.hostnames);
+            for l in mine {
+                let Some(t) = theirs.iter().find(|t| t.name == l.name && admits(t)) else { continue };
+                let hosts = hostnames_overlap(&any_host(l), &any_host(t));
+                let at = format!("{}/{} listener {}", p.namespace, p.name, l.name);
+                if !hosts.is_empty() && !on.iter().any(|(x, _)| *x == at) {
+                    on.push((at, hosts));
+                }
+            }
+        }
+        if !on.is_empty() {
+            let same = o.kind == route.kind && o.rules.iter().flat_map(|r| &r.match_keys).any(|k| match_keys.contains(&k));
+            sharing.push((SharedRoute { route: (*o).clone(), listeners: on }, same));
+        }
+    }
+    sharing
+}
+
 fn attached_to(r: &RouteInfo, namespace: &str, name: &str) -> bool {
     r.parents.iter().any(|p| p.group == GROUP && p.kind == "Gateway" && p.namespace == namespace && p.name == name)
 }
@@ -939,6 +1150,7 @@ pub async fn get_gateway_diagnostics(context_name: &str, namespace: &str, name: 
             certificates.push(GatewayCertificate {
                 listener: json_str(Some(&l), "name").to_string(),
                 hostname: json_str(Some(&l), "hostname").to_string(),
+                group: json_str(Some(&r), "group").to_string(),
                 kind: if kind.is_empty() { "Secret".to_string() } else { kind.to_string() },
                 namespace: if ns.is_empty() { namespace.to_string() } else { ns.to_string() },
                 name: json_str(Some(&r), "name").to_string(),
@@ -947,7 +1159,7 @@ pub async fn get_gateway_diagnostics(context_name: &str, namespace: &str, name: 
             });
         }
     }
-    let is_secret = |c: &GatewayCertificate| c.kind == "Secret";
+    let is_secret = |c: &GatewayCertificate| c.group.is_empty() && c.kind == "Secret";
     let secrets_fut = futures::future::join_all(certificates.iter().filter(|c| is_secret(c)).map(|c| k8s::read_tls_secret(&client, &c.namespace, &c.name)));
     let crosses = certificates.iter().any(|c| c.namespace != namespace);
     let (all, data_plane, events, secrets, grants) = tokio::join!(
@@ -962,7 +1174,7 @@ pub async fn get_gateway_diagnostics(context_name: &str, namespace: &str, name: 
         if is_secret(c) {
             c.secret = secrets.next();
         }
-        c.grant = grant_for(&grants, "Gateway", namespace, "", &c.kind, &c.namespace, &c.name);
+        c.grant = grant_for(&grants, "Gateway", namespace, &c.group, &c.kind, &c.namespace, &c.name);
     }
 
     let class = all.classes.iter().find(|c| c.name == gateway.class).cloned();
@@ -999,15 +1211,17 @@ pub async fn get_route_diagnostics(context_name: &str, kind: &str, namespace: &s
     let route = route_info(kind, &obj);
     let refs: Vec<ParentRef> = items(obj.data.get("spec"), "parentRefs").iter().map(|p| parent_ref(Some(p), namespace)).collect();
 
-    // Each backend once, however many rules send to it.
-    let mut backends: Vec<RouteBackendInfo> = Vec::new();
-    for b in route.rules.iter().flat_map(|r| &r.backends) {
-        if !backends.iter().any(|x| x.group == b.group && x.kind == b.kind && x.namespace == b.namespace && x.name == b.name && x.port == b.port) {
-            backends.push(b.clone());
+    // Each backend once, however many rules send to it, then those only
+    // mirrored to.
+    let mirrors: Vec<RouteBackendInfo> = items(obj.data.get("spec"), "rules").iter().flat_map(|r| mirror_backends(r, namespace)).collect();
+    let mut backends: Vec<(RouteBackendInfo, bool)> = Vec::new();
+    for (b, mirror) in route.rules.iter().flat_map(|r| r.backends.iter().cloned()).map(|b| (b, false)).chain(mirrors.into_iter().map(|b| (b, true))) {
+        if !backends.iter().any(|(x, _)| x.group == b.group && x.kind == b.kind && x.namespace == b.namespace && x.name == b.name && x.port == b.port) {
+            backends.push((b, mirror));
         }
     }
     let core = |b: &RouteBackendInfo| b.group.is_empty() && b.kind == "Service";
-    let services_fut = futures::future::join_all(backends.iter().filter(|b| core(b)).map(|b| k8s::read_service_backend(&client, &b.namespace, &b.name)));
+    let services_fut = futures::future::join_all(backends.iter().filter(|(b, _)| core(b)).map(|(b, _)| k8s::read_service_backend(&client, &b.namespace, &b.name)));
     let gateway_ar = served.iter().find(|ar| ar.kind == "Gateway").cloned();
     let gateways_fut = futures::future::join_all(refs.iter().map(|r| {
         let client = client.clone();
@@ -1028,7 +1242,7 @@ pub async fn get_route_diagnostics(context_name: &str, kind: &str, namespace: &s
             .map(|n| n.metadata.labels.unwrap_or_default())
             .map_err(|e| k8s::get_error("Namespace", namespace, e))
     };
-    let crosses = backends.iter().any(|b| b.namespace != namespace);
+    let crosses = backends.iter().any(|(b, _)| b.namespace != namespace);
     let (all, services, gateways, labels, events, grants) = tokio::join!(
         read_all(&client, &served),
         services_fut,
@@ -1046,7 +1260,13 @@ pub async fn get_route_diagnostics(context_name: &str, kind: &str, namespace: &s
             let is_gateway = r.group == GROUP && r.kind == "Gateway";
             ParentFit {
                 parent: p.clone(),
-                gateway: all.gateways.iter().find(|g| is_gateway && g.namespace == r.namespace && g.name == r.name).cloned(),
+                // As read, which needs no right to list Gateways everywhere.
+                gateway: raw
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map(gateway_info)
+                    .or_else(|| all.gateways.iter().find(|g| is_gateway && g.namespace == r.namespace && g.name == r.name).cloned()),
                 missing: is_gateway && matches!(raw, Ok(None)),
                 read_error: raw.as_ref().err().cloned(),
                 listeners: raw.as_ref().ok().and_then(Option::as_ref).map(|g| listener_fits(g, r, kind, namespace, &labels, &route.hostnames)).unwrap_or_default(),
@@ -1057,27 +1277,36 @@ pub async fn get_route_diagnostics(context_name: &str, kind: &str, namespace: &s
     let mut services = services.into_iter();
     let backends: Vec<RouteBackendCheck> = backends
         .into_iter()
-        .map(|b| RouteBackendCheck {
+        .map(|(b, mirror)| RouteBackendCheck {
             service: if core(&b) { services.next() } else { None },
             grant: grant_for(&grants, kind, namespace, &b.group, &b.kind, &b.namespace, &b.name),
+            mirror,
             backend: b,
         })
         .collect();
 
-    let hosts: Vec<String> = route.hostnames.iter().map(|h| h.to_ascii_lowercase()).collect();
-    let gateways_of = |r: &RouteInfo| r.parents.iter().filter(|p| p.group == GROUP && p.kind == "Gateway").map(|p| (p.namespace.clone(), p.name.clone())).collect::<Vec<_>>();
-    let ours = gateways_of(&route);
-    let sharing: Vec<&RouteInfo> = all
+    // The other routes that claim its traffic.
+    let ours = admitting_listeners(&parents, &gateways);
+    let candidates: Vec<&RouteInfo> = all
         .routes
         .iter()
         .filter(|r| !(r.kind == kind && r.namespace == namespace && r.name == name))
-        .filter(|r| gateways_of(r).iter().any(|g| ours.contains(g)))
-        .filter(|r| r.hostnames.iter().any(|h| hosts.contains(&h.to_ascii_lowercase())))
+        .filter(|r| r.parents.iter().any(|p| on_gateway(&ours, p).is_some()))
         .collect();
-    // The same match, as the same text: the same kind of path and value,
-    // method and headers, which is what makes two routes claim one request.
-    let matches: Vec<&String> = route.rules.iter().flat_map(|r| &r.matches).collect();
-    let same_match: Vec<RouteInfo> = sharing.iter().filter(|r| r.kind == kind && r.rules.iter().flat_map(|x| &x.matches).any(|m| matches.contains(&m))).map(|r| (*r).clone()).collect();
+    // A listener that admits namespaces by label needs the other routes'.
+    let by_label = ours.iter().any(|(g, listeners)| listeners.iter().any(|l| selects_namespaces(g, &l.name)));
+    let namespace_labels: Result<BTreeMap<String, BTreeMap<String, String>>, String> = if by_label && candidates.iter().any(|r| r.namespace != namespace) {
+        Api::<Namespace>::all(client.clone())
+            .list(&ListParams::default())
+            .await
+            .map(|l| l.items.into_iter().map(|n| (n.metadata.name.unwrap_or_default(), n.metadata.labels.unwrap_or_default())).collect())
+            .map_err(|e| format!("Failed to list namespaces: {e}"))
+    } else {
+        Ok(BTreeMap::new())
+    };
+    let sharing = shared_routes(&route, &ours, &candidates, &labels, &namespace_labels);
+    let sharing_hostname = sharing.len();
+    let same_match: Vec<SharedRoute> = sharing.into_iter().filter(|(_, same)| *same).map(|(s, _)| s).collect();
 
     // The controllers of the classes its Gateways belong to.
     let mut controller_names: Vec<String> = Vec::new();
@@ -1099,8 +1328,9 @@ pub async fn get_route_diagnostics(context_name: &str, kind: &str, namespace: &s
         read_error: all.error,
         parents,
         backends,
-        sharing_hostname: sharing.len(),
+        sharing_hostname,
         same_match,
+        sharing_error: namespace_labels.err(),
         controllers,
         controller_logs,
         events,
@@ -1336,6 +1566,107 @@ mod tests {
         assert_eq!(fits.iter().filter(|f| f.selected).map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["https"]);
         assert_eq!(fits[0].refusal.as_deref(), Some("its protocol's route kinds (HTTPRoute, GRPCRoute) do not include TCPRoute"));
         assert!(fits[0].hostname_refusal.is_none());
+    }
+
+    #[test]
+    fn the_host_two_hostnames_share_is_the_narrower() {
+        assert_eq!(hostname_overlap("*.example.com", "api.example.com").as_deref(), Some("api.example.com"));
+        assert_eq!(hostname_overlap("API.example.com", "*.example.com").as_deref(), Some("api.example.com"));
+        assert_eq!(hostname_overlap("*.example.com", "*.a.example.com").as_deref(), Some("*.a.example.com"));
+        assert_eq!(hostname_overlap("", "api.example.com").as_deref(), Some("api.example.com"), "no hostname is any host");
+        assert_eq!(hostname_overlap("", "").as_deref(), Some(""));
+        assert_eq!(hostname_overlap("a.example.com", "b.example.com"), None);
+        // A route's wildcard under a listener's name is served for that name.
+        assert_eq!(hostname_fit("a.example.com", &["*.example.com".to_string()], "HTTPRoute"), (vec!["a.example.com".to_string()], None));
+        assert_eq!(hostname_fit("*.example.com", &[], "HTTPRoute"), (vec!["*.example.com".to_string()], None), "a route without hostnames takes the listener's");
+        assert_eq!(hostname_fit("*.example.com", &[], "TCPRoute"), (vec![], None));
+    }
+
+    #[test]
+    fn two_matches_that_select_the_same_requests_have_one_key() {
+        let key = |m: Value| http_match_key(&m);
+        let api = key(json!({"path": {"type": "PathPrefix", "value": "/api"}, "headers": [{"name": "X-Env", "value": "canary"}, {"name": "x-team", "value": "web"}],
+            "queryParams": [{"name": "a", "value": "1"}, {"name": "b", "value": "2"}]}));
+        let reordered = key(json!({"headers": [{"name": "x-team", "value": "web", "type": "Exact"}, {"name": "x-env", "value": "canary"}], "path": {"value": "/api/"},
+            "queryParams": [{"name": "b", "value": "2"}, {"name": "a", "value": "1"}]}));
+        assert_eq!(api, reordered, "order, header-name case, defaults and a prefix's trailing slash do not matter");
+        let shouted = key(json!({"path": {"value": "/api"}, "headers": [{"name": "x-env", "value": "CANARY"}, {"name": "x-team", "value": "web"}],
+            "queryParams": [{"name": "a", "value": "1"}, {"name": "b", "value": "2"}]}));
+        assert_ne!(api, shouted, "a header's value keeps its case");
+        assert_ne!(key(json!({"queryParams": [{"name": "A", "value": "1"}]})), key(json!({"queryParams": [{"name": "a", "value": "1"}]})), "so does a query parameter's name");
+        assert_ne!(key(json!({"path": {"type": "Exact", "value": "/api/"}})), key(json!({"path": {"type": "Exact", "value": "/api"}})), "an exact path keeps its slash");
+        assert_eq!(key(Value::Null), key(json!({"path": {"type": "PathPrefix", "value": "/"}})), "no match is every path");
+        assert_eq!(
+            grpc_match_key(&json!({"method": {"service": "pkg.Orders"}, "headers": [{"name": "A", "value": "1"}, {"name": "b", "value": "2"}]})),
+            grpc_match_key(&json!({"method": {"type": "Exact", "service": "pkg.Orders"}, "headers": [{"name": "B", "value": "2"}, {"name": "a", "value": "1"}]})),
+        );
+    }
+
+    #[test]
+    fn mirrored_backends_and_certificates_keep_their_references() {
+        let rule = json!({
+            "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "shadow", "port": 8080}}}, {"type": "URLRewrite"}],
+            "backendRefs": [{"name": "web", "port": 80, "filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "audit", "namespace": "audit", "port": 9000}}}]}]
+        });
+        let mirrors = mirror_backends(&rule, "app");
+        assert_eq!(mirrors.iter().map(|b| (b.namespace.as_str(), b.name.as_str(), b.port)).collect::<Vec<_>>(), vec![("app", "shadow", Some(8080)), ("audit", "audit", Some(9000))]);
+        assert_eq!(certificate_ref(&json!({"name": "wild"}), "infra"), "wild");
+        assert_eq!(certificate_ref(&json!({"group": "cert-manager.io", "kind": "Certificate", "name": "wild"}), "infra"), "Certificate.cert-manager.io/wild");
+        assert_eq!(certificate_ref(&json!({"group": "example.com", "name": "wild", "namespace": "certs"}), "infra"), "certs/Secret.example.com/wild");
+    }
+
+    fn listed_route(kind: &str, namespace: &str, name: &str, spec: Value) -> RouteInfo {
+        route_info(kind, &obj(json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": kind, "metadata": {"name": name, "namespace": namespace}, "spec": spec})))
+    }
+
+    #[test]
+    fn routes_compete_only_on_a_listener_that_admits_both_for_a_host_both_are_served_for() {
+        let gw = gateway_obj(
+            json!([
+                {"name": "http", "protocol": "HTTP", "port": 80, "allowedRoutes": {"namespaces": {"from": "All"}}},
+                {"name": "https", "protocol": "HTTPS", "port": 443, "hostname": "*.dev.example.com", "allowedRoutes": {"namespaces": {"from": "All"}}},
+                {"name": "tls", "protocol": "TLS", "port": 8443, "tls": {"mode": "Passthrough"}, "allowedRoutes": {"namespaces": {"from": "All"}}},
+                {"name": "own", "protocol": "HTTP", "port": 8080}
+            ]),
+            json!({}),
+        );
+        let parent = |section: &str| if section.is_empty() { json!({"name": "gw", "namespace": "infra"}) } else { json!({"name": "gw", "namespace": "infra", "sectionName": section}) };
+        let http = |name: &str, section: &str, hostnames: Value, matches: Value| {
+            listed_route("HTTPRoute", "web", name, json!({"parentRefs": [parent(section)], "hostnames": hostnames, "rules": [{"matches": matches, "backendRefs": [{"name": "web", "port": 80}]}]}))
+        };
+        let tls = |name: &str, hostnames: Value| listed_route("TLSRoute", "web", name, json!({"parentRefs": [parent("tls")], "hostnames": hostnames, "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]}));
+        let labels: Result<BTreeMap<String, String>, String> = Ok(BTreeMap::new());
+        let gateways = vec![Ok(Some(gw.clone()))];
+        let shared = |me: &RouteInfo, others: &[&RouteInfo]| -> Vec<(String, bool, Vec<(String, Vec<String>)>)> {
+            let parents = vec![ParentFit {
+                parent: me.parents[0].clone(),
+                gateway: None,
+                missing: false,
+                read_error: None,
+                listeners: listener_fits(&gw, &parent_ref_of(&me.parents[0]), &me.kind, &me.namespace, &labels, &me.hostnames),
+            }];
+            let ours = admitting_listeners(&parents, &gateways);
+            shared_routes(me, &ours, others, &labels, &Ok(BTreeMap::new())).into_iter().map(|(s, same)| (s.route.name, same, s.listeners)).collect()
+        };
+        let api = json!([{"path": {"value": "/api"}, "headers": [{"name": "X-Env", "value": "canary"}, {"name": "x-team", "value": "web"}]}]);
+        let me = http("me", "https", json!(["api.dev.example.com"]), api.clone());
+        let on_http = http("on-http", "http", json!(["api.dev.example.com"]), api.clone());
+        let reordered = http("reordered", "", json!(["*.dev.example.com"]), json!([{"path": {"value": "/api/"}, "headers": [{"name": "x-team", "value": "web"}, {"name": "x-env", "value": "canary"}]}]));
+        let inherits = http("inherits", "https", json!([]), json!([{"path": {"value": "/other"}}]));
+        let elsewhere = http("elsewhere", "https", json!(["web.dev.example.com"]), api.clone());
+        let at_https = |host: &str| vec![("infra/gw listener https".to_string(), vec![host.to_string()])];
+        assert_eq!(
+            shared(&me, &[&on_http, &reordered, &inherits, &elsewhere]),
+            vec![("reordered".to_string(), true, at_https("api.dev.example.com")), ("inherits".to_string(), false, at_https("api.dev.example.com"))],
+            "the http listener does not admit this route, and web.dev.example.com is another host"
+        );
+        // A TLSRoute's rules match every connection for its hostnames.
+        let db = tls("db", json!(["db.dev.example.com"]));
+        let wild = tls("wild", json!(["*.dev.example.com"]));
+        assert_eq!(shared(&db, &[&wild]), vec![("wild".to_string(), true, vec![("infra/gw listener tls".to_string(), vec!["db.dev.example.com".to_string()])])]);
+        // A listener that admits its own namespace only admits neither.
+        let own = http("own", "own", json!([]), api.clone());
+        assert!(shared(&own, &[&http("twin", "own", json!([]), api.clone())]).is_empty());
     }
 
     #[test]

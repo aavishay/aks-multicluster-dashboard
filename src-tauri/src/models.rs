@@ -1406,6 +1406,11 @@ pub struct RouteParentInfo {
     pub name: String,
     /// `sectionName` and/or `port`: the listener it picks. Empty for all.
     pub section: String,
+    /// The same two as given, for finding the listeners it picks.
+    #[serde(skip)]
+    pub section_name: String,
+    #[serde(skip)]
+    pub port: Option<i64>,
     pub controller: String,
     pub conditions: Vec<PodConditionInfo>,
     /// The first condition that is not True, or that nothing reported.
@@ -1419,6 +1424,11 @@ pub struct RouteRuleInfo {
     /// Each match on its own line: `GET PathPrefix /api header x-env=canary`.
     /// Empty for the kinds that have none (TLS, TCP, UDP).
     pub matches: Vec<String>,
+    /// Each match in a form two routes can be compared by: defaults filled
+    /// in, headers and query parameters sorted, header names lowercased. A
+    /// rule of a kind without matches has one key that matches everything.
+    #[serde(skip)]
+    pub match_keys: Vec<String>,
     /// Filter types: RequestRedirect, URLRewrite, RequestHeaderModifier, …
     pub filters: Vec<String>,
     pub backends: Vec<RouteBackendInfo>,

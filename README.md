@@ -197,9 +197,10 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   verdict on it, with every listener of its Gateways checked against it —
   whether the parentRef picks it, whether its allowedRoutes admits the
   route's namespace and kind, which of its hostnames it serves — each backend
-  Service with its port and ready endpoints and the ReferenceGrant one in
-  another namespace needs, other routes claiming the same hostname and match,
-  and the controller's own log lines about it;
+  Service, mirrored-to ones included, with its port and ready endpoints and
+  the ReferenceGrant one in another namespace needs, other routes on the same
+  listener claiming an overlapping hostname and the same match, and the
+  controller's own log lines about it;
 - a Job: its limits, status and conditions — why it failed (backoffLimit,
   activeDeadlineSeconds, its podFailurePolicy) — and its attempts with each
   container's exit code, OOM kills and evictions, with the logs of the worst

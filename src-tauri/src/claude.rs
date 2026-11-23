@@ -739,11 +739,13 @@ You are given the route's hostnames and rules; for each parent it names, the \
 verdict its controller reported and, for a Gateway, the Gateway's own state \
 and each of its listeners checked against the route: whether the parentRef \
 selects it, whether its allowedRoutes admits the route's namespace and kind, \
-and which of the route's hostnames it serves. Then each backend, with a \
-Service's port and ready endpoints and the ReferenceGrant a backend in \
-another namespace needs; other routes on the same Gateway with one of its \
-hostnames and the same match; the controller's workloads and its own log lines from the last \
-hour about this route and its Services; its events; and its manifest. \
+and which hostnames it serves the route for. Then each backend, including \
+those a RequestMirror filter copies requests to, with a Service's port and \
+ready endpoints and the ReferenceGrant a backend in another namespace \
+needs; other routes on a listener that admits it, served for one of its \
+hosts, with the same match; the controller's workloads and its own log \
+lines from the last hour about this route and its Services; its events; \
+and its manifest. \
 Respond with:
 1. The most likely root cause, stated plainly.
 2. The specific evidence that points there — cite the condition, the \
@@ -773,9 +775,11 @@ backend — Envoy Gateway then reports BackendsAvailable False and answers \
 type, method, headers).
 - Partially invalid (PartiallyInvalid True): some rules were dropped and the \
 message says which.
-- A conflict: another route on the same Gateway claims the same hostname and \
-match. The API's precedence decides: the more specific match, then the \
-older route, then the one first in namespace/name order.
+- A conflict: another route on the same listener is served for one of its \
+hosts with the same match. The API's precedence decides: the more specific \
+hostname (an exact name over a wildcard, then the longer), then the more \
+specific match, then the older route, then the one first in namespace/name \
+order.
 
 If the route is healthy, say so plainly rather than inventing a problem.
 
@@ -3316,22 +3320,27 @@ fn render_ingress_backends(ing: &k8s_openapi::api::networking::v1::Ingress, back
     let mut lines = Vec::new();
     for (svc, port) in refs {
         let Some(b) = backends.iter().find(|b| b.name == svc) else { continue };
-        lines.push(render_service_backend(&svc, &port, b));
+        lines.push(render_service_backend(&svc, &port, "TCP", b));
     }
     lines.join("\n")
 }
 
 /// One Service something routes to, by the port it names (a number or a
-/// port name): whether the Service exists, whether that is one of its ports,
-/// and how many endpoints behind that port are ready.
-fn render_service_backend(svc: &str, port: &str, b: &k8s::IngressBackend) -> String {
+/// port name) and the protocol it sends: whether the Service exists, whether
+/// that is one of its ports, and how many endpoints behind that port are
+/// ready. A Service can have one port number twice, for TCP and for UDP (DNS
+/// on 53), so the port is the one with that protocol.
+fn render_service_backend(svc: &str, port: &str, protocol: &str, b: &k8s::IngressBackend) -> String {
     let service = match &b.service {
         Ok(s) => s,
         Err(e) => return format!("Service {svc}:{port}: {}", read_failure("Service", e)),
     };
     let spec = service.spec.clone().unwrap_or_default();
     let ports = spec.ports.clone().unwrap_or_default();
-    let found = ports.iter().find(|p| p.name.as_deref() == Some(port) || p.port.to_string() == port);
+    let named = |p: &&k8s_openapi::api::core::v1::ServicePort| p.name.as_deref() == Some(port) || p.port.to_string() == port;
+    let protocol_of = |p: &k8s_openapi::api::core::v1::ServicePort| p.protocol.clone().unwrap_or_else(|| "TCP".to_string());
+    let exact = ports.iter().filter(named).find(|p| protocol_of(p) == protocol);
+    let found = exact.or_else(|| ports.iter().find(named));
     let have = ports
         .iter()
         .map(|p| match &p.name {
@@ -3342,6 +3351,11 @@ fn render_service_backend(svc: &str, port: &str, b: &k8s::IngressBackend) -> Str
         .join(", ");
     let mut line = format!("Service {svc}:{port} ({})", spec.type_.as_deref().unwrap_or("ClusterIP"));
     match found {
+        Some(p) if exact.is_none() => line.push_str(&format!(
+            ": PORT {port} IS {} ON THE SERVICE, BUT THIS SENDS {protocol} (target port {})",
+            protocol_of(p),
+            p.target_port.as_ref().map(int_or_string).unwrap_or_else(|| p.port.to_string())
+        )),
         Some(p) => line.push_str(&format!(
             ": port exists, → target port {}",
             p.target_port.as_ref().map(int_or_string).unwrap_or_else(|| p.port.to_string())
@@ -3356,11 +3370,15 @@ fn render_service_backend(svc: &str, port: &str, b: &k8s::IngressBackend) -> Str
                 // Counted for this Service port: a slice lists the ports
                 // its endpoints serve by the Service port's name, and a
                 // multi-port Service can have endpoints for one and not another.
-                let port_name = found.map(|p| p.name.clone().unwrap_or_default());
+                let port_name = found.map(|p| (p.name.clone().unwrap_or_default(), protocol_of(p)));
                 let serving: Vec<&k8s_openapi::api::discovery::v1::EndpointSlice> = slices
                     .iter()
                     .filter(|s| match &port_name {
-                        Some(n) => s.ports.iter().flatten().any(|sp| sp.name.clone().unwrap_or_default() == *n),
+                        Some((n, proto)) => s
+                            .ports
+                            .iter()
+                            .flatten()
+                            .any(|sp| sp.name.clone().unwrap_or_default() == *n && sp.protocol.as_deref().unwrap_or("TCP") == proto),
                         None => true,
                     })
                     .collect();
@@ -3678,7 +3696,10 @@ fn render_gateway_certificates(certs: &[crate::gateway_api::GatewayCertificate],
             let hosts: Vec<String> = if c.hostname.is_empty() { Vec::new() } else { vec![c.hostname.clone()] };
             let body = match &c.secret {
                 Some(read) => render_tls_secret(&label, read, &hosts, now),
-                None => format!("{} {label}: not a Secret; its controller must support this kind", c.kind),
+                None => {
+                    let kind = if c.group.is_empty() { c.kind.clone() } else { format!("{}.{}", c.kind, c.group) };
+                    format!("{kind} {label}: not a core Secret; its controller must support this kind")
+                }
             };
             let (first, rest) = body.split_once('\n').map_or((body.as_str(), ""), |(a, b)| (a, b));
             let rest = if rest.is_empty() { String::new() } else { format!("\n{rest}") };
@@ -3788,7 +3809,11 @@ pub async fn build_gateway_diagnosis_payload(context_name: &str, namespace: &str
     let class = redact::redact(&render_gateway_class(&d.gateway.class, &d.class, &d.read_error));
     let certificates = redact::redact(&render_gateway_certificates(&d.certificates, namespace, chrono::Utc::now()));
     let data_plane = redact::redact(&render_gateway_data_plane(&d.data_plane));
-    let routes = redact::redact(&render_gateway_routes(&d.routes));
+    let mut routes_text = render_gateway_routes(&d.routes);
+    if let Some(e) = &d.read_error {
+        routes_text.push_str(&format!("\n(some Gateway API kinds could not be listed, so this may be incomplete: {e})"));
+    }
+    let routes = redact::redact(&routes_text);
     let none = if d.controller.is_empty() {
         "(its class could not be read, so its controller is not known)".to_string()
     } else {
@@ -3902,7 +3927,7 @@ fn render_route_parents(parents: &[crate::gateway_api::ParentFit]) -> String {
                 } else if l.hostnames.is_empty() {
                     "admits it".to_string()
                 } else {
-                    format!("admits it, for {}", l.hostnames.join(", "))
+                    format!("admits it, for {}", any_hostname(&l.hostnames))
                 };
                 lines.push(format!("  - listener {head}: {verdict}"));
             }
@@ -3914,24 +3939,31 @@ fn render_route_parents(parents: &[crate::gateway_api::ParentFit]) -> String {
     lines.join("\n")
 }
 
-fn render_route_backends(route_ns: &str, backends: &[crate::gateway_api::RouteBackendCheck]) -> String {
+/// Hostnames as served, `""` being any host.
+fn any_hostname(hosts: &[String]) -> String {
+    hosts.iter().map(|h| if h.is_empty() { "any hostname" } else { h.as_str() }).collect::<Vec<_>>().join(", ")
+}
+
+fn render_route_backends(kind: &str, route_ns: &str, backends: &[crate::gateway_api::RouteBackendCheck]) -> String {
     if backends.is_empty() {
         return "(its rules name no backend: fine for a redirect or a fixed response; otherwise requests get a 500)".to_string();
     }
+    let protocol = if kind == "UDPRoute" { "UDP" } else { "TCP" };
     backends
         .iter()
         .map(|c| {
             let b = &c.backend;
             let label = if b.namespace == route_ns { b.name.clone() } else { format!("{}/{}", b.namespace, b.name) };
             let body = match (&c.service, b.port) {
-                (Some(svc), Some(port)) => render_service_backend(&label, &port.to_string(), svc),
+                (Some(svc), Some(port)) => render_service_backend(&label, &port.to_string(), protocol, svc),
                 (Some(_), None) => format!("Service {label}: NO PORT — a Service backend must name one"),
                 (None, _) => {
                     let kind = if b.group.is_empty() { b.kind.clone() } else { format!("{}.{}", b.kind, b.group) };
                     format!("{kind} {label}: not a core Service; whether it resolves is its controller's call (ResolvedRefs)")
                 }
             };
-            format!("{body}{}", render_grant(&c.grant, &b.namespace))
+            let mirror = if c.mirror { "mirrored to (RequestMirror; its answers are dropped): " } else { "" };
+            format!("{mirror}{body}{}", render_grant(&c.grant, &b.namespace))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -3940,40 +3972,43 @@ fn render_route_backends(route_ns: &str, backends: &[crate::gateway_api::RouteBa
 /// How many routes claiming the same traffic to show.
 const DIAGNOSE_ROUTE_SAME_HOSTNAME: usize = 10;
 
-/// The other routes on its Gateways with one of its hostnames and the same
-/// match, which claim the same requests; the others sharing a hostname are
-/// only counted, as one host split by path is the ordinary case.
-fn render_route_same_hostname(route: &crate::models::RouteInfo, others: &[crate::models::RouteInfo], sharing: usize) -> String {
+/// The other routes on a listener that admits this one, for a host both are
+/// served for, with the same match: they claim the same requests. The others
+/// on such a listener and host are only counted, as one host split by path
+/// is the ordinary case.
+fn render_route_same_hostname(others: &[crate::gateway_api::SharedRoute], sharing: usize, error: &Option<String>) -> String {
     let rest = match sharing.saturating_sub(others.len()) {
         0 => String::new(),
-        1 => "1 other route on its Gateways shares one of its hostnames with different matches".to_string(),
-        n => format!("{n} other routes on its Gateways share one of its hostnames with different matches"),
+        1 => "1 other route on a listener that admits it is served for one of its hosts, with different matches".to_string(),
+        n => format!("{n} other routes on a listener that admits it are served for one of its hosts, with different matches"),
     };
+    let mut lines: Vec<String> = Vec::new();
     if others.is_empty() {
-        return if rest.is_empty() { "(no other route on its Gateways has one of its hostnames)".to_string() } else { format!("(none with the same match; {rest})") };
-    }
-    let mut lines: Vec<String> = others
-        .iter()
-        .take(DIAGNOSE_ROUTE_SAME_HOSTNAME)
-        .map(|o| {
-            let shared: Vec<&String> = o.hostnames.iter().filter(|h| route.hostnames.iter().any(|x| x.eq_ignore_ascii_case(h))).collect();
-            let matches: Vec<&String> = o.rules.iter().flat_map(|r| &r.matches).collect();
+        lines.push(if rest.is_empty() { "(no other route on a listener that admits it is served for one of its hosts)".to_string() } else { format!("(none with the same match; {rest})") });
+    } else {
+        lines.extend(others.iter().take(DIAGNOSE_ROUTE_SAME_HOSTNAME).map(|o| {
+            let r = &o.route;
+            let on = o.listeners.iter().map(|(at, hosts)| format!("{at} for {}", any_hostname(hosts))).collect::<Vec<_>>().join("; ");
+            let matches: Vec<&String> = r.rules.iter().flat_map(|x| &x.matches).collect();
             format!(
-                "- {} {}/{} (shares {}): {}{}",
-                o.kind,
-                o.namespace,
-                o.name,
-                shared.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", "),
+                "- {} {}/{} (hostnames {}), on {on}: {}{}",
+                r.kind,
+                r.namespace,
+                r.name,
+                if r.hostnames.is_empty() { "none, so its listeners'".to_string() } else { r.hostnames.join(", ") },
                 if matches.is_empty() { "matches everything".to_string() } else { format!("matches {}", matches.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" | ")) },
-                if o.healthy { String::new() } else { " (itself failing)".to_string() },
+                if r.healthy { String::new() } else { " (itself failing)".to_string() },
             )
-        })
-        .collect();
-    if others.len() > DIAGNOSE_ROUTE_SAME_HOSTNAME {
-        lines.push(format!("… and {} more", others.len() - DIAGNOSE_ROUTE_SAME_HOSTNAME));
+        }));
+        if others.len() > DIAGNOSE_ROUTE_SAME_HOSTNAME {
+            lines.push(format!("… and {} more", others.len() - DIAGNOSE_ROUTE_SAME_HOSTNAME));
+        }
+        if !rest.is_empty() {
+            lines.push(format!("({rest})"));
+        }
     }
-    if !rest.is_empty() {
-        lines.push(format!("({rest})"));
+    if let Some(e) = error {
+        lines.push(format!("(routes in other namespaces could not be checked against a listener that admits namespaces by label: {e})"));
     }
     lines.join("\n")
 }
@@ -3991,8 +4026,12 @@ pub async fn build_route_diagnosis_payload(context_name: &str, kind: &str, names
         parents_text.push_str(&format!("\n(some Gateway API kinds could not be listed: {e})"));
     }
     let parents = redact::redact(&parents_text);
-    let backends = redact::redact(&render_route_backends(namespace, &d.backends));
-    let same_hostname = redact::redact(&render_route_same_hostname(&d.route, &d.same_match, d.sharing_hostname));
+    let backends = redact::redact(&render_route_backends(kind, namespace, &d.backends));
+    let mut same_text = render_route_same_hostname(&d.same_match, d.sharing_hostname, &d.sharing_error);
+    if let Some(e) = &d.read_error {
+        same_text.push_str(&format!("\n(some Gateway API kinds could not be listed, so this may be incomplete: {e})"));
+    }
+    let same_hostname = redact::redact(&same_text);
     let controllers = redact::redact(&render_controller_workloads(
         &d.controllers,
         "(no Deployment names its Gateways' controller in its args or runs a known image for it: it may run outside the cluster)",
@@ -4009,7 +4048,7 @@ pub async fn build_route_diagnosis_payload(context_name: &str, kind: &str, names
          ## Hostnames and rules\n{}\n\n\
          ## Parents, and each Gateway listener checked against the route\n{}\n\n\
          ## Backends\n{}\n\n\
-         ## Other routes on its Gateways with one of its hostnames and the same match\n{}\n\n\
+         ## Other routes on a listener that admits it, for one of its hosts, with the same match\n{}\n\n\
          ## Controller\n{}\n\n\
          ## Controller log (last hour, lines about this route and its Services)\n{}\n\n\
          ## Events\n{}\n\n\
@@ -8811,6 +8850,71 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
     }
 
     #[test]
+    fn a_route_backend_is_checked_on_the_port_for_its_protocol() {
+        use crate::gateway_api::RouteBackendCheck;
+        let service = |name: &str, ports: serde_json::Value| -> k8s_openapi::api::core::v1::Service {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": name }, "spec": { "ports": ports } })).unwrap()
+        };
+        let slice = |port: &str, protocol: &str| -> k8s_openapi::api::discovery::v1::EndpointSlice {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": "s" }, "addressType": "IPv4", "ports": [{ "name": port, "port": 53, "protocol": protocol }],
+                "endpoints": [{ "addresses": ["10.0.0.1"], "conditions": { "ready": true } }] }))
+            .unwrap()
+        };
+        let check = |name: &str, port: i64, svc: k8s_openapi::api::core::v1::Service, slices, mirror| RouteBackendCheck {
+            backend: crate::models::RouteBackendInfo { group: String::new(), kind: "Service".into(), namespace: "dns".into(), name: name.into(), port: Some(port), weight: None },
+            service: Some(k8s::IngressBackend { name: name.into(), service: Ok(svc), slices: Ok(slices) }),
+            grant: None,
+            mirror,
+        };
+        // DNS on 53 twice, the TCP port listed first; endpoints ready for UDP.
+        let dns = service("dns", serde_json::json!([{ "name": "dns-tcp", "port": 53, "protocol": "TCP" }, { "name": "dns", "port": 53, "protocol": "UDP" }]));
+        let backends = [check("dns", 53, dns, vec![slice("dns", "UDP")], false)];
+        assert_eq!(render_route_backends("UDPRoute", "dns", &backends), "Service dns:53 (ClusterIP): port exists, → target port 53; 1 of 1 endpoints ready");
+        assert!(render_route_backends("TCPRoute", "dns", &backends).ends_with("NO ENDPOINT SERVES THIS PORT (1 endpoints serve its other ports — the target port resolves on none of the pods)"));
+        // A UDP-only port, mirrored to by an HTTPRoute.
+        let syslog = service("syslog", serde_json::json!([{ "name": "dns", "port": 53, "protocol": "UDP" }]));
+        assert_eq!(
+            render_route_backends("HTTPRoute", "dns", &[check("syslog", 53, syslog, vec![slice("dns", "UDP")], true)]),
+            "mirrored to (RequestMirror; its answers are dropped): Service syslog:53 (ClusterIP): PORT 53 IS UDP ON THE SERVICE, BUT THIS SENDS TCP (target port 53); 1 of 1 endpoints ready"
+        );
+    }
+
+    #[test]
+    fn routes_claiming_the_same_requests_name_the_listener_and_the_host() {
+        use crate::gateway_api::SharedRoute;
+        let route = |name: &str, hostnames: &[&str], healthy: bool| crate::models::RouteInfo {
+            kind: "HTTPRoute".into(),
+            namespace: "web".into(),
+            name: name.into(),
+            hostnames: hostnames.iter().map(|h| h.to_string()).collect(),
+            parents: vec![],
+            rules: vec![crate::models::RouteRuleInfo { name: String::new(), matches: vec!["PathPrefix /api".into()], match_keys: vec![], filters: vec![], backends: vec![] }],
+            healthy,
+            problem: None,
+            age_days: 1,
+            age_seconds: 86400,
+            created_at: None,
+        };
+        let on = |listener: &str, host: &str| (format!("infra/gw listener {listener}"), vec![host.to_string()]);
+        let others = [
+            SharedRoute { route: route("wild", &["*.dev.example.com"], true), listeners: vec![on("https", "api.dev.example.com")] },
+            SharedRoute { route: route("bare", &[], false), listeners: vec![on("http", ""), on("https", "api.dev.example.com")] },
+        ];
+        assert_eq!(
+            render_route_same_hostname(&others, 4, &Some("Failed to list namespaces: forbidden".into())),
+            "- HTTPRoute web/wild (hostnames *.dev.example.com), on infra/gw listener https for api.dev.example.com: matches PathPrefix /api\n\
+             - HTTPRoute web/bare (hostnames none, so its listeners'), on infra/gw listener http for any hostname; infra/gw listener https for api.dev.example.com: matches PathPrefix /api (itself failing)\n\
+             (2 other routes on a listener that admits it are served for one of its hosts, with different matches)\n\
+             (routes in other namespaces could not be checked against a listener that admits namespaces by label: Failed to list namespaces: forbidden)"
+        );
+        assert_eq!(render_route_same_hostname(&[], 0, &None), "(no other route on a listener that admits it is served for one of its hosts)");
+        assert_eq!(
+            render_route_same_hostname(&[], 1, &None),
+            "(none with the same match; 1 other route on a listener that admits it is served for one of its hosts, with different matches)"
+        );
+    }
+
+    #[test]
     fn a_tls_secret_is_checked_for_keys_expiry_and_hosts() {
         let ing = ingress(serde_json::json!({ "spec": {
             "tls": [{ "hosts": ["a.example.com", "b.other.com"], "secretName": "web-tls" }, { "hosts": ["c.example.com"], "secretName": "gone" }],
@@ -8897,6 +9001,8 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             namespace: "infra".into(),
             name: name.into(),
             section: String::new(),
+            section_name: String::new(),
+            port: None,
             controller: "gateway.envoyproxy.io/gatewayclass-controller".into(),
             conditions,
             problem: None,
