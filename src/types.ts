@@ -1014,6 +1014,8 @@ export interface RouteInfo {
 }
 
 export interface RouteParentInfo {
+  /** gateway.networking.k8s.io unless the route names another group. */
+  group: string;
   kind: string;
   namespace: string;
   name: string;
@@ -1033,6 +1035,8 @@ export interface RouteRuleInfo {
 }
 
 export interface RouteBackendInfo {
+  /** Empty, the core group, unless the route names another. */
+  group: string;
   kind: string;
   namespace: string;
   name: string;

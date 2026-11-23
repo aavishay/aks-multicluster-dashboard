@@ -379,7 +379,9 @@ a line naming the GatewayClasses and their controllers; Routes lists
 HTTPRoutes, GRPCRoutes and the experimental TLS, TCP and UDP routes with
 their hostnames, the Gateways they attach to and the backends they send to.
 Both flag any condition that is not True, the controller's own included
-(Envoy Gateway's BackendsAvailable, when a backend has no ready endpoints).
+(Envoy Gateway's BackendsAvailable, when a backend has no ready endpoints),
+or that is True where True is the fault (a listener's Conflicted), and read
+a condition the controller wrote for an older spec as not yet decided.
 A route's panel shows each Gateway's verdict on it and its rules' matches,
 filters and backends, each Service a link; a Gateway's shows its listeners
 and the routes attached to it, failing first. PVC and PV list claims and volumes with status, capacity, access

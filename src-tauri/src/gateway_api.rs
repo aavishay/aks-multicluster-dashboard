@@ -8,12 +8,15 @@
 //! A cluster without the CRDs costs one request, and an experimental kind
 //! that is not installed is simply absent.
 //!
-//! Status is read as the API's conventions define it: every condition is
-//! positive-polarity, so any condition that is not True is worth naming. That
-//! covers the standard ones (Accepted, Programmed, ResolvedRefs) and an
+//! Status is read as the API's conventions define it: a condition is
+//! positive-polarity, so any that is not True is worth naming, except the few
+//! the API defines the other way round (`NEGATIVE`), where True is the fault.
+//! That covers the standard ones (Accepted, Programmed, ResolvedRefs) and an
 //! implementation's own (Envoy Gateway's BackendsAvailable) alike, and the
 //! CRDs' own default — Accepted and Programmed Unknown, reason Pending —
-//! reads as "no controller has picked it up".
+//! reads as "no controller has picked it up". A condition written for an
+//! older generation of the object than its current spec says nothing about
+//! that spec, so it reads as Unknown too, until the controller catches up.
 //!
 //! Nothing here carries a value worth redacting: a listener names its
 //! certificate Secrets, and only their names are kept.
@@ -45,22 +48,52 @@ fn strings(v: Option<&Value>, key: &str) -> Vec<String> {
     items(v, key).iter().filter_map(|s| s.as_str().map(str::to_string)).collect()
 }
 
-fn conditions(status: Option<&Value>) -> Vec<PodConditionInfo> {
+/// The conditions the API defines with negative polarity, where True is the
+/// fault: a listener's Conflicted and OverlappingTLSConfig, a route parent's
+/// PartiallyInvalid. Mirrors `GATEWAY_NEGATIVE_CONDITIONS` in main.ts.
+const NEGATIVE: &[&str] = &["Conflicted", "OverlappingTLSConfig", "PartiallyInvalid"];
+
+fn condition_ok(c: &PodConditionInfo) -> bool {
+    c.status == if NEGATIVE.contains(&c.condition_type.as_str()) { "False" } else { "True" }
+}
+
+/// The conditions under `status`, judged against the object's `generation`:
+/// one the controller wrote for an older spec than the current one is shown
+/// as Unknown, reason Stale, with what it said then, rather than as the
+/// current spec's verdict. A controller that does not record
+/// `observedGeneration` is taken at its word.
+fn conditions(status: Option<&Value>, generation: Option<i64>) -> Vec<PodConditionInfo> {
     items(status, "conditions")
         .iter()
-        .map(|c| PodConditionInfo {
-            condition_type: json_str(Some(c), "type").to_string(),
-            status: json_str(Some(c), "status").to_string(),
-            reason: json_str(Some(c), "reason").to_string(),
-            message: json_str(Some(c), "message").to_string(),
-            last_transition: Some(json_str(Some(c), "lastTransitionTime")).filter(|t| !t.is_empty()).map(str::to_string),
+        .map(|c| {
+            let mut info = PodConditionInfo {
+                condition_type: json_str(Some(c), "type").to_string(),
+                status: json_str(Some(c), "status").to_string(),
+                reason: json_str(Some(c), "reason").to_string(),
+                message: json_str(Some(c), "message").to_string(),
+                last_transition: Some(json_str(Some(c), "lastTransitionTime")).filter(|t| !t.is_empty()).map(str::to_string),
+            };
+            let observed = c.get("observedGeneration").and_then(Value::as_i64);
+            if let (Some(observed), Some(current)) = (observed, generation) {
+                if observed < current {
+                    let then = if info.reason.is_empty() { info.status.clone() } else { format!("{} ({})", info.status, info.reason) };
+                    info.message = format!("{then} for generation {observed}; the spec is at generation {current}, which its controller has not reported on yet");
+                    info.status = "Unknown".to_string();
+                    info.reason = "Stale".to_string();
+                }
+            }
+            info
         })
         .collect()
 }
 
 /// `Accepted is False: NotAllowedByListeners — no listener allows this route`.
 fn describe(c: &PodConditionInfo) -> String {
-    let state = if c.status == "False" { "False".to_string() } else { format!("{} (not yet decided)", if c.status.is_empty() { "Unknown" } else { &c.status }) };
+    let state = match c.status.as_str() {
+        "True" | "False" => c.status.clone(),
+        "" => "Unknown (not yet decided)".to_string(),
+        other => format!("{other} (not yet decided)"),
+    };
     let mut out = format!("{} is {state}", c.condition_type);
     if !c.reason.is_empty() {
         out.push_str(&format!(": {}", c.reason));
@@ -71,12 +104,13 @@ fn describe(c: &PodConditionInfo) -> String {
     out
 }
 
-/// The first condition that is not True, or none reported at all.
+/// The first condition that reports a fault or is undecided, or none
+/// reported at all.
 fn failing(conds: &[PodConditionInfo], none: &str) -> Option<String> {
     if conds.is_empty() {
         return Some(none.to_string());
     }
-    conds.iter().find(|c| c.status != "True").map(describe)
+    conds.iter().find(|c| !condition_ok(c)).map(describe)
 }
 
 fn age(obj: &DynamicObject) -> (i64, i64, Option<String>) {
@@ -86,7 +120,7 @@ fn age(obj: &DynamicObject) -> (i64, i64, Option<String>) {
 
 pub(crate) fn class_info(obj: &DynamicObject) -> GatewayClassInfo {
     let spec = obj.data.get("spec");
-    let conditions = conditions(obj.data.get("status"));
+    let conditions = conditions(obj.data.get("status"), obj.metadata.generation);
     let problem = failing(&conditions, "No controller has accepted it: is the controller it names running?");
     let (age_days, age_seconds, created_at) = age(obj);
     GatewayClassInfo {
@@ -126,7 +160,7 @@ pub(crate) fn gateway_info(obj: &DynamicObject) -> GatewayInfo {
         .map(|l| {
             let name = json_str(Some(l), "name").to_string();
             let st = listener_status.iter().find(|s| json_str(Some(s), "name") == name);
-            let conditions = conditions(st);
+            let conditions = conditions(st, obj.metadata.generation);
             let protocol = json_str(Some(l), "protocol").to_string();
             let tls = l.get("tls");
             let tls_mode = match (tls, json_str(tls, "mode")) {
@@ -149,7 +183,7 @@ pub(crate) fn gateway_info(obj: &DynamicObject) -> GatewayInfo {
             }
         })
         .collect();
-    let conditions = conditions(status);
+    let conditions = conditions(status, obj.metadata.generation);
     let problem = failing(&conditions, "No controller has reported on it: is its GatewayClass's controller running?").or_else(|| {
         listeners.iter().find_map(|l| l.problem.as_ref().map(|p| format!("Listener {}: {p}", l.name)))
     });
@@ -241,6 +275,7 @@ fn backend(b: &Value, route_ns: &str) -> RouteBackendInfo {
     let kind = json_str(Some(b), "kind");
     let ns = json_str(Some(b), "namespace");
     RouteBackendInfo {
+        group: json_str(Some(b), "group").to_string(),
         kind: if kind.is_empty() { "Service".to_string() } else { kind.to_string() },
         namespace: if ns.is_empty() { route_ns.to_string() } else { ns.to_string() },
         name: json_str(Some(b), "name").to_string(),
@@ -281,7 +316,7 @@ pub(crate) fn route_info(kind: &str, obj: &DynamicObject) -> RouteInfo {
             let r = parent_ref(Some(p), &namespace);
             // Each controller that serves the parent reports its own entry.
             let entries: Vec<&Value> = reported.iter().filter(|s| parent_ref(s.get("parentRef"), &namespace) == r).collect();
-            let conditions: Vec<PodConditionInfo> = entries.iter().flat_map(|s| conditions(Some(s))).collect();
+            let conditions: Vec<PodConditionInfo> = entries.iter().flat_map(|s| conditions(Some(s), obj.metadata.generation)).collect();
             let section = match (r.section.as_str(), r.port) {
                 ("", None) => String::new(),
                 (s, None) => s.to_string(),
@@ -293,6 +328,7 @@ pub(crate) fn route_info(kind: &str, obj: &DynamicObject) -> RouteInfo {
                 problem: failing(&conditions, "No controller has reported on it: the parent may not exist, or its controller is not running"),
                 conditions,
                 section,
+                group: r.group,
                 kind: r.kind,
                 namespace: r.namespace,
                 name: r.name,
@@ -379,7 +415,8 @@ pub async fn get_gateway_api(context_name: &str) -> Result<GatewayApiResult, Str
         routes.extend(take(list).iter().map(|o| route_info(kind, o)));
     }
     Ok(GatewayApiResult {
-        installed: served.iter().any(|ar| ar.kind == "Gateway"),
+        // The group is served; a kind it does not serve is simply empty.
+        installed: true,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
         classes,
         gateways,
@@ -424,7 +461,7 @@ mod tests {
         assert_eq!(ok.parents[0].section, "https");
         assert_eq!(ok.hostnames, vec!["web.example.com"]);
         assert_eq!(ok.rules[0].matches, vec!["PathPrefix /"]);
-        assert_eq!(ok.rules[0].backends[0], RouteBackendInfo { kind: "Service".into(), namespace: "app".into(), name: "web".into(), port: Some(80), weight: None });
+        assert_eq!(ok.rules[0].backends[0], RouteBackendInfo { group: String::new(), kind: "Service".into(), namespace: "app".into(), name: "web".into(), port: Some(80), weight: None });
 
         // An implementation's own condition counts like the standard ones.
         let no_endpoints = route(json!({"parents": [{"parentRef": parent, "conditions": [
@@ -443,6 +480,51 @@ mod tests {
             {"type": "Accepted", "status": "True"}
         ]}]}));
         assert!(!other_section.healthy);
+    }
+
+    #[test]
+    fn a_condition_for_an_older_spec_is_not_the_current_verdict() {
+        let route = |observed: i64| {
+            route_info(
+                "HTTPRoute",
+                &obj(json!({
+                    "apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                    "metadata": {"name": "web", "namespace": "app", "generation": 2},
+                    "spec": {"parentRefs": [{"name": "gw"}]},
+                    "status": {"parents": [{"parentRef": {"name": "gw"}, "conditions": [
+                        {"type": "Accepted", "status": "True", "reason": "Accepted", "observedGeneration": observed}
+                    ]}]}
+                })),
+            )
+        };
+        assert!(route(2).healthy);
+        let stale = route(1);
+        assert!(!stale.healthy);
+        assert_eq!(
+            stale.problem.as_deref(),
+            Some("app/gw: Accepted is Unknown (not yet decided): Stale — True (Accepted) for generation 1; the spec is at generation 2, which its controller has not reported on yet")
+        );
+        // The parent keeps its group, for telling a Gateway API Gateway from another group's.
+        assert_eq!(stale.parents[0].group, GROUP);
+    }
+
+    #[test]
+    fn a_negative_polarity_condition_is_a_fault_when_true() {
+        let gw = |conflicted: &str| {
+            gateway_info(&obj(json!({
+                "apiVersion": "gateway.networking.k8s.io/v1", "kind": "Gateway",
+                "metadata": {"name": "gw", "namespace": "infra"},
+                "spec": {"gatewayClassName": "envoy", "listeners": [{"name": "http", "protocol": "HTTP", "port": 80}]},
+                "status": {"conditions": [{"type": "Accepted", "status": "True"}, {"type": "Programmed", "status": "True"}], "listeners": [
+                    {"name": "http", "attachedRoutes": 1, "conditions": [
+                        {"type": "Programmed", "status": "True"},
+                        {"type": "Conflicted", "status": conflicted, "reason": if conflicted == "True" { "HostnameConflict" } else { "NoConflicts" }}
+                    ]}
+                ]}
+            })))
+        };
+        assert!(gw("False").healthy, "{:?}", gw("False").problem);
+        assert_eq!(gw("True").problem.as_deref(), Some("Listener http: Conflicted is True: HostnameConflict"));
     }
 
     #[test]
@@ -470,7 +552,10 @@ mod tests {
         let b = backend(&json!({"kind": "Service", "name": "api", "namespace": "other", "port": 8080, "weight": 90}), "app");
         assert_eq!((b.namespace.as_str(), b.port, b.weight), ("other", Some(8080), Some(90)));
         let s3 = backend(&json!({"group": "example.com", "kind": "Bucket", "name": "b"}), "app");
-        assert_eq!((s3.kind.as_str(), s3.namespace.as_str(), s3.port), ("Bucket", "app", None));
+        assert_eq!((s3.group.as_str(), s3.kind.as_str(), s3.namespace.as_str(), s3.port), ("example.com", "Bucket", "app", None));
+        // A Service of another API group is not a core Service.
+        let imported = backend(&json!({"group": "multicluster.x-k8s.io", "kind": "Service", "name": "api"}), "app");
+        assert_eq!((imported.group.as_str(), imported.kind.as_str()), ("multicluster.x-k8s.io", "Service"));
     }
 
     #[test]
@@ -525,7 +610,7 @@ mod tests {
         let ctx = std::env::var("GATEWAY_TEST_CONTEXT").expect("set GATEWAY_TEST_CONTEXT");
         let r = get_gateway_api(&ctx).await.unwrap();
         println!(
-            "installed={} error={} classes={} gateways={} (unhealthy {}) routes={} (unhealthy {}) by kind={:?} listeners={} attached={}",
+            "installed={} error={} classes={} gateways={} (unhealthy {}) routes={} (unhealthy {}) by kind={:?} listeners={} attached={} stale conditions={}",
             r.installed,
             r.error.is_some(),
             r.classes.len(),
@@ -536,6 +621,11 @@ mod tests {
             ROUTE_KINDS.iter().map(|k| (*k, r.routes.iter().filter(|x| x.kind == *k).count())).collect::<Vec<_>>(),
             r.gateways.iter().map(|g| g.listeners.len()).sum::<usize>(),
             r.gateways.iter().map(|g| g.attached_routes).sum::<i64>(),
+            r.classes.iter().flat_map(|c| &c.conditions)
+                .chain(r.gateways.iter().flat_map(|g| g.conditions.iter().chain(g.listeners.iter().flat_map(|l| &l.conditions))))
+                .chain(r.routes.iter().flat_map(|x| x.parents.iter().flat_map(|p| &p.conditions)))
+                .filter(|c| c.reason == "Stale")
+                .count(),
         );
         assert!(r.error.is_none(), "{:?}", r.error);
         // Every unhealthy object says why.

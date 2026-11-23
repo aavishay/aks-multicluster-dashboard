@@ -11,6 +11,7 @@ import type {
   GatewayClassInfo,
   GatewayInfo,
   RouteBackendInfo,
+  RouteParentInfo,
   RouteInfo,
   NamespaceInfo,
   PvcInfo,
@@ -1235,6 +1236,12 @@ interface ColumnDef<T> {
    * two pods both under a day old don't tie. Defaults to `value`.
    */
   sortValue?: (row: T) => string | number;
+  /**
+   * For an "enum" column whose cell lists several values (a route's
+   * Gateways): each one, for the dropdown to offer and the filter to match
+   * exactly. A row passes when any of them is selected. Defaults to `value`.
+   */
+  values?: (row: T) => string[];
 }
 
 interface ColumnFilterState {
@@ -1755,8 +1762,11 @@ function applyFilters<T>(tab: TabId, rows: T[], columns: ColumnDef<T>[]): T[] {
           if (f.max !== undefined && !(num <= f.max)) return false;
           return true;
         }
-        case "enum":
-          return !f.enumValues || f.enumValues.size === 0 || f.enumValues.has(String(v));
+        case "enum": {
+          if (!f.enumValues || f.enumValues.size === 0) return true;
+          const selected = f.enumValues;
+          return col.values ? col.values(row).some((x) => selected.has(x)) : selected.has(String(v));
+        }
         case "string":
         default:
           return !f.text || String(v).toLowerCase().includes(f.text.toLowerCase());
@@ -1791,7 +1801,7 @@ function filterRowCells<T>(tab: TabId, columns: ColumnDef<T>[], allRows: T[]): s
       }
 
       if (col.filter === "enum") {
-        const distinct = Array.from(new Set(allRows.map((r) => String(col.value(r))))).sort((a, b) =>
+        const distinct = Array.from(new Set(allRows.flatMap((r) => (col.values ? col.values(r) : [String(col.value(r))])))).sort((a, b) =>
           a.localeCompare(b),
         );
         const selected = current?.enumValues;
@@ -13587,10 +13597,38 @@ function renderIngresses(): string {
   });
 }
 
-/** A route's backend as text: `svc:80`, `other-ns/svc:80`, `Kind/name` for a non-Service. */
+const GATEWAY_API_GROUP = "gateway.networking.k8s.io";
+
+/**
+ * The Gateway API conditions with negative polarity, where True is the
+ * fault: a listener's Conflicted and OverlappingTLSConfig, a route parent's
+ * PartiallyInvalid. Mirrors `NEGATIVE` in gateway_api.rs.
+ */
+const GATEWAY_NEGATIVE_CONDITIONS = new Set(["Conflicted", "OverlappingTLSConfig", "PartiallyInvalid"]);
+
+/** Whether a Gateway API condition says all is well. */
+function gatewayConditionOk(c: PodConditionInfo): boolean {
+  return c.status === (GATEWAY_NEGATIVE_CONDITIONS.has(c.condition_type) ? "False" : "True");
+}
+
+/** A core Service: the one kind of backend the app has a panel for. */
+function isCoreService(b: RouteBackendInfo): boolean {
+  return b.kind === "Service" && b.group === "";
+}
+
+/** A Gateway API Gateway, as opposed to another group's kind of that name. */
+function isGatewayParent(p: RouteParentInfo): boolean {
+  return p.kind === "Gateway" && p.group === GATEWAY_API_GROUP;
+}
+
+/**
+ * A route's backend as text: `svc:80`, `other-ns/svc:80`, `Kind/name` for
+ * another core kind, `Kind.group/name` for another group's.
+ */
 function routeBackendText(b: RouteBackendInfo, routeNamespace: string): string {
   const ns = b.namespace !== routeNamespace ? `${b.namespace}/` : "";
-  return `${ns}${b.kind === "Service" ? b.name : `${b.kind}/${b.name}`}${b.port !== null ? `:${b.port}` : ""}`;
+  const kind = isCoreService(b) ? "" : `${b.kind}${b.group ? `.${b.group}` : ""}/`;
+  return `${ns}${kind}${b.name}${b.port !== null ? `:${b.port}` : ""}`;
 }
 
 /** Every backend a route sends to, once each. */
@@ -13598,14 +13636,19 @@ function routeBackends(r: RouteInfo): string[] {
   return [...new Set(r.rules.flatMap((rule) => rule.backends.map((b) => routeBackendText(b, r.namespace))))];
 }
 
-/** A parent as `ns/name`, with the kind when it is not a Gateway. */
-function routeParentText(p: { kind: string; namespace: string; name: string }): string {
-  return `${p.kind === "Gateway" ? "" : `${p.kind}/`}${p.namespace}/${p.name}`;
+/**
+ * A parent as `ns/name` for a Gateway, `Kind/ns/name` for another kind and
+ * `Kind.group/ns/name` for another group's: one text per parent, which the
+ * Routes tab's Gateways filter matches exactly.
+ */
+function routeParentText(p: RouteParentInfo): string {
+  if (isGatewayParent(p)) return `${p.namespace}/${p.name}`;
+  return `${p.kind}${p.group && p.group !== GATEWAY_API_GROUP ? `.${p.group}` : ""}/${p.namespace}/${p.name}`;
 }
 
-/** The first condition that is not True, short: `BackendsAvailable False: EndpointsNotFound`. */
+/** The first condition that is not well, short: `BackendsAvailable False: EndpointsNotFound`. */
 function firstFailingCondition(conditions: PodConditionInfo[]): string | null {
-  const c = conditions.find((x) => x.status !== "True");
+  const c = conditions.find((x) => !gatewayConditionOk(x));
   return c ? `${c.condition_type} ${c.status || "Unknown"}${c.reason ? `: ${c.reason}` : ""}` : null;
 }
 
@@ -13729,7 +13772,7 @@ function renderRoutes(): string {
     { key: "namespace", label: "Namespace", value: (x) => x.r.namespace, filter: "enum" },
     { key: "name", label: "Name", value: (x) => x.r.name, filter: "string" },
     { key: "hostnames", label: "Hostnames", value: (x) => x.r.hostnames.join(", "), filter: "string" },
-    { key: "parents", label: "Gateways", value: (x) => x.r.parents.map(routeParentText).join(", "), filter: "string" },
+    { key: "parents", label: "Gateways", value: (x) => x.r.parents.map(routeParentText).join(", "), values: (x) => x.r.parents.map(routeParentText), filter: "enum" },
     { key: "backends", label: "Backends", value: (x) => routeBackends(x.r).join(", "), filter: "string" },
     { key: "status", label: "Status", value: (x) => routeStatus(x.r), filter: "enum" },
     resourceAgeColumn((x) => x.r),
@@ -13754,7 +13797,7 @@ function renderRoutes(): string {
         <td class="truncate" title="${esc(r.parents.map((p) => `${routeParentText(p)}${p.section ? ` (${p.section})` : ""}`).join("\n"))}">${
           r.parents
             .map((p) =>
-              p.kind === "Gateway"
+              isGatewayParent(p)
                 ? `<button type="button" onclick="window.__app.openResourceDetail(${jsArg(ctx)},'Gateway',${jsArg(p.namespace)},${jsArg(p.name)})" class="hover:text-series-blue hover:underline"><span class="text-ink-muted">${esc(p.namespace)}/</span>${esc(p.name)}</button>`
                 : esc(routeParentText(p)),
             )
@@ -13775,7 +13818,7 @@ function viewRoutesForGateway(ctx: string, namespace: string, name: string) {
   state.yamlEdit = null;
   state.filterState.routes = {
     cluster: { enumValues: new Set([ctx]) },
-    parents: { text: `${namespace}/${name}` },
+    parents: { enumValues: new Set([`${namespace}/${name}`]) },
   };
   state.unhealthyOnly.routes = false;
   state.activeTab = "routes";
@@ -14603,7 +14646,7 @@ function renderResourceOverview(rd: ResourceDetailState): string {
       ),
     );
     rows.push(overviewRow("Created", created(c)));
-    return `${banner}<div>${rows.join("")}</div>${renderConditionsSection(c.conditions)}`;
+    return `${banner}<div>${rows.join("")}</div>${renderConditionsSection(c.conditions, gatewayConditionOk)}`;
   } else if (kind === "Gateway") {
     const res = state.gatewayApi.get(ctx);
     const g = res?.gateways.find((x) => x.namespace === namespace && x.name === name);
@@ -14635,7 +14678,7 @@ function renderResourceOverview(rd: ResourceDetailState): string {
     );
     // Attached as the routes' own status says, failing first.
     const attached = (res?.routes ?? [])
-      .filter((r) => r.parents.some((p) => p.kind === "Gateway" && p.namespace === namespace && p.name === name))
+      .filter((r) => r.parents.some((p) => isGatewayParent(p) && p.namespace === namespace && p.name === name))
       .sort((a, b) => Number(a.healthy) - Number(b.healthy) || a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name));
     const shown = attached.slice(0, 15);
     const routes = attached.length
@@ -14650,7 +14693,7 @@ function renderResourceOverview(rd: ResourceDetailState): string {
           <div><button type="button" onclick="window.__app.viewRoutesForGateway(${jsArg(ctx)},${jsArg(namespace)},${jsArg(name)})" class="text-sm text-series-blue hover:underline">${attached.length > shown.length ? `all ${attached.length} in the Routes tab` : "view in the Routes tab"}</button></div>`,
         )
       : "";
-    return `${banner}<div>${rows.join("")}</div>${listeners}${routes}${renderConditionsSection(g.conditions)}`;
+    return `${banner}<div>${rows.join("")}</div>${listeners}${routes}${renderConditionsSection(g.conditions, gatewayConditionOk)}`;
   } else if (kind === "HTTPRoute" || kind === "GRPCRoute" || kind === "TLSRoute" || kind === "TCPRoute" || kind === "UDPRoute") {
     const r = state.gatewayApi.get(ctx)?.routes.find((x) => x.kind === kind && x.namespace === namespace && x.name === name);
     if (!r) return gone;
@@ -14665,11 +14708,11 @@ function renderResourceOverview(rd: ResourceDetailState): string {
             .map(
               (p) => `
           <div class="rounded-md border border-gridline/60 px-3 py-2 text-sm">
-            <div class="flex items-center gap-2">${statusDot(!p.problem)}${p.kind === "Gateway" ? link(`${p.namespace}/${p.name}`, "Gateway", p.namespace, p.name) : esc(routeParentText(p))}${p.section ? `<span class="text-xs text-ink-muted">${esc(p.section)}</span>` : ""}</div>
+            <div class="flex items-center gap-2">${statusDot(!p.problem)}${isGatewayParent(p) ? link(`${p.namespace}/${p.name}`, "Gateway", p.namespace, p.name) : esc(routeParentText(p))}${p.section ? `<span class="text-xs text-ink-muted">${esc(p.section)}</span>` : ""}</div>
             ${
               p.conditions.length
                 ? `<div class="mt-1 flex flex-col gap-0.5 text-xs">${p.conditions
-                    .map((c) => `<div class="${conditionTone(c.status === "True")}">${esc(c.condition_type)} ${esc(c.status)}<span class="text-ink-secondary">${c.status === "True" ? "" : esc([c.reason, c.message].filter(Boolean).map((x) => ` · ${x}`).join(""))}</span></div>`)
+                    .map((c) => `<div class="${conditionTone(gatewayConditionOk(c))}">${esc(c.condition_type)} ${esc(c.status)}<span class="text-ink-secondary">${gatewayConditionOk(c) ? "" : esc([c.reason, c.message].filter(Boolean).map((x) => ` · ${x}`).join(""))}</span></div>`)
                     .join("")}</div>`
                 : `<div class="mt-1 text-xs text-status-critical">${esc(p.problem ?? "")}</div>`
             }
@@ -14682,7 +14725,7 @@ function renderResourceOverview(rd: ResourceDetailState): string {
     const backendCell = (b: RouteBackendInfo, split: boolean) => {
       const label = routeBackendText(b, namespace);
       const weight = split && b.weight !== null ? ` <span class="text-ink-muted">weight ${b.weight}</span>` : "";
-      return `${b.kind === "Service" ? link(label, "Service", b.namespace, b.name) : esc(label)}${weight}`;
+      return `${isCoreService(b) ? link(label, "Service", b.namespace, b.name) : esc(label)}${weight}`;
     };
     const rules = r.rules.length
       ? overviewSection(

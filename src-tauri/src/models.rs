@@ -1399,6 +1399,8 @@ pub struct RouteInfo {
 /// controller reported about the attachment.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct RouteParentInfo {
+    /// `gateway.networking.k8s.io` unless the route names another group.
+    pub group: String,
     pub kind: String,
     pub namespace: String,
     pub name: String,
@@ -1424,6 +1426,8 @@ pub struct RouteRuleInfo {
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct RouteBackendInfo {
+    /// Empty, the core group, unless the route names another.
+    pub group: String,
     /// `Service` unless the route names another kind.
     pub kind: String,
     /// The route's own namespace unless it names another.
