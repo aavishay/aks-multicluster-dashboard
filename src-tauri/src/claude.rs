@@ -4436,20 +4436,23 @@ fn render_pvc_volume(
     lines.join("\n")
 }
 
-/// Whether a volume's CSI driver is installed, and on how many nodes. That
-/// no node runs it is said only of a driver its CSIDriver object confirms:
-/// an in-tree provisioner (kubernetes.io/azure-file) is in no CSINode.
+/// Whether a volume's CSI driver is installed, and on how many nodes. An
+/// in-tree provisioner (`kubernetes.io/azure-file`, which the PVC diagnosis
+/// can pass from a class) is no CSI driver and in no CSINode, by design; any
+/// other name is a CSI driver, and one no node runs — uninstalled with its
+/// CSIDriver object, or never installed — cannot mount its volumes anywhere.
 fn render_csi_driver(csi: &Option<Result<k8s::PvcCsiDriver, String>>) -> Option<String> {
     match csi {
         None => None,
         Some(Err(e)) => Some(format!("(CSI driver unavailable: {e})")),
+        Some(Ok(d)) if d.name.starts_with("kubernetes.io/") => Some(format!("provisioner {}: in-tree, not a CSI driver", d.name)),
         Some(Ok(d)) => Some(format!(
             "CSI driver {}: {}; on {} of {} nodes{}",
             d.name,
-            if d.registered { "registered" } else { "NO CSIDriver OBJECT (not installed, or an in-tree provisioner)" },
+            if d.registered { "registered" } else { "NO CSIDriver OBJECT: the driver is not installed" },
             d.on_nodes,
             d.nodes,
-            if d.registered && d.nodes > 0 && d.on_nodes == 0 { " — NO NODE CAN MOUNT ITS VOLUMES" } else { "" }
+            if d.nodes > 0 && d.on_nodes == 0 { " — NO NODE CAN MOUNT ITS VOLUMES" } else { "" }
         )),
     }
 }
@@ -6836,26 +6839,31 @@ fn render_pv_claim(pv: &k8s_openapi::api::core::v1::PersistentVolume, claim: &Op
     }
 }
 
-/// Whether the claim its claimRef names is the one bound to it: the same
-/// object, where the claimRef records its uid, and naming it back.
-fn claim_is_this_volumes(pv: &k8s_openapi::api::core::v1::PersistentVolume, claim: &k8s_openapi::api::core::v1::PersistentVolumeClaim) -> bool {
-    let recorded = pv.spec.as_ref().and_then(|s| s.claim_ref.as_ref()).and_then(|r| r.uid.as_ref());
-    recorded.is_none_or(|uid| claim.metadata.uid.as_ref() == Some(uid)) && claim.spec.as_ref().and_then(|s| s.volume_name.as_deref()) == pv.metadata.name.as_deref()
-}
-
 /// The pods that use the volume: those mounting its claim, when that claim
-/// is the one bound to it.
+/// is the one its claimRef means — the same object, where the claimRef
+/// records its uid — and names it back, or names no volume yet, its pods
+/// then waiting on this bind.
 fn render_pv_pods(
     pv: &k8s_openapi::api::core::v1::PersistentVolume,
     claim: &Option<Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>, String>>,
     pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
 ) -> String {
-    match claim {
-        None => "(no claimRef, so no pod uses it)".to_string(),
-        Some(Err(e)) => format!("(its claim could not be read, so which pods use it is unknown: {e})"),
-        Some(Ok(None)) => "(its claim no longer exists, so no pod uses it)".to_string(),
-        Some(Ok(Some(c))) if claim_is_this_volumes(pv, c) => render_pvc_pods(c, pods),
-        Some(Ok(Some(_))) => "(the claim of that name is not the one bound to it — a newer object, or bound to another volume — so its pods do not use this one)".to_string(),
+    let claim_ref = pv.spec.as_ref().and_then(|s| s.claim_ref.as_ref());
+    let c = match claim {
+        None if claim_ref.is_some() => return "(its claimRef names no namespace or name, so no claim, and no pod, uses it)".to_string(),
+        None => return "(no claimRef, so no pod uses it)".to_string(),
+        Some(Err(e)) => return format!("(its claim could not be read, so which pods use it is unknown: {e})"),
+        Some(Ok(None)) => return "(its claim no longer exists, so no pod uses it)".to_string(),
+        Some(Ok(Some(c))) => c,
+    };
+    let recorded = claim_ref.and_then(|r| r.uid.as_ref());
+    if recorded.is_some_and(|uid| c.metadata.uid.as_ref() != Some(uid)) {
+        return "(the claim of that name is a newer object than the one bound to it, so its pods do not use this volume)".to_string();
+    }
+    match c.spec.as_ref().and_then(|s| s.volume_name.as_deref()).filter(|v| !v.is_empty()) {
+        Some(v) if Some(v) == pv.metadata.name.as_deref() => render_pvc_pods(c, pods),
+        Some(other) => format!("(its claim is bound to another volume, {other}, so its pods do not use this one)"),
+        None => format!("(its claim has not bound yet — it names no volume — so these pods wait on the bind:)\n{}", render_pvc_pods(c, pods)),
     }
 }
 
@@ -11814,7 +11822,12 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         // An in-tree provisioner is in no CSINode, and that is no fault.
         assert_eq!(
             render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "kubernetes.io/azure-file".into(), registered: false, on_nodes: 0, nodes: 3 }))).as_deref(),
-            Some("CSI driver kubernetes.io/azure-file: NO CSIDriver OBJECT (not installed, or an in-tree provisioner); on 0 of 3 nodes")
+            Some("provisioner kubernetes.io/azure-file: in-tree, not a CSI driver")
+        );
+        // A CSI driver uninstalled with its CSIDriver object still cannot mount anything.
+        assert_eq!(
+            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "blob.csi.azure.com".into(), registered: false, on_nodes: 0, nodes: 3 }))).as_deref(),
+            Some("CSI driver blob.csi.azure.com: NO CSIDriver OBJECT: the driver is not installed; on 0 of 3 nodes — NO NODE CAN MOUNT ITS VOLUMES")
         );
 
         // Pods are the volume's only through the claim bound to it.
@@ -11824,8 +11837,17 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             "status": { "phase": "Running", "conditions": [{ "type": "Ready", "status": "True" }] }
         })).unwrap()]);
         assert!(render_pv_pods(&released, &Some(Ok(Some(claim("old-uid", "pvc-123")))), &mounting).contains("db-0"));
-        assert!(render_pv_pods(&released, &Some(Ok(Some(claim("new-uid", "pvc-other")))), &mounting).starts_with("(the claim of that name is not the one bound to it"));
-        assert!(render_pv_pods(&released, &Some(Ok(Some(claim("old-uid", "pvc-other")))), &mounting).contains("do not use this one"), "same object, but now bound to another volume");
+        assert_eq!(render_pv_pods(&released, &Some(Ok(Some(claim("new-uid", "pvc-other")))), &mounting), "(the claim of that name is a newer object than the one bound to it, so its pods do not use this volume)");
+        assert_eq!(render_pv_pods(&released, &Some(Ok(Some(claim("old-uid", "pvc-other")))), &mounting), "(its claim is bound to another volume, pvc-other, so its pods do not use this one)");
+        // The same claim, not bound yet: its pods wait on this volume.
+        let waiting = render_pv_pods(&released, &Some(Ok(Some(claim("old-uid", "")))), &mounting);
+        assert!(waiting.starts_with("(its claim has not bound yet — it names no volume — so these pods wait on the bind:)\n") && waiting.contains("db-0"), "{waiting}");
+        // A claimRef that records no uid, as an admin's reservation does.
+        let reserved = pv(serde_json::json!({ "phase": "Available" }), serde_json::json!({ "spec": { "claimRef": { "namespace": "app", "name": "data", "uid": null } } }));
+        assert!(render_pv_pods(&reserved, &Some(Ok(Some(claim("any-uid", "")))), &mounting).contains("wait on the bind"));
+        assert_eq!(render_pv_pods(&reserved, &None, &mounting), "(its claimRef names no namespace or name, so no claim, and no pod, uses it)");
+        let unclaimed = pv(serde_json::json!({ "phase": "Available" }), serde_json::json!({ "spec": { "claimRef": null } }));
+        assert_eq!(render_pv_pods(&unclaimed, &None, &mounting), "(no claimRef, so no pod uses it)");
         assert_eq!(render_pv_pods(&released, &Some(Err("forbidden".into())), &mounting), "(its claim could not be read, so which pods use it is unknown: forbidden)");
         assert_eq!(render_pv_pods(&released, &Some(Ok(None)), &mounting), "(its claim no longer exists, so no pod uses it)");
     }
