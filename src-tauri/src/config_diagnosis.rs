@@ -102,7 +102,12 @@ impl ConsumerPod {
 pub struct Consumer {
     pub kind: String,
     pub name: String,
+    /// How its template uses it; for a consumer found only from its pods,
+    /// how the first of them does.
     pub uses: Vec<Use>,
+    /// Whether `uses` is the template's, against which a pod that differs is
+    /// of an older revision. Pods alone carry no order of revisions.
+    pub from_template: bool,
     pub pods: Vec<ConsumerPod>,
 }
 
@@ -221,8 +226,10 @@ pub(crate) fn uses_in(spec: &PodSpec, kind: &str, name: &str) -> Vec<Use> {
     out
 }
 
-/// When the object's contents last changed: the newest managedFields entry
-/// that owns its data, else the newest entry, else its creation.
+/// The latest its contents can have changed: the newest managedFields entry
+/// that owns its data, else the newest entry. `None` when no entry records a
+/// time: its creation is the earliest its contents could have changed, not
+/// the latest, and says nothing of a later edit.
 pub(crate) fn last_change(meta: &ObjectMeta) -> Option<DateTime<Utc>> {
     let entries = meta.managed_fields.iter().flatten();
     let touches_data = |f: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ManagedFieldsEntry| {
@@ -234,7 +241,6 @@ pub(crate) fn last_change(meta: &ObjectMeta) -> Option<DateTime<Utc>> {
         .filter_map(|f| f.time.as_ref().map(|t| t.0.utc()))
         .max()
         .or_else(|| entries.filter_map(|f| f.time.as_ref().map(|t| t.0.utc())).max())
-        .or_else(|| meta.creation_timestamp.as_ref().map(|t| t.0.utc()))
 }
 
 fn consumer_pod(p: &Pod, uses: Vec<Use>) -> ConsumerPod {
@@ -321,7 +327,7 @@ pub(crate) fn consumers(templates: Vec<(String, String, Option<LabelSelector>, P
                 consumer_pod(&pods[*i], uses.clone())
             })
             .collect();
-        out.push(Consumer { kind: wkind, name: wname, uses, pods: mine });
+        out.push(Consumer { kind: wkind, name: wname, uses, from_template: true, pods: mine });
     }
     for (i, uses) in &pod_uses {
         if claimed.contains(i) {
@@ -330,10 +336,25 @@ pub(crate) fn consumers(templates: Vec<(String, String, Option<LabelSelector>, P
         let (ckind, cname) = controller_of(&pods[*i]);
         match out.iter_mut().find(|c| c.kind == ckind && c.name == cname) {
             Some(c) => c.pods.push(consumer_pod(&pods[*i], uses.clone())),
-            None => out.push(Consumer { kind: ckind, name: cname, uses: uses.clone(), pods: vec![consumer_pod(&pods[*i], uses.clone())] }),
+            None => out.push(Consumer { kind: ckind, name: cname, uses: uses.clone(), from_template: false, pods: vec![consumer_pod(&pods[*i], uses.clone())] }),
         }
     }
     out
+}
+
+/// Annotations that may hold a copy of the object, values and all: kubectl's
+/// last-applied, and any other tool's that keeps one (kapp's
+/// `kapp.k14s.io/original`) — known by being structured or long, as no list
+/// of tools can be complete. Replaced by their size.
+pub(crate) fn mask_copying_annotations(manifest: &mut Value) {
+    let Some(a) = manifest.pointer_mut("/metadata/annotations").and_then(Value::as_object_mut) else { return };
+    for (key, value) in a.iter_mut() {
+        let Some(text) = value.as_str() else { continue };
+        let trimmed = text.trim_start();
+        if key == k8s::LAST_APPLIED_ANNOTATION || trimmed.starts_with('{') || trimmed.starts_with('[') || text.len() > 256 {
+            *value = Value::String(format!("<not sent: {} bytes>", text.len()));
+        }
+    }
 }
 
 /// A ConfigMap's manifest with each value replaced by its size: one can hold
@@ -350,10 +371,17 @@ fn configmap_manifest(cm: &ConfigMap) -> Result<String, String> {
     }
     if let Some(meta) = v.get_mut("metadata").and_then(Value::as_object_mut) {
         meta.remove("managedFields");
-        if let Some(a) = meta.get_mut("annotations").and_then(Value::as_object_mut) {
-            a.remove(k8s::LAST_APPLIED_ANNOTATION);
-        }
     }
+    mask_copying_annotations(&mut v);
+    serde_yaml::to_string(&v).map_err(|e| format!("Failed to render YAML: {e}"))
+}
+
+/// A Secret's manifest as the Secret panel redacts it, its values replaced
+/// by their sizes, and any annotation that may copy them masked too.
+fn secret_manifest(s: &Secret) -> Result<String, String> {
+    let yaml = crate::secrets::redacted_manifest(s)?.yaml_without_managed_fields;
+    let mut v: Value = serde_yaml::from_str(&yaml).map_err(|e| format!("Failed to read the redacted Secret: {e}"))?;
+    mask_copying_annotations(&mut v);
     serde_yaml::to_string(&v).map_err(|e| format!("Failed to render YAML: {e}"))
 }
 
@@ -494,7 +522,7 @@ pub async fn get_config_diagnostics(context_name: &str, kind: &str, namespace: &
             let keys: Vec<(String, usize)> = s.data.iter().flatten().map(|(k, v)| (k.clone(), v.0.len())).collect();
             let overview = crate::secrets::overview_of(&s);
             let tls = (overview.secret_type == "kubernetes.io/tls" || s.data.as_ref().is_some_and(|d| d.contains_key("tls.crt"))).then(|| k8s::tls_secret_of(&s));
-            let manifest = crate::secrets::redacted_manifest(&s)?.yaml_without_managed_fields;
+            let manifest = secret_manifest(&s)?;
             (keys, s.immutable.unwrap_or(false), s.metadata, Some(overview), tls, Vec::new(), manifest)
         }
         other => return Err(format!("{other} is not a ConfigMap or a Secret")),
@@ -625,8 +653,10 @@ mod tests {
             "managedFields": [{ "manager": "kubectl", "operation": "Update", "time": "2026-11-23T10:00:00Z", "fieldsType": "FieldsV1", "fieldsV1": { "f:data": { "f:mode": {} }, "f:metadata": { "f:labels": {} } } }]
         })).unwrap();
         assert_eq!(last_change(&relabelled).map(|t| t.to_rfc3339()).as_deref(), Some("2026-11-23T10:00:00+00:00"));
+        // Without managedFields only its creation is known, the earliest its
+        // contents could have changed, not the latest.
         let bare: ObjectMeta = serde_json::from_value(json!({ "name": "app", "creationTimestamp": "2026-01-01T00:00:00Z" })).unwrap();
-        assert_eq!(last_change(&bare).map(|t| t.to_rfc3339()).as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        assert_eq!(last_change(&bare), None);
     }
 
     #[test]
@@ -646,6 +676,34 @@ mod tests {
         // A whole-volume mount is refreshed whatever the container's age.
         let volume = vec![Use::Volume { volume: "conf".into(), keys: vec![], mounts: vec![("app".into(), "/etc/app".into(), false)], optional: false }];
         assert_eq!(pod(volume, vec![("app", Some("2026-11-01T00:00:00Z"))]).may_be_stale(changed), Some(false));
+    }
+
+    #[test]
+    fn a_containers_current_instance_start_is_read_from_its_state() {
+        let p: Pod = serde_json::from_value(json!({
+            "metadata": { "name": "web-1" }, "spec": { "containers": [] },
+            "status": { "phase": "Running", "containerStatuses": [
+                { "name": "app", "ready": true, "restartCount": 0, "image": "i", "imageID": "", "state": { "running": { "startedAt": "2026-11-24T09:00:00Z" } } },
+                { "name": "done", "ready": false, "restartCount": 0, "image": "i", "imageID": "", "state": { "terminated": { "exitCode": 0, "startedAt": "2026-11-24T08:00:00Z" } } },
+                { "name": "crashing", "ready": false, "restartCount": 4, "image": "i", "imageID": "", "state": { "waiting": { "reason": "CrashLoopBackOff" } } }
+            ] }
+        })).unwrap();
+        let at = |t: &str| Some(chrono::DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc));
+        assert_eq!(consumer_pod(&p, vec![]).container_started, vec![("app".to_string(), at("2026-11-24T09:00:00Z")), ("done".to_string(), at("2026-11-24T08:00:00Z")), ("crashing".to_string(), None)]);
+    }
+
+    #[test]
+    fn annotations_that_may_copy_the_object_are_masked() {
+        let mut v = json!({ "metadata": { "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"data\":{\"password\":\"hunter2\"}}",
+            "kapp.k14s.io/original": "{\"data\":{\"tls.key\":\"LS0tLS1CRUdJTi\"}}",
+            "long": "x".repeat(300),
+            "meta.helm.sh/release-name": "web"
+        } } });
+        mask_copying_annotations(&mut v);
+        let text = v.to_string();
+        assert!(!text.contains("hunter2") && !text.contains("LS0tLS1CRUdJTi") && !text.contains("xxxx"), "{text}");
+        assert!(text.contains("\"meta.helm.sh/release-name\":\"web\""), "short plain annotations stay: {text}");
     }
 
     #[test]

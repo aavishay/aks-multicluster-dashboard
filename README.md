@@ -228,9 +228,10 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   mapped keys it lacks, and ESO's controller with its log lines about it;
 - a ConfigMap or Secret: who uses it and how — env vars and envFrom, which
   are read only when a container starts, volume mounts, which refresh within
-  about a minute, and `subPath` mounts, which never do — so the pods that
-  started before its last change are named; the keys they ask for that are
-  not there; what writes it (Helm, an ExternalSecret, cert-manager), which
+  about a minute, and `subPath` mounts, which never do — so the pods with a
+  container that reads it only at start and began before its last recorded
+  write are named (that write, from managedFields, is when the contents
+  changed at the latest); the keys they ask for that are not there; what writes it (Helm, an ExternalSecret, cert-manager), which
   would undo a manual edit; for a TLS Secret, its certificate against the
   hosts it serves; and for a Secret, the Ingresses, Gateway listeners and
   ServiceAccounts that name it. Key names and sizes only: no value is sent;
