@@ -4436,7 +4436,9 @@ fn render_pvc_volume(
     lines.join("\n")
 }
 
-/// Whether a volume's CSI driver is installed, and on how many nodes.
+/// Whether a volume's CSI driver is installed, and on how many nodes. That
+/// no node runs it is said only of a driver its CSIDriver object confirms:
+/// an in-tree provisioner (kubernetes.io/azure-file) is in no CSINode.
 fn render_csi_driver(csi: &Option<Result<k8s::PvcCsiDriver, String>>) -> Option<String> {
     match csi {
         None => None,
@@ -4447,7 +4449,7 @@ fn render_csi_driver(csi: &Option<Result<k8s::PvcCsiDriver, String>>) -> Option<
             if d.registered { "registered" } else { "NO CSIDriver OBJECT (not installed, or an in-tree provisioner)" },
             d.on_nodes,
             d.nodes,
-            if d.nodes > 0 && d.on_nodes == 0 { " — NO NODE CAN MOUNT ITS VOLUMES" } else { "" }
+            if d.registered && d.nodes > 0 && d.on_nodes == 0 { " — NO NODE CAN MOUNT ITS VOLUMES" } else { "" }
         )),
     }
 }
@@ -6834,6 +6836,29 @@ fn render_pv_claim(pv: &k8s_openapi::api::core::v1::PersistentVolume, claim: &Op
     }
 }
 
+/// Whether the claim its claimRef names is the one bound to it: the same
+/// object, where the claimRef records its uid, and naming it back.
+fn claim_is_this_volumes(pv: &k8s_openapi::api::core::v1::PersistentVolume, claim: &k8s_openapi::api::core::v1::PersistentVolumeClaim) -> bool {
+    let recorded = pv.spec.as_ref().and_then(|s| s.claim_ref.as_ref()).and_then(|r| r.uid.as_ref());
+    recorded.is_none_or(|uid| claim.metadata.uid.as_ref() == Some(uid)) && claim.spec.as_ref().and_then(|s| s.volume_name.as_deref()) == pv.metadata.name.as_deref()
+}
+
+/// The pods that use the volume: those mounting its claim, when that claim
+/// is the one bound to it.
+fn render_pv_pods(
+    pv: &k8s_openapi::api::core::v1::PersistentVolume,
+    claim: &Option<Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>, String>>,
+    pods: &Result<Vec<k8s_openapi::api::core::v1::Pod>, String>,
+) -> String {
+    match claim {
+        None => "(no claimRef, so no pod uses it)".to_string(),
+        Some(Err(e)) => format!("(its claim could not be read, so which pods use it is unknown: {e})"),
+        Some(Ok(None)) => "(its claim no longer exists, so no pod uses it)".to_string(),
+        Some(Ok(Some(c))) if claim_is_this_volumes(pv, c) => render_pvc_pods(c, pods),
+        Some(Ok(Some(_))) => "(the claim of that name is not the one bound to it — a newer object, or bound to another volume — so its pods do not use this one)".to_string(),
+    }
+}
+
 fn render_pv_class(name: Option<&str>, class: &Option<Result<Option<k8s_openapi::api::storage::v1::StorageClass>, String>>) -> String {
     match (name, class) {
         (None, _) | (_, None) => "(it names no StorageClass)".to_string(),
@@ -6870,12 +6895,8 @@ pub async fn build_pv_diagnosis_payload(context_name: &str, name: &str) -> Resul
     let claim = redact::redact(&render_pv_claim(&d.pv, &d.claim));
     let storage = redact::redact(&storage.join("\n"));
     let nodes = redact::redact(&render_pv_nodes(&d.affinity_nodes));
-    let bound = d.pv.spec.as_ref().is_some_and(|s| s.claim_ref.is_some());
     let attachments = redact::redact(&render_pvc_attachments(&d.attachments, true));
-    let pods = redact::redact(&match &d.claim {
-        Some(Ok(Some(c))) if bound => render_pvc_pods(c, &d.pods),
-        _ => "(no claim, so no pod uses it)".to_string(),
-    });
+    let pods = redact::redact(&render_pv_pods(&d.pv, &d.claim, &d.pods));
     let events = redact::redact(&render_nap_events(&d.events, "(no events for this PersistentVolume)", false, 20));
     let manifest = redact::redact(&d.manifest);
 
@@ -11648,7 +11669,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             largest = largest.max(payload.approx_tokens);
             claim_gone += p.contains("THAT CLAIM NO LONGER EXISTS") as usize;
             no_node += p.contains("NO NODE OF THE") as usize;
-            with_pods += (!p.contains("(no pod mounts it)") && !p.contains("(no claim, so no pod uses it)")) as usize;
+            with_pods += !["(no pod mounts it)", "so no pod uses it)", "do not use this one)", "which pods use it is unknown"].iter().any(|s| p.contains(s)) as usize;
             if v.status != "Bound" {
                 explained += (p.contains("RELEASED") || p.contains("FAILED") || p.contains("Available: bound to no claim") || p.contains("PENDING")) as usize;
             }
@@ -11707,6 +11728,23 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "disk.csi.azure.com".into(), registered: true, on_nodes: 0, nodes: 3 }))).as_deref(),
             Some("CSI driver disk.csi.azure.com: registered; on 0 of 3 nodes — NO NODE CAN MOUNT ITS VOLUMES")
         );
+        // An in-tree provisioner is in no CSINode, and that is no fault.
+        assert_eq!(
+            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "kubernetes.io/azure-file".into(), registered: false, on_nodes: 0, nodes: 3 }))).as_deref(),
+            Some("CSI driver kubernetes.io/azure-file: NO CSIDriver OBJECT (not installed, or an in-tree provisioner); on 0 of 3 nodes")
+        );
+
+        // Pods are the volume's only through the claim bound to it.
+        let mounting: Result<Vec<k8s_openapi::api::core::v1::Pod>, String> = Ok(vec![serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "db-0", "namespace": "app" },
+            "spec": { "nodeName": "n1", "containers": [{ "name": "db" }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data" } }] },
+            "status": { "phase": "Running", "conditions": [{ "type": "Ready", "status": "True" }] }
+        })).unwrap()]);
+        assert!(render_pv_pods(&released, &Some(Ok(Some(claim("old-uid", "pvc-123")))), &mounting).contains("db-0"));
+        assert!(render_pv_pods(&released, &Some(Ok(Some(claim("new-uid", "pvc-other")))), &mounting).starts_with("(the claim of that name is not the one bound to it"));
+        assert!(render_pv_pods(&released, &Some(Ok(Some(claim("old-uid", "pvc-other")))), &mounting).contains("do not use this one"), "same object, but now bound to another volume");
+        assert_eq!(render_pv_pods(&released, &Some(Err("forbidden".into())), &mounting), "(its claim could not be read, so which pods use it is unknown: forbidden)");
+        assert_eq!(render_pv_pods(&released, &Some(Ok(None)), &mounting), "(its claim no longer exists, so no pod uses it)");
     }
 
     /// Builds a diagnosis for every ScaledObject and ScaledJob on a cluster and
