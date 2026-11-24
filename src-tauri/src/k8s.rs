@@ -3894,7 +3894,7 @@ pub(crate) fn pvc_usage_from_summary(summary: &serde_json::Value, node: &str, na
 
 pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str) -> Result<PvcDiagnostics, String> {
     use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim};
-    use k8s_openapi::api::storage::v1::{CSIDriver, CSINode, StorageClass, VolumeAttachment};
+    use k8s_openapi::api::storage::v1::{StorageClass, VolumeAttachment};
 
     let client = client_for_context(context_name).await?;
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ApiResource::erase::<PersistentVolumeClaim>(&()));
@@ -3975,15 +3975,7 @@ pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str
         .filter(|p| !p.is_empty());
     let csi_fut = async {
         let driver = provisioner.clone()?;
-        let drivers: Api<CSIDriver> = Api::all(client.clone());
-        let nodes: Api<CSINode> = Api::all(client.clone());
-        let (registered, csi_nodes) = tokio::join!(drivers.get_opt(&driver), nodes.list(&all));
-        Some((|| {
-            let registered = registered.map_err(|e| format!("Failed to read CSIDriver '{driver}': {e}"))?.is_some();
-            let csi_nodes = csi_nodes.map_err(|e| format!("Failed to list CSINodes: {e}"))?.items;
-            let on_nodes = csi_nodes.iter().filter(|n| n.spec.drivers.iter().any(|d| d.name == driver)).count();
-            Ok(PvcCsiDriver { name: driver.clone(), registered, on_nodes, nodes: csi_nodes.len() })
-        })())
+        Some(read_csi_driver(&client, &driver).await)
     };
 
     // The events of pods that mount it and are not ready.
@@ -4042,6 +4034,119 @@ pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str
         attachments,
         usage,
     })
+}
+
+/// Whether a CSI driver is installed: a CSIDriver object for it, and how
+/// many nodes' CSINodes list it — a node without it cannot mount its volumes.
+pub(crate) async fn read_csi_driver(client: &kube::Client, driver: &str) -> Result<PvcCsiDriver, String> {
+    use k8s_openapi::api::storage::v1::{CSIDriver, CSINode};
+    let drivers: Api<CSIDriver> = Api::all(client.clone());
+    let nodes: Api<CSINode> = Api::all(client.clone());
+    let all = ListParams::default();
+    let (registered, csi_nodes) = tokio::join!(drivers.get_opt(driver), nodes.list(&all));
+    let registered = registered.map_err(|e| format!("Failed to read CSIDriver '{driver}': {e}"))?.is_some();
+    let csi_nodes = csi_nodes.map_err(|e| format!("Failed to list CSINodes: {e}"))?.items;
+    let on_nodes = csi_nodes.iter().filter(|n| n.spec.drivers.iter().any(|d| d.name == driver)).count();
+    Ok(PvcCsiDriver { name: driver.to_string(), registered, on_nodes, nodes: csi_nodes.len() })
+}
+
+/// What a PersistentVolume diagnosis reads. Only the volume is required.
+pub struct PvDiagnostics {
+    pub pv: k8s_openapi::api::core::v1::PersistentVolume,
+    pub manifest: String,
+    pub events: Result<Vec<EventInfo>, String>,
+    /// The claim its claimRef names, `None` inside when it no longer
+    /// exists; `None` when it names none.
+    pub claim: Option<Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>, String>>,
+    /// Its storage class, `None` inside when no class of that name exists;
+    /// `None` when it names none.
+    pub storage_class: Option<Result<Option<k8s_openapi::api::storage::v1::StorageClass>, String>>,
+    pub csi_driver: Option<Result<PvcCsiDriver, String>>,
+    pub attachments: Result<Vec<k8s_openapi::api::storage::v1::VolumeAttachment>, String>,
+    /// How many nodes satisfy its node affinity, how many of those are
+    /// ready and schedulable, and how many nodes there are; `None` when it
+    /// has no node affinity.
+    pub affinity_nodes: Option<Result<(usize, usize, usize), String>>,
+    /// The pods that mount its claim.
+    pub pods: Result<Vec<Pod>, String>,
+}
+
+pub async fn get_pv_diagnostics(context_name: &str, name: &str) -> Result<PvDiagnostics, String> {
+    use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim};
+    use k8s_openapi::api::storage::v1::{StorageClass, VolumeAttachment};
+
+    let client = client_for_context(context_name).await?;
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ApiResource::erase::<PersistentVolume>(&()));
+    let mut obj = api.get(name).await.map_err(|e| get_error("PersistentVolume", name, e))?;
+    let pv: PersistentVolume = serde_json::to_value(&obj).and_then(serde_json::from_value).map_err(|e| format!("Failed to read PersistentVolume '{name}': {e}"))?;
+    if let Some(a) = obj.metadata.annotations.as_mut() {
+        a.remove(LAST_APPLIED_ANNOTATION);
+    }
+    let manifest = object_manifest(obj)?.yaml_without_managed_fields;
+    let spec = pv.spec.clone().unwrap_or_default();
+    let claim_ref = spec.claim_ref.clone().and_then(|c| Some((c.namespace.filter(|n| !n.is_empty())?, c.name.filter(|n| !n.is_empty())?)));
+    let class_name = spec.storage_class_name.clone().filter(|c| !c.is_empty());
+    let terms: Vec<k8s_openapi::api::core::v1::NodeSelectorTerm> = spec.node_affinity.as_ref().and_then(|a| a.required.as_ref()).map(|r| r.node_selector_terms.clone()).unwrap_or_default();
+
+    let events_fut = async {
+        let params = ListParams::default().fields(&format!("involvedObject.kind=PersistentVolume,involvedObject.name={name}"));
+        Api::<Event>::all(client.clone())
+            .list(&params)
+            .await
+            .map(|l| {
+                let mut items = l.items;
+                items.sort_by(|a, b| event_last_seen(b).cmp(&event_last_seen(a)));
+                items.into_iter().map(event_to_info).collect::<Vec<_>>()
+            })
+            .map_err(|e| format!("Failed to list events for PersistentVolume '{name}': {e}"))
+    };
+    let claim_fut = async {
+        let (ns, claim) = claim_ref.as_ref()?;
+        Some(Api::<PersistentVolumeClaim>::namespaced(client.clone(), ns).get_opt(claim).await.map_err(|e| get_error("PersistentVolumeClaim", claim, e)))
+    };
+    let pods_fut = async {
+        let Some((ns, claim)) = claim_ref.as_ref() else { return Ok(Vec::new()) };
+        Api::<Pod>::namespaced(client.clone(), ns)
+            .list(&ListParams::default())
+            .await
+            .map(|l| l.items.into_iter().filter(|p| pod_mounts_claim(p, claim)).collect())
+            .map_err(|e| format!("Failed to list pods in '{ns}': {e}"))
+    };
+    let class_fut = async {
+        let class = class_name.as_ref()?;
+        Some(Api::<StorageClass>::all(client.clone()).get_opt(class).await.map_err(|e| get_error("StorageClass", class, e)))
+    };
+    let csi_fut = async {
+        let driver = spec.csi.as_ref().map(|c| c.driver.clone())?;
+        Some(read_csi_driver(&client, &driver).await)
+    };
+    let attachments_fut = async {
+        Api::<VolumeAttachment>::all(client.clone())
+            .list(&ListParams::default())
+            .await
+            .map(|l| l.items.into_iter().filter(|a| a.spec.source.persistent_volume_name.as_deref() == Some(name)).collect())
+            .map_err(|e| format!("Failed to list VolumeAttachments: {e}"))
+    };
+    let nodes_fut = async {
+        if terms.is_empty() {
+            return None;
+        }
+        Some(Api::<Node>::all(client.clone()).list(&ListParams::default()).await.map_err(|e| format!("Failed to list nodes: {e}")).map(|l| {
+            let matching: Vec<&Node> = l.items.iter().filter(|n| terms.iter().any(|t| node_term_matches(t, n))).collect();
+            let usable = matching
+                .iter()
+                .filter(|n| {
+                    !n.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false)
+                        && n.status.as_ref().and_then(|s| s.conditions.as_ref()).is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+                })
+                .count();
+            (matching.len(), usable, l.items.len())
+        }))
+    };
+    let (events, claim, pods, storage_class, csi_driver, attachments, affinity_nodes) =
+        tokio::join!(events_fut, claim_fut, pods_fut, class_fut, csi_fut, attachments_fut, nodes_fut);
+
+    Ok(PvDiagnostics { pv, manifest, events, claim, storage_class, csi_driver, attachments, affinity_nodes, pods })
 }
 
 /// What a Job or CronJob diagnosis reads.
