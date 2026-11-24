@@ -7099,11 +7099,14 @@ fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: 
             (false, false, "Pod") => " (a pod no controller owns)",
             (false, false, _) => " (seen from its pods: its template could not be read, or is of a kind not read)",
         };
-        lines.push(format!("- {} {}{source}: {}", c.kind, c.name, uses_text(&c.uses)));
+        let live: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|&p| !finished(p)).collect();
+        // Found from its pods alone: how a running one uses it, not a
+        // finished one's past use; any finished pod's when none runs.
+        let heading = if c.from_template { c.uses.as_slice() } else { live.first().map_or(c.uses.as_slice(), |p| p.uses.as_slice()) };
+        lines.push(format!("- {} {}{source}: {}", c.kind, c.name, uses_text(heading)));
         // Each distinct way its running pods use it, with how many do so: the
         // template's first, whose next pods ask for it however many run now,
         // then each other way.
-        let live: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|&p| !finished(p)).collect();
         let mut ways: Vec<(&[Use], usize)> =
             if c.from_template { vec![(c.uses.as_slice(), live.iter().filter(|p| p.uses == c.uses).count())] } else { Vec::new() };
         for p in live.iter().filter(|p| !c.from_template || p.uses != c.uses) {
@@ -11318,6 +11321,17 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(out.contains("\n  MISSING KEY legacy (asked for by 1 of its pods): "), "{out}");
         assert!(!out.contains("older revision") && !out.contains("STARTED BEFORE"), "no revision order from pods alone, and the finished pod is not stale: {out}");
         assert!(!out.contains("MISSING KEY region"), "a key only a finished pod asked for fails nothing: {out}");
+        // A finished pod listed first does not stand for the running ones.
+        let mut gone = pod("api-0", env(), "2026-11-20T00:00:00Z", false);
+        gone.phase = "Failed".into();
+        let first_finished = ConfigDiagnostics {
+            consumers: vec![Consumer { kind: "Deployment".into(), name: "api".into(), uses: env(), from_template: false, template_unused: false,
+                pods: vec![gone, pod("api-c", legacy(), "2026-11-24T11:00:00Z", true)] }],
+            ..from_pods
+        };
+        let out = render_config_consumers(&first_finished, now);
+        assert!(out.contains("- Deployment api (seen from its pods: its template could not be read, or is of a kind not read): key legacy as an env var in web\n"), "{out}");
+        assert!(!out.contains("ways:") && !out.contains("envFrom"), "{out}");
 
         // A Secret whose workloads could not all be listed still names its other users.
         let secret = ConfigDiagnostics {
@@ -11329,7 +11343,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             gateways: Ok(vec![("infra/gw listener https (*.example.com)".into(), "*.example.com".into())]),
             service_accounts: Ok(vec!["builder as an image pull secret, so every pod running as it gets it".into()]),
             volumes: Ok(vec!["PersistentVolume pv-files: spec.csi.nodeStageSecretRef".into(), "(Failed to list StorageClasses: forbidden)".into()]),
-            ..from_pods
+            ..first_finished
         };
         assert_eq!(
             render_config_consumers(&secret, now),
