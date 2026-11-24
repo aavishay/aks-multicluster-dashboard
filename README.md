@@ -228,8 +228,9 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   mapped keys it lacks, and ESO's controller with its log lines about it;
 - a PersistentVolume: its phase and for how long — a Released one under
   Retain keeps its data and binds no new claim until its claimRef is
-  cleared — the claim it is bound to and whether that claim still exists
-  and names it back, its StorageClass and CSI driver, how many nodes satisfy
+  cleared — the claim it is bound to (or, by a claimRef with no uid,
+  reserved for) and whether that claim exists and names it back, its
+  StorageClass and CSI driver, how many nodes satisfy
   its node affinity (a zonal disk in a zone with no nodes can never attach),
   its VolumeAttachments with their errors, and the pods that mount its claim;
 - a ConfigMap or Secret: who uses it and how — env vars and envFrom, which
@@ -239,8 +240,11 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   write are named (that write, from managedFields, is when the contents
   changed at the latest); the keys they ask for that are not there; what writes it (Helm, an ExternalSecret, cert-manager), which
   would undo a manual edit; for a TLS Secret, its certificate against the
-  hosts it serves; and for a Secret, the Ingresses, Gateway listeners and
-  ServiceAccounts that name it. Key names and sizes only: no value is sent;
+  hosts its Ingresses and Gateway listeners serve; and for a Secret, the
+  volumes that read it as their credentials (an azureFile share's key, a CSI
+  driver's secret) and the PersistentVolumes, StorageClasses, Ingresses,
+  Gateway listeners and ServiceAccounts that name it. Key names and sizes
+  only: no value is sent;
 - a ServiceAccount: the Azure identity it names and the federated
   credential that identity needs for this cluster — the cluster's issuer and
   the account's subject — the pods that run as it with whether each carries
