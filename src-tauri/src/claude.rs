@@ -6958,7 +6958,7 @@ fn render_config_object(d: &crate::config_diagnosis::ConfigDiagnostics, now: chr
             t.to_rfc3339(),
             job_span((now - t).num_seconds())
         ),
-        None => "last write to its contents: unknown".to_string(),
+        None => "last write to its contents: unknown — no managedFields entry records one, so whether a consumer has seen a change cannot be told".to_string(),
     });
     let mut writers = d.writers.clone();
     if let Some(o) = &d.secret {
@@ -7016,9 +7016,9 @@ fn render_config_use(u: &crate::config_diagnosis::Use) -> String {
     }
 }
 
-/// Who uses it and how; for each, the keys it asks for that are not there,
-/// and its pods that started before the last change while using it in a way
-/// that only a restart refreshes.
+/// Who uses it and how; for each way it is used, the keys asked for that are
+/// not there; and the pods with a container that reads it only at start and
+/// began before its last recorded write.
 fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
     use crate::config_diagnosis::Use;
     let consumers = &d.consumers;
@@ -7026,34 +7026,77 @@ fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: 
     let uses_text = |uses: &[Use]| uses.iter().map(render_config_use).collect::<Vec<_>>().join("; ");
     let mut lines = Vec::new();
     if !consumers.is_empty() {
-        let pods: usize = consumers.iter().map(|c| c.pods.len()).sum();
-        lines.push(format!("{} workload{} use{} it, with {pods} pod{}:", consumers.len(), if consumers.len() == 1 { "" } else { "s" }, if consumers.len() == 1 { "s" } else { "" }, if pods == 1 { "" } else { "s" }));
+        let n = consumers.len();
+        let (s1, s2) = if n == 1 { ("", "s") } else { ("s", "") };
+        lines.push(if d.pods_known {
+            let pods: usize = consumers.iter().map(|c| c.pods.len()).sum();
+            format!("{n} workload{s1} use{s2} it, with {pods} pod{}:", if pods == 1 { "" } else { "s" })
+        } else {
+            format!("{n} workload{s1} use{s2} it (their pods could not be listed):")
+        });
     }
+    let missing = |uses: &[Use]| -> Vec<(String, bool, &'static str)> {
+        uses.iter()
+            .flat_map(|u| match u {
+                Use::EnvKey { key, optional, .. } => vec![(key.clone(), *optional, "its containers fail to start with CreateContainerConfigError")],
+                Use::Volume { keys, optional, .. } => {
+                    keys.iter().map(|k| (k.clone(), *optional, "the volume cannot be mounted, so its pods stay in ContainerCreating (FailedMount)")).collect()
+                }
+                _ => vec![],
+            })
+            .filter(|(k, _, _)| !has(k))
+            .collect()
+    };
+    let plural = |n: usize| if n == 1 { "pod" } else { "pods" };
     for c in consumers.iter().take(DIAGNOSE_CONFIG_CONSUMERS) {
-        lines.push(format!("- {} {}: {}", c.kind, c.name, uses_text(&c.uses)));
-        for u in &c.uses {
-            let (asked, optional, fails): (Vec<&String>, bool, &str) = match u {
-                Use::EnvKey { key, optional, .. } => (vec![key], *optional, "its containers fail to start with CreateContainerConfigError"),
-                Use::Volume { keys, optional, .. } => (keys.iter().collect(), *optional, "the volume cannot be mounted, so its pods stay in ContainerCreating (FailedMount)"),
-                _ => (vec![], false, ""),
-            };
-            for k in asked.into_iter().filter(|k| !has(k)) {
-                lines.push(if optional { format!("  key {k} is absent, and optional: it is simply left out") } else { format!("  MISSING KEY {k}: {fails}") });
+        let source = if c.from_template { "" } else { " (seen from its pods: its template could not be read, or is not one listed)" };
+        lines.push(format!("- {} {}{source}: {}", c.kind, c.name, uses_text(&c.uses)));
+        // Each distinct way it is used, with how many pods use it so: the
+        // template's first, then each other way its pods do.
+        let mut ways: Vec<(&[Use], usize)> = vec![(c.uses.as_slice(), c.pods.iter().filter(|p| p.uses == c.uses).count())];
+        for p in c.pods.iter().filter(|p| p.uses != c.uses) {
+            match ways.iter_mut().find(|(u, _)| *u == p.uses.as_slice()) {
+                Some(w) => w.1 += 1,
+                None => ways.push((p.uses.as_slice(), 1)),
             }
         }
+        if ways.len() > 1 {
+            if c.from_template {
+                for (uses, n) in &ways[1..] {
+                    lines.push(format!("  {n} of its pods {} it differently, from an older revision: {}", if *n == 1 { "uses" } else { "use" }, uses_text(uses)));
+                }
+            } else {
+                lines.push(format!("  its pods use it in {} ways:", ways.len()));
+                for (uses, n) in &ways {
+                    lines.push(format!("  - {n} {}: {}", plural(*n), uses_text(uses)));
+                }
+            }
+        }
+        let mut said: Vec<String> = Vec::new();
+        for (i, (uses, n)) in ways.iter().enumerate() {
+            // Who asks for the key, when more than one way does.
+            let who = match (ways.len() > 1, i == 0 && c.from_template) {
+                (false, _) => String::new(),
+                (true, true) => " (its template asks for it)".to_string(),
+                (true, false) => format!(" (asked for by {n} of its pods)"),
+            };
+            for (k, optional, fails) in missing(uses) {
+                let line = if optional { format!("  key {k} is absent, and optional: it is simply left out{who}") } else { format!("  MISSING KEY {k}{who}: {fails}") };
+                if !said.contains(&line) {
+                    said.push(line);
+                }
+            }
+        }
+        lines.extend(said);
         if c.pods.is_empty() {
             lines.push(if d.pods_known { "  no pod of it is running".to_string() } else { "  (its pods unavailable)".to_string() });
             continue;
         }
-        // Pods of an older revision use it as their own spec says, not as
-        // the template now does: each is judged by its own.
-        let older: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|p| p.uses != c.uses).collect();
-        if !older.is_empty() {
-            lines.push(format!("  {} of its pods use it differently, from an older revision: {}", older.len(), uses_text(&older[0].uses)));
-        }
         let ready = c.pods.iter().filter(|p| p.ready).count();
         let mut pods_line = format!("  pods: {ready} of {} ready", c.pods.len());
-        let at_start: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|p| p.uses.iter().any(Use::needs_restart)).collect();
+        // A finished pod never runs again: whatever it read, it holds nothing now.
+        let finished = |p: &&crate::config_diagnosis::ConsumerPod| matches!(p.phase.as_str(), "Succeeded" | "Failed");
+        let at_start: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|p| !finished(p) && p.uses.iter().any(Use::needs_restart)).collect();
         if let (false, Some(changed)) = (at_start.is_empty(), d.last_change) {
             let stale = at_start.iter().filter(|p| p.may_be_stale(changed) == Some(true)).count();
             let unknown = at_start.iter().filter(|p| p.may_be_stale(changed).is_none()).count();
@@ -7121,7 +7164,9 @@ pub async fn build_config_diagnosis_payload(context_name: &str, kind: &str, name
     let now = chrono::Utc::now();
     let object = redact::redact(&render_config_object(&d, now));
     let consumers = redact::redact(&render_config_consumers(&d, now));
-    let pod_events = redact::redact(&if d.pod_events.is_empty() {
+    let pod_events = redact::redact(&if !d.pods_known {
+        "(pods could not be listed, so their Warning events were not read)".to_string()
+    } else if d.pod_events.is_empty() {
         "(no consumer pod is failing)".to_string()
     } else {
         d.pod_events.iter().map(|(p, e)| format!("pod {p}:\n{}", render_nap_events(e, "(no Warning events)", false, 10))).collect::<Vec<_>>().join("\n\n")
@@ -11153,13 +11198,13 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             tls: None,
             writers: vec!["Helm release web".into()],
             consumers: vec![
-                Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(),
+                Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(), from_template: true,
                     pods: vec![pod("web-1", env(), "2026-11-23T09:00:00Z", true), pod("web-2", env(), "2026-11-24T11:00:00Z", false)] },
-                Consumer { kind: "Deployment".into(), name: "worker".into(),
+                Consumer { kind: "Deployment".into(), name: "worker".into(), from_template: true,
                     uses: vec![Use::Volume { volume: "conf".into(), keys: vec!["app.yaml".into(), "extra.yaml".into()], mounts: vec![("worker".into(), "/etc/app.yaml".into(), true)], optional: true }],
                     pods: vec![] },
                 // Mid-rollout from env vars to a volume: the old pod is judged by its own env use.
-                Consumer { kind: "StatefulSet".into(), name: "db".into(), uses: volume(),
+                Consumer { kind: "StatefulSet".into(), name: "db".into(), uses: volume(), from_template: true,
                     pods: vec![pod("db-0", volume(), "2026-11-01T00:00:00Z", true), pod("db-1", vec![Use::EnvFrom { container: "db".into(), optional: false }], "2026-11-01T00:00:00Z", true)] },
             ],
             consumer_errors: vec!["Failed to list CronJobs: forbidden".into()],
@@ -11188,13 +11233,51 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
              key extra.yaml is absent, and optional: it is simply left out\n  \
              no pod of it is running\n\
              - StatefulSet db: every key mounted at db:/etc/db\n  \
-             1 of its pods use it differently, from an older revision: every key as env vars (envFrom) in db\n  \
+             1 of its pods uses it differently, from an older revision: every key as env vars (envFrom) in db\n  \
              pods: 2 of 2 ready; 1 HAVE A CONTAINER THAT READS IT ONLY AT START AND STARTED BEFORE ITS LAST RECORDED WRITE (2h 0m ago), so they may still have the old contents — that write may have changed only its metadata; a restart makes sure; a mounted volume's files are refreshed within about a minute of a change, and the application has to re-read them\n\
              (Failed to list CronJobs: forbidden: what uses it may be incomplete)"
         );
-        let unknown_pods = ConfigDiagnostics { pods_known: false, consumers: vec![Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(), pods: vec![] }], ..d };
-        assert!(render_config_consumers(&unknown_pods, now).contains("\n  (its pods unavailable)"));
-        let unused = ConfigDiagnostics { consumers: vec![], consumer_errors: vec![], ..unknown_pods };
+        let unknown_pods = ConfigDiagnostics { pods_known: false, consumers: vec![Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(), from_template: true, pods: vec![] }], ..d };
+        let out = render_config_consumers(&unknown_pods, now);
+        assert!(out.starts_with("1 workload uses it (their pods could not be listed):") && out.contains("\n  (its pods unavailable)"), "{out}");
+
+        // Pods alone, in two ways, one of which asks for a key that is gone;
+        // and a finished pod is not stale.
+        let legacy = || vec![Use::EnvKey { container: "web".into(), key: "legacy".into(), optional: false }];
+        let mut done = pod("job-1", env(), "2026-11-20T00:00:00Z", false);
+        done.phase = "Succeeded".into();
+        let from_pods = ConfigDiagnostics {
+            pods_known: true,
+            consumers: vec![Consumer { kind: "Deployment".into(), name: "api".into(), uses: legacy(), from_template: false,
+                pods: vec![pod("api-a", legacy(), "2026-11-24T11:00:00Z", true), pod("api-b", volume(), "2026-11-24T11:00:00Z", true), done] }],
+            consumer_errors: vec!["Failed to list Deployments: forbidden".into()],
+            ..unknown_pods
+        };
+        let out = render_config_consumers(&from_pods, now);
+        assert!(out.contains("- Deployment api (seen from its pods: its template could not be read, or is not one listed): key legacy as an env var in web"), "{out}");
+        assert!(out.contains("\n  its pods use it in 3 ways:\n  - 1 pod: key legacy as an env var in web\n  - 1 pod: every key mounted at db:/etc/db\n  - 1 pod: every key as env vars (envFrom) in web; key region as an env var in web"), "{out}");
+        assert!(out.contains("\n  MISSING KEY legacy (asked for by 1 of its pods): ") && out.contains("\n  MISSING KEY region (asked for by 1 of its pods): "), "{out}");
+        assert!(!out.contains("older revision") && !out.contains("STARTED BEFORE"), "no revision order from pods alone, and the finished pod is not stale: {out}");
+
+        // A Secret whose workloads could not all be listed still names its other users.
+        let secret = ConfigDiagnostics {
+            secret: Some(crate::models::SecretOverview { secret_type: "kubernetes.io/tls".into(), ..Default::default() }),
+            consumers: vec![],
+            consumer_errors: vec!["Failed to list pods: forbidden".into()],
+            pods_known: false,
+            ingresses: Ok(vec![("web".into(), vec!["web.example.com".into()])]),
+            gateways: Ok(vec!["infra/gw listener https (*.example.com)".into()]),
+            service_accounts: Ok(vec!["builder as an image pull secret, so every pod running as it gets it".into()]),
+            ..from_pods
+        };
+        assert_eq!(
+            render_config_consumers(&secret, now),
+            "(Failed to list pods: forbidden: what uses it may be incomplete)\n\
+             - Ingress web: its TLS for web.example.com\n\
+             - Gateway infra/gw listener https (*.example.com): its certificate\n\
+             - ServiceAccount builder as an image pull secret, so every pod running as it gets it"
+        );
+        let unused = ConfigDiagnostics { consumers: vec![], consumer_errors: vec![], secret: None, ..secret };
         assert_eq!(render_config_consumers(&unused, now), "(nothing in app uses it: no pod or workload template names it)");
     }
 
