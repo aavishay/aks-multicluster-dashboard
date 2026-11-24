@@ -455,13 +455,15 @@ You diagnose Kubernetes ConfigMaps and Secrets for an experienced SRE: \
 whether what uses one sees what it holds now.
 
 You are given the object by its key names and sizes — never a value — \
-whether it is immutable, when its contents last changed as its \
-managedFields record it, and what writes it (an owner, Helm, cert-manager, \
-External Secrets); for a TLS Secret, its certificate's public fields \
+whether it is immutable, the last recorded write to its contents (from \
+managedFields: the contents changed at or before then, as a write to its \
+labels by the same manager moves it too), and what writes it (an owner, \
+Helm, cert-manager, External Secrets); for a TLS Secret, its certificate's public fields \
 checked against the hosts it serves. Then who uses it and how: each \
 workload's env vars, envFrom and volume mounts (with subPath), keys asked \
-for that are not there, how many of its pods started before the last \
-change; for a Secret, the Ingresses, Gateway listeners and ServiceAccounts \
+for that are not there, how many of its pods have a container that reads \
+it only at start and began before that write, and pods of an older \
+revision that use it differently; for a Secret, the Ingresses, Gateway listeners and ServiceAccounts \
 that name it. Then the Warning events of consumer pods that are not ready, \
 its events and its manifest with values replaced by sizes. Respond with:
 1. The most likely root cause, stated plainly.
@@ -471,9 +473,10 @@ the mount, the pod, or the field.
 
 Say which of these you are looking at, because the fixes differ:
 - A change has not reached its consumers: env vars and envFrom are read \
-when a container starts, and a subPath mount is never refreshed, so pods \
-started before the change still have the old contents — kubectl rollout \
-restart. A whole volume is refreshed within about a minute, but the \
+when a container starts, and a subPath mount is never refreshed, so a \
+container started before the change still has the old contents — kubectl \
+rollout restart. The write time is an upper bound, so say \"may\" unless the \
+user's account of when they changed it settles it. A whole volume is refreshed within about a minute, but the \
 application has to re-read the file. An immutable object cannot change at \
 all.
 - A key is missing: a required env key stops the container with \
@@ -6732,8 +6735,12 @@ fn render_config_object(d: &crate::config_diagnosis::ConfigDiagnostics, now: chr
         lines.push("IMMUTABLE: its contents cannot be changed; a new one has to be created and its consumers pointed at it".to_string());
     }
     lines.push(match d.last_change {
-        Some(t) => format!("contents last changed: {} ({} ago), as its managedFields record it", t.to_rfc3339(), job_span((now - t).num_seconds())),
-        None => "contents last changed: unknown".to_string(),
+        Some(t) => format!(
+            "last recorded write to its contents: {} ({} ago) — the newest write by a manager that owns its data, which may have changed only its metadata, so the contents changed at or before then",
+            t.to_rfc3339(),
+            job_span((now - t).num_seconds())
+        ),
+        None => "last write to its contents: unknown".to_string(),
     });
     let mut writers = d.writers.clone();
     if let Some(o) = &d.secret {
@@ -6796,18 +6803,16 @@ fn render_config_use(u: &crate::config_diagnosis::Use) -> String {
 /// that only a restart refreshes.
 fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
     use crate::config_diagnosis::Use;
-    let consumers = match &d.consumers {
-        Err(e) => return format!("(consumers unavailable: {e})"),
-        Ok(c) => c,
-    };
+    let consumers = &d.consumers;
     let has = |k: &str| d.keys.iter().any(|(x, _)| x == k);
+    let uses_text = |uses: &[Use]| uses.iter().map(render_config_use).collect::<Vec<_>>().join("; ");
     let mut lines = Vec::new();
     if !consumers.is_empty() {
         let pods: usize = consumers.iter().map(|c| c.pods.len()).sum();
         lines.push(format!("{} workload{} use{} it, with {pods} pod{}:", consumers.len(), if consumers.len() == 1 { "" } else { "s" }, if consumers.len() == 1 { "s" } else { "" }, if pods == 1 { "" } else { "s" }));
     }
     for c in consumers.iter().take(DIAGNOSE_CONFIG_CONSUMERS) {
-        lines.push(format!("- {} {}: {}", c.kind, c.name, c.uses.iter().map(render_config_use).collect::<Vec<_>>().join("; ")));
+        lines.push(format!("- {} {}: {}", c.kind, c.name, uses_text(&c.uses)));
         for u in &c.uses {
             let (asked, optional, fails): (Vec<&String>, bool, &str) = match u {
                 Use::EnvKey { key, optional, .. } => (vec![key], *optional, "its containers fail to start with CreateContainerConfigError"),
@@ -6819,24 +6824,35 @@ fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: 
             }
         }
         if c.pods.is_empty() {
-            lines.push("  no pod of it is running".to_string());
+            lines.push(if d.pods_known { "  no pod of it is running".to_string() } else { "  (its pods unavailable)".to_string() });
             continue;
+        }
+        // Pods of an older revision use it as their own spec says, not as
+        // the template now does: each is judged by its own.
+        let older: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|p| p.uses != c.uses).collect();
+        if !older.is_empty() {
+            lines.push(format!("  {} of its pods use it differently, from an older revision: {}", older.len(), uses_text(&older[0].uses)));
         }
         let ready = c.pods.iter().filter(|p| p.ready).count();
         let mut pods_line = format!("  pods: {ready} of {} ready", c.pods.len());
-        let restart = c.uses.iter().any(Use::needs_restart);
-        if let (true, Some(changed)) = (restart, d.last_change) {
-            let stale = c.pods.iter().filter(|p| p.started.is_some_and(|s| s < changed)).count();
+        let at_start: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|p| p.uses.iter().any(Use::needs_restart)).collect();
+        if let (false, Some(changed)) = (at_start.is_empty(), d.last_change) {
+            let stale = at_start.iter().filter(|p| p.may_be_stale(changed) == Some(true)).count();
+            let unknown = at_start.iter().filter(|p| p.may_be_stale(changed).is_none()).count();
             if stale > 0 {
                 pods_line.push_str(&format!(
-                    "; {stale} STARTED BEFORE ITS LAST CHANGE, so they still have the old contents until they restart ({} ago)",
+                    "; {stale} HAVE A CONTAINER THAT READS IT ONLY AT START AND STARTED BEFORE ITS LAST RECORDED WRITE ({} ago), so they may still have the old contents — that write may have changed only its metadata; a restart makes sure",
                     job_span((now - changed).num_seconds())
                 ));
-            } else {
-                pods_line.push_str("; all started after its last change");
+            } else if unknown == 0 {
+                pods_line.push_str("; every container that reads it only at start started after its last recorded write");
             }
-        } else if c.uses.iter().any(|u| matches!(u, Use::Volume { .. })) {
-            pods_line.push_str("; the volume's files are refreshed within about a minute of a change, and the application has to re-read them");
+            if unknown > 0 {
+                pods_line.push_str(&format!("; for {unknown}, when a container that reads it at start began is not known"));
+            }
+        }
+        if c.pods.iter().any(|p| p.uses.iter().any(Use::refreshed)) {
+            pods_line.push_str("; a mounted volume's files are refreshed within about a minute of a change, and the application has to re-read them");
         }
         lines.push(pods_line);
         for p in c.pods.iter().filter(|p| !p.ready && p.phase != "Succeeded").take(3) {
@@ -6845,6 +6861,9 @@ fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: 
     }
     if consumers.len() > DIAGNOSE_CONFIG_CONSUMERS {
         lines.push(format!("… and {} more workloads", consumers.len() - DIAGNOSE_CONFIG_CONSUMERS));
+    }
+    for e in &d.consumer_errors {
+        lines.push(format!("({e}: what uses it may be incomplete)"));
     }
     if d.name == "kube-root-ca.crt" {
         lines.push("(every pod's API-access volume also mounts it; those are not counted)".to_string());
@@ -10897,7 +10916,14 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         use crate::config_diagnosis::{ConfigDiagnostics, Consumer, ConsumerPod, Use};
         let at = |t: &str| chrono::DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&chrono::Utc);
         let now = at("2026-11-24T12:00:00Z");
-        let pod = |name: &str, started: &str, ready: bool| ConsumerPod { name: name.into(), started: Some(at(started)), ready, phase: "Running".into(), waiting: if ready { vec![] } else { vec!["web: CreateContainerConfigError".into()] } };
+        let env = || vec![Use::EnvFrom { container: "web".into(), optional: false }, Use::EnvKey { container: "web".into(), key: "region".into(), optional: false }];
+        let pod = |name: &str, uses: Vec<Use>, started: &str, ready: bool| ConsumerPod {
+            name: name.into(), ready, phase: "Running".into(),
+            waiting: if ready { vec![] } else { vec!["web: CreateContainerConfigError".into()] },
+            container_started: vec![("web".into(), if ready { Some(at(started)) } else { None }), ("db".into(), Some(at(started)))],
+            uses,
+        };
+        let volume = || vec![Use::Volume { volume: "conf".into(), keys: vec![], mounts: vec![("db".into(), "/etc/db".into(), false)], optional: false }];
         let d = ConfigDiagnostics {
             namespace: "app".into(),
             name: "web-config".into(),
@@ -10907,17 +10933,18 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             secret: None,
             tls: None,
             writers: vec!["Helm release web".into()],
-            consumers: Ok(vec![
-                Consumer { kind: "Deployment".into(), name: "web".into(),
-                    uses: vec![Use::EnvFrom { container: "web".into(), optional: false }, Use::EnvKey { container: "web".into(), key: "region".into(), optional: false }],
-                    pods: vec![pod("web-1", "2026-11-23T09:00:00Z", true), pod("web-2", "2026-11-24T11:00:00Z", false)] },
+            consumers: vec![
+                Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(),
+                    pods: vec![pod("web-1", env(), "2026-11-23T09:00:00Z", true), pod("web-2", env(), "2026-11-24T11:00:00Z", false)] },
                 Consumer { kind: "Deployment".into(), name: "worker".into(),
                     uses: vec![Use::Volume { volume: "conf".into(), keys: vec!["app.yaml".into(), "extra.yaml".into()], mounts: vec![("worker".into(), "/etc/app.yaml".into(), true)], optional: true }],
                     pods: vec![] },
-                Consumer { kind: "StatefulSet".into(), name: "db".into(),
-                    uses: vec![Use::Volume { volume: "conf".into(), keys: vec![], mounts: vec![("db".into(), "/etc/db".into(), false)], optional: false }],
-                    pods: vec![pod("db-0", "2026-11-01T00:00:00Z", true)] },
-            ]),
+                // Mid-rollout from env vars to a volume: the old pod is judged by its own env use.
+                Consumer { kind: "StatefulSet".into(), name: "db".into(), uses: volume(),
+                    pods: vec![pod("db-0", volume(), "2026-11-01T00:00:00Z", true), pod("db-1", vec![Use::EnvFrom { container: "db".into(), optional: false }], "2026-11-01T00:00:00Z", true)] },
+            ],
+            consumer_errors: vec!["Failed to list CronJobs: forbidden".into()],
+            pods_known: true,
             ingresses: Ok(vec![]),
             gateways: Ok(vec![]),
             service_accounts: Ok(vec![]),
@@ -10928,23 +10955,27 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(
             render_config_object(&d, now),
             "ConfigMap; 2 keys: app.yaml (2.1 KiB), mode (4 B)\n\
-             contents last changed: 2026-11-24T10:00:00+00:00 (2h 0m ago), as its managedFields record it\n\
+             last recorded write to its contents: 2026-11-24T10:00:00+00:00 (2h 0m ago) — the newest write by a manager that owns its data, which may have changed only its metadata, so the contents changed at or before then\n\
              written by: Helm release web — a change made by hand is overwritten on its next write"
         );
         assert_eq!(
             render_config_consumers(&d, now),
-            "3 workloads use it, with 3 pods:\n\
+            "3 workloads use it, with 4 pods:\n\
              - Deployment web: every key as env vars (envFrom) in web; key region as an env var in web\n  \
              MISSING KEY region: its containers fail to start with CreateContainerConfigError\n  \
-             pods: 1 of 2 ready; 1 STARTED BEFORE ITS LAST CHANGE, so they still have the old contents until they restart (2h 0m ago)\n  \
+             pods: 1 of 2 ready; 1 HAVE A CONTAINER THAT READS IT ONLY AT START AND STARTED BEFORE ITS LAST RECORDED WRITE (2h 0m ago), so they may still have the old contents — that write may have changed only its metadata; a restart makes sure\n  \
              - web-2: Running NOT READY — web: CreateContainerConfigError\n\
              - Deployment worker: keys app.yaml, extra.yaml mounted at worker:/etc/app.yaml through subPath, which is never refreshed (optional)\n  \
              key extra.yaml is absent, and optional: it is simply left out\n  \
              no pod of it is running\n\
              - StatefulSet db: every key mounted at db:/etc/db\n  \
-             pods: 1 of 1 ready; the volume's files are refreshed within about a minute of a change, and the application has to re-read them"
+             1 of its pods use it differently, from an older revision: every key as env vars (envFrom) in db\n  \
+             pods: 2 of 2 ready; 1 HAVE A CONTAINER THAT READS IT ONLY AT START AND STARTED BEFORE ITS LAST RECORDED WRITE (2h 0m ago), so they may still have the old contents — that write may have changed only its metadata; a restart makes sure; a mounted volume's files are refreshed within about a minute of a change, and the application has to re-read them\n\
+             (Failed to list CronJobs: forbidden: what uses it may be incomplete)"
         );
-        let unused = ConfigDiagnostics { consumers: Ok(vec![]), ..d };
+        let unknown_pods = ConfigDiagnostics { pods_known: false, consumers: vec![Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(), pods: vec![] }], ..d };
+        assert!(render_config_consumers(&unknown_pods, now).contains("\n  (its pods unavailable)"));
+        let unused = ConfigDiagnostics { consumers: vec![], consumer_errors: vec![], ..unknown_pods };
         assert_eq!(render_config_consumers(&unused, now), "(nothing in app uses it: no pod or workload template names it)");
     }
 

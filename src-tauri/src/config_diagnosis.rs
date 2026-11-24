@@ -6,8 +6,10 @@
 //! a pod started before the change keeps the old value until it restarts. A
 //! mounted volume is refreshed by the kubelet within about a minute — but a
 //! `subPath` mount never is, and the application still has to re-read the
-//! file. So the diagnosis reads the object's last change, as its
-//! managedFields record it, and each consumer's pods' start times.
+//! file. So the diagnosis reads the last write to the object's data, as its
+//! managedFields record it — an upper bound, as the same manager writing a
+//! label moves it too — and when each consumer container's current instance
+//! started.
 //!
 //! No value is read into the payload: a ConfigMap's and a Secret's keys are
 //! named with their sizes, a TLS certificate by its public fields.
@@ -31,7 +33,7 @@ pub enum Use {
     EnvFrom { container: String, optional: bool },
     /// Mounted as a volume, or as one source of a projected volume: the keys
     /// it picks (empty for all), and where each container mounts it, with
-    /// whether through `subPath`.
+    /// whether through `subPath` or `subPathExpr`.
     Volume { volume: String, keys: Vec<String>, mounts: Vec<(String, String, bool)>, optional: bool },
     /// A Secret as an image pull secret.
     PullSecret,
@@ -40,22 +42,59 @@ pub enum Use {
 impl Use {
     /// Whether a change reaches it only when the container restarts.
     pub fn needs_restart(&self) -> bool {
+        !self.restart_containers().is_empty()
+    }
+
+    /// The containers that read it only when they start: through env vars,
+    /// or a `subPath` mount, which is never refreshed.
+    pub fn restart_containers(&self) -> Vec<&str> {
         match self {
-            Use::EnvKey { .. } | Use::EnvFrom { .. } => true,
-            Use::Volume { mounts, .. } => mounts.iter().any(|(_, _, sub_path)| *sub_path),
-            Use::PullSecret => false,
+            Use::EnvKey { container, .. } | Use::EnvFrom { container, .. } => vec![container.as_str()],
+            Use::Volume { mounts, .. } => mounts.iter().filter(|(_, _, sub_path)| *sub_path).map(|(c, _, _)| c.as_str()).collect(),
+            Use::PullSecret => Vec::new(),
         }
+    }
+
+    /// Whether it is a volume mount the kubelet refreshes.
+    pub fn refreshed(&self) -> bool {
+        matches!(self, Use::Volume { mounts, .. } if mounts.iter().any(|(_, _, sub_path)| !*sub_path))
     }
 }
 
 /// A pod that uses it.
 pub struct ConsumerPod {
     pub name: String,
-    pub started: Option<DateTime<Utc>>,
     pub ready: bool,
     pub phase: String,
     /// `container: Reason` for each container waiting or last terminated.
     pub waiting: Vec<String>,
+    /// How this pod itself uses it, which for a pod of an older revision is
+    /// not how its workload's template does now.
+    pub uses: Vec<Use>,
+    /// When each container's current instance started; `None` for one
+    /// waiting to start, whose next start reads the contents as they are then.
+    pub container_started: Vec<(String, Option<DateTime<Utc>>)>,
+}
+
+impl ConsumerPod {
+    /// Whether a container that reads it only at start began before `changed`
+    /// and so may hold older contents: `None` when such a container's start is
+    /// not known.
+    pub fn may_be_stale(&self, changed: DateTime<Utc>) -> Option<bool> {
+        let mut unknown = false;
+        for container in self.uses.iter().flat_map(Use::restart_containers) {
+            match self.container_started.iter().find(|(c, _)| c == container) {
+                Some((_, Some(started))) if *started < changed => return Some(true),
+                Some(_) => {}
+                None => unknown = true,
+            }
+        }
+        if unknown {
+            None
+        } else {
+            Some(false)
+        }
+    }
 }
 
 /// A workload, or for pods no listed workload accounts for their controller,
@@ -75,7 +114,9 @@ pub struct ConfigDiagnostics {
     /// Each key and its size in bytes.
     pub keys: Vec<(String, usize)>,
     pub immutable: bool,
-    /// When its contents last changed, as managedFields record it.
+    /// The latest its contents can have changed: the newest write by a
+    /// manager that owns its data. That manager's write to another field (a
+    /// label) moves it too, so a change then is possible, not certain.
     pub last_change: Option<DateTime<Utc>>,
     /// A Secret's type and what writes it; `None` for a ConfigMap.
     pub secret: Option<crate::models::SecretOverview>,
@@ -83,7 +124,12 @@ pub struct ConfigDiagnostics {
     pub tls: Option<k8s::IngressTlsSecret>,
     /// What writes a ConfigMap: its owners and managed-by label.
     pub writers: Vec<String>,
-    pub consumers: Result<Vec<Consumer>, String>,
+    /// What uses it, from whatever could be read.
+    pub consumers: Vec<Consumer>,
+    /// The reads behind `consumers` that failed: the pods, or a workload kind.
+    pub consumer_errors: Vec<String>,
+    /// Whether its namespace's pods could be listed.
+    pub pods_known: bool,
     /// For a Secret: the Ingresses whose TLS names it, with their hosts.
     pub ingresses: Result<Vec<(String, Vec<String>)>, String>,
     /// For a Secret: the Gateway listeners whose certificate it is.
@@ -157,7 +203,14 @@ pub(crate) fn uses_in(spec: &PodSpec, kind: &str, name: &str) -> Vec<Use> {
                 .iter()
                 .flatten()
                 .chain(spec.containers.iter())
-                .flat_map(|c| c.volume_mounts.iter().flatten().filter(|m| m.name == v.name).map(|m| (c.name.clone(), m.mount_path.clone(), m.sub_path.as_deref().is_some_and(|s| !s.is_empty()))))
+                .flat_map(|c| {
+                    c.volume_mounts.iter().flatten().filter(|m| m.name == v.name).map(|m| {
+                        // subPathExpr is a subPath expanded from env vars, and as
+                        // little refreshed.
+                        let sub_path = [&m.sub_path, &m.sub_path_expr].iter().any(|p| p.as_deref().is_some_and(|s| !s.is_empty()));
+                        (c.name.clone(), m.mount_path.clone(), sub_path)
+                    })
+                })
                 .collect();
             out.push(Use::Volume { volume: v.name.clone(), keys, mounts, optional });
         }
@@ -184,11 +237,27 @@ pub(crate) fn last_change(meta: &ObjectMeta) -> Option<DateTime<Utc>> {
         .or_else(|| meta.creation_timestamp.as_ref().map(|t| t.0.utc()))
 }
 
-fn consumer_pod(p: &Pod) -> ConsumerPod {
+fn consumer_pod(p: &Pod, uses: Vec<Use>) -> ConsumerPod {
     let status = p.status.clone().unwrap_or_default();
+    let container_started = status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .map(|c| {
+            let state = c.state.as_ref();
+            let started = state
+                .and_then(|s| s.running.as_ref())
+                .and_then(|r| r.started_at.as_ref())
+                .or_else(|| state.and_then(|s| s.terminated.as_ref()).and_then(|t| t.started_at.as_ref()))
+                .map(|t| t.0.utc());
+            (c.name.clone(), started)
+        })
+        .collect();
     ConsumerPod {
         name: p.metadata.name.clone().unwrap_or_default(),
-        started: status.start_time.as_ref().map(|t| t.0.utc()),
+        uses,
+        container_started,
         ready: status.conditions.iter().flatten().any(|c| c.type_ == "Ready" && c.status == "True"),
         phase: status.phase.clone().unwrap_or_default(),
         waiting: status
@@ -247,9 +316,9 @@ pub(crate) fn consumers(templates: Vec<(String, String, Option<LabelSelector>, P
                     None => controller_of(p).1.strip_prefix(&format!("{wname}-")).is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit())),
                 }
             })
-            .map(|(i, _)| {
+            .map(|(i, uses)| {
                 claimed.insert(*i);
-                consumer_pod(&pods[*i])
+                consumer_pod(&pods[*i], uses.clone())
             })
             .collect();
         out.push(Consumer { kind: wkind, name: wname, uses, pods: mine });
@@ -260,8 +329,8 @@ pub(crate) fn consumers(templates: Vec<(String, String, Option<LabelSelector>, P
         }
         let (ckind, cname) = controller_of(&pods[*i]);
         match out.iter_mut().find(|c| c.kind == ckind && c.name == cname) {
-            Some(c) => c.pods.push(consumer_pod(&pods[*i])),
-            None => out.push(Consumer { kind: ckind, name: cname, uses: uses.clone(), pods: vec![consumer_pod(&pods[*i])] }),
+            Some(c) => c.pods.push(consumer_pod(&pods[*i], uses.clone())),
+            None => out.push(Consumer { kind: ckind, name: cname, uses: uses.clone(), pods: vec![consumer_pod(&pods[*i], uses.clone())] }),
         }
     }
     out
@@ -303,8 +372,9 @@ async fn events_of(client: &Client, kind: &str, namespace: &str, name: &str, war
         .map_err(|e| format!("Failed to list events for {kind} '{name}': {e}"))
 }
 
-/// The pod templates of the namespace's workloads.
-async fn read_templates(client: &Client, namespace: &str) -> Result<Vec<(String, String, Option<LabelSelector>, PodSpec)>, String> {
+/// The pod templates of the namespace's workloads, and the kinds that could
+/// not be listed: one forbidden kind leaves the others.
+async fn read_templates(client: &Client, namespace: &str) -> (Vec<(String, String, Option<LabelSelector>, PodSpec)>, Vec<String>) {
     use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
     use k8s_openapi::api::batch::v1::CronJob;
     let params = ListParams::default();
@@ -312,29 +382,37 @@ async fn read_templates(client: &Client, namespace: &str) -> Result<Vec<(String,
     let (daemonset_api, cronjob_api) = (Api::<DaemonSet>::namespaced(client.clone(), namespace), Api::<CronJob>::namespaced(client.clone(), namespace));
     let (deployments, statefulsets, daemonsets, cronjobs) =
         tokio::join!(deployment_api.list(&params), statefulset_api.list(&params), daemonset_api.list(&params), cronjob_api.list(&params));
-    let failed = |what: &str, e: kube::Error| format!("Failed to list {what}: {e}");
+    fn items<K: Clone>(errors: &mut Vec<String>, what: &str, r: Result<kube::api::ObjectList<K>, kube::Error>) -> Vec<K> {
+        r.map(|l| l.items).unwrap_or_else(|e| {
+            errors.push(format!("Failed to list {what}: {e}"));
+            Vec::new()
+        })
+    }
+    let mut errors = Vec::new();
+    let (deployments, statefulsets) = (items(&mut errors, "Deployments", deployments), items(&mut errors, "StatefulSets", statefulsets));
+    let (daemonsets, cronjobs) = (items(&mut errors, "DaemonSets", daemonsets), items(&mut errors, "CronJobs", cronjobs));
     let mut out = Vec::new();
-    for d in deployments.map_err(|e| failed("Deployments", e))?.items {
+    for d in deployments {
         if let Some(spec) = d.spec.template.spec {
             out.push(("Deployment".to_string(), d.metadata.name.unwrap_or_default(), Some(d.spec.selector), spec));
         }
     }
-    for s in statefulsets.map_err(|e| failed("StatefulSets", e))?.items {
+    for s in statefulsets {
         if let Some(spec) = s.spec.template.spec {
             out.push(("StatefulSet".to_string(), s.metadata.name.unwrap_or_default(), Some(s.spec.selector), spec));
         }
     }
-    for d in daemonsets.map_err(|e| failed("DaemonSets", e))?.items {
+    for d in daemonsets {
         if let Some(spec) = d.spec.template.spec {
             out.push(("DaemonSet".to_string(), d.metadata.name.unwrap_or_default(), Some(d.spec.selector), spec));
         }
     }
-    for c in cronjobs.map_err(|e| failed("CronJobs", e))?.items {
+    for c in cronjobs {
         if let Some(spec) = c.spec.job_template.spec.and_then(|s| s.template.spec) {
             out.push(("CronJob".to_string(), c.metadata.name.unwrap_or_default(), None, spec));
         }
     }
-    Ok(out)
+    (out, errors)
 }
 
 /// The Ingresses in the namespace whose TLS names the Secret, with the hosts
@@ -438,12 +516,14 @@ pub async fn get_config_diagnostics(context_name: &str, kind: &str, namespace: &
         events_of(&client, kind, namespace, name, false),
     );
 
-    let consumers = match (pods, templates) {
-        (Ok(pods), Ok(templates)) => Ok(consumers(templates, &pods, kind, name)),
-        (Err(e), _) | (_, Err(e)) => Err(e),
-    };
-    let unready: Vec<String> =
-        consumers.iter().flatten().flat_map(|c| &c.pods).filter(|p| !p.ready && p.phase != "Succeeded").map(|p| p.name.clone()).take(3).collect();
+    let (templates, mut consumer_errors) = templates;
+    let pods_known = pods.is_ok();
+    let pods = pods.unwrap_or_else(|e| {
+        consumer_errors.push(e);
+        Vec::new()
+    });
+    let consumers = consumers(templates, &pods, kind, name);
+    let unready: Vec<String> = consumers.iter().flat_map(|c| &c.pods).filter(|p| !p.ready && p.phase != "Succeeded").map(|p| p.name.clone()).take(3).collect();
     let pod_events = futures::future::join_all(unready.into_iter().map(|pod| {
         let client = client.clone();
         async move {
@@ -463,6 +543,8 @@ pub async fn get_config_diagnostics(context_name: &str, kind: &str, namespace: &
         tls,
         writers,
         consumers,
+        consumer_errors,
+        pods_known,
         ingresses,
         gateways,
         service_accounts,
@@ -490,11 +572,13 @@ mod tests {
                 "env": [{ "name": "MODE", "valueFrom": { "configMapKeyRef": { "name": "app", "key": "mode", "optional": true } } },
                         { "name": "OTHER", "valueFrom": { "configMapKeyRef": { "name": "other", "key": "x" } } }],
                 "volumeMounts": [{ "name": "conf", "mountPath": "/etc/app" }, { "name": "one", "mountPath": "/etc/app.yaml", "subPath": "app.yaml" },
+                                 { "name": "per-pod", "mountPath": "/etc/pod.yaml", "subPathExpr": "$(POD_NAME).yaml" },
                                  { "name": "kube-api-access-abcde", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount" }]
             }],
             "volumes": [
                 { "name": "conf", "configMap": { "name": "app" } },
                 { "name": "one", "projected": { "sources": [{ "configMap": { "name": "app", "items": [{ "key": "app.yaml", "path": "app.yaml" }] } }] } },
+                { "name": "per-pod", "configMap": { "name": "app" } },
                 { "name": "kube-api-access-abcde", "projected": { "sources": [{ "configMap": { "name": "app" } }] } }
             ]
         }));
@@ -504,8 +588,9 @@ mod tests {
             Use::EnvKey { container: "web".into(), key: "mode".into(), optional: true },
             Use::Volume { volume: "conf".into(), keys: vec![], mounts: vec![("web".into(), "/etc/app".into(), false)], optional: false },
             Use::Volume { volume: "one".into(), keys: vec!["app.yaml".into()], mounts: vec![("web".into(), "/etc/app.yaml".into(), true)], optional: false },
+            Use::Volume { volume: "per-pod".into(), keys: vec![], mounts: vec![("web".into(), "/etc/pod.yaml".into(), true)], optional: false },
         ]);
-        assert_eq!(uses.iter().map(Use::needs_restart).collect::<Vec<_>>(), vec![true, true, false, true]);
+        assert_eq!(uses.iter().map(Use::needs_restart).collect::<Vec<_>>(), vec![true, true, false, true, true], "subPathExpr is as unrefreshed as subPath");
         assert!(uses_in(&s, "Secret", "app").is_empty(), "a Secret of the same name is another object");
     }
 
@@ -533,8 +618,34 @@ mod tests {
             ]
         })).unwrap();
         assert_eq!(last_change(&meta).map(|t| t.to_rfc3339()).as_deref(), Some("2026-11-20T10:00:00+00:00"), "a label change is not a change of contents");
+        // The data's owner writing only a label moves its time too: the last
+        // change is at most this, not certainly this.
+        let relabelled: ObjectMeta = serde_json::from_value(json!({
+            "name": "app",
+            "managedFields": [{ "manager": "kubectl", "operation": "Update", "time": "2026-11-23T10:00:00Z", "fieldsType": "FieldsV1", "fieldsV1": { "f:data": { "f:mode": {} }, "f:metadata": { "f:labels": {} } } }]
+        })).unwrap();
+        assert_eq!(last_change(&relabelled).map(|t| t.to_rfc3339()).as_deref(), Some("2026-11-23T10:00:00+00:00"));
         let bare: ObjectMeta = serde_json::from_value(json!({ "name": "app", "creationTimestamp": "2026-01-01T00:00:00Z" })).unwrap();
         assert_eq!(last_change(&bare).map(|t| t.to_rfc3339()).as_deref(), Some("2026-01-01T00:00:00+00:00"));
+    }
+
+    #[test]
+    fn a_pod_may_be_stale_only_by_the_start_of_a_container_that_reads_it_at_start() {
+        let at = |t: &str| chrono::DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc);
+        let changed = at("2026-11-24T10:00:00Z");
+        let pod = |uses: Vec<Use>, started: Vec<(&str, Option<&str>)>| ConsumerPod {
+            name: "p".into(), ready: true, phase: "Running".into(), waiting: vec![], uses,
+            container_started: started.into_iter().map(|(c, t)| (c.to_string(), t.map(at))).collect(),
+        };
+        let env = || vec![Use::EnvFrom { container: "app".into(), optional: false }];
+        // The pod is old, but its container restarted after the change.
+        assert_eq!(pod(env(), vec![("app", Some("2026-11-24T11:00:00Z")), ("sidecar", Some("2026-11-01T00:00:00Z"))]).may_be_stale(changed), Some(false));
+        assert_eq!(pod(env(), vec![("app", Some("2026-11-24T09:00:00Z"))]).may_be_stale(changed), Some(true));
+        assert_eq!(pod(env(), vec![("app", None)]).may_be_stale(changed), Some(false), "waiting to start: its next start reads what is there then");
+        assert_eq!(pod(env(), vec![]).may_be_stale(changed), None, "no status for the container: unknown");
+        // A whole-volume mount is refreshed whatever the container's age.
+        let volume = vec![Use::Volume { volume: "conf".into(), keys: vec![], mounts: vec![("app".into(), "/etc/app".into(), false)], optional: false }];
+        assert_eq!(pod(volume, vec![("app", Some("2026-11-01T00:00:00Z"))]).may_be_stale(changed), Some(false));
     }
 
     #[test]
@@ -622,7 +733,8 @@ mod tests {
         for (kind, ns, name) in &sample {
             let d = get_config_diagnostics(&ctx, kind, ns, name).await.expect("diagnostics");
             let p = crate::claude::build_config_diagnosis_payload(&ctx, kind, ns, name).await.expect("payload");
-            let consumers = d.consumers.as_ref().expect("consumers");
+            assert!(d.consumer_errors.is_empty(), "{:?}", d.consumer_errors);
+            let consumers = &d.consumers;
             let restart: usize = consumers.iter().filter(|c| c.uses.iter().any(Use::needs_restart)).count();
             println!(
                 "{kind}: keys={} last change known={} consumers={} (needing a restart for a change {restart}) pods={} ingresses={:?} gateways={:?} accounts={:?} tls={} tokens={} unavailable={}",
