@@ -111,7 +111,7 @@ fn placeholder(bytes: usize) -> String {
 /// Redacted on a JSON copy rather than on the typed object: `data` is a map of
 /// raw bytes, so writing a placeholder back into it would serialise as the
 /// placeholder's base64 — "PHJlZGFjdGVkPg==" — which reads like a real value.
-fn redacted_manifest(secret: &Secret) -> Result<ObjectManifest, String> {
+pub(crate) fn redacted_manifest(secret: &Secret) -> Result<ObjectManifest, String> {
     let mut v = serde_json::to_value(secret).map_err(|e| format!("Failed to render the Secret: {e}"))?;
 
     if let Some(data) = v.get_mut("data").and_then(Value::as_object_mut) {
@@ -174,7 +174,7 @@ const CERTS_SHOWN: usize = 20;
 /// Values are read here, in Rust, only to describe them: a certificate's
 /// public fields, a pull secret's registry hosts. No value, and nothing that
 /// would let one be reconstructed, goes into the result.
-fn overview_of(s: &Secret) -> SecretOverview {
+pub(crate) fn overview_of(s: &Secret) -> SecretOverview {
     let annotation = |k: &str| s.metadata.annotations.as_ref().and_then(|a| a.get(k)).cloned().unwrap_or_default();
     let label = |k: &str| s.metadata.labels.as_ref().and_then(|l| l.get(k)).cloned().unwrap_or_default();
     let data = s.data.as_ref();

@@ -1,6 +1,7 @@
 mod ai;
 mod claude;
 mod commands;
+mod config_diagnosis;
 mod exec;
 mod external_secrets;
 mod gateway_api;
@@ -209,6 +210,7 @@ pub fn run() {
             commands::ai_build_external_secret_diagnosis,
             commands::ai_build_secret_store_diagnosis,
             commands::ai_build_service_account_diagnosis,
+            commands::ai_build_config_diagnosis,
             commands::ai_diagnose,
             commands::kubeconfig_path,
             commands::get_write_enabled,

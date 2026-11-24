@@ -5025,20 +5025,22 @@ pub(crate) async fn read_service_backend(client: &kube::Client, namespace: &str,
 pub(crate) async fn read_tls_secret(client: &kube::Client, namespace: &str, secret: &str) -> Result<IngressTlsSecret, String> {
     use k8s_openapi::api::core::v1::Secret;
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    api.get(secret)
-        .await
-        .map(|s| IngressTlsSecret {
-            secret_type: s.type_.clone().unwrap_or_else(|| "Opaque".to_string()),
-            keys: s.data.iter().flatten().map(|(k, _)| k.clone()).collect(),
-            leaf: s
-                .data
-                .as_ref()
-                .and_then(|d| d.get("tls.crt"))
-                .and_then(|v| std::str::from_utf8(&v.0).ok())
-                .map(crate::x509::parse_pem_bundle)
-                .and_then(|all| crate::secrets::leaf_of(&all).cloned()),
-        })
-        .map_err(|e| get_error("Secret", secret, e))
+    api.get(secret).await.map(|s| tls_secret_of(&s)).map_err(|e| get_error("Secret", secret, e))
+}
+
+/// A TLS Secret by its type, key names and certificate, its values dropped.
+pub(crate) fn tls_secret_of(s: &k8s_openapi::api::core::v1::Secret) -> IngressTlsSecret {
+    IngressTlsSecret {
+        secret_type: s.type_.clone().unwrap_or_else(|| "Opaque".to_string()),
+        keys: s.data.iter().flatten().map(|(k, _)| k.clone()).collect(),
+        leaf: s
+            .data
+            .as_ref()
+            .and_then(|d| d.get("tls.crt"))
+            .and_then(|v| std::str::from_utf8(&v.0).ok())
+            .map(crate::x509::parse_pem_bundle)
+            .and_then(|all| crate::secrets::leaf_of(&all).cloned()),
+    }
 }
 
 /// The log lines a controller's pods wrote that `is_about` keeps, and how

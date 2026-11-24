@@ -6011,6 +6011,7 @@ function setMetricsRange(minutes: number) {
   diagnoseSubject,
   diagnoseSecretStore,
   diagnoseServiceAccount,
+  diagnoseConfig,
   confirmDiagnose,
   closeClaudeDiagnose,
   toggleDiagnosePayload,
@@ -7223,6 +7224,8 @@ function renderClaudeDiagnosePanel(): string {
                   ? "Policy, limits and conditions, every NodeClaim with the state of its node, the events on them, the pods Karpenter could not place on this pool and why, its node class, and its manifest."
                   : d.kind === "ExternalSecret"
                   ? "Its store, target, policies, refresh and conditions, what it maps from the provider, its store with how it signs in and whether it is ready, the Secrets and ServiceAccount the store signs in with (checked by key name, never value), the target Secret's type, key names and owner (never its values), ESO's controller and its log lines about it, its events, and its manifest."
+                  : d.kind === "ConfigMap" || d.kind === "Secret"
+                  ? "Its key names and sizes (never a value), whether it is immutable, when its contents last changed and what writes it, a TLS certificate's public fields; who uses it and how — env vars, envFrom, volume mounts and subPath — the keys they ask for that are not there and the pods that started before its last change; for a Secret, the Ingresses, Gateway listeners and ServiceAccounts that name it; the Warning events of failing consumer pods, its events, and its manifest with values replaced by sizes."
                   : d.kind === "ServiceAccount"
                   ? "The Azure identity it names and the federated credential that identity needs for this cluster, the pods that run as it with whether each got its Workload Identity token, the workloads whose pod template runs as it, the Workload Identity webhook, excerpts of its pods' log lines about signing in to Azure or RBAC refusals, the roles bound to it, its image pull secrets (by type, never value), the Warning events of its pods that are not ready, its events, and its manifest."
                   : d.kind === "SecretStore" || d.kind === "ClusterSecretStore"
@@ -8760,6 +8763,10 @@ function diagnosePvc(ctx: string, namespace: string, name: string) {
 
 function diagnoseExternalSecret(ctx: string, namespace: string, name: string) {
   startDiagnosis(ctx, "ExternalSecret", namespace, name, "", () => api.aiBuildExternalSecretDiagnosis(ctx, namespace, name));
+}
+
+function diagnoseConfig(ctx: string, kind: string, namespace: string, name: string) {
+  startDiagnosis(ctx, kind, namespace, name, "", () => api.aiBuildConfigDiagnosis(ctx, kind, namespace, name));
 }
 
 function diagnoseServiceAccount(ctx: string, namespace: string, name: string) {
@@ -11769,6 +11776,7 @@ function renderSecretDetailPanel(): string {
             <div class="truncate text-xs text-ink-muted">Secret · ${esc(sd.secretType)} · ${esc(sd.namespace)} · ${esc(sd.ctx)}</div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
+            ${claudeDiagnoseButton(`window.__app.diagnoseConfig(${jsArg(sd.ctx)},'Secret',${jsArg(sd.namespace)},${jsArg(sd.name)})`, "secret")}
             <button type="button" onclick="window.__app.closeSecretDetail()" class="rounded-md p-1 text-ink-secondary hover:bg-surface-2 hover:text-ink-primary" title="Close">✕</button>
           </div>
         </div>
@@ -12858,6 +12866,8 @@ function eventDiagnosisTable(): Record<string, EventDiagnosis> {
     Node: { group: "", what: "node", label: "node", listed: (ctx, ns, n) => listedIn(state.nodes.get(ctx), ns, n) },
     Namespace: { group: "", what: "namespace", label: "namespace", listed: (ctx, ns, n) => listedIn(state.namespaces.get(ctx), ns, n) },
     Service: { group: "", what: "service", label: "service", listed: (ctx, ns, n) => listedIn(state.services.get(ctx), ns, n) },
+    ConfigMap: { group: "", what: "config", label: "config map", listed: (ctx, ns, n) => listedIn(state.configmaps.get(ctx), ns, n) },
+    Secret: { group: "", what: "config", label: "secret", listed: (ctx, ns, n) => listedIn(state.secrets.get(ctx), ns, n) },
     ServiceAccount: { group: "", what: "serviceaccount", label: "service account", listed: (ctx, ns, n) => listedIn(state.serviceAccounts.get(ctx), ns, n) },
     PersistentVolumeClaim: { group: "", what: "pvc", label: "volume claim", listed: (ctx, ns, n) => listedIn(state.pvcs.get(ctx), ns, n) },
     Ingress: { group: "networking.k8s.io", what: "ingress", label: "ingress", listed: (ctx, ns, n) => listedIn(state.ingresses.get(ctx), ns, n) },
@@ -13272,7 +13282,7 @@ function renderSecrets(): string {
                 ? `<td class="tabular" title="${esc(sec.keys.map((k) => k.name).join(", "))}">${sec.keys.length}</td>`
                 : `<td class="tabular text-ink-muted" title="Not read — Helm keeps a full copy of each release revision here, so these are listed without their contents. The Helm tab shows the releases.">—</td>`;
               return `
-            <tr>
+            <tr${diagnoseAttrs({ what: "config", ctx, kind: "Secret", namespace: sec.namespace, name: sec.name, container: "" })}>
               ${rowCheckboxCell("secrets", keyOf(row))}
               ${
                 multi
@@ -14089,7 +14099,7 @@ function renderConfigMaps(): string {
     renderRow: ({ ctx, c }) => {
       const names = c.keys.map((k) => k.name);
       return `
-      <tr>
+      <tr${diagnoseAttrs({ what: "config", ctx, kind: "ConfigMap", namespace: c.namespace, name: c.name, container: "" })}>
         ${rowCheckboxCell("configmaps", `${ctx}:${c.namespace}:${c.name}`)}
         ${multi ? resourceClusterCell("configmaps", ctx) : ""}
         ${resourceNamespaceCell("configmaps", c.namespace)}
@@ -15250,6 +15260,8 @@ function renderResourceDetailPanel(): string {
                     ? claudeDiagnoseButton(`window.__app.diagnoseJob(${jsArg(rd.ctx)},${jsArg(rd.kind)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, rd.kind === "Job" ? "job" : "cron job")
                     : rd.kind === "PodDisruptionBudget"
                     ? claudeDiagnoseButton(`window.__app.diagnosePdb(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "disruption budget")
+                    : rd.kind === "ConfigMap"
+                    ? claudeDiagnoseButton(`window.__app.diagnoseConfig(${jsArg(rd.ctx)},'ConfigMap',${jsArg(rd.namespace)},${jsArg(rd.name)})`, "config map")
                     : rd.kind === "ServiceAccount"
                     ? claudeDiagnoseButton(`window.__app.diagnoseServiceAccount(${jsArg(rd.ctx)},${jsArg(rd.namespace)},${jsArg(rd.name)})`, "service account")
                     : rd.kind === "SecretStore" || rd.kind === "ClusterSecretStore"
@@ -16728,6 +16740,9 @@ function runDiagnosis(s: DiagnoseSubject): boolean {
       return true;
     case "serviceaccount":
       diagnoseServiceAccount(ctx, ns, name);
+      return true;
+    case "config":
+      diagnoseConfig(ctx, s.kind || "ConfigMap", ns, name);
       return true;
     case "job":
       diagnoseJob(ctx, s.kind || "Job", ns, name);

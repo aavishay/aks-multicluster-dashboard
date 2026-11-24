@@ -450,6 +450,54 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_CONFIG_SYSTEM: &str = "\
+You diagnose Kubernetes ConfigMaps and Secrets for an experienced SRE: \
+whether what uses one sees what it holds now.
+
+You are given the object by its key names and sizes — never a value — \
+whether it is immutable, when its contents last changed as its \
+managedFields record it, and what writes it (an owner, Helm, cert-manager, \
+External Secrets); for a TLS Secret, its certificate's public fields \
+checked against the hosts it serves. Then who uses it and how: each \
+workload's env vars, envFrom and volume mounts (with subPath), keys asked \
+for that are not there, how many of its pods started before the last \
+change; for a Secret, the Ingresses, Gateway listeners and ServiceAccounts \
+that name it. Then the Warning events of consumer pods that are not ready, \
+its events and its manifest with values replaced by sizes. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the consumer, the key, \
+the mount, the pod, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- A change has not reached its consumers: env vars and envFrom are read \
+when a container starts, and a subPath mount is never refreshed, so pods \
+started before the change still have the old contents — kubectl rollout \
+restart. A whole volume is refreshed within about a minute, but the \
+application has to re-read the file. An immutable object cannot change at \
+all.
+- A key is missing: a required env key stops the container with \
+CreateContainerConfigError; a key a volume picks by items fails the mount. \
+An optional one is silently left out — say so if the app then lacks it.
+- A manual edit will not last: something writes it (Helm, an \
+ExternalSecret, cert-manager, an operator that owns it) and puts back its \
+own contents. Change it at the source.
+- A TLS Secret that is expired, lacks a key, or does not cover a host it \
+serves; a pull secret of the wrong type.
+- Unused: nothing in its namespace names it. Say so; it is not a fault in \
+itself, though a typo in a consumer's reference to it would look the same \
+from the consumer's side.
+
+If nothing is wrong, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl. Prefer one well-supported cause over \
+a list of possibilities. If the evidence is genuinely insufficient, say so \
+and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -6647,6 +6695,218 @@ pub async fn build_service_account_diagnosis_payload(context_name: &str, namespa
     Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
 }
 
+/// A size in bytes as a person reads it.
+fn size_text(bytes: usize) -> String {
+    match bytes {
+        b if b >= 1 << 20 => format!("{:.1} MiB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.1} KiB", b as f64 / 1024.0),
+        b => format!("{b} B"),
+    }
+}
+
+/// How many keys and consumers to name; the rest are counted.
+const DIAGNOSE_CONFIG_KEYS: usize = 30;
+const DIAGNOSE_CONFIG_CONSUMERS: usize = 20;
+
+/// The object itself: its keys by size, whether it can change, when it last
+/// did, what writes it, and a TLS Secret's certificate.
+fn render_config_object(d: &crate::config_diagnosis::ConfigDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
+    let mut lines = Vec::new();
+    let kind = match &d.secret {
+        Some(o) => format!("Secret, type {}", o.secret_type),
+        None => "ConfigMap".to_string(),
+    };
+    let keys: Vec<String> = d.keys.iter().take(DIAGNOSE_CONFIG_KEYS).map(|(k, b)| format!("{k} ({})", size_text(*b))).collect();
+    lines.push(format!(
+        "{kind}; {} key{}{}{}",
+        d.keys.len(),
+        if d.keys.len() == 1 { "" } else { "s" },
+        if keys.is_empty() { String::new() } else { format!(": {}", keys.join(", ")) },
+        if d.keys.len() > DIAGNOSE_CONFIG_KEYS { format!(", and {} more", d.keys.len() - DIAGNOSE_CONFIG_KEYS) } else { String::new() }
+    ));
+    let total: usize = d.keys.iter().map(|(_, b)| b).sum();
+    if total > 900 * 1024 {
+        lines.push(format!("NEAR THE 1 MiB LIMIT: {} in all", size_text(total)));
+    }
+    if d.immutable {
+        lines.push("IMMUTABLE: its contents cannot be changed; a new one has to be created and its consumers pointed at it".to_string());
+    }
+    lines.push(match d.last_change {
+        Some(t) => format!("contents last changed: {} ({} ago), as its managedFields record it", t.to_rfc3339(), job_span((now - t).num_seconds())),
+        None => "contents last changed: unknown".to_string(),
+    });
+    let mut writers = d.writers.clone();
+    if let Some(o) = &d.secret {
+        writers.extend(o.owners.iter().map(|w| format!("owned by {} {}", w.kind, w.name)));
+        if !o.managed_by.is_empty() {
+            writers.push(format!("app.kubernetes.io/managed-by: {}", o.managed_by));
+        }
+        if !o.helm_release.is_empty() {
+            writers.push(format!("Helm release {}", o.helm_release));
+        }
+        if !o.cert_manager_certificate.is_empty() {
+            writers.push(format!(
+                "cert-manager Certificate {}{}",
+                o.cert_manager_certificate,
+                if o.cert_manager_issuer.is_empty() { String::new() } else { format!(", issued by {} {}", o.cert_manager_issuer_kind, o.cert_manager_issuer) }
+            ));
+        }
+        if !o.service_account.is_empty() {
+            writers.push(format!("a token for ServiceAccount {}", o.service_account));
+        }
+        if !o.registries.is_empty() {
+            writers.push(format!("pull credentials for {}", o.registries.join(", ")));
+        }
+    }
+    lines.push(if writers.is_empty() {
+        "written by: nothing that marks it — edited by hand or by a tool that leaves no label".to_string()
+    } else {
+        format!("written by: {} — a change made by hand is overwritten on its next write", writers.join("; "))
+    });
+    if let Some(tls) = &d.tls {
+        let mut hosts: Vec<String> = d.ingresses.iter().flatten().flat_map(|(_, h)| h.clone()).collect();
+        hosts.sort();
+        hosts.dedup();
+        let read = Ok(k8s::IngressTlsSecret { secret_type: tls.secret_type.clone(), keys: tls.keys.clone(), leaf: tls.leaf.clone() });
+        lines.push(format!("TLS: {}", render_tls_secret(&d.name, &read, &hosts, now)));
+    }
+    lines.join("\n")
+}
+
+fn render_config_use(u: &crate::config_diagnosis::Use) -> String {
+    use crate::config_diagnosis::Use;
+    let optional = |o: bool| if o { " (optional)" } else { "" };
+    match u {
+        Use::EnvKey { container, key, optional: o } => format!("key {key} as an env var in {container}{}", optional(*o)),
+        Use::EnvFrom { container, optional: o } => format!("every key as env vars (envFrom) in {container}{}", optional(*o)),
+        Use::Volume { volume, keys, mounts, optional: o } => {
+            let at = if mounts.is_empty() {
+                format!("as volume {volume}, mounted by no container")
+            } else {
+                mounts.iter().map(|(c, path, sub)| format!("at {c}:{path}{}", if *sub { " through subPath, which is never refreshed" } else { "" })).collect::<Vec<_>>().join(", ")
+            };
+            format!("{} mounted {at}{}", if keys.is_empty() { "every key".to_string() } else { format!("keys {}", keys.join(", ")) }, optional(*o))
+        }
+        Use::PullSecret => "as an image pull secret".to_string(),
+    }
+}
+
+/// Who uses it and how; for each, the keys it asks for that are not there,
+/// and its pods that started before the last change while using it in a way
+/// that only a restart refreshes.
+fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
+    use crate::config_diagnosis::Use;
+    let consumers = match &d.consumers {
+        Err(e) => return format!("(consumers unavailable: {e})"),
+        Ok(c) => c,
+    };
+    let has = |k: &str| d.keys.iter().any(|(x, _)| x == k);
+    let mut lines = Vec::new();
+    if !consumers.is_empty() {
+        let pods: usize = consumers.iter().map(|c| c.pods.len()).sum();
+        lines.push(format!("{} workload{} use{} it, with {pods} pod{}:", consumers.len(), if consumers.len() == 1 { "" } else { "s" }, if consumers.len() == 1 { "s" } else { "" }, if pods == 1 { "" } else { "s" }));
+    }
+    for c in consumers.iter().take(DIAGNOSE_CONFIG_CONSUMERS) {
+        lines.push(format!("- {} {}: {}", c.kind, c.name, c.uses.iter().map(render_config_use).collect::<Vec<_>>().join("; ")));
+        for u in &c.uses {
+            let (asked, optional, fails): (Vec<&String>, bool, &str) = match u {
+                Use::EnvKey { key, optional, .. } => (vec![key], *optional, "its containers fail to start with CreateContainerConfigError"),
+                Use::Volume { keys, optional, .. } => (keys.iter().collect(), *optional, "the volume cannot be mounted, so its pods stay in ContainerCreating (FailedMount)"),
+                _ => (vec![], false, ""),
+            };
+            for k in asked.into_iter().filter(|k| !has(k)) {
+                lines.push(if optional { format!("  key {k} is absent, and optional: it is simply left out") } else { format!("  MISSING KEY {k}: {fails}") });
+            }
+        }
+        if c.pods.is_empty() {
+            lines.push("  no pod of it is running".to_string());
+            continue;
+        }
+        let ready = c.pods.iter().filter(|p| p.ready).count();
+        let mut pods_line = format!("  pods: {ready} of {} ready", c.pods.len());
+        let restart = c.uses.iter().any(Use::needs_restart);
+        if let (true, Some(changed)) = (restart, d.last_change) {
+            let stale = c.pods.iter().filter(|p| p.started.is_some_and(|s| s < changed)).count();
+            if stale > 0 {
+                pods_line.push_str(&format!(
+                    "; {stale} STARTED BEFORE ITS LAST CHANGE, so they still have the old contents until they restart ({} ago)",
+                    job_span((now - changed).num_seconds())
+                ));
+            } else {
+                pods_line.push_str("; all started after its last change");
+            }
+        } else if c.uses.iter().any(|u| matches!(u, Use::Volume { .. })) {
+            pods_line.push_str("; the volume's files are refreshed within about a minute of a change, and the application has to re-read them");
+        }
+        lines.push(pods_line);
+        for p in c.pods.iter().filter(|p| !p.ready && p.phase != "Succeeded").take(3) {
+            lines.push(format!("  - {}: {} NOT READY{}", p.name, if p.phase.is_empty() { "Unknown" } else { &p.phase }, if p.waiting.is_empty() { String::new() } else { format!(" — {}", p.waiting.join(", ")) }));
+        }
+    }
+    if consumers.len() > DIAGNOSE_CONFIG_CONSUMERS {
+        lines.push(format!("… and {} more workloads", consumers.len() - DIAGNOSE_CONFIG_CONSUMERS));
+    }
+    if d.name == "kube-root-ca.crt" {
+        lines.push("(every pod's API-access volume also mounts it; those are not counted)".to_string());
+    }
+    if d.secret.is_some() {
+        match &d.ingresses {
+            Err(e) => lines.push(format!("(Ingresses unavailable: {e})")),
+            Ok(list) => {
+                lines.extend(list.iter().take(DIAGNOSE_CONFIG_CONSUMERS).map(|(i, hosts)| format!("- Ingress {i}: its TLS for {}", if hosts.is_empty() { "every host (none listed)".to_string() } else { hosts.join(", ") })));
+                if list.len() > DIAGNOSE_CONFIG_CONSUMERS {
+                    lines.push(format!("… and {} more Ingresses", list.len() - DIAGNOSE_CONFIG_CONSUMERS));
+                }
+            }
+        }
+        match &d.gateways {
+            Err(e) => lines.push(format!("(Gateways unavailable: {e})")),
+            Ok(list) => lines.extend(list.iter().map(|g| if g.starts_with('(') { g.clone() } else { format!("- Gateway {g}: its certificate") })),
+        }
+        match &d.service_accounts {
+            Err(e) => lines.push(format!("(ServiceAccounts unavailable: {e})")),
+            Ok(list) => lines.extend(list.iter().map(|a| format!("- ServiceAccount {a}"))),
+        }
+    }
+    if lines.is_empty() {
+        return format!(
+            "(nothing in {} uses it: no pod or workload template{} names it)",
+            d.namespace,
+            if d.secret.is_some() { ", Ingress, Gateway listener or ServiceAccount" } else { "" }
+        );
+    }
+    lines.join("\n")
+}
+
+/// Assembles a ConfigMap or Secret diagnosis, redacted. No value is sent.
+pub async fn build_config_diagnosis_payload(context_name: &str, kind: &str, namespace: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = crate::config_diagnosis::get_config_diagnostics(context_name, kind, namespace, name).await?;
+    let now = chrono::Utc::now();
+    let object = redact::redact(&render_config_object(&d, now));
+    let consumers = redact::redact(&render_config_consumers(&d, now));
+    let pod_events = redact::redact(&if d.pod_events.is_empty() {
+        "(no consumer pod is failing)".to_string()
+    } else {
+        d.pod_events.iter().map(|(p, e)| format!("pod {p}:\n{}", render_nap_events(e, "(no Warning events)", false, 10))).collect::<Vec<_>>().join("\n\n")
+    });
+    let events = redact::redact(&render_nap_events(&d.events, &format!("(no events for this {kind})"), false, 10));
+    let manifest = redact::redact(&d.manifest);
+
+    let prompt = format!(
+        "{kind} {namespace}/{name}.\n\n\
+         ## The object (key names and sizes only; no value is sent)\n{}\n\n\
+         ## Who uses it, and how\n{}\n\n\
+         ## Warning events of the consumer pods that are not ready\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted, values replaced by their sizes)\n```yaml\n{}\n```",
+        object.text, consumers.text, pod_events.text, events.text, manifest.text,
+    );
+    let whole = redact::redact(&prompt);
+    let redaction_summary = redact::Redacted::merge([&object, &consumers, &pod_events, &events, &manifest, &whole]).summary();
+    let prompt = whole.text.clone();
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
 /// The StatefulSet sections of a workload diagnosis.
 fn render_sts_sections(d: &k8s::StatefulSetDiagnostics, now: chrono::DateTime<chrono::Utc>) -> String {
     let claim_events = if d.claim_events.is_empty() {
@@ -7972,6 +8232,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "ExternalSecret" => DIAGNOSE_EXTERNALSECRET_SYSTEM,
         "SecretStore" | "ClusterSecretStore" => DIAGNOSE_SECRET_STORE_SYSTEM,
         "ServiceAccount" => DIAGNOSE_SERVICE_ACCOUNT_SYSTEM,
+        "ConfigMap" | "Secret" => DIAGNOSE_CONFIG_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
         "Deployment" => DIAGNOSE_DEPLOYMENT_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
@@ -10629,6 +10890,62 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             render_sa_pull_secrets(&[("acr".into(), Ok(Some("kubernetes.io/dockerconfigjson".into()))), ("gone".into(), Ok(None)), ("plain".into(), Ok(Some("Opaque".into())))]),
             "Secret acr: kubernetes.io/dockerconfigjson\nSECRET gone DOES NOT EXIST: pulls that need it fail\nSecret plain IS OF TYPE Opaque, NOT kubernetes.io/dockerconfigjson: the kubelet cannot pull with it"
         );
+    }
+
+    #[test]
+    fn a_config_map_says_which_consumers_have_not_seen_its_last_change() {
+        use crate::config_diagnosis::{ConfigDiagnostics, Consumer, ConsumerPod, Use};
+        let at = |t: &str| chrono::DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&chrono::Utc);
+        let now = at("2026-11-24T12:00:00Z");
+        let pod = |name: &str, started: &str, ready: bool| ConsumerPod { name: name.into(), started: Some(at(started)), ready, phase: "Running".into(), waiting: if ready { vec![] } else { vec!["web: CreateContainerConfigError".into()] } };
+        let d = ConfigDiagnostics {
+            namespace: "app".into(),
+            name: "web-config".into(),
+            keys: vec![("app.yaml".into(), 2150), ("mode".into(), 4)],
+            immutable: false,
+            last_change: Some(at("2026-11-24T10:00:00Z")),
+            secret: None,
+            tls: None,
+            writers: vec!["Helm release web".into()],
+            consumers: Ok(vec![
+                Consumer { kind: "Deployment".into(), name: "web".into(),
+                    uses: vec![Use::EnvFrom { container: "web".into(), optional: false }, Use::EnvKey { container: "web".into(), key: "region".into(), optional: false }],
+                    pods: vec![pod("web-1", "2026-11-23T09:00:00Z", true), pod("web-2", "2026-11-24T11:00:00Z", false)] },
+                Consumer { kind: "Deployment".into(), name: "worker".into(),
+                    uses: vec![Use::Volume { volume: "conf".into(), keys: vec!["app.yaml".into(), "extra.yaml".into()], mounts: vec![("worker".into(), "/etc/app.yaml".into(), true)], optional: true }],
+                    pods: vec![] },
+                Consumer { kind: "StatefulSet".into(), name: "db".into(),
+                    uses: vec![Use::Volume { volume: "conf".into(), keys: vec![], mounts: vec![("db".into(), "/etc/db".into(), false)], optional: false }],
+                    pods: vec![pod("db-0", "2026-11-01T00:00:00Z", true)] },
+            ]),
+            ingresses: Ok(vec![]),
+            gateways: Ok(vec![]),
+            service_accounts: Ok(vec![]),
+            manifest: String::new(),
+            events: Ok(vec![]),
+            pod_events: vec![],
+        };
+        assert_eq!(
+            render_config_object(&d, now),
+            "ConfigMap; 2 keys: app.yaml (2.1 KiB), mode (4 B)\n\
+             contents last changed: 2026-11-24T10:00:00+00:00 (2h 0m ago), as its managedFields record it\n\
+             written by: Helm release web — a change made by hand is overwritten on its next write"
+        );
+        assert_eq!(
+            render_config_consumers(&d, now),
+            "3 workloads use it, with 3 pods:\n\
+             - Deployment web: every key as env vars (envFrom) in web; key region as an env var in web\n  \
+             MISSING KEY region: its containers fail to start with CreateContainerConfigError\n  \
+             pods: 1 of 2 ready; 1 STARTED BEFORE ITS LAST CHANGE, so they still have the old contents until they restart (2h 0m ago)\n  \
+             - web-2: Running NOT READY — web: CreateContainerConfigError\n\
+             - Deployment worker: keys app.yaml, extra.yaml mounted at worker:/etc/app.yaml through subPath, which is never refreshed (optional)\n  \
+             key extra.yaml is absent, and optional: it is simply left out\n  \
+             no pod of it is running\n\
+             - StatefulSet db: every key mounted at db:/etc/db\n  \
+             pods: 1 of 1 ready; the volume's files are refreshed within about a minute of a change, and the application has to re-read them"
+        );
+        let unused = ConfigDiagnostics { consumers: Ok(vec![]), ..d };
+        assert_eq!(render_config_consumers(&unused, now), "(nothing in app uses it: no pod or workload template names it)");
     }
 
     #[test]
