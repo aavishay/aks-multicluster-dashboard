@@ -167,7 +167,7 @@ which installs for your user alone and needs no admin rights.
 
 ### Optional: AI diagnosis
 
-Any node, namespace, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, Gateway, Gateway API route, PVC, PodDisruptionBudget, ServiceAccount, ExternalSecret, SecretStore, ClusterSecretStore, HPA, KEDA
+Any node, namespace, NAP NodePool, workload, pod, Job, CronJob, Service, Ingress, Gateway, Gateway API route, PVC, PodDisruptionBudget, ConfigMap, Secret, ServiceAccount, ExternalSecret, SecretStore, ClusterSecretStore, HPA, KEDA
 ScaledObject or ScaledJob, Argo CD application or Helm release can be diagnosed by an AI model: open it
 and click **Diagnose** in its panel, or press `⌘D` on a focused row. An event offers the diagnosis of the
 object it is about the same way — for a pod, with the logs of the container the event names; for a
@@ -226,6 +226,15 @@ The app gathers the status, events and manifest behind it, plus what that kind o
   admits the namespace), the Secrets and ServiceAccount the store signs in
   with, the target Secret's type, key names and owner — never a value — the
   mapped keys it lacks, and ESO's controller with its log lines about it;
+- a ConfigMap or Secret: who uses it and how — env vars and envFrom, which
+  are read only when a container starts, volume mounts, which refresh within
+  about a minute, and `subPath` mounts, which never do — so the pods with a
+  container that reads it only at start and began before its last recorded
+  write are named (that write, from managedFields, is when the contents
+  changed at the latest); the keys they ask for that are not there; what writes it (Helm, an ExternalSecret, cert-manager), which
+  would undo a manual edit; for a TLS Secret, its certificate against the
+  hosts it serves; and for a Secret, the Ingresses, Gateway listeners and
+  ServiceAccounts that name it. Key names and sizes only: no value is sent;
 - a ServiceAccount: the Azure identity it names and the federated
   credential that identity needs for this cluster — the cluster's issuer and
   the account's subject — the pods that run as it with whether each carries
