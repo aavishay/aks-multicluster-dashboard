@@ -3614,6 +3614,9 @@ pub struct PvcUsage {
 /// Whether the CSI driver that provisions a volume is installed.
 pub struct PvcCsiDriver {
     pub name: String,
+    /// A volume's spec.csi names it, so it is a CSI driver; otherwise the
+    /// name is only a provisioner's, which may be no CSI driver.
+    pub confirmed: bool,
     /// A CSIDriver object exists for it.
     pub registered: bool,
     /// Nodes whose CSINode lists the driver, of all CSINodes.
@@ -3952,12 +3955,9 @@ pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str
     // The provisioner, from wherever it is written: the bound volume's CSI
     // driver, the claim's own annotation, or its class.
     let class_name = pvc.spec.as_ref().and_then(|s| s.storage_class_name.clone());
-    let provisioner = pv
-        .as_ref()
-        .and_then(|p| p.as_ref().ok())
-        .and_then(|p| p.spec.as_ref())
-        .and_then(|s| s.csi.as_ref())
-        .map(|c| c.driver.clone())
+    let volume_driver = pv.as_ref().and_then(|p| p.as_ref().ok()).and_then(|p| p.spec.as_ref()).and_then(|s| s.csi.as_ref()).map(|c| c.driver.clone());
+    let confirmed = volume_driver.is_some();
+    let provisioner = volume_driver
         .or_else(|| {
             pvc.metadata
                 .annotations
@@ -3975,7 +3975,7 @@ pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str
         .filter(|p| !p.is_empty());
     let csi_fut = async {
         let driver = provisioner.clone()?;
-        Some(read_csi_driver(&client, &driver).await)
+        Some(read_csi_driver(&client, &driver, confirmed).await)
     };
 
     // The events of pods that mount it and are not ready.
@@ -4038,7 +4038,9 @@ pub async fn get_pvc_diagnostics(context_name: &str, namespace: &str, name: &str
 
 /// Whether a CSI driver is installed: a CSIDriver object for it, and how
 /// many nodes' CSINodes list it — a node without it cannot mount its volumes.
-pub(crate) async fn read_csi_driver(client: &kube::Client, driver: &str) -> Result<PvcCsiDriver, String> {
+/// The CSI driver of that name: `confirmed` when a volume's spec.csi names
+/// it, and not only a provisioner annotation or class.
+pub(crate) async fn read_csi_driver(client: &kube::Client, driver: &str, confirmed: bool) -> Result<PvcCsiDriver, String> {
     use k8s_openapi::api::storage::v1::{CSIDriver, CSINode};
     let drivers: Api<CSIDriver> = Api::all(client.clone());
     let nodes: Api<CSINode> = Api::all(client.clone());
@@ -4047,7 +4049,7 @@ pub(crate) async fn read_csi_driver(client: &kube::Client, driver: &str) -> Resu
     let registered = registered.map_err(|e| format!("Failed to read CSIDriver '{driver}': {e}"))?.is_some();
     let csi_nodes = csi_nodes.map_err(|e| format!("Failed to list CSINodes: {e}"))?.items;
     let on_nodes = csi_nodes.iter().filter(|n| n.spec.drivers.iter().any(|d| d.name == driver)).count();
-    Ok(PvcCsiDriver { name: driver.to_string(), registered, on_nodes, nodes: csi_nodes.len() })
+    Ok(PvcCsiDriver { name: driver.to_string(), confirmed, registered, on_nodes, nodes: csi_nodes.len() })
 }
 
 /// What a PersistentVolume diagnosis reads. Only the volume is required.
@@ -4118,7 +4120,7 @@ pub async fn get_pv_diagnostics(context_name: &str, name: &str) -> Result<PvDiag
     };
     let csi_fut = async {
         let driver = spec.csi.as_ref().map(|c| c.driver.clone())?;
-        Some(read_csi_driver(&client, &driver).await)
+        Some(read_csi_driver(&client, &driver, true).await)
     };
     let attachments_fut = async {
         Api::<VolumeAttachment>::all(client.clone())

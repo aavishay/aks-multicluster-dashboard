@@ -463,8 +463,10 @@ checked against the hosts it serves. Then who uses it and how: each \
 workload's env vars, envFrom and volume mounts (with subPath), keys asked \
 for that are not there, how many of its pods have a container that reads \
 it only at start and began before that write, and pods of an older \
-revision that use it differently; for a Secret, the Ingresses, Gateway listeners and ServiceAccounts \
-that name it. Then the Warning events of consumer pods that are not ready, \
+revision that use it differently; for a Secret, the volumes that read it \
+as their credentials (an azureFile share's key, a CSI driver's secret) and \
+the PersistentVolumes, StorageClasses, Ingresses, Gateway listeners and \
+ServiceAccounts that name it. Then the Warning events of consumer pods that are not ready, \
 its events and its manifest with values replaced by sizes. Respond with:
 1. The most likely root cause, stated plainly.
 2. The specific evidence that points there — cite the consumer, the key, \
@@ -487,9 +489,10 @@ ExternalSecret, cert-manager, an operator that owns it) and puts back its \
 own contents. Change it at the source.
 - A TLS Secret that is expired, lacks a key, or does not cover a host it \
 serves; a pull secret of the wrong type.
-- Unused: nothing in its namespace names it. Say so; it is not a fault in \
-itself, though a typo in a consumer's reference to it would look the same \
-from the consumer's side.
+- Unused: nothing that was looked for names it. Say so, and that a \
+controller reading it through the API (from its flags or its own \
+resources) is not seen; it is not a fault in itself, though a typo in a \
+consumer's reference to it would look the same from the consumer's side.
 
 If nothing is wrong, say so plainly rather than inventing a problem.
 
@@ -526,7 +529,9 @@ backing disk, which Retain leaves behind and keeps billing.
 backing disk — the events say why (the disk still attached to a node, a \
 permission, a lock), or its CSI driver is not running.
 - Bound to a claim that is gone or was recreated: the claimRef's uid no \
-longer matches, so the new claim will not bind it.
+longer matches, so the new claim will not bind it. A claimRef with no uid \
+is a reservation made before binding: only the claim it names can bind the \
+volume, and until that claim exists the volume waits.
 - Not usable where pods run: no node satisfies its node affinity (a zonal \
 disk in a zone with no nodes, or the only ones cordoned), or the driver \
 runs on no node.
@@ -4438,18 +4443,30 @@ fn render_pvc_volume(
 
 /// Whether a volume's CSI driver is installed, and on how many nodes. An
 /// in-tree provisioner (`kubernetes.io/azure-file`, which the PVC diagnosis
-/// can pass from a class) is no CSI driver and in no CSINode, by design; any
-/// other name is a CSI driver, and one no node runs — uninstalled with its
-/// CSIDriver object, or never installed — cannot mount its volumes anywhere.
+/// can pass from a class) is no CSI driver and in no CSINode, by design. A
+/// driver a volume's spec.csi names, or one with a CSIDriver object or on a
+/// node, is a CSI driver, and one no node runs cannot mount its volumes
+/// anywhere; a CSIDriver object is optional, so its absence alone is no fault.
 fn render_csi_driver(csi: &Option<Result<k8s::PvcCsiDriver, String>>) -> Option<String> {
     match csi {
         None => None,
         Some(Err(e)) => Some(format!("(CSI driver unavailable: {e})")),
         Some(Ok(d)) if d.name.starts_with("kubernetes.io/") => Some(format!("provisioner {}: in-tree, not a CSI driver", d.name)),
+        // A provisioner name alone, known to no CSIDriver object and no node,
+        // may be an external provisioner that is no CSI driver at all.
+        Some(Ok(d)) if !d.confirmed && !d.registered && d.on_nodes == 0 => Some(format!(
+            "provisioner {}: no CSIDriver object and on none of the {} nodes' CSI drivers — either an external provisioner that is not a CSI driver, or a CSI driver that is not installed, and then no node can mount its volumes",
+            d.name, d.nodes
+        )),
         Some(Ok(d)) => Some(format!(
             "CSI driver {}: {}; on {} of {} nodes{}",
             d.name,
-            if d.registered { "registered" } else { "NO CSIDriver OBJECT: the driver is not installed" },
+            match (d.registered, d.on_nodes) {
+                (true, _) => "registered",
+                (false, 0) => "NO CSIDriver OBJECT: the driver is not installed",
+                // The object is optional: a driver can run without one.
+                (false, _) => "no CSIDriver object (optional)",
+            },
             d.on_nodes,
             d.nodes,
             if d.nodes > 0 && d.on_nodes == 0 { " — NO NODE CAN MOUNT ITS VOLUMES" } else { "" }
@@ -6808,7 +6825,15 @@ fn render_pv_state(pv: &k8s_openapi::api::core::v1::PersistentVolume, now: chron
         ),
         "Released" => lines.push(format!("RELEASED UNDER {reclaim}: its provisioner should have reclaimed it by now — is its driver running? Its events say why not")),
         "Failed" => lines.push("FAILED: reclaiming it failed; the status and events say why".to_string()),
-        "Available" => lines.push("Available: bound to no claim; a claim of its class, with a size and access modes it satisfies, can bind it".to_string()),
+        "Available" => lines.push(match spec.claim_ref.as_ref().filter(|r| r.name.is_some()) {
+            // A claimRef set before binding reserves it for that claim alone.
+            Some(r) => format!(
+                "Available, reserved by its claimRef for claim {}/{}: only that claim can bind it",
+                r.namespace.as_deref().unwrap_or("-"),
+                r.name.as_deref().unwrap_or("-")
+            ),
+            None => "Available: bound to no claim; a claim of its class, with a size and access modes it satisfies, can bind it".to_string(),
+        }),
         "Pending" => lines.push("PENDING: not yet available for binding".to_string()),
         _ => {}
     }
@@ -6825,6 +6850,9 @@ fn render_pv_claim(pv: &k8s_openapi::api::core::v1::PersistentVolume, claim: &Op
     match claim {
         None => format!("claimRef {at}, which names no namespace or name"),
         Some(Err(e)) => format!("claimRef {at}: (claim unavailable: {e})"),
+        // A claimRef that records no uid was set before any bind: that claim
+        // may never have existed.
+        Some(Ok(None)) if r.uid.is_none() => format!("claimRef {at}: reserves it for that claim, WHICH DOES NOT EXIST; it binds once a claim of that name is created"),
         Some(Ok(None)) => format!("claimRef {at}: THAT CLAIM NO LONGER EXISTS"),
         Some(Ok(Some(c))) => {
             let phase = c.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
@@ -6853,6 +6881,7 @@ fn render_pv_pods(
         None if claim_ref.is_some() => return "(its claimRef names no namespace or name, so no claim, and no pod, uses it)".to_string(),
         None => return "(no claimRef, so no pod uses it)".to_string(),
         Some(Err(e)) => return format!("(its claim could not be read, so which pods use it is unknown: {e})"),
+        Some(Ok(None)) if claim_ref.is_some_and(|r| r.uid.is_none()) => return "(the claim it is reserved for does not exist, so no pod uses it)".to_string(),
         Some(Ok(None)) => return "(its claim no longer exists, so no pod uses it)".to_string(),
         Some(Ok(Some(c))) => c,
     };
@@ -6984,11 +7013,12 @@ fn render_config_object(d: &crate::config_diagnosis::ConfigDiagnostics, now: chr
                 if o.cert_manager_issuer.is_empty() { String::new() } else { format!(", issued by {} {}", o.cert_manager_issuer_kind, o.cert_manager_issuer) }
             ));
         }
+        // What it holds, not what writes it: a hand edit to either stays.
         if !o.service_account.is_empty() {
-            writers.push(format!("a token for ServiceAccount {}", o.service_account));
+            lines.push(format!("holds: a token for ServiceAccount {}", o.service_account));
         }
         if !o.registries.is_empty() {
-            writers.push(format!("pull credentials for {}", o.registries.join(", ")));
+            lines.push(format!("holds: pull credentials for {}", o.registries.join(", ")));
         }
     }
     lines.push(if writers.is_empty() {
@@ -6998,6 +7028,8 @@ fn render_config_object(d: &crate::config_diagnosis::ConfigDiagnostics, now: chr
     });
     if let Some(tls) = &d.tls {
         let mut hosts: Vec<String> = d.ingresses.iter().flatten().flat_map(|(_, h)| h.clone()).collect();
+        // A listener with no hostname serves any, which no certificate is checked against.
+        hosts.extend(d.gateways.iter().flatten().map(|(_, h)| h.clone()).filter(|h| !h.is_empty()));
         hosts.sort();
         hosts.dedup();
         let read = Ok(k8s::IngressTlsSecret { secret_type: tls.secret_type.clone(), keys: tls.keys.clone(), leaf: tls.leaf.clone() });
@@ -7021,6 +7053,7 @@ fn render_config_use(u: &crate::config_diagnosis::Use) -> String {
             format!("{} mounted {at}{}", if keys.is_empty() { "every key".to_string() } else { format!("keys {}", keys.join(", ")) }, optional(*o))
         }
         Use::PullSecret => "as an image pull secret".to_string(),
+        Use::VolumeCredentials { volume, source } => format!("as the credentials of its {source} volume {volume}, read when the volume is mounted"),
     }
 }
 
@@ -7056,13 +7089,24 @@ fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: 
             .collect()
     };
     let plural = |n: usize| if n == 1 { "pod" } else { "pods" };
+    // A finished pod never runs again: whatever it read, it holds nothing now,
+    // and a key it asked for fails nothing.
+    let finished = |p: &crate::config_diagnosis::ConsumerPod| matches!(p.phase.as_str(), "Succeeded" | "Failed");
     for c in consumers.iter().take(DIAGNOSE_CONFIG_CONSUMERS) {
-        let source = if c.from_template { "" } else { " (seen from its pods: its template could not be read, or is not one listed)" };
+        let source = match (c.from_template, c.template_unused, c.kind.as_str()) {
+            (true, _, _) => "",
+            (false, true, _) => " (its template no longer uses it: these pods are of an older revision)",
+            (false, false, "Pod") => " (a pod no controller owns)",
+            (false, false, _) => " (seen from its pods: its template could not be read, or is of a kind not read)",
+        };
         lines.push(format!("- {} {}{source}: {}", c.kind, c.name, uses_text(&c.uses)));
-        // Each distinct way it is used, with how many pods use it so: the
-        // template's first, then each other way its pods do.
-        let mut ways: Vec<(&[Use], usize)> = vec![(c.uses.as_slice(), c.pods.iter().filter(|p| p.uses == c.uses).count())];
-        for p in c.pods.iter().filter(|p| p.uses != c.uses) {
+        // Each distinct way its running pods use it, with how many do so: the
+        // template's first, whose next pods ask for it however many run now,
+        // then each other way.
+        let live: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|&p| !finished(p)).collect();
+        let mut ways: Vec<(&[Use], usize)> =
+            if c.from_template { vec![(c.uses.as_slice(), live.iter().filter(|p| p.uses == c.uses).count())] } else { Vec::new() };
+        for p in live.iter().filter(|p| !c.from_template || p.uses != c.uses) {
             match ways.iter_mut().find(|(u, _)| *u == p.uses.as_slice()) {
                 Some(w) => w.1 += 1,
                 None => ways.push((p.uses.as_slice(), 1)),
@@ -7102,9 +7146,7 @@ fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: 
         }
         let ready = c.pods.iter().filter(|p| p.ready).count();
         let mut pods_line = format!("  pods: {ready} of {} ready", c.pods.len());
-        // A finished pod never runs again: whatever it read, it holds nothing now.
-        let finished = |p: &&crate::config_diagnosis::ConsumerPod| matches!(p.phase.as_str(), "Succeeded" | "Failed");
-        let at_start: Vec<&crate::config_diagnosis::ConsumerPod> = c.pods.iter().filter(|p| !finished(p) && p.uses.iter().any(Use::needs_restart)).collect();
+        let at_start: Vec<&crate::config_diagnosis::ConsumerPod> = live.iter().copied().filter(|p| p.uses.iter().any(Use::needs_restart)).collect();
         if let (false, Some(changed)) = (at_start.is_empty(), d.last_change) {
             let stale = at_start.iter().filter(|p| p.may_be_stale(changed) == Some(true)).count();
             let unknown = at_start.iter().filter(|p| p.may_be_stale(changed).is_none()).count();
@@ -7114,7 +7156,11 @@ fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: 
                     job_span((now - changed).num_seconds())
                 ));
             } else if unknown == 0 {
-                pods_line.push_str("; every container that reads it only at start started after its last recorded write");
+                pods_line.push_str(if at_start.iter().any(|p| p.yet_to_start()) {
+                    "; every container that reads it only at start started after its last recorded write, or has yet to start and then reads it as it is"
+                } else {
+                    "; every container that reads it only at start started after its last recorded write"
+                });
             }
             if unknown > 0 {
                 pods_line.push_str(&format!("; for {unknown}, when a container that reads it at start began is not known"));
@@ -7149,18 +7195,22 @@ fn render_config_consumers(d: &crate::config_diagnosis::ConfigDiagnostics, now: 
         }
         match &d.gateways {
             Err(e) => lines.push(format!("(Gateways unavailable: {e})")),
-            Ok(list) => lines.extend(list.iter().map(|g| if g.starts_with('(') { g.clone() } else { format!("- Gateway {g}: its certificate") })),
+            Ok(list) => lines.extend(list.iter().map(|(g, _)| if g.starts_with('(') { g.clone() } else { format!("- Gateway {g}: its certificate") })),
         }
         match &d.service_accounts {
             Err(e) => lines.push(format!("(ServiceAccounts unavailable: {e})")),
             Ok(list) => lines.extend(list.iter().map(|a| format!("- ServiceAccount {a}"))),
         }
+        match &d.volumes {
+            Err(e) => lines.push(format!("(PersistentVolumes and StorageClasses unavailable: {e})")),
+            Ok(list) => lines.extend(list.iter().map(|v| if v.starts_with('(') { v.clone() } else { format!("- {v}") })),
+        }
     }
     if lines.is_empty() {
         return format!(
-            "(nothing in {} uses it: no pod or workload template{} names it)",
+            "(nothing that was looked for uses it: no pod or workload template in {}{} names it; a controller that reads it through the API is not seen)",
             d.namespace,
-            if d.secret.is_some() { ", Ingress, Gateway listener or ServiceAccount" } else { "" }
+            if d.secret.is_some() { ", Ingress, Gateway listener or ServiceAccount there, and no PersistentVolume or StorageClass," } else { "" }
         );
     }
     lines.join("\n")
@@ -11206,13 +11256,13 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             tls: None,
             writers: vec!["Helm release web".into()],
             consumers: vec![
-                Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(), from_template: true,
+                Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(), from_template: true, template_unused: false,
                     pods: vec![pod("web-1", env(), "2026-11-23T09:00:00Z", true), pod("web-2", env(), "2026-11-24T11:00:00Z", false)] },
-                Consumer { kind: "Deployment".into(), name: "worker".into(), from_template: true,
+                Consumer { kind: "Deployment".into(), name: "worker".into(), from_template: true, template_unused: false,
                     uses: vec![Use::Volume { volume: "conf".into(), keys: vec!["app.yaml".into(), "extra.yaml".into()], mounts: vec![("worker".into(), "/etc/app.yaml".into(), true)], optional: true }],
                     pods: vec![] },
                 // Mid-rollout from env vars to a volume: the old pod is judged by its own env use.
-                Consumer { kind: "StatefulSet".into(), name: "db".into(), uses: volume(), from_template: true,
+                Consumer { kind: "StatefulSet".into(), name: "db".into(), uses: volume(), from_template: true, template_unused: false,
                     pods: vec![pod("db-0", volume(), "2026-11-01T00:00:00Z", true), pod("db-1", vec![Use::EnvFrom { container: "db".into(), optional: false }], "2026-11-01T00:00:00Z", true)] },
             ],
             consumer_errors: vec!["Failed to list CronJobs: forbidden".into()],
@@ -11220,6 +11270,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             ingresses: Ok(vec![]),
             gateways: Ok(vec![]),
             service_accounts: Ok(vec![]),
+            volumes: Ok(vec![]),
             manifest: String::new(),
             events: Ok(vec![]),
             pod_events: vec![],
@@ -11245,7 +11296,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
              pods: 2 of 2 ready; 1 HAVE A CONTAINER THAT READS IT ONLY AT START AND STARTED BEFORE ITS LAST RECORDED WRITE (2h 0m ago), so they may still have the old contents — that write may have changed only its metadata; a restart makes sure; a mounted volume's files are refreshed within about a minute of a change, and the application has to re-read them\n\
              (Failed to list CronJobs: forbidden: what uses it may be incomplete)"
         );
-        let unknown_pods = ConfigDiagnostics { pods_known: false, consumers: vec![Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(), from_template: true, pods: vec![] }], ..d };
+        let unknown_pods = ConfigDiagnostics { pods_known: false, consumers: vec![Consumer { kind: "Deployment".into(), name: "web".into(), uses: env(), from_template: true, template_unused: false, pods: vec![] }], ..d };
         let out = render_config_consumers(&unknown_pods, now);
         assert!(out.starts_with("1 workload uses it (their pods could not be listed):") && out.contains("\n  (its pods unavailable)"), "{out}");
 
@@ -11256,16 +11307,17 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         done.phase = "Succeeded".into();
         let from_pods = ConfigDiagnostics {
             pods_known: true,
-            consumers: vec![Consumer { kind: "Deployment".into(), name: "api".into(), uses: legacy(), from_template: false,
+            consumers: vec![Consumer { kind: "Deployment".into(), name: "api".into(), uses: legacy(), from_template: false, template_unused: false,
                 pods: vec![pod("api-a", legacy(), "2026-11-24T11:00:00Z", true), pod("api-b", volume(), "2026-11-24T11:00:00Z", true), done] }],
             consumer_errors: vec!["Failed to list Deployments: forbidden".into()],
             ..unknown_pods
         };
         let out = render_config_consumers(&from_pods, now);
-        assert!(out.contains("- Deployment api (seen from its pods: its template could not be read, or is not one listed): key legacy as an env var in web"), "{out}");
-        assert!(out.contains("\n  its pods use it in 3 ways:\n  - 1 pod: key legacy as an env var in web\n  - 1 pod: every key mounted at db:/etc/db\n  - 1 pod: every key as env vars (envFrom) in web; key region as an env var in web"), "{out}");
-        assert!(out.contains("\n  MISSING KEY legacy (asked for by 1 of its pods): ") && out.contains("\n  MISSING KEY region (asked for by 1 of its pods): "), "{out}");
+        assert!(out.contains("- Deployment api (seen from its pods: its template could not be read, or is of a kind not read): key legacy as an env var in web"), "{out}");
+        assert!(out.contains("\n  its pods use it in 2 ways:\n  - 1 pod: key legacy as an env var in web\n  - 1 pod: every key mounted at db:/etc/db\n"), "{out}");
+        assert!(out.contains("\n  MISSING KEY legacy (asked for by 1 of its pods): "), "{out}");
         assert!(!out.contains("older revision") && !out.contains("STARTED BEFORE"), "no revision order from pods alone, and the finished pod is not stale: {out}");
+        assert!(!out.contains("MISSING KEY region"), "a key only a finished pod asked for fails nothing: {out}");
 
         // A Secret whose workloads could not all be listed still names its other users.
         let secret = ConfigDiagnostics {
@@ -11274,8 +11326,9 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             consumer_errors: vec!["Failed to list pods: forbidden".into()],
             pods_known: false,
             ingresses: Ok(vec![("web".into(), vec!["web.example.com".into()])]),
-            gateways: Ok(vec!["infra/gw listener https (*.example.com)".into()]),
+            gateways: Ok(vec![("infra/gw listener https (*.example.com)".into(), "*.example.com".into())]),
             service_accounts: Ok(vec!["builder as an image pull secret, so every pod running as it gets it".into()]),
+            volumes: Ok(vec!["PersistentVolume pv-files: spec.csi.nodeStageSecretRef".into(), "(Failed to list StorageClasses: forbidden)".into()]),
             ..from_pods
         };
         assert_eq!(
@@ -11283,10 +11336,56 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             "(Failed to list pods: forbidden: what uses it may be incomplete)\n\
              - Ingress web: its TLS for web.example.com\n\
              - Gateway infra/gw listener https (*.example.com): its certificate\n\
-             - ServiceAccount builder as an image pull secret, so every pod running as it gets it"
+             - ServiceAccount builder as an image pull secret, so every pod running as it gets it\n\
+             - PersistentVolume pv-files: spec.csi.nodeStageSecretRef\n\
+             (Failed to list StorageClasses: forbidden)"
         );
-        let unused = ConfigDiagnostics { consumers: vec![], consumer_errors: vec![], secret: None, ..secret };
-        assert_eq!(render_config_consumers(&unused, now), "(nothing in app uses it: no pod or workload template names it)");
+        // The certificate is checked against the Gateway listener's hostname too.
+        let leaf = crate::x509::CertificateInfo {
+            subject: "CN=web.example.com".into(),
+            issuer: "CN=ca".into(),
+            sans: vec!["web.example.com".into()],
+            not_before: None,
+            not_after: Some("2027-11-24T12:00:00Z".into()),
+            is_ca: false,
+        };
+        let tls = ConfigDiagnostics { tls: Some(k8s::IngressTlsSecret { secret_type: "kubernetes.io/tls".into(), keys: vec!["tls.crt".into(), "tls.key".into()], leaf: Some(leaf) }), ..secret };
+        let object = render_config_object(&tls, now);
+        assert!(object.contains("DOES NOT COVER *.example.com") && !object.contains("DOES NOT COVER web.example.com"), "{object}");
+        // What a Secret holds is no writer: a hand edit to it stays.
+        let pull = ConfigDiagnostics {
+            secret: Some(crate::models::SecretOverview {
+                secret_type: "kubernetes.io/dockerconfigjson".into(),
+                registries: vec!["example.azurecr.io".into()],
+                ..Default::default()
+            }),
+            tls: None,
+            writers: vec![],
+            ..tls
+        };
+        let object = render_config_object(&pull, now);
+        assert!(object.contains("\nholds: pull credentials for example.azurecr.io\n") && object.ends_with("written by: nothing that marks it — edited by hand or by a tool that leaves no label"), "{object}");
+
+        let unused = ConfigDiagnostics { consumers: vec![], consumer_errors: vec![], volumes: Ok(vec![]), ingresses: Ok(vec![]), gateways: Ok(vec![]), service_accounts: Ok(vec![]), ..pull };
+        assert_eq!(
+            render_config_consumers(&unused, now),
+            "(nothing that was looked for uses it: no pod or workload template in app, Ingress, Gateway listener or ServiceAccount there, and no PersistentVolume or StorageClass, names it; a controller that reads it through the API is not seen)"
+        );
+        let unused = ConfigDiagnostics { secret: None, ..unused };
+        assert_eq!(
+            render_config_consumers(&unused, now),
+            "(nothing that was looked for uses it: no pod or workload template in app names it; a controller that reads it through the API is not seen)"
+        );
+
+        // A template that was read and no longer uses it; a pod no controller
+        // owns; a container that has yet to start.
+        let dropped = Consumer { kind: "Deployment".into(), name: "old".into(), uses: legacy(), from_template: false, template_unused: true, pods: vec![pod("old-a", legacy(), "2026-11-24T11:00:00Z", true)] };
+        let bare = Consumer { kind: "Pod".into(), name: "debug".into(), uses: legacy(), from_template: false, template_unused: false, pods: vec![pod("debug", legacy(), "2026-11-24T11:00:00Z", false)] };
+        let out = render_config_consumers(&ConfigDiagnostics { consumers: vec![dropped, bare], pods_known: true, ..unused }, now);
+        assert!(out.contains("- Deployment old (its template no longer uses it: these pods are of an older revision): "), "{out}");
+        assert!(out.contains("- Pod debug (a pod no controller owns): "), "{out}");
+        assert!(out.contains("pods: 1 of 1 ready; every container that reads it only at start started after its last recorded write\n"), "{out}");
+        assert!(out.contains("pods: 0 of 1 ready; every container that reads it only at start started after its last recorded write, or has yet to start and then reads it as it is\n"), "{out}");
     }
 
     #[test]
@@ -11369,7 +11468,7 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             "status": { "phase": "Released" }
         }))
         .unwrap();
-        let csi = Some(Ok(k8s::PvcCsiDriver { name: "disk.csi.azure.com".into(), registered: true, on_nodes: 5, nodes: 6 }));
+        let csi = Some(Ok(k8s::PvcCsiDriver { name: "disk.csi.azure.com".into(), confirmed: true, registered: true, on_nodes: 5, nodes: 6 }));
         let mut unclaimed = pv.clone();
         unclaimed.spec.as_mut().unwrap().claim_ref = None;
         let out = render_pvc_volume(&pvc(serde_json::json!({})), &Some(Ok(unclaimed)), &None);
@@ -11760,9 +11859,9 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
             largest = largest.max(payload.approx_tokens);
             claim_gone += p.contains("THAT CLAIM NO LONGER EXISTS") as usize;
             no_node += p.contains("NO NODE OF THE") as usize;
-            with_pods += !["(no pod mounts it)", "so no pod uses it)", "do not use this one)", "which pods use it is unknown"].iter().any(|s| p.contains(s)) as usize;
+            with_pods += !["(no pod mounts it)", "so no pod uses it)", "no pod, uses it)", "do not use this one)", "do not use this volume)", "which pods use it is unknown"].iter().any(|s| p.contains(s)) as usize;
             if v.status != "Bound" {
-                explained += (p.contains("RELEASED") || p.contains("FAILED") || p.contains("Available: bound to no claim") || p.contains("PENDING")) as usize;
+                explained += (p.contains("RELEASED") || p.contains("FAILED") || p.contains("Available: bound to no claim") || p.contains("Available, reserved") || p.contains("PENDING")) as usize;
             }
         }
         println!(
@@ -11816,19 +11915,27 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(render_pv_nodes(&Some(Ok((2, 0, 6)))).ends_with("NONE OF THEM IS READY AND SCHEDULABLE"));
         assert_eq!(render_pv_class(Some("gone"), &Some(Ok(None))), "NO STORAGECLASS NAMED gone EXISTS: nothing provisions or expands volumes of that class");
         assert_eq!(
-            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "disk.csi.azure.com".into(), registered: true, on_nodes: 0, nodes: 3 }))).as_deref(),
+            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "disk.csi.azure.com".into(), confirmed: true, registered: true, on_nodes: 0, nodes: 3 }))).as_deref(),
             Some("CSI driver disk.csi.azure.com: registered; on 0 of 3 nodes — NO NODE CAN MOUNT ITS VOLUMES")
         );
         // An in-tree provisioner is in no CSINode, and that is no fault.
         assert_eq!(
-            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "kubernetes.io/azure-file".into(), registered: false, on_nodes: 0, nodes: 3 }))).as_deref(),
+            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "kubernetes.io/azure-file".into(), confirmed: false, registered: false, on_nodes: 0, nodes: 3 }))).as_deref(),
             Some("provisioner kubernetes.io/azure-file: in-tree, not a CSI driver")
         );
         // A CSI driver uninstalled with its CSIDriver object still cannot mount anything.
         assert_eq!(
-            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "blob.csi.azure.com".into(), registered: false, on_nodes: 0, nodes: 3 }))).as_deref(),
+            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "blob.csi.azure.com".into(), confirmed: true, registered: false, on_nodes: 0, nodes: 3 }))).as_deref(),
             Some("CSI driver blob.csi.azure.com: NO CSIDriver OBJECT: the driver is not installed; on 0 of 3 nodes — NO NODE CAN MOUNT ITS VOLUMES")
         );
+        // A CSIDriver object is optional: a driver on its nodes without one is no fault.
+        assert_eq!(
+            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "nfs.csi.k8s.io".into(), confirmed: true, registered: false, on_nodes: 3, nodes: 3 }))).as_deref(),
+            Some("CSI driver nfs.csi.k8s.io: no CSIDriver object (optional); on 3 of 3 nodes")
+        );
+        // A provisioner name alone, known nowhere, may be no CSI driver at all.
+        let external = render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "rancher.io/local-path".into(), confirmed: false, registered: false, on_nodes: 0, nodes: 3 }))).unwrap();
+        assert!(external.starts_with("provisioner rancher.io/local-path: no CSIDriver object") && !external.contains("NO NODE CAN MOUNT"), "{external}");
 
         // Pods are the volume's only through the claim bound to it.
         let mounting: Result<Vec<k8s_openapi::api::core::v1::Pod>, String> = Ok(vec![serde_json::from_value(serde_json::json!({
@@ -11850,6 +11957,11 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert_eq!(render_pv_pods(&unclaimed, &None, &mounting), "(no claimRef, so no pod uses it)");
         assert_eq!(render_pv_pods(&released, &Some(Err("forbidden".into())), &mounting), "(its claim could not be read, so which pods use it is unknown: forbidden)");
         assert_eq!(render_pv_pods(&released, &Some(Ok(None)), &mounting), "(its claim no longer exists, so no pod uses it)");
+        // A reservation for a claim not yet created: that claim never existed.
+        assert_eq!(render_pv_pods(&reserved, &Some(Ok(None)), &mounting), "(the claim it is reserved for does not exist, so no pod uses it)");
+        assert!(render_pv_claim(&reserved, &Some(Ok(None))).starts_with("claimRef app/data: reserves it for that claim, WHICH DOES NOT EXIST"));
+        assert!(render_pv_state(&reserved, now).ends_with("Available, reserved by its claimRef for claim app/data: only that claim can bind it"));
+        assert!(render_pv_state(&unclaimed, now).ends_with("Available: bound to no claim; a claim of its class, with a size and access modes it satisfies, can bind it"));
     }
 
     /// Builds a diagnosis for every ScaledObject and ScaledJob on a cluster and

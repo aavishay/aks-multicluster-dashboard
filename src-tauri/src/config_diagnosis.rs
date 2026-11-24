@@ -18,7 +18,7 @@ use crate::k8s::{self, event_to_info, Chrono};
 use crate::kubeconfig::client_for_context;
 use crate::models::EventInfo;
 use chrono::{DateTime, Utc};
-use k8s_openapi::api::core::v1::{ConfigMap, Pod, PodSpec, Secret};
+use k8s_openapi::api::core::v1::{ConfigMap, LocalObjectReference, PersistentVolume, Pod, PodSpec, Secret, SecretReference, Volume};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::api::{Api, ListParams};
 use kube::Client;
@@ -37,6 +37,10 @@ pub enum Use {
     Volume { volume: String, keys: Vec<String>, mounts: Vec<(String, String, bool)>, optional: bool },
     /// A Secret as an image pull secret.
     PullSecret,
+    /// A Secret as the credentials a volume plugin reads when it mounts an
+    /// inline volume: an azureFile share's account key, a CSI driver's
+    /// node-publish secret.
+    VolumeCredentials { volume: String, source: &'static str },
 }
 
 impl Use {
@@ -51,7 +55,7 @@ impl Use {
         match self {
             Use::EnvKey { container, .. } | Use::EnvFrom { container, .. } => vec![container.as_str()],
             Use::Volume { mounts, .. } => mounts.iter().filter(|(_, _, sub_path)| *sub_path).map(|(c, _, _)| c.as_str()).collect(),
-            Use::PullSecret => Vec::new(),
+            Use::PullSecret | Use::VolumeCredentials { .. } => Vec::new(),
         }
     }
 
@@ -95,6 +99,12 @@ impl ConsumerPod {
             Some(false)
         }
     }
+
+    /// Whether a container that reads it only at start has yet to start: it
+    /// will read the contents as they are then.
+    pub fn yet_to_start(&self) -> bool {
+        self.uses.iter().flat_map(Use::restart_containers).any(|c| self.container_started.iter().any(|(name, started)| name == c && started.is_none()))
+    }
 }
 
 /// A workload, or for pods no listed workload accounts for their controller,
@@ -108,6 +118,9 @@ pub struct Consumer {
     /// Whether `uses` is the template's, against which a pod that differs is
     /// of an older revision. Pods alone carry no order of revisions.
     pub from_template: bool,
+    /// For a consumer found only from its pods: its workload's template was
+    /// read and does not use it, so its pods are of an older revision.
+    pub template_unused: bool,
     pub pods: Vec<ConsumerPod>,
 }
 
@@ -137,10 +150,16 @@ pub struct ConfigDiagnostics {
     pub pods_known: bool,
     /// For a Secret: the Ingresses whose TLS names it, with their hosts.
     pub ingresses: Result<Vec<(String, Vec<String>)>, String>,
-    /// For a Secret: the Gateway listeners whose certificate it is.
-    pub gateways: Result<Vec<String>, String>,
+    /// For a Secret: the Gateway listeners whose certificate it is, each
+    /// with the hostname it serves (empty for any); a note in parentheses
+    /// when some Gateway API kinds could not be listed.
+    pub gateways: Result<Vec<(String, String)>, String>,
     /// For a Secret: the ServiceAccounts that list it.
     pub service_accounts: Result<Vec<String>, String>,
+    /// For a Secret: the PersistentVolumes and StorageClasses that name it as
+    /// a volume plugin's credentials, by the field; a note in parentheses for
+    /// a kind that could not be listed.
+    pub volumes: Result<Vec<String>, String>,
     pub manifest: String,
     pub events: Result<Vec<EventInfo>, String>,
     /// The Warning events of consumer pods that are not ready, by pod.
@@ -219,9 +238,88 @@ pub(crate) fn uses_in(spec: &PodSpec, kind: &str, name: &str) -> Vec<Use> {
                 .collect();
             out.push(Use::Volume { volume: v.name.clone(), keys, mounts, optional });
         }
+        if let Some(source) = secret.then(|| volume_credentials(v, name)).flatten() {
+            out.push(Use::VolumeCredentials { volume: v.name.clone(), source });
+        }
     }
     if secret && spec.image_pull_secrets.iter().flatten().any(|r| r.name == name) {
         out.push(Use::PullSecret);
+    }
+    out
+}
+
+/// The plugin of an inline volume that reads the named Secret for its
+/// credentials when it mounts the volume.
+fn volume_credentials(v: &Volume, name: &str) -> Option<&'static str> {
+    let names = |r: Option<&LocalObjectReference>| r.is_some_and(|r| r.name == name);
+    if v.azure_file.as_ref().is_some_and(|a| a.secret_name == name) {
+        Some("azureFile")
+    } else if v.csi.as_ref().is_some_and(|c| names(c.node_publish_secret_ref.as_ref())) {
+        Some("CSI")
+    } else if v.cephfs.as_ref().is_some_and(|c| names(c.secret_ref.as_ref())) {
+        Some("cephfs")
+    } else if v.rbd.as_ref().is_some_and(|r| names(r.secret_ref.as_ref())) {
+        Some("rbd")
+    } else if v.iscsi.as_ref().is_some_and(|i| names(i.secret_ref.as_ref())) {
+        Some("iscsi")
+    } else if v.flex_volume.as_ref().is_some_and(|f| names(f.secret_ref.as_ref())) {
+        Some("flexVolume")
+    } else {
+        None
+    }
+}
+
+/// The fields of a PersistentVolume that name the Secret as its plugin's
+/// credentials. A reference that names no namespace means its claim's.
+pub(crate) fn pv_secret_fields(pv: &PersistentVolume, namespace: &str, name: &str) -> Vec<&'static str> {
+    let Some(spec) = pv.spec.as_ref() else { return Vec::new() };
+    let claim_namespace = spec.claim_ref.as_ref().and_then(|r| r.namespace.as_deref());
+    let here = |ns: Option<&str>| ns.or(claim_namespace) == Some(namespace);
+    let names = |r: Option<&SecretReference>| r.is_some_and(|r| r.name.as_deref() == Some(name) && here(r.namespace.as_deref()));
+    let mut out = Vec::new();
+    if let Some(c) = &spec.csi {
+        for (field, r) in [
+            ("spec.csi.nodeStageSecretRef", &c.node_stage_secret_ref),
+            ("spec.csi.nodePublishSecretRef", &c.node_publish_secret_ref),
+            ("spec.csi.controllerPublishSecretRef", &c.controller_publish_secret_ref),
+            ("spec.csi.controllerExpandSecretRef", &c.controller_expand_secret_ref),
+            ("spec.csi.nodeExpandSecretRef", &c.node_expand_secret_ref),
+        ] {
+            if names(r.as_ref()) {
+                out.push(field);
+            }
+        }
+    }
+    if spec.azure_file.as_ref().is_some_and(|a| a.secret_name == name && here(a.secret_namespace.as_deref())) {
+        out.push("spec.azureFile.secretName");
+    }
+    for (field, r) in [
+        ("spec.cephfs.secretRef", spec.cephfs.as_ref().and_then(|c| c.secret_ref.as_ref())),
+        ("spec.rbd.secretRef", spec.rbd.as_ref().and_then(|c| c.secret_ref.as_ref())),
+        ("spec.iscsi.secretRef", spec.iscsi.as_ref().and_then(|c| c.secret_ref.as_ref())),
+        ("spec.flexVolume.secretRef", spec.flex_volume.as_ref().and_then(|c| c.secret_ref.as_ref())),
+    ] {
+        if names(r) {
+            out.push(field);
+        }
+    }
+    out
+}
+
+/// The parameters of a StorageClass that name the Secret: a CSI driver's
+/// secrets, and the azurefile driver's `secretName`. A namespace left out,
+/// or `${pvc.namespace}`, is each claim's.
+pub(crate) fn storage_class_secret_parameters(parameters: &std::collections::BTreeMap<String, String>, namespace: &str, name: &str) -> Vec<String> {
+    let here = |ns: Option<&String>| ns.is_none_or(|ns| ns == namespace || ns == "${pvc.namespace}");
+    let mut out = Vec::new();
+    for prefix in ["provisioner", "controller-publish", "node-stage", "node-publish", "controller-expand", "node-expand"] {
+        let key = format!("csi.storage.k8s.io/{prefix}-secret-name");
+        if parameters.get(&key).is_some_and(|n| n == name) && here(parameters.get(&format!("csi.storage.k8s.io/{prefix}-secret-namespace"))) {
+            out.push(key);
+        }
+    }
+    if parameters.get("secretName").is_some_and(|n| n == name) && here(parameters.get("secretNamespace")) {
+        out.push("secretName".to_string());
     }
     out
 }
@@ -305,6 +403,9 @@ fn controller_of(p: &Pod) -> (String, String) {
 pub(crate) fn consumers(templates: Vec<(String, String, Option<LabelSelector>, PodSpec)>, pods: &[Pod], kind: &str, name: &str) -> Vec<Consumer> {
     let mut out: Vec<Consumer> = Vec::new();
     let mut claimed = std::collections::HashSet::new();
+    let read: Vec<(String, String)> = templates.iter().map(|(k, n, _, _)| (k.clone(), n.clone())).collect();
+    // A CronJob's pods belong to its Jobs, named after it.
+    let job_of = |cronjob: &str, job: &str| job.strip_prefix(&format!("{cronjob}-")).is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()));
     let pod_uses: Vec<(usize, Vec<Use>)> =
         pods.iter().enumerate().filter_map(|(i, p)| p.spec.as_ref().map(|s| (i, uses_in(s, kind, name))).filter(|(_, u)| !u.is_empty())).collect();
     for (wkind, wname, selector, spec) in templates {
@@ -318,8 +419,7 @@ pub(crate) fn consumers(templates: Vec<(String, String, Option<LabelSelector>, P
                 let p = &pods[*i];
                 match &selector {
                     Some(sel) => k8s::label_selector_matches(sel, p.metadata.labels.as_ref()),
-                    // A CronJob's pods belong to its Jobs, named after it.
-                    None => controller_of(p).1.strip_prefix(&format!("{wname}-")).is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit())),
+                    None => job_of(&wname, &controller_of(p).1),
                 }
             })
             .map(|(i, uses)| {
@@ -327,7 +427,7 @@ pub(crate) fn consumers(templates: Vec<(String, String, Option<LabelSelector>, P
                 consumer_pod(&pods[*i], uses.clone())
             })
             .collect();
-        out.push(Consumer { kind: wkind, name: wname, uses, from_template: true, pods: mine });
+        out.push(Consumer { kind: wkind, name: wname, uses, from_template: true, template_unused: false, pods: mine });
     }
     for (i, uses) in &pod_uses {
         if claimed.contains(i) {
@@ -336,7 +436,10 @@ pub(crate) fn consumers(templates: Vec<(String, String, Option<LabelSelector>, P
         let (ckind, cname) = controller_of(&pods[*i]);
         match out.iter_mut().find(|c| c.kind == ckind && c.name == cname) {
             Some(c) => c.pods.push(consumer_pod(&pods[*i], uses.clone())),
-            None => out.push(Consumer { kind: ckind, name: cname, uses: uses.clone(), from_template: false, pods: vec![consumer_pod(&pods[*i], uses.clone())] }),
+            None => {
+                let template_unused = read.iter().any(|(k, n)| (*k == ckind && *n == cname) || (k == "CronJob" && ckind == "Job" && job_of(n, &cname)));
+                out.push(Consumer { kind: ckind, name: cname, uses: uses.clone(), from_template: false, template_unused, pods: vec![consumer_pod(&pods[*i], uses.clone())] })
+            }
         }
     }
     out
@@ -461,21 +564,52 @@ async fn read_ingresses(client: &Client, namespace: &str, name: &str) -> Result<
 }
 
 /// The Gateway listeners whose certificate is the Secret, as
-/// `namespace/gateway listener (hostname)`.
-async fn read_gateways(context_name: &str, namespace: &str, name: &str) -> Result<Vec<String>, String> {
+/// `namespace/gateway listener (hostname)`, each with its hostname.
+async fn read_gateways(context_name: &str, namespace: &str, name: &str) -> Result<Vec<(String, String)>, String> {
     let api = crate::gateway_api::get_gateway_api(context_name).await?;
     let mut out = Vec::new();
     for g in &api.gateways {
         for l in &g.listeners {
             let names_it = l.certificates.iter().any(|c| (g.namespace == namespace && c == name) || *c == format!("{namespace}/{name}"));
             if names_it {
-                out.push(format!("{}/{} listener {}{}", g.namespace, g.name, l.name, if l.hostname.is_empty() { String::new() } else { format!(" ({})", l.hostname) }));
+                let label = format!("{}/{} listener {}{}", g.namespace, g.name, l.name, if l.hostname.is_empty() { String::new() } else { format!(" ({})", l.hostname) });
+                out.push((label, l.hostname.clone()));
             }
         }
     }
     if let Some(e) = api.error {
-        out.push(format!("(some Gateway API kinds could not be listed: {e})"));
+        out.push((format!("(some Gateway API kinds could not be listed: {e})"), String::new()));
     }
+    Ok(out)
+}
+
+/// The PersistentVolumes and StorageClasses that name the Secret as their
+/// plugin's credentials. One kind that cannot be listed leaves the other.
+async fn read_volumes(client: &Client, namespace: &str, name: &str) -> Result<Vec<String>, String> {
+    use k8s_openapi::api::storage::v1::StorageClass;
+    let all = ListParams::default();
+    let (pv_api, class_api) = (Api::<PersistentVolume>::all(client.clone()), Api::<StorageClass>::all(client.clone()));
+    let (pvs, classes) = tokio::join!(pv_api.list(&all), class_api.list(&all));
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    match pvs {
+        Ok(l) => out.extend(l.items.iter().filter_map(|pv| {
+            let fields = pv_secret_fields(pv, namespace, name);
+            (!fields.is_empty()).then(|| format!("PersistentVolume {}: {}", pv.metadata.name.as_deref().unwrap_or_default(), fields.join(", ")))
+        })),
+        Err(e) => errors.push(format!("Failed to list PersistentVolumes: {e}")),
+    }
+    match classes {
+        Ok(l) => out.extend(l.items.iter().filter_map(|c| {
+            let keys = storage_class_secret_parameters(c.parameters.as_ref()?, namespace, name);
+            (!keys.is_empty()).then(|| format!("StorageClass {}: parameter {}", c.metadata.name.as_deref().unwrap_or_default(), keys.join(", ")))
+        })),
+        Err(e) => errors.push(format!("Failed to list StorageClasses: {e}")),
+    }
+    if errors.len() == 2 {
+        return Err(errors.join("; "));
+    }
+    out.extend(errors.into_iter().map(|e| format!("({e})")));
     Ok(out)
 }
 
@@ -535,12 +669,14 @@ pub async fn get_config_diagnostics(context_name: &str, kind: &str, namespace: &
     let ingresses_fut = async { if is_secret { read_ingresses(&client, namespace, name).await } else { Ok(Vec::new()) } };
     let gateways_fut = async { if tls_secret { read_gateways(context_name, namespace, name).await } else { Ok(Vec::new()) } };
     let accounts_fut = async { if is_secret { read_service_accounts(&client, namespace, name).await } else { Ok(Vec::new()) } };
-    let (pods, templates, ingresses, gateways, service_accounts, events) = tokio::join!(
+    let volumes_fut = async { if is_secret { read_volumes(&client, namespace, name).await } else { Ok(Vec::new()) } };
+    let (pods, templates, ingresses, gateways, service_accounts, volumes, events) = tokio::join!(
         pods_fut,
         read_templates(&client, namespace),
         ingresses_fut,
         gateways_fut,
         accounts_fut,
+        volumes_fut,
         events_of(&client, kind, namespace, name, false),
     );
 
@@ -576,6 +712,7 @@ pub async fn get_config_diagnostics(context_name: &str, kind: &str, namespace: &
         ingresses,
         gateways,
         service_accounts,
+        volumes,
         manifest,
         events,
         pod_events,
@@ -637,6 +774,53 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_is_found_as_a_volume_plugins_credentials() {
+        let s = spec(json!({
+            "containers": [{ "name": "web" }],
+            "volumes": [
+                { "name": "share", "azureFile": { "secretName": "storage", "shareName": "data" } },
+                { "name": "vault", "csi": { "driver": "secrets-store.csi.k8s.io", "nodePublishSecretRef": { "name": "storage" } } },
+                { "name": "other", "csi": { "driver": "file.csi.azure.com", "nodePublishSecretRef": { "name": "elsewhere" } } }
+            ]
+        }));
+        assert_eq!(uses_in(&s, "Secret", "storage"), vec![
+            Use::VolumeCredentials { volume: "share".into(), source: "azureFile" },
+            Use::VolumeCredentials { volume: "vault".into(), source: "CSI" },
+        ]);
+        assert!(uses_in(&s, "ConfigMap", "storage").is_empty(), "only a Secret holds a volume's credentials");
+        assert!(!Use::VolumeCredentials { volume: "share".into(), source: "azureFile" }.needs_restart());
+
+        let pv: PersistentVolume = serde_json::from_value(json!({
+            "metadata": { "name": "pv-files" },
+            "spec": {
+                "claimRef": { "namespace": "app", "name": "files" },
+                "csi": { "driver": "file.csi.azure.com", "volumeHandle": "h",
+                    "nodeStageSecretRef": { "name": "storage", "namespace": "app" },
+                    "nodePublishSecretRef": { "name": "storage", "namespace": "other" } },
+                "azureFile": { "secretName": "storage", "shareName": "data" }
+            }
+        }))
+        .unwrap();
+        // A reference that names no namespace means its claim's.
+        assert_eq!(pv_secret_fields(&pv, "app", "storage"), vec!["spec.csi.nodeStageSecretRef", "spec.azureFile.secretName"]);
+        assert_eq!(pv_secret_fields(&pv, "other", "storage"), vec!["spec.csi.nodePublishSecretRef"]);
+        assert!(pv_secret_fields(&pv, "app", "elsewhere").is_empty());
+
+        let parameters: std::collections::BTreeMap<String, String> = [
+            ("csi.storage.k8s.io/node-stage-secret-name", "storage"),
+            ("csi.storage.k8s.io/node-stage-secret-namespace", "${pvc.namespace}"),
+            ("csi.storage.k8s.io/provisioner-secret-name", "storage"),
+            ("csi.storage.k8s.io/provisioner-secret-namespace", "kube-system"),
+            ("secretName", "storage"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(storage_class_secret_parameters(&parameters, "app", "storage"), vec!["csi.storage.k8s.io/node-stage-secret-name", "secretName"]);
+        assert_eq!(storage_class_secret_parameters(&parameters, "kube-system", "storage").len(), 3);
+    }
+
+    #[test]
     fn the_last_change_is_the_newest_write_to_the_data() {
         let meta: ObjectMeta = serde_json::from_value(json!({
             "name": "app", "creationTimestamp": "2026-01-01T00:00:00Z",
@@ -672,6 +856,8 @@ mod tests {
         assert_eq!(pod(env(), vec![("app", Some("2026-11-24T11:00:00Z")), ("sidecar", Some("2026-11-01T00:00:00Z"))]).may_be_stale(changed), Some(false));
         assert_eq!(pod(env(), vec![("app", Some("2026-11-24T09:00:00Z"))]).may_be_stale(changed), Some(true));
         assert_eq!(pod(env(), vec![("app", None)]).may_be_stale(changed), Some(false), "waiting to start: its next start reads what is there then");
+        assert!(pod(env(), vec![("app", None)]).yet_to_start());
+        assert!(!pod(env(), vec![("app", Some("2026-11-24T11:00:00Z")), ("sidecar", None)]).yet_to_start(), "only a container that reads it counts");
         assert_eq!(pod(env(), vec![]).may_be_stale(changed), None, "no status for the container: unknown");
         // A whole-volume mount is refreshed whatever the container's age.
         let volume = vec![Use::Volume { volume: "conf".into(), keys: vec![], mounts: vec![("app".into(), "/etc/app".into(), false)], optional: false }];
@@ -726,10 +912,20 @@ mod tests {
             pod("api-77c4-a", json!({ "app": "api", "pod-template-hash": "77c4" }), rs("api-77c4"), true),
             pod("other-1", json!({ "app": "other" }), rs("other-1"), false),
             pod("nightly-29123456-x", json!({}), json!({ "apiVersion": "batch/v1", "kind": "Job", "name": "nightly-29123456", "uid": "j", "controller": true }), true),
+            // Workloads whose templates were read and no longer use it.
+            pod("old-6b9c-a", json!({ "app": "old", "pod-template-hash": "6b9c" }), rs("old-6b9c"), true),
+            pod("weekly-29123456-x", json!({}), json!({ "apiVersion": "batch/v1", "kind": "Job", "name": "weekly-29123456", "uid": "w", "controller": true }), true),
         ];
         let cron = spec(json!({ "containers": [{ "name": "job", "envFrom": [{ "configMapRef": { "name": "app" } }] }] }));
+        let unused = spec(json!({ "containers": [{ "name": "web" }] }));
+        let old_selector: LabelSelector = serde_json::from_value(json!({ "matchLabels": { "app": "old" } })).unwrap();
         let found = consumers(
-            vec![("Deployment".into(), "web".into(), Some(selector), template), ("CronJob".into(), "nightly".into(), None, cron)],
+            vec![
+                ("Deployment".into(), "web".into(), Some(selector), template),
+                ("CronJob".into(), "nightly".into(), None, cron),
+                ("Deployment".into(), "old".into(), Some(old_selector), unused.clone()),
+                ("CronJob".into(), "weekly".into(), None, unused),
+            ],
             &pods,
             "ConfigMap",
             "app",
@@ -740,7 +936,11 @@ mod tests {
             ("CronJob".to_string(), "nightly".to_string(), vec!["nightly-29123456-x".to_string()]),
             // Its template was not listed (another namespace's view, say): found from the pod and taken back to its Deployment.
             ("Deployment".to_string(), "api".to_string(), vec!["api-77c4-a".to_string()]),
+            ("Deployment".to_string(), "old".to_string(), vec!["old-6b9c-a".to_string()]),
+            ("Job".to_string(), "weekly-29123456".to_string(), vec!["weekly-29123456-x".to_string()]),
         ]);
+        let unused_templates: Vec<(&str, bool)> = found.iter().map(|c| (c.name.as_str(), c.template_unused)).collect();
+        assert_eq!(unused_templates, vec![("web", false), ("nightly", false), ("api", false), ("old", true), ("weekly-29123456", true)]);
     }
 
     /// Diagnoses a sample of ConfigMaps and Secrets, the most used first,
@@ -795,7 +995,7 @@ mod tests {
             let consumers = &d.consumers;
             let restart: usize = consumers.iter().filter(|c| c.uses.iter().any(Use::needs_restart)).count();
             println!(
-                "{kind}: keys={} last change known={} consumers={} (needing a restart for a change {restart}) pods={} ingresses={:?} gateways={:?} accounts={:?} tls={} tokens={} unavailable={}",
+                "{kind}: keys={} last change known={} consumers={} (needing a restart for a change {restart}) pods={} ingresses={:?} gateways={:?} accounts={:?} volumes={:?} tls={} tokens={} unavailable={}",
                 d.keys.len(),
                 d.last_change.is_some(),
                 consumers.len(),
@@ -803,11 +1003,33 @@ mod tests {
                 d.ingresses.as_ref().map(Vec::len),
                 d.gateways.as_ref().map(Vec::len),
                 d.service_accounts.as_ref().map(Vec::len),
+                d.volumes.as_ref().map(Vec::len),
                 d.tls.is_some(),
                 p.approx_tokens,
                 p.prompt.matches("unavailable").count(),
             );
             assert!(!consumers.is_empty(), "an object the pods use has consumers");
+        }
+        // A Secret a PersistentVolume reads its credentials from is found
+        // through that volume.
+        let pvs = Api::<PersistentVolume>::all(client.clone()).list(&ListParams::default()).await.unwrap().items;
+        let referenced = pvs.iter().find_map(|pv| {
+            let spec = pv.spec.as_ref()?;
+            let claim_namespace = spec.claim_ref.as_ref().and_then(|r| r.namespace.clone());
+            let csi = spec.csi.as_ref().and_then(|c| c.node_stage_secret_ref.clone().or_else(|| c.node_publish_secret_ref.clone()));
+            csi.and_then(|r| Some((r.namespace.or_else(|| claim_namespace.clone())?, r.name?)))
+                .or_else(|| spec.azure_file.as_ref().and_then(|a| Some((a.secret_namespace.clone().or_else(|| claim_namespace.clone())?, a.secret_name.clone()))))
+        });
+        println!("a Secret a PersistentVolume reads found={}", referenced.is_some());
+        if let Some((ns, name)) = referenced {
+            match get_config_diagnostics(&ctx, "Secret", &ns, &name).await {
+                Ok(d) => {
+                    let named = d.volumes.as_ref().map(|v| v.iter().filter(|l| l.starts_with("PersistentVolume ")).count());
+                    println!("that Secret: PersistentVolumes naming it={named:?}");
+                    assert!(named.is_ok_and(|n| n > 0), "the volume that reads it names it");
+                }
+                Err(_) => println!("that Secret does not exist"),
+            }
         }
     }
 }
