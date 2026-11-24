@@ -498,6 +498,50 @@ Some values are replaced with [REDACTED] before you see them — secrets and \
 personal data are stripped deliberately. Do not speculate about redacted \
 contents, and do not ask for them.";
 
+const DIAGNOSE_PV_SYSTEM: &str = "\
+You diagnose Kubernetes PersistentVolumes on AKS for an experienced SRE.
+
+You are given the volume's phase and how long it has been in it, size, \
+access modes, reclaim policy, source and node affinity; the claim its \
+claimRef names and whether that claim still exists, is the same object and \
+names the volume back; its StorageClass and CSI driver, and on how many \
+nodes the driver runs; how many nodes satisfy its node affinity; its \
+VolumeAttachments; the pods that mount its claim; its events; and its \
+manifest. Respond with:
+1. The most likely root cause, stated plainly.
+2. The specific evidence that points there — cite the phase, the claimRef, \
+the node count, the attachment error, the event, or the field.
+3. Concrete next steps: the exact command to run or field to change.
+
+Say which of these you are looking at, because the fixes differ:
+- Released under Retain: its claim is gone and it keeps the data. To \
+reuse it, clear spec.claimRef (kubectl patch pv <name> --type json -p \
+'[{\"op\":\"remove\",\"path\":\"/spec/claimRef\"}]') and create a claim that \
+asks for it by volumeName; to discard it, delete the PV and then its \
+backing disk, which Retain leaves behind and keeps billing.
+- Released or Failed under Delete: the provisioner could not delete the \
+backing disk — the events say why (the disk still attached to a node, a \
+permission, a lock), or its CSI driver is not running.
+- Bound to a claim that is gone or was recreated: the claimRef's uid no \
+longer matches, so the new claim will not bind it.
+- Not usable where pods run: no node satisfies its node affinity (a zonal \
+disk in a zone with no nodes, or the only ones cordoned), or the driver \
+runs on no node.
+- An attach that fails: the VolumeAttachment's error — a disk still \
+attached to another node (multi-attach), a node at its data-disk limit.
+- Available and unused: no claim matches it. Say so; it may be intended \
+(static provisioning) or an orphan that still costs money.
+
+If the volume is healthy, say so plainly rather than inventing a problem.
+
+Be direct; assume fluency with kubectl and az. Prefer one well-supported \
+cause over a list of possibilities. If the evidence is genuinely \
+insufficient, say so and name what would settle it.
+
+Some values are replaced with [REDACTED] before you see them — secrets and \
+personal data are stripped deliberately. Do not speculate about redacted \
+contents, and do not ask for them.";
+
 const DIAGNOSE_GITOPS_SYSTEM: &str = "\
 You diagnose failing ArgoCD Applications for an experienced SRE.
 
@@ -4385,18 +4429,24 @@ fn render_pvc_volume(
             }
         }
     }
+    lines.extend(render_csi_driver(csi));
+    lines.join("\n")
+}
+
+/// Whether a volume's CSI driver is installed, and on how many nodes.
+fn render_csi_driver(csi: &Option<Result<k8s::PvcCsiDriver, String>>) -> Option<String> {
     match csi {
-        None => {}
-        Some(Err(e)) => lines.push(format!("(CSI driver unavailable: {e})")),
-        Some(Ok(d)) => lines.push(format!(
-            "CSI driver {}: {}; on {} of {} nodes",
+        None => None,
+        Some(Err(e)) => Some(format!("(CSI driver unavailable: {e})")),
+        Some(Ok(d)) => Some(format!(
+            "CSI driver {}: {}; on {} of {} nodes{}",
             d.name,
             if d.registered { "registered" } else { "NO CSIDriver OBJECT (not installed, or an in-tree provisioner)" },
             d.on_nodes,
-            d.nodes
+            d.nodes,
+            if d.nodes > 0 && d.on_nodes == 0 { " — NO NODE CAN MOUNT ITS VOLUMES" } else { "" }
         )),
     }
-    lines.join("\n")
 }
 
 /// The pods mounting the claim, and whether a single-node volume is wanted
@@ -6695,6 +6745,153 @@ pub async fn build_service_account_diagnosis_payload(context_name: &str, namespa
     Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
 }
 
+/// The volume itself: phase and why, size, modes, reclaim policy, source,
+/// and the node affinity that decides where it can be used.
+fn render_pv_state(pv: &k8s_openapi::api::core::v1::PersistentVolume, now: chrono::DateTime<chrono::Utc>) -> String {
+    use k8s::Chrono;
+    let spec = pv.spec.clone().unwrap_or_default();
+    let status = pv.status.clone().unwrap_or_default();
+    let phase = status.phase.clone().unwrap_or_else(|| "(unknown)".to_string());
+    let reclaim = spec.persistent_volume_reclaim_policy.clone().unwrap_or_else(|| "Retain".to_string());
+    let since = status.last_phase_transition_time.as_ref().map(|t| format!(" for {}", job_span((now - t.0.utc()).num_seconds()))).unwrap_or_default();
+    let mut lines = vec![
+        format!("phase: {phase}{since}"),
+        format!(
+            "capacity {}, access modes {}, volume mode {}, reclaim policy {reclaim}",
+            spec.capacity.as_ref().and_then(|c| c.get("storage")).map(|q| q.0.clone()).unwrap_or_else(|| "(unset)".to_string()),
+            spec.access_modes.clone().unwrap_or_default().join(", "),
+            spec.volume_mode.as_deref().unwrap_or("Filesystem"),
+        ),
+        format!("storage class: {}", spec.storage_class_name.as_deref().filter(|c| !c.is_empty()).unwrap_or("(none: only a claim that asks for no class can bind it)")),
+    ];
+    if let Some(m) = status.message.as_deref().filter(|m| !m.is_empty()) {
+        lines.push(format!("status: {} {m}", status.reason.as_deref().unwrap_or_default()));
+    }
+    let source = if let Some(c) = &spec.csi {
+        format!("CSI driver {}, volume handle {}", c.driver, c.volume_handle)
+    } else if let Some(d) = &spec.azure_disk {
+        format!("in-tree azureDisk {}", d.disk_name)
+    } else if let Some(f) = &spec.azure_file {
+        format!("in-tree azureFile share {}", f.share_name)
+    } else if let Some(h) = &spec.host_path {
+        format!("hostPath {} — the data lives on one node only", h.path)
+    } else if let Some(l) = &spec.local {
+        format!("local {} — the data lives on one node only", l.path)
+    } else if let Some(n) = &spec.nfs {
+        format!("NFS {}:{}", n.server, n.path)
+    } else {
+        "another in-tree source (see the manifest)".to_string()
+    };
+    lines.push(format!("source: {source}"));
+    if let Some(m) = spec.mount_options.as_ref().filter(|m| !m.is_empty()) {
+        lines.push(format!("mount options: {}", m.join(", ")));
+    }
+    for term in spec.node_affinity.iter().flat_map(|a| a.required.iter()).flat_map(|r| r.node_selector_terms.iter()) {
+        let exprs: Vec<String> =
+            term.match_expressions.iter().flatten().map(|e| format!("{} {} ({})", e.key, e.operator, e.values.clone().unwrap_or_default().join(","))).collect();
+        if !exprs.is_empty() {
+            lines.push(format!("usable only on nodes with: {}", exprs.join(" and ")));
+        }
+    }
+    match phase.as_str() {
+        "Released" if reclaim == "Retain" => lines.push(
+            "RELEASED: its claim was deleted. Under Retain the volume and its data stay, and no claim can bind it until its claimRef is cleared — or it is deleted along with its backing disk"
+                .to_string(),
+        ),
+        "Released" => lines.push(format!("RELEASED UNDER {reclaim}: its provisioner should have reclaimed it by now — is its driver running? Its events say why not")),
+        "Failed" => lines.push("FAILED: reclaiming it failed; the status and events say why".to_string()),
+        "Available" => lines.push("Available: bound to no claim; a claim of its class, with a size and access modes it satisfies, can bind it".to_string()),
+        "Pending" => lines.push("PENDING: not yet available for binding".to_string()),
+        _ => {}
+    }
+    lines.join("\n")
+}
+
+/// The claim it is bound to: whether that claim still exists, is the same
+/// object, and names this volume back.
+fn render_pv_claim(pv: &k8s_openapi::api::core::v1::PersistentVolume, claim: &Option<Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>, String>>) -> String {
+    let name = pv.metadata.name.as_deref().unwrap_or_default();
+    let claim_ref = pv.spec.as_ref().and_then(|s| s.claim_ref.as_ref());
+    let Some(r) = claim_ref else { return "(no claimRef: it is bound to no claim)".to_string() };
+    let at = format!("{}/{}", r.namespace.as_deref().unwrap_or("-"), r.name.as_deref().unwrap_or("-"));
+    match claim {
+        None => format!("claimRef {at}, which names no namespace or name"),
+        Some(Err(e)) => format!("claimRef {at}: (claim unavailable: {e})"),
+        Some(Ok(None)) => format!("claimRef {at}: THAT CLAIM NO LONGER EXISTS"),
+        Some(Ok(Some(c))) => {
+            let phase = c.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
+            if r.uid.is_some() && r.uid != c.metadata.uid {
+                format!("claimRef {at}: A CLAIM OF THAT NAME EXISTS, BUT IT IS A NEWER OBJECT (its uid is not the claimRef's), so this volume will not bind to it")
+            } else if c.spec.as_ref().and_then(|s| s.volume_name.as_deref()) != Some(name) {
+                format!("claimRef {at} ({phase}): THE CLAIM NAMES ANOTHER VOLUME, or none yet")
+            } else {
+                format!("bound to claim {at} ({phase})")
+            }
+        }
+    }
+}
+
+fn render_pv_class(name: Option<&str>, class: &Option<Result<Option<k8s_openapi::api::storage::v1::StorageClass>, String>>) -> String {
+    match (name, class) {
+        (None, _) | (_, None) => "(it names no StorageClass)".to_string(),
+        (Some(n), Some(Err(e))) => format!("StorageClass {n}: (unavailable: {e})"),
+        (Some(n), Some(Ok(None))) => format!("NO STORAGECLASS NAMED {n} EXISTS: nothing provisions or expands volumes of that class"),
+        (Some(n), Some(Ok(Some(c)))) => format!(
+            "{n}: provisioner {}, reclaim policy {}, binding mode {}, expansion {}",
+            c.provisioner,
+            c.reclaim_policy.as_deref().unwrap_or("Delete"),
+            c.volume_binding_mode.as_deref().unwrap_or("Immediate"),
+            if c.allow_volume_expansion == Some(true) { "allowed" } else { "not allowed" }
+        ),
+    }
+}
+
+fn render_pv_nodes(nodes: &Option<Result<(usize, usize, usize), String>>) -> String {
+    match nodes {
+        None => "(no node affinity: usable on any node)".to_string(),
+        Some(Err(e)) => format!("(nodes unavailable: {e})"),
+        Some(Ok((0, _, total))) => format!("NO NODE OF THE {total} SATISFIES ITS NODE AFFINITY: a pod that uses it cannot be scheduled (a zonal disk in a zone with no nodes)"),
+        Some(Ok((matching, 0, total))) => format!("{matching} of {total} nodes satisfy its node affinity, but NONE OF THEM IS READY AND SCHEDULABLE"),
+        Some(Ok((matching, usable, total))) => format!("{matching} of {total} nodes satisfy its node affinity, {usable} of them ready and schedulable"),
+    }
+}
+
+/// Assembles a PersistentVolume diagnosis, redacted.
+pub async fn build_pv_diagnosis_payload(context_name: &str, name: &str) -> Result<ClaudeDiagnosisPayload, String> {
+    let d = k8s::get_pv_diagnostics(context_name, name).await?;
+    let now = chrono::Utc::now();
+    let class_name = d.pv.spec.as_ref().and_then(|s| s.storage_class_name.as_deref()).filter(|c| !c.is_empty());
+    let mut storage = vec![render_pv_class(class_name, &d.storage_class)];
+    storage.extend(render_csi_driver(&d.csi_driver));
+    let state = redact::redact(&render_pv_state(&d.pv, now));
+    let claim = redact::redact(&render_pv_claim(&d.pv, &d.claim));
+    let storage = redact::redact(&storage.join("\n"));
+    let nodes = redact::redact(&render_pv_nodes(&d.affinity_nodes));
+    let bound = d.pv.spec.as_ref().is_some_and(|s| s.claim_ref.is_some());
+    let attachments = redact::redact(&render_pvc_attachments(&d.attachments, true));
+    let pods = redact::redact(&match &d.claim {
+        Some(Ok(Some(c))) if bound => render_pvc_pods(c, &d.pods),
+        _ => "(no claim, so no pod uses it)".to_string(),
+    });
+    let events = redact::redact(&render_nap_events(&d.events, "(no events for this PersistentVolume)", false, 20));
+    let manifest = redact::redact(&d.manifest);
+
+    let prompt = format!(
+        "PersistentVolume {name}.\n\n\
+         ## The volume\n{}\n\n\
+         ## Its claim\n{}\n\n\
+         ## Storage class and driver\n{}\n\n\
+         ## Nodes that can use it\n{}\n\n\
+         ## VolumeAttachments\n{}\n\n\
+         ## Pods that mount its claim\n{}\n\n\
+         ## Events\n{}\n\n\
+         ## Manifest (managed fields omitted)\n```yaml\n{}\n```",
+        state.text, claim.text, storage.text, nodes.text, attachments.text, pods.text, events.text, manifest.text,
+    );
+    let redaction_summary = redact::Redacted::merge([&state, &claim, &storage, &nodes, &attachments, &pods, &events, &manifest]).summary();
+    Ok(ClaudeDiagnosisPayload { approx_tokens: approx_tokens(&prompt), prompt, redaction_summary, log_note: None })
+}
+
 /// A size in bytes as a person reads it.
 fn size_text(bytes: usize) -> String {
     match bytes {
@@ -8233,6 +8430,7 @@ pub async fn diagnose(prompt: &str, kind: &str, on_token: tauri::ipc::Channel<St
         "SecretStore" | "ClusterSecretStore" => DIAGNOSE_SECRET_STORE_SYSTEM,
         "ServiceAccount" => DIAGNOSE_SERVICE_ACCOUNT_SYSTEM,
         "ConfigMap" | "Secret" => DIAGNOSE_CONFIG_SYSTEM,
+        "PersistentVolume" => DIAGNOSE_PV_SYSTEM,
         "DaemonSet" => DIAGNOSE_DAEMONSET_SYSTEM,
         "Deployment" => DIAGNOSE_DEPLOYMENT_SYSTEM,
         _ => DIAGNOSE_WORKLOAD_SYSTEM,
@@ -11395,6 +11593,89 @@ no endpoints available for service \"example-metrics-victoria-metrics-operator\"
         assert!(built > 0, "no claim to diagnose");
         assert_eq!(unavailable, 0);
         assert_eq!(unbound_explained, unbound);
+    }
+
+    /// Builds a diagnosis for every PersistentVolume not Bound and a sample of
+    /// the Bound ones, printing counts only:
+    /// PV_DIAG_TEST_CONTEXT=<context> cargo test --lib
+    /// claude::tests::pv_diagnosis_against_a_live_cluster -- --ignored --exact --nocapture
+    #[tokio::test]
+    #[ignore = "needs a reachable cluster; set PV_DIAG_TEST_CONTEXT to run"]
+    async fn pv_diagnosis_against_a_live_cluster() {
+        let Ok(ctx) = std::env::var("PV_DIAG_TEST_CONTEXT") else { return };
+        let all = crate::resources::get_pvs(&ctx).await.expect("pvs");
+        let mut volumes: Vec<_> = all.iter().filter(|v| v.status != "Bound").collect();
+        volumes.extend(all.iter().filter(|v| v.status == "Bound").take(10));
+        let mut by_phase: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let (mut built, mut unavailable, mut largest, mut explained, mut claim_gone, mut no_node, mut with_pods) = (0, 0, 0, 0, 0, 0, 0);
+        for v in volumes.iter().copied() {
+            let payload = build_pv_diagnosis_payload(&ctx, &v.name).await.expect("payload");
+            let p = &payload.prompt;
+            *by_phase.entry(v.status.clone()).or_default() += 1;
+            built += 1;
+            unavailable += p.matches("unavailable: ").count();
+            largest = largest.max(payload.approx_tokens);
+            claim_gone += p.contains("THAT CLAIM NO LONGER EXISTS") as usize;
+            no_node += p.contains("NO NODE OF THE") as usize;
+            with_pods += (!p.contains("(no pod mounts it)") && !p.contains("(no claim, so no pod uses it)")) as usize;
+            if v.status != "Bound" {
+                explained += (p.contains("RELEASED") || p.contains("FAILED") || p.contains("Available: bound to no claim") || p.contains("PENDING")) as usize;
+            }
+        }
+        println!(
+            "pvs={} sampled={} by phase={by_phase:?} built={built} unavailable_sections={unavailable} largest_tokens={largest} claim_gone={claim_gone} no_node={no_node} with_pods={with_pods}",
+            all.len(),
+            volumes.len()
+        );
+        assert!(built > 0, "no volume to diagnose");
+        assert_eq!(unavailable, 0);
+        assert_eq!(explained, volumes.iter().filter(|v| v.status != "Bound").count(), "every volume not Bound says why");
+    }
+
+    #[test]
+    fn a_persistent_volume_says_what_holds_it_and_where_it_can_be_used() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-24T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let pv = |status: serde_json::Value, extra: serde_json::Value| -> k8s_openapi::api::core::v1::PersistentVolume {
+            let mut base = serde_json::json!({
+                "metadata": { "name": "pvc-123" },
+                "spec": { "capacity": { "storage": "32Gi" }, "accessModes": ["ReadWriteOnce"], "persistentVolumeReclaimPolicy": "Retain", "storageClassName": "managed-csi",
+                    "csi": { "driver": "disk.csi.azure.com", "volumeHandle": "/subscriptions/s/disks/d" },
+                    "claimRef": { "namespace": "app", "name": "data", "uid": "old-uid" },
+                    "nodeAffinity": { "required": { "nodeSelectorTerms": [{ "matchExpressions": [{ "key": "topology.disk.csi.azure.com/zone", "operator": "In", "values": ["westeurope-1"] }] }] } } },
+                "status": status
+            });
+            json_merge(&mut base, extra);
+            serde_json::from_value(base).unwrap()
+        };
+        let released = pv(serde_json::json!({ "phase": "Released", "lastPhaseTransitionTime": "2026-11-21T12:00:00Z" }), serde_json::json!({}));
+        assert_eq!(
+            render_pv_state(&released, now),
+            "phase: Released for 3d 0h\n\
+             capacity 32Gi, access modes ReadWriteOnce, volume mode Filesystem, reclaim policy Retain\n\
+             storage class: managed-csi\n\
+             source: CSI driver disk.csi.azure.com, volume handle /subscriptions/s/disks/d\n\
+             usable only on nodes with: topology.disk.csi.azure.com/zone In (westeurope-1)\n\
+             RELEASED: its claim was deleted. Under Retain the volume and its data stay, and no claim can bind it until its claimRef is cleared — or it is deleted along with its backing disk"
+        );
+        let deleting = pv(serde_json::json!({ "phase": "Released" }), serde_json::json!({ "spec": { "persistentVolumeReclaimPolicy": "Delete" } }));
+        assert!(render_pv_state(&deleting, now).ends_with("RELEASED UNDER Delete: its provisioner should have reclaimed it by now — is its driver running? Its events say why not"));
+
+        let claim = |uid: &str, volume: &str| -> k8s_openapi::api::core::v1::PersistentVolumeClaim {
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": "data", "namespace": "app", "uid": uid }, "spec": { "volumeName": volume }, "status": { "phase": "Bound" } })).unwrap()
+        };
+        assert_eq!(render_pv_claim(&released, &Some(Ok(None))), "claimRef app/data: THAT CLAIM NO LONGER EXISTS");
+        assert!(render_pv_claim(&released, &Some(Ok(Some(claim("new-uid", ""))))).contains("IT IS A NEWER OBJECT"));
+        assert_eq!(render_pv_claim(&released, &Some(Ok(Some(claim("old-uid", "pvc-123"))))), "bound to claim app/data (Bound)");
+        assert!(render_pv_claim(&released, &Some(Ok(Some(claim("old-uid", "pvc-other"))))).contains("THE CLAIM NAMES ANOTHER VOLUME"));
+
+        assert!(render_pv_nodes(&Some(Ok((0, 0, 6)))).starts_with("NO NODE OF THE 6 SATISFIES ITS NODE AFFINITY"));
+        assert_eq!(render_pv_nodes(&Some(Ok((2, 2, 6)))), "2 of 6 nodes satisfy its node affinity, 2 of them ready and schedulable");
+        assert!(render_pv_nodes(&Some(Ok((2, 0, 6)))).ends_with("NONE OF THEM IS READY AND SCHEDULABLE"));
+        assert_eq!(render_pv_class(Some("gone"), &Some(Ok(None))), "NO STORAGECLASS NAMED gone EXISTS: nothing provisions or expands volumes of that class");
+        assert_eq!(
+            render_csi_driver(&Some(Ok(k8s::PvcCsiDriver { name: "disk.csi.azure.com".into(), registered: true, on_nodes: 0, nodes: 3 }))).as_deref(),
+            Some("CSI driver disk.csi.azure.com: registered; on 0 of 3 nodes — NO NODE CAN MOUNT ITS VOLUMES")
+        );
     }
 
     /// Builds a diagnosis for every ScaledObject and ScaledJob on a cluster and
